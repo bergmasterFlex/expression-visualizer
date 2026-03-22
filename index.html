@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AST Visualizer 3D — Bevy + WebGL</title>
+  <link data-trunk rel="rust" data-wasm-opt="s" />
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700;800&display=swap');
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 100%; height: 100%;
+      overflow: hidden;
+      background: #08081a;
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    }
+
+    #bevy-canvas {
+      width: 100%; height: 100%;
+      display: block;
+      position: absolute;
+      top: 0; left: 0;
+    }
+
+    /* ── Top bar ─────────────────────────────────── */
+    #top-bar {
+      position: absolute; top: 0; left: 0; right: 0;
+      z-index: 10;
+      padding: 14px 20px;
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
+      background: linear-gradient(to bottom, rgba(8,8,26,0.96) 60%, transparent);
+      pointer-events: none;
+    }
+
+    #top-bar h1 {
+      color: #E8E4DE; font-size: 22px; font-weight: 800;
+      letter-spacing: -0.5px;
+    }
+    #top-bar h1 span.accent { color: #22D3EE; }
+    #top-bar h1 span.sub { color: #3A3A50; font-size: 13px; font-weight: 400; }
+
+    #top-bar .subtitle {
+      color: #3A3A50; font-size: 10px;
+    }
+    #top-bar .subtitle .hl { color: #22D3EE; }
+
+    .input-row {
+      display: flex; align-items: center; gap: 8px;
+      pointer-events: auto;
+    }
+    .input-row label { color: #4A4A5E; font-size: 11px; }
+
+    #expr-input {
+      background: #0f0f28;
+      border: 1.5px solid #1e1e3e;
+      border-radius: 8px;
+      color: #E8E4DE;
+      font-size: 14px;
+      font-family: 'JetBrains Mono', monospace;
+      padding: 5px 12px;
+      width: 300px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    #expr-input:focus { border-color: #22D3EE; }
+
+    .presets {
+      display: flex; flex-wrap: wrap; gap: 5px;
+      justify-content: center;
+      pointer-events: auto;
+    }
+
+    .preset-btn {
+      background: transparent;
+      border: 1px solid #1e1e3e;
+      border-radius: 6px;
+      color: #4A4A5E;
+      font-size: 10px;
+      font-family: 'JetBrains Mono', monospace;
+      padding: 3px 8px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .preset-btn:hover, .preset-btn.active {
+      background: #141438;
+      border-color: #22D3EE;
+      color: #22D3EE;
+    }
+
+    /* ── Controls hint ───────────────────────────── */
+    #controls-hint {
+      position: absolute; bottom: 14px; left: 50%;
+      transform: translateX(-50%);
+      display: flex; gap: 14px; z-index: 10;
+    }
+    .ctrl { display: flex; align-items: center; gap: 4px; }
+    .ctrl-key {
+      background: #10102a; border: 1px solid #1e1e3e;
+      border-radius: 4px; color: #4A4A5E;
+      font-size: 9px; padding: 2px 5px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .ctrl-desc {
+      color: #2E2E46; font-size: 9px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* ── Legend ───────────────────────────────────── */
+    #legend {
+      position: absolute; bottom: 14px; right: 14px;
+      z-index: 10;
+      display: flex; flex-direction: column; gap: 3px;
+    }
+    .legend-item {
+      display: flex; align-items: center; gap: 5px;
+    }
+    .legend-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+    }
+    .legend-box {
+      width: 8px; height: 8px; border-radius: 2px;
+    }
+    .legend-diamond {
+      width: 8px; height: 8px;
+      transform: rotate(45deg) scale(0.75);
+      border-radius: 1px;
+    }
+    .legend-label {
+      color: #3A3A50; font-size: 9px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* ── Axis key ────────────────────────────────── */
+    #axis-key {
+      position: absolute; bottom: 50px; left: 14px;
+      z-index: 10;
+      display: flex; flex-direction: column; gap: 2px;
+    }
+    #axis-key span {
+      color: rgba(74,74,94,0.35); font-size: 9px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+  </style>
+</head>
+<body>
+  <!-- Bevy renders into this canvas -->
+  <canvas id="bevy-canvas"></canvas>
+
+  <!-- UI overlay (HTML, not Bevy) -->
+  <div id="top-bar">
+    <h1>
+      <span class="accent">AST</span> Visualizer
+      <span class="sub">3D · Bevy + WebGL</span>
+    </h1>
+    <p class="subtitle">
+      <span class="hl">↑ Y</span> = evaluation order · ternary branches split along
+      <span class="hl">Z</span> and flow <em>upward</em>
+    </p>
+    <div class="input-row">
+      <label>expr =</label>
+      <input id="expr-input" value="(5 > 3) ? 10 + 1 : 20 - 5" spellcheck="false" />
+    </div>
+    <div class="presets" id="presets"></div>
+  </div>
+
+  <div id="controls-hint">
+    <div class="ctrl"><span class="ctrl-key">Drag</span><span class="ctrl-desc">Orbit</span></div>
+    <div class="ctrl"><span class="ctrl-key">Scroll</span><span class="ctrl-desc">Zoom</span></div>
+    <div class="ctrl"><span class="ctrl-key">Right-drag</span><span class="ctrl-desc">Pan</span></div>
+  </div>
+
+  <div id="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#FF6B6B"></div><span class="legend-label">Add +</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background:#4ECDC4"></div><span class="legend-label">Sub −</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background:#FFE66D"></div><span class="legend-label">Mul ×</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background:#A78BFA"></div><span class="legend-label">Div ÷</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background:#FB923C"></div><span class="legend-label">Compare</span></div>
+    <div class="legend-item"><div class="legend-diamond" style="background:#22D3EE"></div><span class="legend-label">Ternary ?:</span></div>
+    <div class="legend-item"><div class="legend-box" style="background:#4ADE80"></div><span class="legend-label">true</span></div>
+    <div class="legend-item"><div class="legend-box" style="background:#F87171"></div><span class="legend-label">false</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background:#E8E4DE"></div><span class="legend-label">Number</span></div>
+  </div>
+
+  <div id="axis-key">
+    <span>↑ Y = evaluation order</span>
+    <span>← X → binary splits</span>
+    <span>← Z → ternary branches</span>
+  </div>
+
+  <script>
+    // ── Expression bridge to WASM ──────────────────
+    window.astExpression = "(5 > 3) ? 10 + 1 : 20 - 5";
+
+    const input = document.getElementById('expr-input');
+    input.addEventListener('input', () => {
+      window.astExpression = input.value;
+      updatePresetHighlights();
+    });
+
+    // ── Presets ────────────────────────────────────
+    const presets = [
+      "(5 > 3) ? 10 + 1 : 20 - 5",
+      "true ? 3 + 4 : 5 * 2",
+      "false ? 1 : true ? 2 : 3",
+      "(2 * 3 > 5) ? 8 : 0",
+      "(1 + 2) * (3 + 4)",
+    ];
+
+    const presetsContainer = document.getElementById('presets');
+    presets.forEach(expr => {
+      const btn = document.createElement('button');
+      btn.className = 'preset-btn';
+      btn.textContent = expr;
+      btn.addEventListener('click', () => {
+        input.value = expr;
+        window.astExpression = expr;
+        updatePresetHighlights();
+      });
+      presetsContainer.appendChild(btn);
+    });
+
+    function updatePresetHighlights() {
+      document.querySelectorAll('.preset-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.textContent === input.value);
+      });
+    }
+    updatePresetHighlights();
+
+    // Prevent canvas right-click menu
+    document.addEventListener('contextmenu', e => {
+      if (e.target.tagName === 'CANVAS') e.preventDefault();
+    });
+  </script>
+</body>
+</html>
