@@ -19,8 +19,6 @@ pub struct OrbitCamera {
     pub radius: f32,
     /// Look-at target.
     pub target: Vec3,
-    /// Whether auto-rotation is active.
-    pub auto_rotate: bool,
     /// Auto-rotation speed (radians/sec).
     pub auto_speed: f32,
 }
@@ -32,7 +30,6 @@ impl Default for OrbitCamera {
             phi: 1.0,
             radius: 12.0,
             target: Vec3::new(0.0, 0.0, 0.0),
-            auto_rotate: true,
             auto_speed: 0.15,
         }
     }
@@ -75,14 +72,12 @@ fn orbit_input(
 
     // Left mouse drag → orbit
     if mouse_buttons.pressed(MouseButton::Left) && total_motion != Vec2::ZERO {
-        orbit.auto_rotate = false;
         orbit.theta -= total_motion.x * 0.007;
         orbit.phi = (orbit.phi - total_motion.y * 0.007).clamp(0.15, std::f32::consts::PI - 0.15);
     }
 
     // Right mouse drag → pan
     if mouse_buttons.pressed(MouseButton::Right) && total_motion != Vec2::ZERO {
-        orbit.auto_rotate = false;
         let theta = orbit.theta;
         let right = Vec3::new(theta.cos(), 0.0, -theta.sin());
         let up = Vec3::Y;
@@ -93,11 +88,6 @@ fn orbit_input(
     // Scroll → zoom
     if scroll_delta != 0.0 {
         orbit.radius = (orbit.radius - scroll_delta).clamp(2.0, 35.0);
-    }
-
-    // Auto-rotate
-    if orbit.auto_rotate {
-        orbit.theta += orbit.auto_speed * time.delta_seconds();
     }
 }
 

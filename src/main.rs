@@ -2,9 +2,7 @@ mod ast;
 mod camera;
 mod layout;
 
-use bevy::prelude::*;
-use camera::{OrbitCamera, OrbitCameraPlugin, OrbitCameraTag};
-use layout::{EdgeDir, LayoutEdge, LayoutNode};
+use bevy::{input::keyboard::KeyboardInput, prelude::*};
 
 // ── WASM bridge ─────────────────────────────────────────────
 
@@ -16,26 +14,23 @@ fn read_expression_from_js() -> Option<String> {
     val.as_string()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn read_expression_from_js() -> Option<String> {
-    None // desktop: use default
-}
-
 // ── Resources ───────────────────────────────────────────────
 
 #[derive(Resource)]
 struct AstState {
-    expression: String,
-    nodes: Vec<LayoutNode>,
-    edges: Vec<LayoutEdge>,
+    nodes: Vec<layout::LayoutNode>,
+    edges: Vec<layout::LayoutEdge>,
 }
 
 impl Default for AstState {
     fn default() -> Self {
-        let expr = "(5 > 3) ? 10 + 1 : 20 - 5".to_string();
-        let tree = ast::parse(&expr);
+        let tree = ast::AstNode::BinaryExpr {
+            op: '+',
+            left: Box::new(ast::AstNode::NumLiteral("3".to_string())),
+            right: Box::new(ast::AstNode::NumLiteral("7".to_string())),
+        };
         let (nodes, edges) = layout::compute_layout(&tree);
-        Self { expression: expr, nodes, edges }
+        Self { nodes, edges }
     }
 }
 
@@ -52,6 +47,33 @@ struct NeedsRebuild(bool);
 /// Marker for any spawned scene entity (cleaned on rebuild).
 #[derive(Component)]
 struct AstSceneEntity;
+
+#[derive(Component)]
+struct ResetButton;
+
+/// Stores which node is hovered / selected.
+#[derive(Resource, Default)]
+struct PickState {
+    hovered: Option<usize>,   // node_id
+    selected: Option<usize>,  // node_id
+}
+
+/// UI text showing the selected node's info.
+#[derive(Component)]
+struct SelectionDisplay;
+
+#[derive(Component)]
+struct TextInput {
+    value: String,
+    focused: bool,
+    cursor: usize,
+}
+
+#[derive(Component)]
+struct TextInputDisplay;
+
+#[derive(Component)]
+struct TextInputBox;
 
 // ── Colors ──────────────────────────────────────────────────
 
@@ -129,7 +151,7 @@ fn setup_scene(mut commands: Commands) {
             },
             ..default()
         },
-        OrbitCameraTag,
+        camera::OrbitCameraTag,
     ));
 
     // Directional light
@@ -260,6 +282,56 @@ fn spawn_ast_nodes(
                 AstSceneEntity,
             ));
         }
+
+        //Value label
+        spawn_world_label(
+            &mut commands,
+            &node.ast.label(),
+            node_color(&node.ast),
+            18.0,
+            node.pos,
+            Vec2::ZERO,
+            AstSceneEntity,
+        );
+
+        // Type label (smaller, above)
+        spawn_world_label(
+            &mut commands,
+            node.ast.type_name(),
+            Color::srgba(0.3, 0.3, 0.37, 1.0),
+            14.0,
+            node.pos,
+            Vec2::new(0.0, -22.0),  // 22px above
+            AstSceneEntity,
+        );
+
+        spawn_world_label(
+            &mut commands,
+            "X",
+            Color::srgba(1.0, 1.0, 1.0, 1.0),
+            18.0,
+            Vec3::new(10.0, 0.0, 0.0),
+            Vec2::new(0.0, -22.0),  // 22px above
+            AstSceneEntity,
+        );
+        spawn_world_label(
+            &mut commands,
+            "Y",
+            Color::srgba(1.0, 1.0, 1.0, 1.0),
+            18.0,
+            Vec3::new(0.0, 10.0, 0.0),
+            Vec2::new(0.0, -22.0),  // 22px above
+            AstSceneEntity,
+        );
+        spawn_world_label(
+            &mut commands,
+            "Z",
+            Color::srgba(1.0, 1.0, 1.0, 1.0),
+            18.0,
+            Vec3::new(0.0, 0.0, 10.0),
+            Vec2::new(0.0, -22.0),  // 22px above
+            AstSceneEntity,
+        );
     }
 
     // Translucent Z-planes for ternary branches (thin cuboids facing Z)
@@ -297,21 +369,127 @@ fn spawn_ast_nodes(
     }
 }
 
+fn spawn_ui(mut commands: Commands) {
+    commands.spawn((
+        ButtonBundle {
+            style: Style {
+                position_type: PositionType::Absolute,
+                top: Val::Px(12.0),
+                left: Val::Px(12.0),
+                padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+                ..default()
+            },
+            background_color: Color::srgba(0.16, 0.16, 0.22, 0.9).into(),
+            border_radius: BorderRadius::all(Val::Px(6.0)),
+            ..default()
+        },
+        ResetButton,
+    )).with_children(|parent| {
+        parent.spawn(TextBundle::from_section(
+            "reset",
+            TextStyle {
+                font_size: 14.0,
+                color: Color::srgb(0.6, 0.6, 0.7),
+                ..default()
+            },
+        ));
+    });
+}
+
+fn handle_reset_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (With<Interaction>, With<ResetButton>),
+    >,
+    mut text_q: Query<&mut Text>,
+    mut state: ResMut<AstState>,
+    mut orbit: ResMut<camera::OrbitCamera>,
+    mut rebuild: ResMut<NeedsRebuild>,
+    mut commands: Commands,
+    scene_entities: Query<Entity, With<AstSceneEntity>>,
+) {
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut text = text_q.get_mut(children[0]).unwrap();
+
+        match *interaction {
+            Interaction::Pressed => {
+                /*
+                // Reset expression
+                let expr = "2 + 2".to_string();
+                let tree = crate::ast::parse(&expr);
+                let (nodes, edges) = crate::layout::compute_layout(&tree);
+                state.expression = expr;
+                state.nodes = nodes;
+                state.edges = edges;
+
+                for entity in scene_entities.iter() {
+                    commands.entity(entity).despawn_recursive();
+                }
+                rebuild.0 = true;
+                orbit.auto_rotate = true;
+                orbit.theta = 0.6;
+                orbit.phi = 1.0;
+                orbit.radius = 7.0;
+
+                bg.0 = Color::srgba(0.1, 0.1, 0.2, 0.95);
+                text.sections[0].style.color = Color::srgb(0.133, 0.827, 0.933);
+                */
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
+                text.sections[0].style.color = Color::srgb(0.85, 0.85, 0.9);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
+                text.sections[0].style.color = Color::srgb(0.6, 0.6, 0.7);
+            }
+        }
+    }
+}
+
+
 /// Draw edges using Gizmos (called every frame).
 fn draw_edges(mut gizmos: Gizmos, state: Res<AstState>) {
-    for edge in &state.edges {
+    let edges = &state.edges;
+    let edges = edges.into_iter().cloned().chain(vec![
+        layout::LayoutEdge {
+            from_id: 0,
+            to_id: 0,
+            from_pos: Vec3::new(0.0, 0.0, 0.0),
+            to_pos: Vec3::new(10.0, 0.0, 0.0),
+            label: "X",
+            dir: layout::EdgeDir::Up
+        },
+        layout::LayoutEdge {
+            from_id: 0,
+            to_id: 0,
+            from_pos: Vec3::new(0.0, 0.0, 0.0),
+            to_pos: Vec3::new(0.0, 10.0, 0.0),
+            label: "Y",
+            dir: layout::EdgeDir::Up
+        },
+        layout::LayoutEdge {
+            from_id: 0,
+            to_id: 0,
+            from_pos: Vec3::new(0.0, 0.0, 0.0),
+            to_pos: Vec3::new(0.0, 0.0, 10.0),
+            label: "Z",
+            dir: layout::EdgeDir::Up
+        }
+    ].into_iter()).collect::<Vec<layout::LayoutEdge>>();
+    for edge in edges {
         let from = edge.from_pos;
         let to = edge.to_pos;
         let is_ternary_edge = matches!(edge.label, "then" | "else" | "cond");
 
         // Determine start/end offsets along Y
         let node_radius = 0.4;
-        let start = if edge.dir == EdgeDir::Up {
+        let start = if edge.dir == layout::EdgeDir::Up {
             from + Vec3::Y * node_radius
         } else {
             from - Vec3::Y * node_radius
         };
-        let end = if edge.dir == EdgeDir::Up {
+        let end = if edge.dir == layout::EdgeDir::Up {
             to - Vec3::Y * node_radius
         } else {
             to + Vec3::Y * node_radius
@@ -360,6 +538,7 @@ fn draw_edges(mut gizmos: Gizmos, state: Res<AstState>) {
         gizmos.line(end, arrow_base - perp1, color);
         gizmos.line(end, arrow_base + perp2, color);
         gizmos.line(end, arrow_base - perp2, color);
+
     }
 }
 
@@ -375,42 +554,6 @@ fn animate_nodes(
     }
 }
 
-/// Poll the JS bridge for expression changes and rebuild the tree if needed.
-fn poll_expression(
-    mut commands: Commands,
-    mut state: ResMut<AstState>,
-    mut orbit: ResMut<OrbitCamera>,
-    mut rebuild: ResMut<NeedsRebuild>,
-    scene_entities: Query<Entity, With<AstSceneEntity>>,
-) {
-    if let Some(new_expr) = read_expression_from_js() {
-        if new_expr != state.expression && !new_expr.is_empty() {
-            state.expression = new_expr.clone();
-            let tree = ast::parse(&new_expr);
-            let (nodes, edges) = layout::compute_layout(&tree);
-            state.nodes = nodes;
-            state.edges = edges;
-
-            // Despawn old scene entities
-            for entity in scene_entities.iter() {
-                commands.entity(entity).despawn_recursive();
-            }
-
-            // Reset camera
-            orbit.auto_rotate = true;
-            orbit.theta = 0.6;
-            orbit.phi = 1.0;
-
-            // Compute new radius
-            let max_spread = state.nodes.iter()
-                .map(|n| n.pos.length())
-                .fold(0.0f32, f32::max);
-            orbit.radius = (max_spread * 1.3 + 4.0).max(7.0);
-
-            rebuild.0 = true;
-        }
-    }
-}
 
 /// If rebuild was requested, respawn the AST scene.
 fn rebuild_scene(
@@ -426,6 +569,361 @@ fn rebuild_scene(
     }
 }
 
+#[derive(Component)]
+pub struct WorldLabel {
+    pub world_pos: Vec3,
+    pub offset: Vec2,  // screen-space pixel offset
+}
+
+/// Spawn a UI text label that tracks a world position.
+fn spawn_world_label(
+    commands: &mut Commands,
+    text: &str,
+    color: Color,
+    font_size: f32,
+    world_pos: Vec3,
+    offset: Vec2,
+    marker: impl Bundle,
+) -> Entity {
+    commands.spawn((
+        TextBundle {
+            text: Text::from_section(
+                text,
+                TextStyle {
+                    font_size,
+                    color,
+                    ..default()
+                },
+            ),
+            style: Style {
+                position_type: PositionType::Absolute,
+                ..default()
+            },
+            visibility: Visibility::Hidden,
+            ..default()
+        },
+        WorldLabel { world_pos, offset },
+        marker,
+    )).id()
+}
+
+/// Each frame, project world positions → screen and reposition the text.
+fn update_world_labels(
+    camera_q: Query<(&Camera, &GlobalTransform), With<camera::OrbitCameraTag>>,
+    mut label_q: Query<(&WorldLabel, &mut Style, &mut Visibility, &Node)>,
+) {
+    let Ok((camera, cam_gt)) = camera_q.get_single() else { return };
+
+    for (label, mut style, mut vis, node) in label_q.iter_mut() {
+        if let Some(screen_pos) = camera.world_to_viewport(cam_gt, label.world_pos) {
+            let size = node.size();
+            style.left = Val::Px(screen_pos.x - size.x / 2.0 + label.offset.x);
+            style.top = Val::Px(screen_pos.y - size.y / 2.0 + label.offset.y);
+            *vis = Visibility::Visible;
+        } else {
+            // Behind camera
+            *vis = Visibility::Hidden;
+        }
+    }
+}
+
+fn spawn_selection_display(mut commands: Commands) {
+    commands.spawn((
+        TextBundle {
+            text: Text::from_section(
+                "",
+                TextStyle {
+                    font_size: 16.0,
+                    color: Color::srgb(0.85, 0.85, 0.9),
+                    ..default()
+                },
+            ),
+            style: Style {
+                position_type: PositionType::Absolute,
+                top: Val::Px(14.0),
+                right: Val::Px(14.0),
+                ..default()
+            },
+            ..default()
+        },
+        SelectionDisplay,
+    ));
+}
+
+fn pick_nodes(
+    camera_q: Query<(&Camera, &GlobalTransform), With<camera::OrbitCameraTag>>,
+    windows: Query<&Window>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut pick: ResMut<PickState>,
+    node_q: Query<(&AstNodeEntity, &Transform)>,
+) {
+    let Ok((camera, cam_gt)) = camera_q.get_single() else { return };
+    let Ok(window) = windows.get_single() else { return };
+    let Some(cursor) = window.cursor_position() else {
+        pick.hovered = None;
+        return;
+    };
+
+    // Build ray from camera through cursor
+    let Some(ray) = camera.viewport_to_world(cam_gt, cursor) else {
+        pick.hovered = None;
+        return;
+    };
+
+    // Test intersection with each node (sphere test, radius 0.35)
+    let radius = 0.35_f32;
+    let mut closest: Option<(usize, f32)> = None;
+
+    for (node_ent, transform) in node_q.iter() {
+        let center = transform.translation;
+        let oc = ray.origin - center;
+        let b = oc.dot(*ray.direction);
+        let c = oc.dot(oc) - radius * radius;
+        let disc = b * b - c;
+
+        if disc >= 0.0 {
+            let t = -b - disc.sqrt();
+            if t > 0.0 {
+                if closest.is_none() || t < closest.unwrap().1 {
+                    closest = Some((node_ent.node_id, t));
+                }
+            }
+        }
+    }
+
+    pick.hovered = closest.map(|(id, _)| id);
+
+    if mouse.just_pressed(MouseButton::Left) {
+        pick.selected = closest.map(|(id, _)| id);
+    }
+}
+
+fn highlight_hovered(
+    pick: Res<PickState>,
+    node_q: Query<(&AstNodeEntity, &Handle<StandardMaterial>)>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    state: Res<AstState>,
+) {
+    for (node_ent, mat_handle) in node_q.iter() {
+        let Some(mat) = materials.get_mut(mat_handle) else { continue };
+        let Some(layout_node) = state.nodes.iter().find(|n| n.id == node_ent.node_id) else { continue };
+
+        let base = node_emissive(&layout_node.ast);
+        let is_hovered = pick.hovered == Some(node_ent.node_id);
+        let is_selected = pick.selected == Some(node_ent.node_id);
+
+        let intensity = if is_hovered { 4.0 } else if is_selected { 2.5 } else { 1.0 };
+
+        mat.emissive = LinearRgba::new(
+            base.red * intensity,
+            base.green * intensity,
+            base.blue * intensity,
+            1.0,
+        );
+    }
+}
+
+fn update_selection_display(
+    pick: Res<PickState>,
+    state: Res<AstState>,
+    mut display_q: Query<&mut Text, With<SelectionDisplay>>,
+) {
+    let Ok(mut text) = display_q.get_single_mut() else { return };
+
+    if let Some(id) = pick.selected {
+        if let Some(node) = state.nodes.iter().find(|n| n.id == id) {
+            text.sections[0].value = format!(
+                "{} : {}",
+                node.ast.label(),
+                node.ast.type_name(),
+            );
+            text.sections[0].style.color = node_color(&node.ast);
+        }
+    } else {
+        text.sections[0].value.clear();
+    }
+}
+
+fn update_cursor(
+    pick: Res<PickState>,
+    mut windows: Query<&mut Window>,
+) {
+    let Ok(mut window) = windows.get_single_mut() else { return };
+    window.cursor.icon = if pick.hovered.is_some() {
+        CursorIcon::Pointer
+    } else {
+        CursorIcon::Default
+    };
+}
+
+fn spawn_text_input(commands: &mut Commands, initial: &str) {
+    // Outer container (clickable background)
+    commands.spawn((
+        ButtonBundle {
+            style: Style {
+                position_type: PositionType::Absolute,
+                top: Val::Px(12.0),
+                left: Val::Px(90.0),  // next to reset button
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                min_width: Val::Px(220.0),
+                border: UiRect::all(Val::Px(1.5)),
+                ..default()
+            },
+            background_color: Color::srgba(0.06, 0.06, 0.12, 0.9).into(),
+            border_color: Color::srgb(0.12, 0.12, 0.24).into(),
+            border_radius: BorderRadius::all(Val::Px(6.0)),
+            ..default()
+        },
+        TextInputBox,
+        TextInput {
+            value: initial.to_string(),
+            focused: false,
+            cursor: initial.len(),
+        },
+    )).with_children(|parent| {
+        parent.spawn((
+            TextBundle::from_section(
+                initial,
+                TextStyle {
+                    font_size: 14.0,
+                    color: Color::srgb(0.91, 0.89, 0.87),
+                    ..default()
+                },
+            ),
+            TextInputDisplay,
+        ));
+    });
+}
+
+fn text_input_focus(
+    mut input_q: Query<(&Interaction, &mut TextInput, &mut BorderColor), With<TextInputBox>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+) {
+    let clicked_outside = mouse.just_pressed(MouseButton::Left);
+
+    for (interaction, mut input, mut border) in input_q.iter_mut() {
+        if *interaction == Interaction::Pressed {
+            input.focused = true;
+        } else if clicked_outside && *interaction == Interaction::None {
+            input.focused = false;
+        }
+
+        if keys.just_pressed(KeyCode::Escape) {
+            input.focused = false;
+        }
+
+        // Visual feedback
+        border.0 = if input.focused {
+            Color::srgb(0.133, 0.827, 0.933) // cyan when focused
+        } else {
+            Color::srgb(0.12, 0.12, 0.24)
+        };
+    }
+}
+
+fn text_input_keyboard(
+    mut input_q: Query<(&mut TextInput, &Children), With<TextInputBox>>,
+    mut text_q: Query<&mut Text, With<TextInputDisplay>>,
+    mut key_events: EventReader<KeyboardInput>,
+    mut state: ResMut<AstState>,
+    mut orbit: ResMut<camera::OrbitCamera>,
+    mut rebuild: ResMut<NeedsRebuild>,
+    mut commands: Commands,
+    scene_entities: Query<Entity, With<AstSceneEntity>>,
+) {
+    for (mut input, children) in input_q.iter_mut() {
+        if !input.focused {
+            continue;
+        }
+
+        let mut changed = false;
+
+        for ev in key_events.read() {
+            if ev.state != bevy::input::ButtonState::Pressed { continue; }
+
+            let input_cursor = input.cursor;
+
+            match &ev.logical_key {
+                bevy::input::keyboard::Key::Character(s) => {
+                    input.value.insert_str(input_cursor, s.as_str());
+                    input.cursor += s.len();
+                    changed = true;
+                }
+                bevy::input::keyboard::Key::Space => {
+                    input.value.insert(input_cursor, ' ');
+                    input.cursor += 1;
+                    changed = true;
+                }
+                bevy::input::keyboard::Key::Backspace => {
+                    if input.cursor > 0 {
+                        let prev = input.value[..input.cursor]
+                            .char_indices().last()
+                            .map(|(i, _)| i).unwrap_or(0);
+                        input.value.remove(prev);
+                        input.cursor = prev;
+                        changed = true;
+                    }
+                }
+                bevy::input::keyboard::Key::Delete => {
+                    if input.cursor < input.value.len() {
+                        input.value.remove(input_cursor);
+                        changed = true;
+                    }
+                }
+                bevy::input::keyboard::Key::ArrowLeft => {
+                    if input.cursor > 0 {
+                        input.cursor = input.value[..input.cursor]
+                            .char_indices().last()
+                            .map(|(i, _)| i).unwrap_or(0);
+                    }
+                }
+                bevy::input::keyboard::Key::ArrowRight => {
+                    if input.cursor < input.value.len() {
+                        input.cursor += input.value[input.cursor..]
+                            .chars().next()
+                            .map(|c| c.len_utf8()).unwrap_or(0);
+                    }
+                }
+                bevy::input::keyboard::Key::Home => { input.cursor = 0; }
+                bevy::input::keyboard::Key::End => { input.cursor = input.value.len(); }
+                bevy::input::keyboard::Key::Escape => { input.focused = false; }
+                _ => {}
+            }
+        }
+
+        // Update display text with blinking cursor
+        if let Ok(mut text) = text_q.get_mut(children[0]) {
+            let (before, after) = input.value.split_at(input.cursor);
+            text.sections[0].value = if input.focused {
+                format!("{}|{}", before, after)
+            } else {
+                input.value.clone()
+            };
+        }
+
+        // Rebuild AST on change
+        if changed && !input.value.is_empty() {
+            /*
+            let tree = crate::ast::parse(&input.value);
+            let (nodes, edges) = crate::layout::compute_layout(&tree);
+            state.expression = input.value.clone();
+            state.nodes = nodes;
+            state.edges = edges;
+
+            for entity in scene_entities.iter() {
+                commands.entity(entity).despawn_recursive();
+            }
+            */
+            rebuild.0 = true;
+            //orbit.auto_rotate = true;
+            orbit.theta = 0.6;
+            orbit.phi = 1.0;
+            
+        }
+    }
+}
+
 // ── App entry ───────────────────────────────────────────────
 
 fn main() {
@@ -437,19 +935,30 @@ fn main() {
                     canvas: Some("#bevy-canvas".into()),
                     fit_canvas_to_parent: true,
                     prevent_default_event_handling: true,
+                    present_mode: bevy::window::PresentMode::AutoNoVsync, 
                     ..default()
                 }),
                 ..default()
             }),
-            OrbitCameraPlugin,
+            camera::OrbitCameraPlugin,
         ))
         .init_resource::<AstState>()
         .init_resource::<NeedsRebuild>()
-        .add_systems(Startup, (setup_scene, spawn_ast_nodes).chain())
+        .init_resource::<PickState>()
+        .add_systems(Startup, (setup_scene, spawn_ast_nodes, spawn_ui, spawn_selection_display).chain())
+        .add_systems(Startup, |mut commands: Commands| spawn_text_input(&mut commands, "(5 > 3) ? 10 + 1 : 20 - 5"))
         .add_systems(Update, (
             draw_edges,
             animate_nodes,
-            (poll_expression, rebuild_scene).chain(),
+            handle_reset_button,
+            pick_nodes,
+            highlight_hovered,
+            update_selection_display,
+            update_cursor, 
+            text_input_focus,
+            text_input_keyboard,
+            (rebuild_scene).chain(),
         ))
+        .add_systems(Update, update_world_labels)
         .run();
 }
