@@ -19,7 +19,7 @@
         # Rust toolchain with WASM target
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           targets = [ "wasm32-unknown-unknown" ];
-          extensions = [ "rust-analyzer" ];
+          extensions = [ "rust-analyzer" "rust-src"];
         };
 
         # ── Bevy native runtime deps (Linux) ──────────────
