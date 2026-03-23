@@ -1,56 +1,100 @@
-/// Arithmetic expression tokenizer and recursive-descent parser.
-///
-/// Grammar:
-///   expr       → ternary
-///   ternary    → comparison ('?' ternary ':' ternary)?
-///   comparison → additive (('>'|'<'|'>='|'<='|'=='|'!=') additive)?
-///   additive   → mult (('+' | '-') mult)*
-///   mult       → atom (('*' | '/') atom)*
-///   atom       → NUMBER | BOOL | '(' expr ')'
-
 // ── AST node types ──────────────────────────────────────────
+//
+pub struct Ast {
+    pub nodes: std::collections::HashMap<AstNodeId, EAstNode>,
+}
+
+impl Ast {
+    pub fn empty() -> Self {
+        Self {
+            nodes: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn plus(&self, n: EAstNode) -> Self {
+        let mut nodes = self.nodes.clone();
+        nodes.insert(self.next_id(), n);
+        Self { nodes }
+    }
+
+    pub fn next_id(&self) -> AstNodeId {
+        AstNodeId(self.nodes.keys().map(|id| id.0 + 1).max().unwrap_or(0))
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct AstNodeId(usize);
 
 #[derive(Debug, Clone)]
-pub enum AstNode {
+pub enum EAstNode {
+    Sink {
+        input: Option<AstNodeId>,
+    },
+    FunctionCall {
+        function_declaration_id: FunctionDeclarationId,
+        input_arguments: Vec<AstNodeId>,
+    },
     NumLiteral(String),
     BoolLiteral(bool),
-    BinaryExpr {
-        op: char,
-        left: Box<AstNode>,
-        right: Box<AstNode>,
+    MatchTrue {
+        input_argument: Option<AstNodeId>,
     },
-    ComparisonExpr {
-        op: String,
-        left: Box<AstNode>,
-        right: Box<AstNode>,
-    },
-    TernaryExpr {
-        condition: Box<AstNode>,
-        consequent: Box<AstNode>,
-        alternate: Box<AstNode>,
+    MatchFalse {
+        input_argument: Option<AstNodeId>,
     },
 }
 
-impl AstNode {
-    /// Short display label for rendering.
-    pub fn label(&self) -> String {
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct FunctionDeclarationId(usize);
+
+pub struct FunctionDeclaration {
+    name: String,
+    inputs: Vec<FunctionParameterDeclaration>,
+    output_type: EType,
+}
+
+pub struct FunctionParameterDeclaration {
+    name: String,
+    r#type: EType,
+}
+
+#[derive(Debug, Clone)]
+pub enum EType {
+    Number,
+    Bool,
+    SumType(Vec<EType>),
+    Error,
+}
+
+impl EAstNode {
+    pub fn label(
+        &self,
+        function_declarations: &std::collections::HashMap<
+            FunctionDeclarationId,
+            FunctionDeclaration,
+        >,
+    ) -> String {
         match self {
-            AstNode::NumLiteral(v) => v.clone(),
-            AstNode::BoolLiteral(b) => if *b { "true" } else { "false" }.into(),
-            AstNode::BinaryExpr { op, .. } => op.to_string(),
-            AstNode::ComparisonExpr { op, .. } => op.clone(),
-            AstNode::TernaryExpr { .. } => "?:".into(),
+            EAstNode::Sink { .. } => "sink".to_string(),
+            EAstNode::FunctionCall {
+                function_declaration_id,
+                ..
+            } => function_declarations
+                .get(&function_declaration_id)
+                .unwrap()
+                .name
+                .to_string(),
+            EAstNode::BoolLiteral(b) => b.to_string(),
+            EAstNode::NumLiteral(n) => n.to_string(),
+            EAstNode::MatchTrue { .. } => "true".to_string(),
+            EAstNode::MatchFalse { .. } => "false".to_string(),
         }
     }
 
     /// Type name for UI tooltips.
     pub fn type_name(&self) -> &'static str {
         match self {
-            AstNode::NumLiteral(_) => "NumLiteral",
-            AstNode::BoolLiteral(_) => "BoolLiteral",
-            AstNode::BinaryExpr { .. } => "BinaryExpr",
-            AstNode::ComparisonExpr { .. } => "CompareExpr",
-            AstNode::TernaryExpr { .. } => "TernaryExpr",
+            _ => "<dummy type>",
         }
     }
 }

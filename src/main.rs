@@ -18,26 +18,24 @@ fn read_expression_from_js() -> Option<String> {
 
 #[derive(Resource)]
 struct AstState {
-    nodes: Vec<layout::LayoutNode>,
-    edges: Vec<layout::LayoutEdge>,
+    layout_ast: layout::LayoutAst,
+    function_declarations:
+        std::collections::HashMap<ast::FunctionDeclarationId, ast::FunctionDeclaration>,
 }
 
 impl Default for AstState {
     fn default() -> Self {
-        let tree = ast::AstNode::BinaryExpr {
-            op: '+',
-            left: Box::new(ast::AstNode::NumLiteral("3".to_string())),
-            right: Box::new(ast::AstNode::NumLiteral("7".to_string())),
-        };
-        let (nodes, edges) = layout::compute_layout(&tree);
-        Self { nodes, edges }
+        Self {
+            layout_ast: layout::LayoutAst::empty().plus_sink(),
+            function_declarations: std::collections::HashMap::from([]),
+        }
     }
 }
 
 /// Marker for AST node mesh entities (so we can despawn them on rebuild).
 #[derive(Component)]
 struct AstNodeEntity {
-    node_id: usize,
+    node_id: ast::AstNodeId,
 }
 
 /// Flag resource that signals the scene needs rebuilding.
@@ -51,11 +49,14 @@ struct AstSceneEntity;
 #[derive(Component)]
 struct ResetButton;
 
+#[derive(Component)]
+struct AddNumberLiteralButton;
+
 /// Stores which node is hovered / selected.
 #[derive(Resource, Default)]
 struct PickState {
-    hovered: Option<usize>,   // node_id
-    selected: Option<usize>,  // node_id
+    hovered: Option<ast::AstNodeId>,  // node_id
+    selected: Option<ast::AstNodeId>, // node_id
 }
 
 /// UI text showing the selected node's info.
@@ -77,22 +78,19 @@ struct TextInputBox;
 
 // ── Colors ──────────────────────────────────────────────────
 
-fn node_color(node: &ast::AstNode) -> Color {
+fn node_color(node: &ast::EAstNode) -> Color {
     match node {
-        ast::AstNode::BinaryExpr { op: '+', .. } => Color::srgb(1.0, 0.42, 0.42),     // #FF6B6B
-        ast::AstNode::BinaryExpr { op: '-', .. } => Color::srgb(0.306, 0.804, 0.769),  // #4ECDC4
-        ast::AstNode::BinaryExpr { op: '*', .. } => Color::srgb(1.0, 0.9, 0.427),      // #FFE66D
-        ast::AstNode::BinaryExpr { op: '/', .. } => Color::srgb(0.655, 0.545, 0.98),   // #A78BFA
-        ast::AstNode::BinaryExpr { .. }          => Color::srgb(1.0, 0.42, 0.42),
-        ast::AstNode::ComparisonExpr { .. }      => Color::srgb(0.984, 0.573, 0.235),   // #FB923C
-        ast::AstNode::TernaryExpr { .. }         => Color::srgb(0.133, 0.827, 0.933),   // #22D3EE
-        ast::AstNode::BoolLiteral(true)          => Color::srgb(0.29, 0.87, 0.50),      // #4ADE80
-        ast::AstNode::BoolLiteral(false)         => Color::srgb(0.973, 0.443, 0.443),   // #F87171
-        ast::AstNode::NumLiteral(_)              => Color::srgb(0.91, 0.894, 0.871),    // #E8E4DE
+        ast::EAstNode::Sink { .. } => Color::srgb(1.0, 0.0, 0.0), // #FF6B6B
+        ast::EAstNode::FunctionCall { .. } => Color::srgb(0.306, 0.804, 0.769), // #4ECDC4
+        ast::EAstNode::MatchTrue { .. } => Color::srgb(0.984, 0.573, 0.235), // #FB923C
+        ast::EAstNode::MatchFalse { .. } => Color::srgb(0.133, 0.827, 0.933), // #22D3EE
+        ast::EAstNode::BoolLiteral(true) => Color::srgb(0.29, 0.87, 0.50), // #4ADE80
+        ast::EAstNode::BoolLiteral(false) => Color::srgb(0.973, 0.443, 0.443), // #F87171
+        ast::EAstNode::NumLiteral(_) => Color::srgb(0.91, 0.894, 0.871), // #E8E4DE
     }
 }
 
-fn node_emissive(node: &ast::AstNode) -> LinearRgba {
+fn node_emissive(node: &ast::EAstNode) -> LinearRgba {
     let c = node_color(node).to_linear();
     LinearRgba::new(c.red * 0.15, c.green * 0.15, c.blue * 0.15, 1.0)
 }
@@ -102,16 +100,15 @@ fn node_emissive(node: &ast::AstNode) -> LinearRgba {
 /// Build an octahedron mesh (6 verts, 8 faces).
 fn octahedron_mesh(size: f32) -> Mesh {
     let v = [
-        [0.0, size, 0.0],     // 0 top
-        [0.0, -size, 0.0],    // 1 bottom
-        [size, 0.0, 0.0],     // 2 +X
-        [-size, 0.0, 0.0],    // 3 -X
-        [0.0, 0.0, size],     // 4 +Z
-        [0.0, 0.0, -size],    // 5 -Z
+        [0.0, size, 0.0],  // 0 top
+        [0.0, -size, 0.0], // 1 bottom
+        [size, 0.0, 0.0],  // 2 +X
+        [-size, 0.0, 0.0], // 3 -X
+        [0.0, 0.0, size],  // 4 +Z
+        [0.0, 0.0, -size], // 5 -Z
     ];
     let indices: Vec<u32> = vec![
-        0, 4, 2,  0, 2, 5,  0, 5, 3,  0, 3, 4,
-        1, 2, 4,  1, 5, 2,  1, 3, 5,  1, 4, 3,
+        0, 4, 2, 0, 2, 5, 0, 5, 3, 0, 3, 4, 1, 2, 4, 1, 5, 2, 1, 3, 5, 1, 4, 3,
     ];
     // Compute flat normals per face
     let mut positions = Vec::new();
@@ -207,14 +204,14 @@ fn spawn_ast_nodes(
     let ring_mesh = meshes.add(Torus::new(0.025, 0.38));
     let ring_big_mesh = meshes.add(Torus::new(0.025, 0.48));
 
-    for node in &state.nodes {
-        let color = node_color(&node.ast);
-        let emissive = node_emissive(&node.ast);
+    for (node_id, node) in &state.layout_ast.ast.nodes {
+        let color = node_color(node);
+        let emissive = node_emissive(&node);
 
         // Pick shape based on AST type
-        let mesh = match &node.ast {
-            ast::AstNode::TernaryExpr { .. } => octa_mesh.clone(),
-            ast::AstNode::BoolLiteral(_) => cube_mesh.clone(),
+        let mesh = match node {
+            //ast::EAstNode::TernaryExpr { .. } => octa_mesh.clone(),
+            //ast::EAstNode::BoolLiteral(_) => cube_mesh.clone(),
             _ => sphere_mesh.clone(),
         };
 
@@ -226,21 +223,30 @@ fn spawn_ast_nodes(
             ..default()
         });
 
+        let node_pos = state.layout_ast.layout_nodes.get(node_id).unwrap().pos;
+
         // Node body
         commands.spawn((
             PbrBundle {
                 mesh,
                 material,
-                transform: Transform::from_translation(node.pos),
+                transform: Transform::from_translation(node_pos),
                 ..default()
             },
-            AstNodeEntity { node_id: node.id },
+            AstNodeEntity {
+                node_id: node_id.clone(),
+            },
             AstSceneEntity,
         ));
 
+        /*
         // Ring
         let is_ternary = matches!(node.ast, ast::AstNode::TernaryExpr { .. });
-        let ring = if is_ternary { ring_big_mesh.clone() } else { ring_mesh.clone() };
+        let ring = if is_ternary {
+            ring_big_mesh.clone()
+        } else {
+            ring_mesh.clone()
+        };
         let ring_mat = materials.add(StandardMaterial {
             base_color: color.with_alpha(0.7),
             emissive: LinearRgba::new(
@@ -282,18 +288,20 @@ fn spawn_ast_nodes(
                 AstSceneEntity,
             ));
         }
+        */
 
         //Value label
         spawn_world_label(
             &mut commands,
-            &node.ast.label(),
-            node_color(&node.ast),
+            &node.label(&state.function_declarations),
+            node_color(node),
             18.0,
-            node.pos,
+            node_pos,
             Vec2::ZERO,
             AstSceneEntity,
         );
 
+        /*
         // Type label (smaller, above)
         spawn_world_label(
             &mut commands,
@@ -301,9 +309,10 @@ fn spawn_ast_nodes(
             Color::srgba(0.3, 0.3, 0.37, 1.0),
             14.0,
             node.pos,
-            Vec2::new(0.0, -22.0),  // 22px above
+            Vec2::new(0.0, -22.0), // 22px above
             AstSceneEntity,
         );
+        */
 
         spawn_world_label(
             &mut commands,
@@ -311,7 +320,7 @@ fn spawn_ast_nodes(
             Color::srgba(1.0, 1.0, 1.0, 1.0),
             18.0,
             Vec3::new(10.0, 0.0, 0.0),
-            Vec2::new(0.0, -22.0),  // 22px above
+            Vec2::new(0.0, -22.0), // 22px above
             AstSceneEntity,
         );
         spawn_world_label(
@@ -320,7 +329,7 @@ fn spawn_ast_nodes(
             Color::srgba(1.0, 1.0, 1.0, 1.0),
             18.0,
             Vec3::new(0.0, 10.0, 0.0),
-            Vec2::new(0.0, -22.0),  // 22px above
+            Vec2::new(0.0, -22.0), // 22px above
             AstSceneEntity,
         );
         spawn_world_label(
@@ -329,11 +338,12 @@ fn spawn_ast_nodes(
             Color::srgba(1.0, 1.0, 1.0, 1.0),
             18.0,
             Vec3::new(0.0, 0.0, 10.0),
-            Vec2::new(0.0, -22.0),  // 22px above
+            Vec2::new(0.0, -22.0), // 22px above
             AstSceneEntity,
         );
     }
 
+    /*
     // Translucent Z-planes for ternary branches (thin cuboids facing Z)
     let z_levels: std::collections::HashSet<i32> = state
         .nodes
@@ -367,33 +377,63 @@ fn spawn_ast_nodes(
             AstSceneEntity,
         ));
     }
+    */
 }
 
 fn spawn_ui(mut commands: Commands) {
-    commands.spawn((
-        ButtonBundle {
-            style: Style {
-                position_type: PositionType::Absolute,
-                top: Val::Px(12.0),
-                left: Val::Px(12.0),
-                padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+    commands
+        .spawn((
+            ButtonBundle {
+                style: Style {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(12.0),
+                    left: Val::Px(12.0),
+                    padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+                    ..default()
+                },
+                background_color: Color::srgba(0.16, 0.16, 0.22, 0.9).into(),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
-            background_color: Color::srgba(0.16, 0.16, 0.22, 0.9).into(),
-            border_radius: BorderRadius::all(Val::Px(6.0)),
-            ..default()
-        },
-        ResetButton,
-    )).with_children(|parent| {
-        parent.spawn(TextBundle::from_section(
-            "reset",
-            TextStyle {
-                font_size: 14.0,
-                color: Color::srgb(0.6, 0.6, 0.7),
+            ResetButton,
+        ))
+        .with_children(|parent| {
+            parent.spawn(TextBundle::from_section(
+                "reset",
+                TextStyle {
+                    font_size: 14.0,
+                    color: Color::srgb(0.6, 0.6, 0.7),
+                    ..default()
+                },
+            ));
+        });
+
+    commands
+        .spawn((
+            ButtonBundle {
+                style: Style {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(48.0),
+                    left: Val::Px(12.0),
+                    padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+                    ..default()
+                },
+                background_color: Color::srgba(0.16, 0.16, 0.22, 0.9).into(),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
-        ));
-    });
+            AddNumberLiteralButton,
+        ))
+        .with_children(|parent| {
+            parent.spawn(TextBundle::from_section(
+                "Add Number",
+                TextStyle {
+                    font_size: 14.0,
+                    color: Color::srgb(0.6, 0.6, 0.7),
+                    ..default()
+                },
+            ));
+        });
 }
 
 fn handle_reset_button(
@@ -447,68 +487,98 @@ fn handle_reset_button(
     }
 }
 
+fn handle_add_number_literal_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (With<Interaction>, With<AddNumberLiteralButton>),
+    >,
+    mut text_q: Query<&mut Text>,
+    mut state: ResMut<AstState>,
+    mut orbit: ResMut<camera::OrbitCamera>,
+    mut rebuild: ResMut<NeedsRebuild>,
+    mut commands: Commands,
+    scene_entities: Query<Entity, With<AstSceneEntity>>,
+) {
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut text = text_q.get_mut(children[0]).unwrap();
+
+        match *interaction {
+            Interaction::Pressed => {
+                // Reset expression
+                state.layout_ast = state.layout_ast.plus_number_literal(7);
+
+                rebuild.0 = true;
+                /*
+                orbit.auto_rotate = true;
+                orbit.theta = 0.6;
+                orbit.phi = 1.0;
+                orbit.radius = 7.0;
+
+                bg.0 = Color::srgba(0.1, 0.1, 0.2, 0.95);
+                text.sections[0].style.color = Color::srgb(0.133, 0.827, 0.933);
+            */
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
+                text.sections[0].style.color = Color::srgb(0.85, 0.85, 0.9);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
+                text.sections[0].style.color = Color::srgb(0.6, 0.6, 0.7);
+            }
+        }
+    }
+}
 
 /// Draw edges using Gizmos (called every frame).
 fn draw_edges(mut gizmos: Gizmos, state: Res<AstState>) {
-    let edges = &state.edges;
-    let edges = edges.into_iter().cloned().chain(vec![
-        layout::LayoutEdge {
-            from_id: 0,
-            to_id: 0,
-            from_pos: Vec3::new(0.0, 0.0, 0.0),
-            to_pos: Vec3::new(10.0, 0.0, 0.0),
-            label: "X",
-            dir: layout::EdgeDir::Up
-        },
-        layout::LayoutEdge {
-            from_id: 0,
-            to_id: 0,
-            from_pos: Vec3::new(0.0, 0.0, 0.0),
-            to_pos: Vec3::new(0.0, 10.0, 0.0),
-            label: "Y",
-            dir: layout::EdgeDir::Up
-        },
-        layout::LayoutEdge {
-            from_id: 0,
-            to_id: 0,
-            from_pos: Vec3::new(0.0, 0.0, 0.0),
-            to_pos: Vec3::new(0.0, 0.0, 10.0),
-            label: "Z",
-            dir: layout::EdgeDir::Up
-        }
-    ].into_iter()).collect::<Vec<layout::LayoutEdge>>();
+    let edges = &state.layout_ast.edges();
+    /*
+    let edges = edges
+        .into_iter()
+        .chain(
+            vec![
+                layout::LayoutEdge {
+                    from_id: 0,
+                    to_id: 0,
+                    from_pos: Vec3::new(0.0, 0.0, 0.0),
+                    to_pos: Vec3::new(10.0, 0.0, 0.0),
+                    label: "X",
+                    dir: layout::EdgeDir::Up,
+                },
+                layout::LayoutEdge {
+                    from_id: 0,
+                    to_id: 0,
+                    from_pos: Vec3::new(0.0, 0.0, 0.0),
+                    to_pos: Vec3::new(0.0, 10.0, 0.0),
+                    label: "Y",
+                    dir: layout::EdgeDir::Up,
+                },
+                layout::LayoutEdge {
+                    from_id: 0,
+                    to_id: 0,
+                    from_pos: Vec3::new(0.0, 0.0, 0.0),
+                    to_pos: Vec3::new(0.0, 0.0, 10.0),
+                    label: "Z",
+                    dir: layout::EdgeDir::Up,
+                },
+            ]
+            .into_iter(),
+        )
+        .collect::<Vec<layout::LayoutEdge>>();
+    */
     for edge in edges {
-        let from = edge.from_pos;
+        let from = Vec3::from(edge.from_pos);
         let to = edge.to_pos;
-        let is_ternary_edge = matches!(edge.label, "then" | "else" | "cond");
 
         // Determine start/end offsets along Y
         let node_radius = 0.4;
-        let start = if edge.dir == layout::EdgeDir::Up {
-            from + Vec3::Y * node_radius
-        } else {
-            from - Vec3::Y * node_radius
-        };
-        let end = if edge.dir == layout::EdgeDir::Up {
-            to - Vec3::Y * node_radius
-        } else {
-            to + Vec3::Y * node_radius
-        };
+        let start = from;
+        let end = to;
 
         // Determine color
-        let from_node = state.nodes.iter().find(|n| n.id == edge.from_id);
-        let color = match edge.label {
-            "then" => Color::srgba(0.29, 0.87, 0.50, 0.55),
-            "else" => Color::srgba(0.973, 0.443, 0.443, 0.55),
-            "cond" => Color::srgba(0.133, 0.827, 0.933, 0.55),
-            _ => {
-                if let Some(n) = from_node {
-                    node_color(&n.ast).with_alpha(0.3)
-                } else {
-                    Color::srgba(0.3, 0.3, 0.4, 0.3)
-                }
-            }
-        };
+        //let from_node = state.nodes.iter().find(|n| n.id == edge.from_id);
+        let color = Color::srgba(0.29, 0.87, 0.50, 0.55);
 
         // Sample a cubic bezier for a smooth curve
         let mid_y = (start.y + end.y) / 2.0;
@@ -538,22 +608,19 @@ fn draw_edges(mut gizmos: Gizmos, state: Res<AstState>) {
         gizmos.line(end, arrow_base - perp1, color);
         gizmos.line(end, arrow_base + perp2, color);
         gizmos.line(end, arrow_base - perp2, color);
-
     }
 }
 
 /// Gentle pulsing animation for nodes.
-fn animate_nodes(
-    time: Res<Time>,
-    mut query: Query<(&AstNodeEntity, &mut Transform)>,
-) {
+fn animate_nodes(time: Res<Time>, mut query: Query<(&AstNodeEntity, &mut Transform)>) {
+    /*
     let t = time.elapsed_seconds();
     for (node_ent, mut transform) in query.iter_mut() {
         let pulse = 1.0 + 0.04 * (t * 2.0 + node_ent.node_id as f32 * 1.5).sin();
         transform.scale = Vec3::splat(pulse);
     }
+    */
 }
-
 
 /// If rebuild was requested, respawn the AST scene.
 fn rebuild_scene(
@@ -572,7 +639,7 @@ fn rebuild_scene(
 #[derive(Component)]
 pub struct WorldLabel {
     pub world_pos: Vec3,
-    pub offset: Vec2,  // screen-space pixel offset
+    pub offset: Vec2, // screen-space pixel offset
 }
 
 /// Spawn a UI text label that tracks a world position.
@@ -585,26 +652,28 @@ fn spawn_world_label(
     offset: Vec2,
     marker: impl Bundle,
 ) -> Entity {
-    commands.spawn((
-        TextBundle {
-            text: Text::from_section(
-                text,
-                TextStyle {
-                    font_size,
-                    color,
+    commands
+        .spawn((
+            TextBundle {
+                text: Text::from_section(
+                    text,
+                    TextStyle {
+                        font_size,
+                        color,
+                        ..default()
+                    },
+                ),
+                style: Style {
+                    position_type: PositionType::Absolute,
                     ..default()
                 },
-            ),
-            style: Style {
-                position_type: PositionType::Absolute,
+                visibility: Visibility::Hidden,
                 ..default()
             },
-            visibility: Visibility::Hidden,
-            ..default()
-        },
-        WorldLabel { world_pos, offset },
-        marker,
-    )).id()
+            WorldLabel { world_pos, offset },
+            marker,
+        ))
+        .id()
 }
 
 /// Each frame, project world positions → screen and reposition the text.
@@ -612,7 +681,9 @@ fn update_world_labels(
     camera_q: Query<(&Camera, &GlobalTransform), With<camera::OrbitCameraTag>>,
     mut label_q: Query<(&WorldLabel, &mut Style, &mut Visibility, &Node)>,
 ) {
-    let Ok((camera, cam_gt)) = camera_q.get_single() else { return };
+    let Ok((camera, cam_gt)) = camera_q.get_single() else {
+        return;
+    };
 
     for (label, mut style, mut vis, node) in label_q.iter_mut() {
         if let Some(screen_pos) = camera.world_to_viewport(cam_gt, label.world_pos) {
@@ -657,8 +728,12 @@ fn pick_nodes(
     mut pick: ResMut<PickState>,
     node_q: Query<(&AstNodeEntity, &Transform)>,
 ) {
-    let Ok((camera, cam_gt)) = camera_q.get_single() else { return };
-    let Ok(window) = windows.get_single() else { return };
+    let Ok((camera, cam_gt)) = camera_q.get_single() else {
+        return;
+    };
+    let Ok(window) = windows.get_single() else {
+        return;
+    };
     let Some(cursor) = window.cursor_position() else {
         pick.hovered = None;
         return;
@@ -672,7 +747,7 @@ fn pick_nodes(
 
     // Test intersection with each node (sphere test, radius 0.35)
     let radius = 0.35_f32;
-    let mut closest: Option<(usize, f32)> = None;
+    let mut closest: Option<(ast::AstNodeId, f32)> = None;
 
     for (node_ent, transform) in node_q.iter() {
         let center = transform.translation;
@@ -684,14 +759,14 @@ fn pick_nodes(
         if disc >= 0.0 {
             let t = -b - disc.sqrt();
             if t > 0.0 {
-                if closest.is_none() || t < closest.unwrap().1 {
-                    closest = Some((node_ent.node_id, t));
+                if closest.is_none() || t < closest.clone().unwrap().1 {
+                    closest = Some((node_ent.node_id.clone(), t));
                 }
             }
         }
     }
 
-    pick.hovered = closest.map(|(id, _)| id);
+    pick.hovered = closest.clone().map(|(id, _)| id);
 
     if mouse.just_pressed(MouseButton::Left) {
         pick.selected = closest.map(|(id, _)| id);
@@ -705,14 +780,30 @@ fn highlight_hovered(
     state: Res<AstState>,
 ) {
     for (node_ent, mat_handle) in node_q.iter() {
-        let Some(mat) = materials.get_mut(mat_handle) else { continue };
-        let Some(layout_node) = state.nodes.iter().find(|n| n.id == node_ent.node_id) else { continue };
+        let Some(mat) = materials.get_mut(mat_handle) else {
+            continue;
+        };
+        let Some((_, layout_node)) = state
+            .layout_ast
+            .ast
+            .nodes
+            .iter()
+            .find(|(n_id, _)| **n_id == node_ent.node_id)
+        else {
+            continue;
+        };
 
-        let base = node_emissive(&layout_node.ast);
-        let is_hovered = pick.hovered == Some(node_ent.node_id);
-        let is_selected = pick.selected == Some(node_ent.node_id);
+        let base = node_emissive(layout_node);
+        let is_hovered = pick.hovered == Some(node_ent.node_id.clone());
+        let is_selected = pick.selected == Some(node_ent.node_id.clone());
 
-        let intensity = if is_hovered { 4.0 } else if is_selected { 2.5 } else { 1.0 };
+        let intensity = if is_hovered {
+            4.0
+        } else if is_selected {
+            2.5
+        } else {
+            1.0
+        };
 
         mat.emissive = LinearRgba::new(
             base.red * intensity,
@@ -728,27 +819,26 @@ fn update_selection_display(
     state: Res<AstState>,
     mut display_q: Query<&mut Text, With<SelectionDisplay>>,
 ) {
-    let Ok(mut text) = display_q.get_single_mut() else { return };
-
-    if let Some(id) = pick.selected {
-        if let Some(node) = state.nodes.iter().find(|n| n.id == id) {
+    let Ok(mut text) = display_q.get_single_mut() else {
+        return;
+    };
+    if let Some(id) = &pick.selected {
+        if let Some(node) = state.layout_ast.ast.nodes.get(&id) {
             text.sections[0].value = format!(
-                "{} : {}",
-                node.ast.label(),
-                node.ast.type_name(),
+                "{} : <unknown type>",
+                node.label(&state.function_declarations)
             );
-            text.sections[0].style.color = node_color(&node.ast);
+            text.sections[0].style.color = node_color(&node);
         }
     } else {
         text.sections[0].value.clear();
     }
 }
 
-fn update_cursor(
-    pick: Res<PickState>,
-    mut windows: Query<&mut Window>,
-) {
-    let Ok(mut window) = windows.get_single_mut() else { return };
+fn update_cursor(pick: Res<PickState>, mut windows: Query<&mut Window>) {
+    let Ok(mut window) = windows.get_single_mut() else {
+        return;
+    };
     window.cursor.icon = if pick.hovered.is_some() {
         CursorIcon::Pointer
     } else {
@@ -758,41 +848,43 @@ fn update_cursor(
 
 fn spawn_text_input(commands: &mut Commands, initial: &str) {
     // Outer container (clickable background)
-    commands.spawn((
-        ButtonBundle {
-            style: Style {
-                position_type: PositionType::Absolute,
-                top: Val::Px(12.0),
-                left: Val::Px(90.0),  // next to reset button
-                padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
-                min_width: Val::Px(220.0),
-                border: UiRect::all(Val::Px(1.5)),
-                ..default()
-            },
-            background_color: Color::srgba(0.06, 0.06, 0.12, 0.9).into(),
-            border_color: Color::srgb(0.12, 0.12, 0.24).into(),
-            border_radius: BorderRadius::all(Val::Px(6.0)),
-            ..default()
-        },
-        TextInputBox,
-        TextInput {
-            value: initial.to_string(),
-            focused: false,
-            cursor: initial.len(),
-        },
-    )).with_children(|parent| {
-        parent.spawn((
-            TextBundle::from_section(
-                initial,
-                TextStyle {
-                    font_size: 14.0,
-                    color: Color::srgb(0.91, 0.89, 0.87),
+    commands
+        .spawn((
+            ButtonBundle {
+                style: Style {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(12.0),
+                    left: Val::Px(90.0), // next to reset button
+                    padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                    min_width: Val::Px(220.0),
+                    border: UiRect::all(Val::Px(1.5)),
                     ..default()
                 },
-            ),
-            TextInputDisplay,
-        ));
-    });
+                background_color: Color::srgba(0.06, 0.06, 0.12, 0.9).into(),
+                border_color: Color::srgb(0.12, 0.12, 0.24).into(),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            TextInputBox,
+            TextInput {
+                value: initial.to_string(),
+                focused: false,
+                cursor: initial.len(),
+            },
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                TextBundle::from_section(
+                    initial,
+                    TextStyle {
+                        font_size: 14.0,
+                        color: Color::srgb(0.91, 0.89, 0.87),
+                        ..default()
+                    },
+                ),
+                TextInputDisplay,
+            ));
+        });
 }
 
 fn text_input_focus(
@@ -840,7 +932,9 @@ fn text_input_keyboard(
         let mut changed = false;
 
         for ev in key_events.read() {
-            if ev.state != bevy::input::ButtonState::Pressed { continue; }
+            if ev.state != bevy::input::ButtonState::Pressed {
+                continue;
+            }
 
             let input_cursor = input.cursor;
 
@@ -858,8 +952,10 @@ fn text_input_keyboard(
                 bevy::input::keyboard::Key::Backspace => {
                     if input.cursor > 0 {
                         let prev = input.value[..input.cursor]
-                            .char_indices().last()
-                            .map(|(i, _)| i).unwrap_or(0);
+                            .char_indices()
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
                         input.value.remove(prev);
                         input.cursor = prev;
                         changed = true;
@@ -874,20 +970,30 @@ fn text_input_keyboard(
                 bevy::input::keyboard::Key::ArrowLeft => {
                     if input.cursor > 0 {
                         input.cursor = input.value[..input.cursor]
-                            .char_indices().last()
-                            .map(|(i, _)| i).unwrap_or(0);
+                            .char_indices()
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
                     }
                 }
                 bevy::input::keyboard::Key::ArrowRight => {
                     if input.cursor < input.value.len() {
                         input.cursor += input.value[input.cursor..]
-                            .chars().next()
-                            .map(|c| c.len_utf8()).unwrap_or(0);
+                            .chars()
+                            .next()
+                            .map(|c| c.len_utf8())
+                            .unwrap_or(0);
                     }
                 }
-                bevy::input::keyboard::Key::Home => { input.cursor = 0; }
-                bevy::input::keyboard::Key::End => { input.cursor = input.value.len(); }
-                bevy::input::keyboard::Key::Escape => { input.focused = false; }
+                bevy::input::keyboard::Key::Home => {
+                    input.cursor = 0;
+                }
+                bevy::input::keyboard::Key::End => {
+                    input.cursor = input.value.len();
+                }
+                bevy::input::keyboard::Key::Escape => {
+                    input.focused = false;
+                }
                 _ => {}
             }
         }
@@ -919,7 +1025,6 @@ fn text_input_keyboard(
             //orbit.auto_rotate = true;
             orbit.theta = 0.6;
             orbit.phi = 1.0;
-            
         }
     }
 }
@@ -935,7 +1040,7 @@ fn main() {
                     canvas: Some("#bevy-canvas".into()),
                     fit_canvas_to_parent: true,
                     prevent_default_event_handling: true,
-                    present_mode: bevy::window::PresentMode::AutoNoVsync, 
+                    present_mode: bevy::window::PresentMode::AutoNoVsync,
                     ..default()
                 }),
                 ..default()
@@ -945,20 +1050,35 @@ fn main() {
         .init_resource::<AstState>()
         .init_resource::<NeedsRebuild>()
         .init_resource::<PickState>()
-        .add_systems(Startup, (setup_scene, spawn_ast_nodes, spawn_ui, spawn_selection_display).chain())
-        .add_systems(Startup, |mut commands: Commands| spawn_text_input(&mut commands, "(5 > 3) ? 10 + 1 : 20 - 5"))
-        .add_systems(Update, (
-            draw_edges,
-            animate_nodes,
-            handle_reset_button,
-            pick_nodes,
-            highlight_hovered,
-            update_selection_display,
-            update_cursor, 
-            text_input_focus,
-            text_input_keyboard,
-            (rebuild_scene).chain(),
-        ))
+        .add_systems(
+            Startup,
+            (
+                setup_scene,
+                spawn_ast_nodes,
+                spawn_ui,
+                spawn_selection_display,
+            )
+                .chain(),
+        )
+        .add_systems(Startup, |mut commands: Commands| {
+            spawn_text_input(&mut commands, "(5 > 3) ? 10 + 1 : 20 - 5")
+        })
+        .add_systems(
+            Update,
+            (
+                draw_edges,
+                animate_nodes,
+                handle_reset_button,
+                handle_add_number_literal_button,
+                pick_nodes,
+                highlight_hovered,
+                update_selection_display,
+                update_cursor,
+                text_input_focus,
+                text_input_keyboard,
+                (rebuild_scene).chain(),
+            ),
+        )
         .add_systems(Update, update_world_labels)
         .run();
 }
