@@ -47,7 +47,7 @@ impl LayoutAst {
         }
     }
 
-    pub fn plus_number_literal(&self, value: i32) -> Self {
+    pub fn plus_number_literal(&self, value: String, pos: Vec3) -> Self {
         let id = self.ast.next_id();
         let number_literal = crate::ast::EAstNode::NumLiteral(value.to_string());
         LayoutAst {
@@ -56,13 +56,7 @@ impl LayoutAst {
                 .layout_nodes
                 .clone()
                 .into_iter()
-                .chain([(
-                    id.clone(),
-                    LayoutNode {
-                        node_id: id,
-                        pos: Vec3::new(3.0, 0.0, 0.0),
-                    },
-                )])
+                .chain([(id.clone(), LayoutNode { node_id: id, pos })])
                 .collect(),
         }
     }

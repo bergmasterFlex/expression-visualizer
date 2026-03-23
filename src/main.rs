@@ -23,6 +23,9 @@ struct AstState {
         std::collections::HashMap<ast::FunctionDeclarationId, ast::FunctionDeclaration>,
 }
 
+#[derive(Resource, Default)]
+struct CurrentInputString(String);
+
 impl Default for AstState {
     fn default() -> Self {
         Self {
@@ -301,18 +304,18 @@ fn spawn_ast_nodes(
             AstSceneEntity,
         );
 
-        /*
         // Type label (smaller, above)
         spawn_world_label(
             &mut commands,
-            node.ast.type_name(),
+            node.eval_type(&state.layout_ast.ast, &state.function_declarations)
+                .to_string()
+                .as_ref(),
             Color::srgba(0.3, 0.3, 0.37, 1.0),
             14.0,
-            node.pos,
+            node_pos,
             Vec2::new(0.0, -22.0), // 22px above
             AstSceneEntity,
         );
-        */
 
         spawn_world_label(
             &mut commands,
@@ -494,8 +497,10 @@ fn handle_add_number_literal_button(
     >,
     mut text_q: Query<&mut Text>,
     mut state: ResMut<AstState>,
+    mut current_input_string: ResMut<CurrentInputString>,
     mut orbit: ResMut<camera::OrbitCamera>,
     mut rebuild: ResMut<NeedsRebuild>,
+    mut pick: ResMut<PickState>,
     mut commands: Commands,
     scene_entities: Query<Entity, With<AstSceneEntity>>,
 ) {
@@ -504,19 +509,29 @@ fn handle_add_number_literal_button(
 
         match *interaction {
             Interaction::Pressed => {
+                if let Some(selected_node_id) = &pick.selected {
+                    let selected_pos = state
+                        .layout_ast
+                        .layout_nodes
+                        .get(selected_node_id)
+                        .unwrap()
+                        .pos;
+                    state.layout_ast = state.layout_ast.plus_number_literal(
+                        current_input_string.0.to_string(),
+                        Vec3::new(selected_pos.x + 1.0, selected_pos.y, selected_pos.z),
+                    );
+                    rebuild.0 = true;
+                }
                 // Reset expression
-                state.layout_ast = state.layout_ast.plus_number_literal(7);
-
-                rebuild.0 = true;
                 /*
-                orbit.auto_rotate = true;
-                orbit.theta = 0.6;
-                orbit.phi = 1.0;
-                orbit.radius = 7.0;
+                    orbit.auto_rotate = true;
+                    orbit.theta = 0.6;
+                    orbit.phi = 1.0;
+                    orbit.radius = 7.0;
 
-                bg.0 = Color::srgba(0.1, 0.1, 0.2, 0.95);
-                text.sections[0].style.color = Color::srgb(0.133, 0.827, 0.933);
-            */
+                    bg.0 = Color::srgba(0.1, 0.1, 0.2, 0.95);
+                    text.sections[0].style.color = Color::srgb(0.133, 0.827, 0.933);
+                */
             }
             Interaction::Hovered => {
                 bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
@@ -825,8 +840,10 @@ fn update_selection_display(
     if let Some(id) = &pick.selected {
         if let Some(node) = state.layout_ast.ast.nodes.get(&id) {
             text.sections[0].value = format!(
-                "{} : <unknown type>",
-                node.label(&state.function_declarations)
+                "{} : {}",
+                node.label(&state.function_declarations),
+                node.eval_type(&state.layout_ast.ast, &state.function_declarations)
+                    .to_string()
             );
             text.sections[0].style.color = node_color(&node);
         }
@@ -918,6 +935,7 @@ fn text_input_keyboard(
     mut input_q: Query<(&mut TextInput, &Children), With<TextInputBox>>,
     mut text_q: Query<&mut Text, With<TextInputDisplay>>,
     mut key_events: EventReader<KeyboardInput>,
+    mut current_input_string: ResMut<CurrentInputString>,
     mut state: ResMut<AstState>,
     mut orbit: ResMut<camera::OrbitCamera>,
     mut rebuild: ResMut<NeedsRebuild>,
@@ -998,6 +1016,8 @@ fn text_input_keyboard(
             }
         }
 
+        current_input_string.0 = input.value.to_string();
+
         // Update display text with blinking cursor
         if let Ok(mut text) = text_q.get_mut(children[0]) {
             let (before, after) = input.value.split_at(input.cursor);
@@ -1048,6 +1068,7 @@ fn main() {
             camera::OrbitCameraPlugin,
         ))
         .init_resource::<AstState>()
+        .init_resource::<CurrentInputString>()
         .init_resource::<NeedsRebuild>()
         .init_resource::<PickState>()
         .add_systems(
@@ -1068,9 +1089,9 @@ fn main() {
             (
                 draw_edges,
                 animate_nodes,
+                pick_nodes,
                 handle_reset_button,
                 handle_add_number_literal_button,
-                pick_nodes,
                 highlight_hovered,
                 update_selection_display,
                 update_cursor,

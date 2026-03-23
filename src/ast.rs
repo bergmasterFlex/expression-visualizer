@@ -66,6 +66,21 @@ pub enum EType {
     Error,
 }
 
+impl ToString for EType {
+    fn to_string(&self) -> String {
+        match self {
+            EType::Number => "number".to_string(),
+            EType::Bool => "bool".to_string(),
+            EType::SumType(sub_types) => sub_types
+                .iter()
+                .map(|sub_type| sub_type.to_string())
+                .collect::<Vec<_>>()
+                .join("|"),
+            EType::Error => "error".to_string(),
+        }
+    }
+}
+
 impl EAstNode {
     pub fn label(
         &self,
@@ -92,9 +107,32 @@ impl EAstNode {
     }
 
     /// Type name for UI tooltips.
-    pub fn type_name(&self) -> &'static str {
+    pub fn eval_type(
+        &self,
+        ast: &Ast,
+        function_declarations: &std::collections::HashMap<
+            FunctionDeclarationId,
+            FunctionDeclaration,
+        >,
+    ) -> EType {
         match self {
-            _ => "<dummy type>",
+            EAstNode::Sink { input } => input
+                .as_ref()
+                .and_then(|i| ast.nodes.get(i))
+                .map(|n| n.eval_type(ast, function_declarations))
+                .unwrap_or(EType::Error),
+            EAstNode::FunctionCall {
+                function_declaration_id,
+                ..
+            } => function_declarations
+                .get(&function_declaration_id)
+                .unwrap()
+                .output_type
+                .clone(),
+            EAstNode::BoolLiteral(_) => EType::Bool,
+            EAstNode::NumLiteral(_) => EType::Number,
+            EAstNode::MatchTrue { .. } => EType::Bool,
+            EAstNode::MatchFalse { .. } => EType::Bool,
         }
     }
 }
