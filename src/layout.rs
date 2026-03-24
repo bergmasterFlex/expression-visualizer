@@ -1,5 +1,7 @@
 use bevy::prelude::*;
 
+use crate::ast::FunctionDeclarationId;
+
 #[derive(Debug, Clone)]
 pub struct LayoutNode {
     pub node_id: crate::ast::AstNodeId,
@@ -28,30 +30,56 @@ impl LayoutAst {
     }
 
     pub fn plus_sink(&self) -> Self {
-        let id = self.ast.next_id();
-        let sink = crate::ast::EAstNode::Sink { input: None };
-        LayoutAst {
-            ast: self.ast.plus(sink),
-            layout_nodes: self
-                .layout_nodes
-                .clone()
-                .into_iter()
-                .chain([(
-                    id.clone(),
-                    LayoutNode {
-                        node_id: id,
-                        pos: Vec3::new(0.0, 0.0, 0.0),
-                    },
-                )])
-                .collect(),
-        }
+        self._plus_node(
+            crate::ast::EAstNode::Sink { input: None },
+            Vec3::new(0.0, 0.0, 0.0),
+        )
     }
 
-    pub fn plus_number_literal(&self, value: String, pos: Vec3) -> Self {
+    pub fn plus_number_literal(&self, value: f32, pos: Vec3) -> Self {
+        self._plus_node(crate::ast::EAstNode::NumLiteral(value), pos)
+    }
+
+    pub fn plus_bool_literal(&self, value: bool, pos: Vec3) -> Self {
+        self._plus_node(crate::ast::EAstNode::BoolLiteral(value), pos)
+    }
+
+    pub fn plus_function_call(
+        &self,
+        function_declaration: FunctionDeclarationId,
+        pos: Vec3,
+    ) -> Self {
+        self._plus_node(
+            crate::ast::EAstNode::FunctionCall {
+                function_declaration_id: function_declaration,
+                input_arguments: vec![],
+            },
+            pos,
+        )
+    }
+
+    pub fn plus_match_true(&self, pos: Vec3) -> Self {
+        self._plus_node(
+            crate::ast::EAstNode::MatchTrue {
+                input_argument: None,
+            },
+            pos,
+        )
+    }
+
+    pub fn plus_match_false(&self, pos: Vec3) -> Self {
+        self._plus_node(
+            crate::ast::EAstNode::MatchFalse {
+                input_argument: None,
+            },
+            pos,
+        )
+    }
+
+    fn _plus_node(&self, node: crate::ast::EAstNode, pos: Vec3) -> Self {
         let id = self.ast.next_id();
-        let number_literal = crate::ast::EAstNode::NumLiteral(value.to_string());
-        LayoutAst {
-            ast: self.ast.plus(number_literal),
+        Self {
+            ast: self.ast.plus(node),
             layout_nodes: self
                 .layout_nodes
                 .clone()

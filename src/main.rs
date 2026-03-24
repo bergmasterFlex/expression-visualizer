@@ -2,6 +2,7 @@ mod ast;
 mod camera;
 mod layout;
 
+use ast::FunctionParameterDeclaration;
 use bevy::{input::keyboard::KeyboardInput, prelude::*};
 
 // ── WASM bridge ─────────────────────────────────────────────
@@ -30,7 +31,45 @@ impl Default for AstState {
     fn default() -> Self {
         Self {
             layout_ast: layout::LayoutAst::empty().plus_sink(),
-            function_declarations: std::collections::HashMap::from([]),
+            function_declarations: std::collections::HashMap::from([
+                (
+                    ast::FunctionDeclarationId(0),
+                    ast::FunctionDeclaration {
+                        name: "+".to_string(),
+                        inputs: vec![
+                            FunctionParameterDeclaration {
+                                name: "summand1".to_string(),
+                                r#type: ast::EType::Number,
+                            },
+                            FunctionParameterDeclaration {
+                                name: "summand2".to_string(),
+                                r#type: ast::EType::Number,
+                            },
+                        ],
+                        output_type: ast::EType::Number,
+                    },
+                ),
+                (
+                    ast::FunctionDeclarationId(1),
+                    ast::FunctionDeclaration {
+                        name: "/".to_string(),
+                        inputs: vec![
+                            FunctionParameterDeclaration {
+                                name: "summand1".to_string(),
+                                r#type: ast::EType::Number,
+                            },
+                            FunctionParameterDeclaration {
+                                name: "summand2".to_string(),
+                                r#type: ast::EType::Number,
+                            },
+                        ],
+                        output_type: ast::EType::SumType(vec![
+                            ast::EType::Number,
+                            ast::EType::Error,
+                        ]),
+                    },
+                ),
+            ]),
         }
     }
 }
@@ -49,11 +88,17 @@ struct NeedsRebuild(bool);
 #[derive(Component)]
 struct AstSceneEntity;
 
+//Buttons
 #[derive(Component)]
 struct ResetButton;
-
-#[derive(Component)]
-struct AddNumberLiteralButton;
+#[derive(Component, Clone)]
+enum EAstActionButton {
+    AddNumberLiteralButton,
+    AddBoolLiteralButton,
+    AddFunctionCallButton,
+    AddMatchTrueButton,
+    AddMatchFalseButton,
+}
 
 /// Stores which node is hovered / selected.
 #[derive(Resource, Default)]
@@ -384,40 +429,58 @@ fn spawn_ast_nodes(
 }
 
 fn spawn_ui(mut commands: Commands) {
-    commands
-        .spawn((
-            ButtonBundle {
-                style: Style {
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(12.0),
-                    left: Val::Px(12.0),
-                    padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
-                    ..default()
-                },
-                background_color: Color::srgba(0.16, 0.16, 0.22, 0.9).into(),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
-                ..default()
-            },
-            ResetButton,
-        ))
-        .with_children(|parent| {
-            parent.spawn(TextBundle::from_section(
-                "reset",
-                TextStyle {
-                    font_size: 14.0,
-                    color: Color::srgb(0.6, 0.6, 0.7),
-                    ..default()
-                },
-            ));
-        });
+    let y_offset = 12.0;
+    spawn_ui_button(
+        &mut commands,
+        "reset",
+        ResetButton,
+        Vec2::new(12.0, y_offset),
+    );
+    let y_offset = y_offset + 36.0;
+    spawn_ui_button(
+        &mut commands,
+        "Add Number",
+        EAstActionButton::AddNumberLiteralButton,
+        Vec2::new(12.0, y_offset),
+    );
+    let y_offset = y_offset + 36.0;
+    spawn_ui_button(
+        &mut commands,
+        "Add Bool",
+        EAstActionButton::AddBoolLiteralButton,
+        Vec2::new(12.0, y_offset),
+    );
+    let y_offset = y_offset + 36.0;
+    spawn_ui_button(
+        &mut commands,
+        "Add FunctionCall",
+        EAstActionButton::AddFunctionCallButton,
+        Vec2::new(12.0, y_offset),
+    );
+    let y_offset = y_offset + 36.0;
+    spawn_ui_button(
+        &mut commands,
+        "Add MatchTrue",
+        EAstActionButton::AddMatchTrueButton,
+        Vec2::new(12.0, y_offset),
+    );
+    let y_offset = y_offset + 36.0;
+    spawn_ui_button(
+        &mut commands,
+        "Add MatchFalse",
+        EAstActionButton::AddMatchFalseButton,
+        Vec2::new(12.0, y_offset),
+    );
+}
 
+fn spawn_ui_button<C: Component>(commands: &mut Commands, label: &str, component: C, pos: Vec2) {
     commands
         .spawn((
             ButtonBundle {
                 style: Style {
                     position_type: PositionType::Absolute,
-                    top: Val::Px(48.0),
-                    left: Val::Px(12.0),
+                    top: Val::Px(pos.y),
+                    left: Val::Px(pos.x),
                     padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
                     ..default()
                 },
@@ -425,11 +488,11 @@ fn spawn_ui(mut commands: Commands) {
                 border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
-            AddNumberLiteralButton,
+            component,
         ))
         .with_children(|parent| {
             parent.spawn(TextBundle::from_section(
-                "Add Number",
+                label,
                 TextStyle {
                     font_size: 14.0,
                     color: Color::srgb(0.6, 0.6, 0.7),
@@ -492,8 +555,13 @@ fn handle_reset_button(
 
 fn handle_add_number_literal_button(
     mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (With<Interaction>, With<AddNumberLiteralButton>),
+        (
+            &Interaction,
+            &mut BackgroundColor,
+            &Children,
+            &EAstActionButton,
+        ),
+        With<Interaction>,
     >,
     mut text_q: Query<&mut Text>,
     mut state: ResMut<AstState>,
@@ -504,7 +572,7 @@ fn handle_add_number_literal_button(
     mut commands: Commands,
     scene_entities: Query<Entity, With<AstSceneEntity>>,
 ) {
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+    for (interaction, mut bg, children, action) in interaction_q.iter_mut() {
         let mut text = text_q.get_mut(children[0]).unwrap();
 
         match *interaction {
@@ -516,22 +584,34 @@ fn handle_add_number_literal_button(
                         .get(selected_node_id)
                         .unwrap()
                         .pos;
-                    state.layout_ast = state.layout_ast.plus_number_literal(
-                        current_input_string.0.to_string(),
-                        Vec3::new(selected_pos.x + 1.0, selected_pos.y, selected_pos.z),
-                    );
+                    let new_pos = Vec3::new(selected_pos.x + 1.0, selected_pos.y, selected_pos.z);
+                    state.layout_ast = match action {
+                        EAstActionButton::AddNumberLiteralButton => state
+                            .layout_ast
+                            .plus_number_literal(current_input_string.0.parse().unwrap(), new_pos),
+                        EAstActionButton::AddBoolLiteralButton => state
+                            .layout_ast
+                            .plus_bool_literal(current_input_string.0.parse().unwrap(), new_pos),
+                        EAstActionButton::AddFunctionCallButton => {
+                            state.layout_ast.plus_function_call(
+                                state
+                                    .function_declarations
+                                    .iter()
+                                    .find(|(_, d)| current_input_string.0 == d.name)
+                                    .map(|(id, _)| id.clone())
+                                    .unwrap(),
+                                new_pos,
+                            )
+                        }
+                        EAstActionButton::AddMatchTrueButton => {
+                            state.layout_ast.plus_match_true(new_pos)
+                        }
+                        EAstActionButton::AddMatchFalseButton => {
+                            state.layout_ast.plus_match_false(new_pos)
+                        }
+                    };
                     rebuild.0 = true;
                 }
-                // Reset expression
-                /*
-                    orbit.auto_rotate = true;
-                    orbit.theta = 0.6;
-                    orbit.phi = 1.0;
-                    orbit.radius = 7.0;
-
-                    bg.0 = Color::srgba(0.1, 0.1, 0.2, 0.95);
-                    text.sections[0].style.color = Color::srgb(0.133, 0.827, 0.933);
-                */
             }
             Interaction::Hovered => {
                 bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
@@ -1082,7 +1162,7 @@ fn main() {
                 .chain(),
         )
         .add_systems(Startup, |mut commands: Commands| {
-            spawn_text_input(&mut commands, "(5 > 3) ? 10 + 1 : 20 - 5")
+            spawn_text_input(&mut commands, "")
         })
         .add_systems(
             Update,

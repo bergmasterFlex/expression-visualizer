@@ -34,7 +34,7 @@ pub enum EAstNode {
         function_declaration_id: FunctionDeclarationId,
         input_arguments: Vec<AstNodeId>,
     },
-    NumLiteral(String),
+    NumLiteral(f32),
     BoolLiteral(bool),
     MatchTrue {
         input_argument: Option<AstNodeId>,
@@ -45,17 +45,17 @@ pub enum EAstNode {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub struct FunctionDeclarationId(usize);
+pub struct FunctionDeclarationId(pub usize);
 
 pub struct FunctionDeclaration {
-    name: String,
-    inputs: Vec<FunctionParameterDeclaration>,
-    output_type: EType,
+    pub name: String,
+    pub inputs: Vec<FunctionParameterDeclaration>,
+    pub output_type: EType,
 }
 
 pub struct FunctionParameterDeclaration {
-    name: String,
-    r#type: EType,
+    pub name: String,
+    pub r#type: EType,
 }
 
 #[derive(Debug, Clone)]
@@ -101,8 +101,8 @@ impl EAstNode {
                 .to_string(),
             EAstNode::BoolLiteral(b) => b.to_string(),
             EAstNode::NumLiteral(n) => n.to_string(),
-            EAstNode::MatchTrue { .. } => "true".to_string(),
-            EAstNode::MatchFalse { .. } => "false".to_string(),
+            EAstNode::MatchTrue { .. } => "match true".to_string(),
+            EAstNode::MatchFalse { .. } => "match false".to_string(),
         }
     }
 
