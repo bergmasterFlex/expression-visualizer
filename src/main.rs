@@ -246,6 +246,7 @@ fn spawn_ast_nodes(
     mut materials: ResMut<Assets<StandardMaterial>>,
     state: Res<AstState>,
 ) {
+    println!("spawn");
     let sphere_mesh = meshes.add(Sphere::new(0.32));
     let cube_mesh = meshes.add(Cuboid::new(0.45, 0.45, 0.45));
     let octa_mesh = meshes.add(octahedron_mesh(0.38));
@@ -272,6 +273,7 @@ fn spawn_ast_nodes(
         });
 
         let node_pos = state.layout_ast.layout_nodes.get(node_id).unwrap().pos;
+        let node_pos = node_pos * Vec3::new(3.0, 1.5, 3.0);
 
         // Node body
         commands.spawn((
@@ -553,7 +555,7 @@ fn handle_reset_button(
     }
 }
 
-fn handle_add_number_literal_button(
+fn handle_add_node_button(
     mut interaction_q: Query<
         (
             &Interaction,
@@ -717,15 +719,40 @@ fn animate_nodes(time: Res<Time>, mut query: Query<(&AstNodeEntity, &mut Transfo
     */
 }
 
-/// If rebuild was requested, respawn the AST scene.
-fn rebuild_scene(
+fn clear_scene(
     mut commands: Commands,
-    meshes: ResMut<Assets<Mesh>>,
-    materials: ResMut<Assets<StandardMaterial>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
     state: Res<AstState>,
-    mut rebuild: ResMut<NeedsRebuild>,
+    rebuild: ResMut<NeedsRebuild>,
+    query_ast_entities: Query<Entity, With<AstSceneEntity>>,
 ) {
     if rebuild.0 {
+        for entity in query_ast_entities.iter() {
+            commands.entity(entity).despawn_recursive();
+        }
+
+        let mesh_ids: Vec<_> = meshes.ids().collect();
+        for id in mesh_ids {
+            meshes.remove(id);
+        }
+
+        let mat_ids: Vec<_> = materials.ids().collect();
+        for id in mat_ids {
+            materials.remove(id);
+        }
+    }
+}
+fn rebuild_scene(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    state: Res<AstState>,
+    mut rebuild: ResMut<NeedsRebuild>,
+    query_ast_entities: Query<Entity, With<AstSceneEntity>>,
+) {
+    if rebuild.0 {
+        println!("rebuild");
         spawn_ast_nodes(commands, meshes, materials, state);
         rebuild.0 = false;
     }
@@ -1129,6 +1156,73 @@ fn text_input_keyboard(
     }
 }
 
+fn handle_arrow_keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut state: ResMut<AstState>,
+    mut pick: ResMut<PickState>,
+    mut rebuild: ResMut<NeedsRebuild>,
+) {
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    if keys.just_pressed(KeyCode::ArrowUp) {
+        if shift {
+            if let Some(selected_node_id) = &pick.selected {
+                state.layout_ast = state
+                    .layout_ast
+                    .move_node_delta(selected_node_id.clone(), Vec3::new(0.0, 1.0, 0.0));
+                rebuild.0 = true;
+            }
+        } else {
+            if let Some(selected_node_id) = &pick.selected {
+                state.layout_ast = state
+                    .layout_ast
+                    .move_node_delta(selected_node_id.clone(), Vec3::new(-1.0, 0.0, 0.0));
+                rebuild.0 = true;
+            }
+        }
+    }
+    if keys.just_pressed(KeyCode::ArrowDown) {
+        if shift {
+            if let Some(selected_node_id) = &pick.selected {
+                state.layout_ast = state
+                    .layout_ast
+                    .move_node_delta(selected_node_id.clone(), Vec3::new(0.0, -1.0, 0.0));
+                rebuild.0 = true;
+            }
+        } else {
+            if let Some(selected_node_id) = &pick.selected {
+                state.layout_ast = state
+                    .layout_ast
+                    .move_node_delta(selected_node_id.clone(), Vec3::new(1.0, 0.0, 0.0));
+                rebuild.0 = true;
+            }
+        }
+    }
+    if keys.just_pressed(KeyCode::ArrowLeft) {
+        if shift {
+            // Shift + Left
+        } else {
+            if let Some(selected_node_id) = &pick.selected {
+                state.layout_ast = state
+                    .layout_ast
+                    .move_node_delta(selected_node_id.clone(), Vec3::new(0.0, 0.0, 1.0));
+                rebuild.0 = true;
+            }
+        }
+    }
+    if keys.just_pressed(KeyCode::ArrowRight) {
+        if shift {
+            // Shift + Right
+        } else {
+            if let Some(selected_node_id) = &pick.selected {
+                state.layout_ast = state
+                    .layout_ast
+                    .move_node_delta(selected_node_id.clone(), Vec3::new(0.0, 0.0, -1.0));
+                rebuild.0 = true;
+            }
+        }
+    }
+}
+
 // ── App entry ───────────────────────────────────────────────
 
 fn main() {
@@ -1167,18 +1261,21 @@ fn main() {
         .add_systems(
             Update,
             (
-                draw_edges,
-                animate_nodes,
-                pick_nodes,
-                handle_reset_button,
-                handle_add_number_literal_button,
-                highlight_hovered,
-                update_selection_display,
-                update_cursor,
-                text_input_focus,
-                text_input_keyboard,
-                (rebuild_scene).chain(),
-            ),
+                (
+                    draw_edges,
+                    animate_nodes,
+                    handle_reset_button,
+                    (handle_add_node_button, pick_nodes).chain(),
+                    highlight_hovered,
+                    update_selection_display,
+                    update_cursor,
+                    text_input_focus,
+                    text_input_keyboard,
+                    handle_arrow_keys,
+                ),
+                (clear_scene, apply_deferred, rebuild_scene).chain(),
+            )
+                .chain(),
         )
         .add_systems(Update, update_world_labels)
         .run();

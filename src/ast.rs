@@ -1,5 +1,6 @@
 // ── AST node types ──────────────────────────────────────────
 //
+#[derive(Clone)]
 pub struct Ast {
     pub nodes: std::collections::HashMap<AstNodeId, EAstNode>,
 }

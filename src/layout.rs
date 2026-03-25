@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 
-use crate::ast::FunctionDeclarationId;
+use crate::ast::{AstNodeId, FunctionDeclarationId};
 
 #[derive(Debug, Clone)]
 pub struct LayoutNode {
@@ -26,6 +26,29 @@ impl LayoutAst {
         Self {
             ast: crate::ast::Ast::empty(),
             layout_nodes: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn move_node_delta(&self, node_id: AstNodeId, delta_pos: Vec3) -> Self {
+        Self {
+            ast: self.ast.clone(),
+            layout_nodes: self
+                .layout_nodes
+                .iter()
+                .map(|(id, layout_node)| {
+                    (
+                        id.clone(),
+                        if *id == node_id {
+                            LayoutNode {
+                                node_id: id.clone(),
+                                pos: layout_node.pos + delta_pos,
+                            }
+                        } else {
+                            layout_node.clone()
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
