@@ -1,6 +1,9 @@
 mod ast;
 mod camera;
 mod layout;
+mod mesh;
+
+use std::f32::consts::PI;
 
 use ast::FunctionParameterDeclaration;
 use bevy::{input::keyboard::KeyboardInput, prelude::*};
@@ -143,45 +146,6 @@ fn node_emissive(node: &ast::EAstNode) -> LinearRgba {
     LinearRgba::new(c.red * 0.15, c.green * 0.15, c.blue * 0.15, 1.0)
 }
 
-// ── Mesh helpers ────────────────────────────────────────────
-
-/// Build an octahedron mesh (6 verts, 8 faces).
-fn octahedron_mesh(size: f32) -> Mesh {
-    let v = [
-        [0.0, size, 0.0],  // 0 top
-        [0.0, -size, 0.0], // 1 bottom
-        [size, 0.0, 0.0],  // 2 +X
-        [-size, 0.0, 0.0], // 3 -X
-        [0.0, 0.0, size],  // 4 +Z
-        [0.0, 0.0, -size], // 5 -Z
-    ];
-    let indices: Vec<u32> = vec![
-        0, 4, 2, 0, 2, 5, 0, 5, 3, 0, 3, 4, 1, 2, 4, 1, 5, 2, 1, 3, 5, 1, 4, 3,
-    ];
-    // Compute flat normals per face
-    let mut positions = Vec::new();
-    let mut normals = Vec::new();
-    for tri in indices.chunks(3) {
-        let a = Vec3::from(v[tri[0] as usize]);
-        let b = Vec3::from(v[tri[1] as usize]);
-        let c = Vec3::from(v[tri[2] as usize]);
-        let normal = (b - a).cross(c - a).normalize();
-        for &idx in tri {
-            positions.push(v[idx as usize]);
-            normals.push(normal.to_array());
-        }
-    }
-    let flat_indices: Vec<u32> = (0..positions.len() as u32).collect();
-
-    Mesh::new(
-        bevy::render::mesh::PrimitiveTopology::TriangleList,
-        bevy::render::render_asset::RenderAssetUsages::default(),
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_indices(bevy::render::mesh::Indices::U32(flat_indices))
-}
-
 // ── Systems ─────────────────────────────────────────────────
 
 /// Initial scene setup: camera, lights, ambient.
@@ -247,22 +211,19 @@ fn spawn_ast_nodes(
     state: Res<AstState>,
 ) {
     println!("spawn");
+
     let sphere_mesh = meshes.add(Sphere::new(0.32));
     let cube_mesh = meshes.add(Cuboid::new(0.45, 0.45, 0.45));
-    let octa_mesh = meshes.add(octahedron_mesh(0.38));
-    let ring_mesh = meshes.add(Torus::new(0.025, 0.38));
+    let octa_mesh = meshes.add(mesh::octahedron_mesh(0.38));
+    let ring_mesh = meshes.add(Torus::new(0.225, 0.38));
     let ring_big_mesh = meshes.add(Torus::new(0.025, 0.48));
+    let cone_mesh = meshes.add(mesh::create_cone_mesh(0.5, 1.0, 16));
+    let pyramide_mesh = meshes.add(mesh::create_cone_mesh(0.5, 1.0, 4));
+    let bool_mesh = meshes.add(mesh::create_bool_mesh(0.5, 1.0, 16));
 
     for (node_id, node) in &state.layout_ast.ast.nodes {
         let color = node_color(node);
         let emissive = node_emissive(&node);
-
-        // Pick shape based on AST type
-        let mesh = match node {
-            //ast::EAstNode::TernaryExpr { .. } => octa_mesh.clone(),
-            //ast::EAstNode::BoolLiteral(_) => cube_mesh.clone(),
-            _ => sphere_mesh.clone(),
-        };
 
         let material = materials.add(StandardMaterial {
             base_color: Color::srgb(0.05, 0.05, 0.10),
@@ -275,14 +236,62 @@ fn spawn_ast_nodes(
         let node_pos = state.layout_ast.layout_nodes.get(node_id).unwrap().pos;
         let node_pos = node_pos * Vec3::new(3.0, 1.5, 3.0);
 
-        // Node body
-        commands.spawn((
-            PbrBundle {
-                mesh,
+        // Pick shape based on AST type
+        let pbr_bundle = match node {
+            ast::EAstNode::NumLiteral(_) => PbrBundle {
+                mesh: cube_mesh.clone(),
                 material,
                 transform: Transform::from_translation(node_pos),
                 ..default()
             },
+            ast::EAstNode::BoolLiteral(_) => PbrBundle {
+                mesh: bool_mesh.clone(),
+                material,
+                transform: Transform::from_translation(node_pos),
+                ..default()
+            },
+            ast::EAstNode::MatchTrue { .. } => PbrBundle {
+                mesh: cone_mesh.clone(),
+                material,
+                transform: Transform::from_translation(node_pos),
+                ..default()
+            },
+            ast::EAstNode::MatchFalse { .. } => PbrBundle {
+                mesh: cone_mesh.clone(),
+                material,
+                transform: Transform::from_translation(node_pos)
+                    * Transform::from_rotation(Quat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), PI)),
+                ..default()
+            },
+            ast::EAstNode::FunctionCall { .. } => PbrBundle {
+                mesh: pyramide_mesh.clone(),
+                material,
+                transform: Transform::from_translation(node_pos)
+                    * Transform::from_rotation(Quat::from_axis_angle(
+                        Vec3::new(1.0, 0.0, 0.0),
+                        PI * -0.5,
+                    ))
+                    * Transform::from_rotation(Quat::from_axis_angle(
+                        Vec3::new(0.0, 1.0, 0.0),
+                        PI * 0.25,
+                    )),
+                ..default()
+            },
+            ast::EAstNode::Sink { .. } => PbrBundle {
+                mesh: ring_mesh.clone(),
+                material,
+                transform: Transform::from_translation(node_pos)
+                    * Transform::from_rotation(Quat::from_axis_angle(
+                        Vec3::new(1.0, 0.0, 0.0),
+                        PI * 0.5,
+                    )),
+                ..default()
+            },
+        };
+
+        // Node body
+        commands.spawn((
+            pbr_bundle,
             AstNodeEntity {
                 node_id: node_id.clone(),
             },
