@@ -18,6 +18,12 @@ impl Ast {
         Self { nodes }
     }
 
+    pub fn minus(&self, n_id: &AstNodeId) -> Self {
+        let mut nodes = self.nodes.clone();
+        nodes.remove(n_id);
+        Self { nodes }
+    }
+
     pub fn next_id(&self) -> AstNodeId {
         AstNodeId(self.nodes.keys().map(|id| id.0 + 1).max().unwrap_or(0))
     }

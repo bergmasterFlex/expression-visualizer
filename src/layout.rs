@@ -29,6 +29,18 @@ impl LayoutAst {
         }
     }
 
+    pub fn minus_node(&self, node_id: &AstNodeId) -> Self {
+        Self {
+            ast: self.ast.minus(node_id),
+            layout_nodes: self
+                .layout_nodes
+                .clone()
+                .into_iter()
+                .filter(|(id, _)| id != node_id)
+                .collect(),
+        }
+    }
+
     pub fn move_node_delta(&self, node_id: AstNodeId, delta_pos: Vec3) -> Self {
         Self {
             ast: self.ast.clone(),

@@ -93,7 +93,7 @@ struct AstSceneEntity;
 
 //Buttons
 #[derive(Component)]
-struct ResetButton;
+struct DeleteNodeButton;
 #[derive(Component, Clone)]
 enum EAstActionButton {
     AddNumberLiteralButton,
@@ -441,10 +441,50 @@ fn spawn_ast_nodes(
 
 fn spawn_ui(mut commands: Commands) {
     let y_offset = 12.0;
+    // Outer container (clickable background)
+    let initial = "";
+    commands
+        .spawn((
+            ButtonBundle {
+                style: Style {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(y_offset),
+                    left: Val::Px(12.0), // next to reset button
+                    padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                    min_width: Val::Px(220.0),
+                    border: UiRect::all(Val::Px(1.5)),
+                    ..default()
+                },
+                background_color: Color::srgba(0.06, 0.06, 0.12, 0.9).into(),
+                border_color: Color::srgb(0.12, 0.12, 0.24).into(),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            TextInputBox,
+            TextInput {
+                value: initial.to_string(),
+                focused: false,
+                cursor: initial.len(),
+            },
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                TextBundle::from_section(
+                    initial,
+                    TextStyle {
+                        font_size: 14.0,
+                        color: Color::srgb(0.91, 0.89, 0.87),
+                        ..default()
+                    },
+                ),
+                TextInputDisplay,
+            ));
+        });
+    let y_offset = y_offset + 36.0;
     spawn_ui_button(
         &mut commands,
-        "reset",
-        ResetButton,
+        "Delete Node",
+        DeleteNodeButton,
         Vec2::new(12.0, y_offset),
     );
     let y_offset = y_offset + 36.0;
@@ -513,15 +553,16 @@ fn spawn_ui_button<C: Component>(commands: &mut Commands, label: &str, component
         });
 }
 
-fn handle_reset_button(
+fn handle_delete_node_button(
     mut interaction_q: Query<
         (&Interaction, &mut BackgroundColor, &Children),
-        (With<Interaction>, With<ResetButton>),
+        (With<Interaction>, With<DeleteNodeButton>),
     >,
     mut text_q: Query<&mut Text>,
     mut state: ResMut<AstState>,
     mut orbit: ResMut<camera::OrbitCamera>,
     mut rebuild: ResMut<NeedsRebuild>,
+    mut pick: ResMut<PickState>,
     mut commands: Commands,
     scene_entities: Query<Entity, With<AstSceneEntity>>,
 ) {
@@ -530,27 +571,10 @@ fn handle_reset_button(
 
         match *interaction {
             Interaction::Pressed => {
-                /*
-                // Reset expression
-                let expr = "2 + 2".to_string();
-                let tree = crate::ast::parse(&expr);
-                let (nodes, edges) = crate::layout::compute_layout(&tree);
-                state.expression = expr;
-                state.nodes = nodes;
-                state.edges = edges;
-
-                for entity in scene_entities.iter() {
-                    commands.entity(entity).despawn_recursive();
+                if let Some(selected_node_id) = &pick.selected {
+                    state.layout_ast = state.layout_ast.minus_node(&selected_node_id.clone());
+                    rebuild.0 = true;
                 }
-                rebuild.0 = true;
-                orbit.auto_rotate = true;
-                orbit.theta = 0.6;
-                orbit.phi = 1.0;
-                orbit.radius = 7.0;
-
-                bg.0 = Color::srgba(0.1, 0.1, 0.2, 0.95);
-                text.sections[0].style.color = Color::srgb(0.133, 0.827, 0.933);
-                */
             }
             Interaction::Hovered => {
                 bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
@@ -979,47 +1003,6 @@ fn update_cursor(pick: Res<PickState>, mut windows: Query<&mut Window>) {
     };
 }
 
-fn spawn_text_input(commands: &mut Commands, initial: &str) {
-    // Outer container (clickable background)
-    commands
-        .spawn((
-            ButtonBundle {
-                style: Style {
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(12.0),
-                    left: Val::Px(90.0), // next to reset button
-                    padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
-                    min_width: Val::Px(220.0),
-                    border: UiRect::all(Val::Px(1.5)),
-                    ..default()
-                },
-                background_color: Color::srgba(0.06, 0.06, 0.12, 0.9).into(),
-                border_color: Color::srgb(0.12, 0.12, 0.24).into(),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
-                ..default()
-            },
-            TextInputBox,
-            TextInput {
-                value: initial.to_string(),
-                focused: false,
-                cursor: initial.len(),
-            },
-        ))
-        .with_children(|parent| {
-            parent.spawn((
-                TextBundle::from_section(
-                    initial,
-                    TextStyle {
-                        font_size: 14.0,
-                        color: Color::srgb(0.91, 0.89, 0.87),
-                        ..default()
-                    },
-                ),
-                TextInputDisplay,
-            ));
-        });
-}
-
 fn text_input_focus(
     mut input_q: Query<(&Interaction, &mut TextInput, &mut BorderColor), With<TextInputBox>>,
     mouse: Res<ButtonInput<MouseButton>>,
@@ -1264,17 +1247,18 @@ fn main() {
             )
                 .chain(),
         )
-        .add_systems(Startup, |mut commands: Commands| {
-            spawn_text_input(&mut commands, "")
-        })
         .add_systems(
             Update,
             (
                 (
                     draw_edges,
                     animate_nodes,
-                    handle_reset_button,
-                    (handle_add_node_button, pick_nodes).chain(),
+                    (
+                        handle_delete_node_button,
+                        handle_add_node_button,
+                        pick_nodes,
+                    )
+                        .chain(),
                     highlight_hovered,
                     update_selection_display,
                     update_cursor,
