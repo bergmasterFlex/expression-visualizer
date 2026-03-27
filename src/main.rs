@@ -1,5 +1,6 @@
 mod ast;
 mod camera;
+mod grid;
 mod layout;
 mod mesh;
 
@@ -161,6 +162,11 @@ fn setup_scene(mut commands: Commands) {
             ..default()
         },
         camera::OrbitCameraTag,
+        FogSettings {
+            color: Color::srgba(0.02, 0.02, 0.36, 1.0), // very dark blue-ish
+            falloff: FogFalloff::Exponential { density: 0.03 },
+            ..default()
+        }
     ));
 
     // Directional light
@@ -1233,6 +1239,7 @@ fn main() {
             }),
             camera::OrbitCameraPlugin,
         ))
+        .add_plugins(grid::GridPlugin)
         .init_resource::<AstState>()
         .init_resource::<CurrentInputString>()
         .init_resource::<NeedsRebuild>()
