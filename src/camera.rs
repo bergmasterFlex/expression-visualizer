@@ -1,12 +1,11 @@
+use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 /// Orbit camera controller for 3D scene navigation.
 ///
 /// - Left drag: orbit (rotate around target)
 /// - Scroll: zoom in/out
 /// - Right drag: pan
 /// - Auto-rotates slowly until user interacts
-
 use bevy::prelude::*;
-use bevy::input::mouse::{MouseMotion, MouseWheel, MouseScrollUnit};
 
 /// Orbit camera state stored as a resource.
 #[derive(Resource)]
@@ -55,6 +54,7 @@ fn orbit_input(
     mut motion_events: EventReader<MouseMotion>,
     mut scroll_events: EventReader<MouseWheel>,
     mut orbit: ResMut<OrbitCamera>,
+    drag: Res<crate::DragState>,
     time: Res<Time>,
 ) {
     let mut total_motion = Vec2::ZERO;
@@ -71,7 +71,10 @@ fn orbit_input(
     }
 
     // Left mouse drag → orbit
-    if mouse_buttons.pressed(MouseButton::Left) && total_motion != Vec2::ZERO {
+    if mouse_buttons.pressed(MouseButton::Left)
+        && total_motion != Vec2::ZERO
+        && drag.active.is_none()
+    {
         orbit.theta -= total_motion.x * 0.007;
         orbit.phi = (orbit.phi - total_motion.y * 0.007).clamp(0.15, std::f32::consts::PI - 0.15);
     }
@@ -92,10 +95,7 @@ fn orbit_input(
 }
 
 /// Apply orbit state to camera transform.
-fn orbit_apply(
-    orbit: Res<OrbitCamera>,
-    mut query: Query<&mut Transform, With<OrbitCameraTag>>,
-) {
+fn orbit_apply(orbit: Res<OrbitCamera>, mut query: Query<&mut Transform, With<OrbitCameraTag>>) {
     for mut transform in query.iter_mut() {
         let x = orbit.target.x + orbit.radius * orbit.phi.sin() * orbit.theta.sin();
         let y = orbit.target.y + orbit.radius * orbit.phi.cos();

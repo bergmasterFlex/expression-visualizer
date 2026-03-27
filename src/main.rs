@@ -78,6 +78,48 @@ impl Default for AstState {
     }
 }
 
+/// Marker: cursor ist über diesem Anchor
+#[derive(Component)]
+pub struct AnchorHovered;
+
+#[derive(Component)]
+pub struct Anchor {
+    pub kind: AnchorKind,
+    pub param_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorKind {
+    Input,
+    Output,
+}
+
+#[derive(Component)]
+pub struct Edge {
+    pub from_anchor: Entity,
+    pub to_anchor: Entity,
+}
+
+pub struct DragInfo {
+    pub source_anchor: Entity,
+    pub source_pos: Vec3,
+    pub current_end: Vec3,
+    pub target_anchor: Option<Entity>,
+}
+
+#[derive(Resource, Default)]
+pub struct DragState {
+    pub active: Option<DragInfo>,
+}
+
+/// Vorberechnete Materials für Anchors
+#[derive(Resource)]
+pub struct AnchorAssets {
+    pub mesh: Handle<Mesh>,
+    pub mat_normal: Handle<StandardMaterial>,
+    pub mat_hovered: Handle<StandardMaterial>,
+}
+
 /// Marker for AST node mesh entities (so we can despawn them on rebuild).
 #[derive(Component)]
 struct AstNodeEntity {
@@ -166,7 +208,7 @@ fn setup_scene(mut commands: Commands) {
             color: Color::srgba(0.02, 0.02, 0.36, 1.0), // very dark blue-ish
             falloff: FogFalloff::Exponential { density: 0.03 },
             ..default()
-        }
+        },
     ));
 
     // Directional light
@@ -214,10 +256,9 @@ fn spawn_ast_nodes(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut anchor_assets: ResMut<AnchorAssets>,
     state: Res<AstState>,
 ) {
-    println!("spawn");
-
     let sphere_mesh = meshes.add(Sphere::new(0.32));
     let cube_mesh = meshes.add(Cuboid::new(0.45, 0.45, 0.45));
     let octa_mesh = meshes.add(mesh::octahedron_mesh(0.38));
@@ -295,15 +336,17 @@ fn spawn_ast_nodes(
             },
         };
 
-        // Node body
-        commands.spawn((
-            pbr_bundle,
-            AstNodeEntity {
-                node_id: node_id.clone(),
-            },
-            AstSceneEntity,
-        ));
+        let node_entity = commands
+            .spawn((
+                pbr_bundle,
+                AstNodeEntity {
+                    node_id: node_id.clone(),
+                },
+                AstSceneEntity,
+            ))
+            .id();
 
+        spawn_anchors(&mut commands, node_entity, 3, true, &anchor_assets);
         /*
         // Ring
         let is_ternary = matches!(node.ast, ast::AstNode::TernaryExpr { .. });
@@ -788,11 +831,11 @@ fn rebuild_scene(
     mut materials: ResMut<Assets<StandardMaterial>>,
     state: Res<AstState>,
     mut rebuild: ResMut<NeedsRebuild>,
+    mut anchor_assets: ResMut<AnchorAssets>,
     query_ast_entities: Query<Entity, With<AstSceneEntity>>,
 ) {
     if rebuild.0 {
-        println!("rebuild");
-        spawn_ast_nodes(commands, meshes, materials, state);
+        spawn_ast_nodes(commands, meshes, materials, anchor_assets, state);
         rebuild.0 = false;
     }
 }
@@ -1221,6 +1264,238 @@ fn handle_arrow_keys(
     }
 }
 
+fn setup_anchor_assets(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    commands.insert_resource(AnchorAssets {
+        mesh: meshes.add(Sphere::new(0.06).mesh().ico(2).unwrap()),
+        mat_normal: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.3, 0.6, 1.0),
+            emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
+            unlit: true,
+            ..default()
+        }),
+        mat_hovered: materials.add(StandardMaterial {
+            base_color: Color::srgb(0.5, 0.9, 1.0),
+            emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
+            unlit: true,
+            ..default()
+        }),
+    });
+}
+
+fn spawn_anchors(
+    commands: &mut Commands,
+    node_entity: Entity,
+    num_inputs: usize,
+    has_output: bool,
+    assets: &AnchorAssets,
+) {
+    commands.entity(node_entity).with_children(|parent| {
+        // Input-Anchors oben entlang der X-Achse verteilen
+        let spread = 0.3;
+        let start_x = -(num_inputs as f32 - 1.0) * spread / 2.0;
+        for i in 0..num_inputs {
+            let x = start_x + i as f32 * spread;
+            parent.spawn((
+                PbrBundle {
+                    mesh: assets.mesh.clone(),
+                    material: assets.mat_normal.clone(),
+                    transform: Transform::from_translation(Vec3::new(x, 0.55, 0.0)),
+                    ..default()
+                },
+                Anchor {
+                    kind: AnchorKind::Input,
+                    param_index: i,
+                },
+            ));
+        }
+        // Output-Anchor unten
+        if has_output {
+            parent.spawn((
+                PbrBundle {
+                    mesh: assets.mesh.clone(),
+                    material: assets.mat_normal.clone(),
+                    transform: Transform::from_translation(Vec3::new(0.0, -0.55, 0.0)),
+                    ..default()
+                },
+                Anchor {
+                    kind: AnchorKind::Output,
+                    param_index: 0,
+                },
+            ));
+        }
+    });
+}
+
+fn anchor_hover_system(
+    mut commands: Commands,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    camera_q: Query<(&Camera, &GlobalTransform)>,
+    anchors: Query<(Entity, &GlobalTransform), With<Anchor>>,
+    existing_hovers: Query<Entity, With<AnchorHovered>>,
+) {
+    // Alle vorherigen Hovers entfernen
+    for e in &existing_hovers {
+        commands.entity(e).remove::<AnchorHovered>();
+    }
+
+    let Ok(window) = windows.get_single() else {
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    let Ok((camera, cam_tf)) = camera_q.get_single() else {
+        return;
+    };
+
+    let mut closest: Option<(Entity, f32)> = None;
+
+    for (entity, global_tf) in &anchors {
+        let Some(screen_pos) = camera.world_to_viewport(cam_tf, global_tf.translation()) else {
+            continue;
+        };
+
+        let dist = cursor.distance(screen_pos);
+        if dist < 25.0 {
+            if closest.map_or(true, |(_, d)| dist < d) {
+                closest = Some((entity, dist));
+            }
+        }
+    }
+
+    if let Some((entity, _)) = closest {
+        commands.entity(entity).insert(AnchorHovered);
+    }
+}
+
+fn anchor_hover_visual_system(
+    mut anchors: Query<
+        (
+            &mut Transform,
+            &mut Handle<StandardMaterial>,
+            Option<&AnchorHovered>,
+        ),
+        With<Anchor>,
+    >,
+    assets: Res<AnchorAssets>,
+) {
+    for (mut tf, mut mat, hovered) in &mut anchors {
+        let (target_scale, target_mat) = if hovered.is_some() {
+            (1.8, &assets.mat_hovered)
+        } else {
+            (1.0, &assets.mat_normal)
+        };
+
+        // Smooth scale
+        let s = tf.scale.x + (target_scale - tf.scale.x) * 0.18;
+        tf.scale = Vec3::splat(s);
+
+        // Material swap (Handle-Vergleich ist billig)
+        if *mat != *target_mat {
+            *mat = target_mat.clone();
+        }
+    }
+}
+
+fn draw_edges_gizmos(
+    edges: Query<&Edge>,
+    transforms: Query<&GlobalTransform>,
+    mut gizmos: Gizmos,
+) {
+    for edge in &edges {
+        let (Ok(from), Ok(to)) = (
+            transforms.get(edge.from_anchor),
+            transforms.get(edge.to_anchor),
+        ) else { continue };
+        gizmos.line(from.translation(), to.translation(), Color::WHITE);
+    }
+}
+
+fn draw_drag_preview(drag: Res<DragState>, mut gizmos: Gizmos) {
+    let Some(ref info) = drag.active else { return };
+    let color = if info.target_anchor.is_some() {
+        Color::rgb(0.3, 1.0, 0.4) // grün = eingeschnappt
+    } else {
+        Color::rgb(1.0, 0.9, 0.3) // gelb = dragging
+    };
+    gizmos.line(info.source_pos, info.current_end, color);
+}
+
+fn drag_start_system(
+    mouse: Res<ButtonInput<MouseButton>>,
+    hovered: Query<(Entity, &GlobalTransform), (With<Anchor>, With<AnchorHovered>)>,
+    mut drag: ResMut<DragState>,
+) {
+    if mouse.just_pressed(MouseButton::Left) {
+        if let Ok((entity, tf)) = hovered.get_single() {
+            let pos = tf.translation();
+            drag.active = Some(DragInfo {
+                source_anchor: entity,
+                source_pos: pos,
+                current_end: pos,
+                target_anchor: None,
+            });
+        }
+    }
+}
+
+fn drag_update_system(
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    camera_q: Query<(&Camera, &GlobalTransform)>,
+    hovered: Query<(Entity, &GlobalTransform), (With<Anchor>, With<AnchorHovered>)>,
+    mut drag: ResMut<DragState>,
+) {
+    let Some(ref mut info) = drag.active else { return };
+
+    let Ok(window) = windows.get_single() else { return };
+    let Some(cursor) = window.cursor_position() else { return };
+    let Ok((camera, cam_tf)) = camera_q.get_single() else { return };
+
+    // Ray durch Cursor
+    let Some(ray) = camera.viewport_to_world(cam_tf, cursor) else { return };
+
+    // Schnitt mit Ebene durch source_pos, senkrecht zur Kamera
+    let normal: Vec3 = -*cam_tf.forward();
+    let denom = ray.direction.dot(normal);
+    if denom.abs() > 1e-6 {
+        let t = (info.source_pos - ray.origin).dot(normal) / denom;
+        if t > 0.0 {
+            info.current_end = ray.origin + *ray.direction * t;
+        }
+    }
+
+    // Snap zu hovering target
+    info.target_anchor = None;
+    if let Ok((entity, tf)) = hovered.get_single() {
+        if entity != info.source_anchor {
+            info.target_anchor = Some(entity);
+            info.current_end = tf.translation();
+        }
+    }
+}
+
+fn drag_end_system(
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut drag: ResMut<DragState>,
+    mut commands: Commands,
+) {
+    if mouse.just_released(MouseButton::Left) {
+        if let Some(info) = drag.active.take() {
+            if let Some(target) = info.target_anchor {
+                commands.spawn(Edge {
+                    from_anchor: info.source_anchor,
+                    to_anchor: target,
+                });
+            }
+            // Kein target → Drag wird einfach verworfen
+        }
+    }
+}
+
 // ── App entry ───────────────────────────────────────────────
 
 fn main() {
@@ -1244,10 +1519,12 @@ fn main() {
         .init_resource::<CurrentInputString>()
         .init_resource::<NeedsRebuild>()
         .init_resource::<PickState>()
+        .init_resource::<DragState>()
         .add_systems(
             Startup,
             (
                 setup_scene,
+                setup_anchor_assets,
                 spawn_ast_nodes,
                 spawn_ui,
                 spawn_selection_display,
@@ -1258,6 +1535,16 @@ fn main() {
             Update,
             (
                 (
+                    (
+                        anchor_hover_system,
+                        drag_start_system,
+                        drag_update_system,
+                        drag_end_system,
+                        anchor_hover_visual_system,
+                        draw_edges_gizmos,
+                        draw_drag_preview,
+                    )
+                        .chain(),
                     draw_edges,
                     animate_nodes,
                     (
