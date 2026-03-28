@@ -1,3 +1,4 @@
+use bevy::asset::load_internal_asset;
 use bevy::prelude::*;
 use bevy::render::render_resource::*;
 use bevy::reflect::TypePath;
@@ -23,25 +24,27 @@ impl Default for GridConfig {
 
 // --- Shader Material ---
 
+pub const GRID_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(0x47524944_4D415400); // can be any aribtrary unique numer
+
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
 pub struct GridMaterial {
     #[uniform(0)]
     pub plane_color: LinearRgba,
-    #[uniform(1)]
+    #[uniform(0)]
     pub line_color: LinearRgba,
-    #[uniform(2)]
+    #[uniform(0)]
     pub spacing: f32,
-    #[uniform(3)]
+    #[uniform(0)]
     pub fade_start: f32,
-    #[uniform(4)]
+    #[uniform(0)]
     pub fade_end: f32,
-    #[uniform(5)]
+    #[uniform(0)]
     pub line_thickness: f32,
 }
 
 impl Material for GridMaterial {
     fn fragment_shader() -> ShaderRef {
-        "shaders/grid.wgsl".into()
+         GRID_SHADER_HANDLE.into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {
@@ -65,6 +68,12 @@ pub struct GridPlugin;
 
 impl Plugin for GridPlugin {
     fn build(&self, app: &mut App) {
+         load_internal_asset!(
+            app,
+            GRID_SHADER_HANDLE,
+            "../assets/shaders/grid.wgsl",
+            Shader::from_wgsl
+        );
         app.init_resource::<GridConfig>()
             .add_plugins(MaterialPlugin::<GridMaterial>::default())
             .add_systems(Startup, spawn_grid);
