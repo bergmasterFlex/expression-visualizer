@@ -83,15 +83,15 @@ impl Default for AstState {
 pub struct AnchorHovered;
 
 #[derive(Component)]
-pub struct Anchor {
-    pub kind: AnchorKind,
-    pub param_index: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AnchorKind {
-    Input,
-    Output,
+pub enum EAnchor {
+    Input {
+        num_inputs: usize,
+        param_index: usize,
+        relative_transform: Transform,
+    },
+    Output {
+        relative_transform: Transform,
+    },
 }
 
 #[derive(Component)]
@@ -113,9 +113,13 @@ pub struct DragState {
 }
 
 /// Vorberechnete Materials für Anchors
-#[derive(Resource)]
+#[derive(Component, Clone)]
 pub struct AnchorAssets {
     pub mesh: Handle<Mesh>,
+    pub tf_normal_pre: Transform,
+    pub tf_normal_post: Transform,
+    pub tf_hovered_pre: Transform,
+    pub tf_hovered_post: Transform,
     pub mat_normal: Handle<StandardMaterial>,
     pub mat_hovered: Handle<StandardMaterial>,
 }
@@ -256,7 +260,6 @@ fn spawn_ast_nodes(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut anchor_assets: ResMut<AnchorAssets>,
     state: Res<AstState>,
 ) {
     let sphere_mesh = meshes.add(Sphere::new(0.32));
@@ -327,13 +330,118 @@ fn spawn_ast_nodes(
             ast::EAstNode::Sink { .. } => PbrBundle {
                 mesh: ring_mesh.clone(),
                 material,
-                transform: Transform::from_translation(node_pos)
+                transform: Transform::from_scale(Vec3::new(2.0, 2.0, 2.0))
+                    * Transform::from_translation(node_pos)
                     * Transform::from_rotation(Quat::from_axis_angle(
                         Vec3::new(1.0, 0.0, 0.0),
                         PI * 0.5,
                     )),
                 ..default()
             },
+        };
+
+        let anchor_assets = match node {
+            ast::EAstNode::BoolLiteral(_)
+            | ast::EAstNode::NumLiteral(_)
+            | ast::EAstNode::MatchTrue { .. }
+            | ast::EAstNode::MatchFalse { .. } => AnchorAssets {
+                mesh: meshes.add(Sphere::new(0.06).mesh().ico(2).unwrap()),
+                tf_normal_pre: Transform::IDENTITY,
+                tf_normal_post: Transform::IDENTITY,
+                tf_hovered_pre: Transform::from_scale(Vec3::splat(1.8)),
+                tf_hovered_post: Transform::IDENTITY,
+                mat_normal: materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.3, 0.6, 1.0),
+                    emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
+                    unlit: true,
+                    ..default()
+                }),
+                mat_hovered: materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.5, 0.9, 1.0),
+                    emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
+                    unlit: true,
+                    ..default()
+                }),
+            },
+            ast::EAstNode::FunctionCall { .. } => AnchorAssets {
+                mesh: meshes.add(Sphere::new(0.06).mesh().ico(2).unwrap()),
+                tf_normal_pre: Transform::IDENTITY,
+                tf_normal_post: Transform::from_rotation(Quat::from_axis_angle(
+                    Vec3::new(1.0, 0.0, 0.0),
+                    PI * 0.5,
+                )) * Transform::from_rotation(Quat::from_axis_angle(
+                    Vec3::new(0.0, 0.0, 1.0),
+                    PI * 0.25,
+                )),
+                tf_hovered_pre: Transform::from_scale(Vec3::splat(1.8)),
+                tf_hovered_post: Transform::from_rotation(Quat::from_axis_angle(
+                    Vec3::new(1.0, 0.0, 0.0),
+                    PI * 0.5,
+                )) * Transform::from_rotation(Quat::from_axis_angle(
+                    Vec3::new(0.0, 0.0, 1.0),
+                    PI * 0.25,
+                )),
+                mat_normal: materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.3, 0.6, 1.0),
+                    emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
+                    unlit: true,
+                    ..default()
+                }),
+                mat_hovered: materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.5, 0.9, 1.0),
+                    emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
+                    unlit: true,
+                    ..default()
+                }),
+            },
+            ast::EAstNode::Sink { .. } => AnchorAssets {
+                mesh: meshes.add(Sphere::new(0.06).mesh().ico(2).unwrap()),
+                tf_normal_pre: Transform::IDENTITY,
+                tf_normal_post: Transform::from_scale(Vec3::new(0.5, 0.5, 0.5))
+                    * Transform::from_rotation(Quat::from_axis_angle(
+                        Vec3::new(1.0, 0.0, 0.0),
+                        PI * -0.5,
+                    )),
+                tf_hovered_pre: Transform::from_scale(Vec3::splat(1.8)),
+                tf_hovered_post: Transform::from_scale(Vec3::new(0.5, 0.5, 0.5))
+                    * Transform::from_rotation(Quat::from_axis_angle(
+                        Vec3::new(1.0, 0.0, 0.0),
+                        PI * -0.5,
+                    )),
+                mat_normal: materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.3, 0.6, 1.0),
+                    emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
+                    unlit: true,
+                    ..default()
+                }),
+                mat_hovered: materials.add(StandardMaterial {
+                    base_color: Color::srgb(0.5, 0.9, 1.0),
+                    emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
+                    unlit: true,
+                    ..default()
+                }),
+            },
+        };
+
+        let bundle_anchors = match node {
+            ast::EAstNode::BoolLiteral(_)
+            | ast::EAstNode::NumLiteral(_)
+            | ast::EAstNode::MatchFalse { .. }
+            | ast::EAstNode::MatchTrue { .. } => spawn_anchors(1, true, &anchor_assets),
+            ast::EAstNode::FunctionCall {
+                function_declaration_id,
+                ..
+            } => spawn_anchors(
+                state
+                    .function_declarations
+                    .get(function_declaration_id)
+                    .unwrap()
+                    .inputs
+                    .len(),
+                true,
+                &anchor_assets,
+            ),
+            ast::EAstNode::Sink { .. } => spawn_anchors(1, false, &anchor_assets),
         };
 
         let node_entity = commands
@@ -346,57 +454,11 @@ fn spawn_ast_nodes(
             ))
             .id();
 
-        spawn_anchors(&mut commands, node_entity, 3, true, &anchor_assets);
-        /*
-        // Ring
-        let is_ternary = matches!(node.ast, ast::AstNode::TernaryExpr { .. });
-        let ring = if is_ternary {
-            ring_big_mesh.clone()
-        } else {
-            ring_mesh.clone()
-        };
-        let ring_mat = materials.add(StandardMaterial {
-            base_color: color.with_alpha(0.7),
-            emissive: LinearRgba::new(
-                emissive.red * 2.0,
-                emissive.green * 2.0,
-                emissive.blue * 2.0,
-                1.0,
-            ),
-            unlit: true,
-            alpha_mode: AlphaMode::Blend,
-            ..default()
+        bundle_anchors.into_iter().for_each(|(b, a)| {
+            commands.entity(node_entity).with_children(|parent| {
+                parent.spawn((b, a, anchor_assets.clone()));
+            });
         });
-
-        let mut ring_transform = Transform::from_translation(node.pos);
-        if is_ternary {
-            ring_transform.rotate_x(std::f32::consts::FRAC_PI_4);
-        }
-        commands.spawn((
-            PbrBundle {
-                mesh: ring.clone(),
-                material: ring_mat.clone(),
-                transform: ring_transform,
-                ..default()
-            },
-            AstSceneEntity,
-        ));
-
-        // Second ring for ternary (crossed)
-        if is_ternary {
-            let mut t2 = Transform::from_translation(node.pos);
-            t2.rotate_x(-std::f32::consts::FRAC_PI_4);
-            commands.spawn((
-                PbrBundle {
-                    mesh: ring,
-                    material: ring_mat,
-                    transform: t2,
-                    ..default()
-                },
-                AstSceneEntity,
-            ));
-        }
-        */
 
         //Value label
         spawn_world_label(
@@ -831,11 +893,10 @@ fn rebuild_scene(
     mut materials: ResMut<Assets<StandardMaterial>>,
     state: Res<AstState>,
     mut rebuild: ResMut<NeedsRebuild>,
-    mut anchor_assets: ResMut<AnchorAssets>,
     query_ast_entities: Query<Entity, With<AstSceneEntity>>,
 ) {
     if rebuild.0 {
-        spawn_ast_nodes(commands, meshes, materials, anchor_assets, state);
+        spawn_ast_nodes(commands, meshes, materials, state);
         rebuild.0 = false;
     }
 }
@@ -1264,77 +1325,72 @@ fn handle_arrow_keys(
     }
 }
 
-fn setup_anchor_assets(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    commands.insert_resource(AnchorAssets {
-        mesh: meshes.add(Sphere::new(0.06).mesh().ico(2).unwrap()),
-        mat_normal: materials.add(StandardMaterial {
-            base_color: Color::srgb(0.3, 0.6, 1.0),
-            emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-            unlit: true,
-            ..default()
-        }),
-        mat_hovered: materials.add(StandardMaterial {
-            base_color: Color::srgb(0.5, 0.9, 1.0),
-            emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-            unlit: true,
-            ..default()
-        }),
-    });
+fn anchor_transformation(anchor: &EAnchor, assets: &AnchorAssets, is_hovered: bool) -> Transform {
+    let (pre_transform, post_transform) = if is_hovered {
+        (assets.tf_hovered_pre, assets.tf_hovered_post)
+    } else {
+        (assets.tf_normal_pre, assets.tf_normal_post)
+    };
+    match anchor {
+        EAnchor::Output { relative_transform } => {
+            post_transform * *relative_transform * pre_transform
+        }
+        EAnchor::Input {
+            relative_transform, ..
+        } => post_transform * *relative_transform * pre_transform,
+    }
 }
 
 fn spawn_anchors(
-    commands: &mut Commands,
-    node_entity: Entity,
     num_inputs: usize,
     has_output: bool,
     assets: &AnchorAssets,
-) {
-    commands.entity(node_entity).with_children(|parent| {
-        // Input-Anchors oben entlang der X-Achse verteilen
-        let spread = 0.3;
-        let start_x = -(num_inputs as f32 - 1.0) * spread / 2.0;
-        for i in 0..num_inputs {
-            let x = start_x + i as f32 * spread;
-            parent.spawn((
-                PbrBundle {
-                    mesh: assets.mesh.clone(),
-                    material: assets.mat_normal.clone(),
-                    transform: Transform::from_translation(Vec3::new(x, 0.55, 0.0)),
-                    ..default()
-                },
-                Anchor {
-                    kind: AnchorKind::Input,
-                    param_index: i,
-                },
-            ));
-        }
-        // Output-Anchor unten
-        if has_output {
-            parent.spawn((
-                PbrBundle {
-                    mesh: assets.mesh.clone(),
-                    material: assets.mat_normal.clone(),
-                    transform: Transform::from_translation(Vec3::new(0.0, -0.55, 0.0)),
-                    ..default()
-                },
-                Anchor {
-                    kind: AnchorKind::Output,
-                    param_index: 0,
-                },
-            ));
-        }
-    });
+) -> Vec<(PbrBundle, EAnchor)> {
+    let mut bundle_anchors = vec![];
+    let spread = 0.3;
+    let start_x = -(num_inputs as f32 - 1.0) * spread / 2.0;
+    // Input-Anchors oben entlang der X-Achse verteilen
+    for i in 0..num_inputs {
+        let x = start_x + i as f32 * spread;
+
+        let anchor = EAnchor::Input {
+            relative_transform: Transform::from_translation(Vec3::new(x, 0.0, 0.55)),
+            num_inputs: num_inputs,
+            param_index: i,
+        };
+        bundle_anchors.push((
+            PbrBundle {
+                mesh: assets.mesh.clone(),
+                material: assets.mat_normal.clone(),
+                transform: anchor_transformation(&anchor, assets, false),
+                ..default()
+            },
+            anchor,
+        ));
+    }
+    // Output-Anchor unten
+    if has_output {
+        let anchor = EAnchor::Output {
+            relative_transform: Transform::from_translation(Vec3::new(0.0, 0.0, -0.55)),
+        };
+        bundle_anchors.push((
+            PbrBundle {
+                mesh: assets.mesh.clone(),
+                material: assets.mat_normal.clone(),
+                transform: anchor_transformation(&anchor, assets, false),
+                ..default()
+            },
+            anchor,
+        ));
+    }
+    return bundle_anchors;
 }
 
 fn anchor_hover_system(
     mut commands: Commands,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform)>,
-    anchors: Query<(Entity, &GlobalTransform), With<Anchor>>,
+    anchors: Query<(Entity, &GlobalTransform), With<EAnchor>>,
     existing_hovers: Query<Entity, With<AnchorHovered>>,
 ) {
     // Alle vorherigen Hovers entfernen
@@ -1373,26 +1429,25 @@ fn anchor_hover_system(
 }
 
 fn anchor_hover_visual_system(
-    mut anchors: Query<
-        (
-            &mut Transform,
-            &mut Handle<StandardMaterial>,
-            Option<&AnchorHovered>,
-        ),
-        With<Anchor>,
-    >,
-    assets: Res<AnchorAssets>,
+    mut anchors: Query<(
+        &EAnchor,
+        &mut Transform,
+        &mut Handle<StandardMaterial>,
+        Option<&AnchorHovered>,
+        &AnchorAssets,
+    )>,
 ) {
-    for (mut tf, mut mat, hovered) in &mut anchors {
-        let (target_scale, target_mat) = if hovered.is_some() {
-            (1.8, &assets.mat_hovered)
+    for (anchor, mut tf, mut mat, hovered, assets) in &mut anchors {
+        let (is_hovered, target_mat) = if hovered.is_some() {
+            (true, &assets.mat_hovered)
         } else {
-            (1.0, &assets.mat_normal)
+            (false, &assets.mat_normal)
         };
 
         // Smooth scale
-        let s = tf.scale.x + (target_scale - tf.scale.x) * 0.18;
-        tf.scale = Vec3::splat(s);
+        //let s = tf.scale.x + (target_scale - tf.scale.x) * 0.18;
+        //tf.scale = Vec3::splat(s);
+        *tf = anchor_transformation(anchor, assets, is_hovered);
 
         // Material swap (Handle-Vergleich ist billig)
         if *mat != *target_mat {
@@ -1401,16 +1456,14 @@ fn anchor_hover_visual_system(
     }
 }
 
-fn draw_edges_gizmos(
-    edges: Query<&Edge>,
-    transforms: Query<&GlobalTransform>,
-    mut gizmos: Gizmos,
-) {
+fn draw_edges_gizmos(edges: Query<&Edge>, transforms: Query<&GlobalTransform>, mut gizmos: Gizmos) {
     for edge in &edges {
         let (Ok(from), Ok(to)) = (
             transforms.get(edge.from_anchor),
             transforms.get(edge.to_anchor),
-        ) else { continue };
+        ) else {
+            continue;
+        };
         gizmos.line(from.translation(), to.translation(), Color::WHITE);
     }
 }
@@ -1427,7 +1480,7 @@ fn draw_drag_preview(drag: Res<DragState>, mut gizmos: Gizmos) {
 
 fn drag_start_system(
     mouse: Res<ButtonInput<MouseButton>>,
-    hovered: Query<(Entity, &GlobalTransform), (With<Anchor>, With<AnchorHovered>)>,
+    hovered: Query<(Entity, &GlobalTransform), (With<EAnchor>, With<AnchorHovered>)>,
     mut drag: ResMut<DragState>,
 ) {
     if mouse.just_pressed(MouseButton::Left) {
@@ -1446,17 +1499,27 @@ fn drag_start_system(
 fn drag_update_system(
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform)>,
-    hovered: Query<(Entity, &GlobalTransform), (With<Anchor>, With<AnchorHovered>)>,
+    hovered: Query<(Entity, &GlobalTransform), (With<EAnchor>, With<AnchorHovered>)>,
     mut drag: ResMut<DragState>,
 ) {
-    let Some(ref mut info) = drag.active else { return };
+    let Some(ref mut info) = drag.active else {
+        return;
+    };
 
-    let Ok(window) = windows.get_single() else { return };
-    let Some(cursor) = window.cursor_position() else { return };
-    let Ok((camera, cam_tf)) = camera_q.get_single() else { return };
+    let Ok(window) = windows.get_single() else {
+        return;
+    };
+    let Some(cursor) = window.cursor_position() else {
+        return;
+    };
+    let Ok((camera, cam_tf)) = camera_q.get_single() else {
+        return;
+    };
 
     // Ray durch Cursor
-    let Some(ray) = camera.viewport_to_world(cam_tf, cursor) else { return };
+    let Some(ray) = camera.viewport_to_world(cam_tf, cursor) else {
+        return;
+    };
 
     // Schnitt mit Ebene durch source_pos, senkrecht zur Kamera
     let normal: Vec3 = -*cam_tf.forward();
@@ -1524,7 +1587,6 @@ fn main() {
             Startup,
             (
                 setup_scene,
-                setup_anchor_assets,
                 spawn_ast_nodes,
                 spawn_ui,
                 spawn_selection_display,
