@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 
-use crate::ast::{AstNodeId, FunctionDeclarationId};
+use crate::ast::{AstNodeId, FunctionDeclaration, FunctionDeclarationId};
 
 #[derive(Debug, Clone)]
 pub struct LayoutNode {
@@ -65,109 +65,142 @@ impl LayoutAst {
     }
 
     pub fn plus_sink(&self) -> Self {
-        self._plus_node(
-            crate::ast::EAstNode::Sink { input: None },
-            Vec3::new(0.0, 0.0, 0.0),
-        )
+        let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
+        let (ast, node_id) = ast.plus(crate::ast::EAstNode::Sink {
+            input_anchor: input_anchor_id,
+        });
+        Self {
+            ast,
+            layout_nodes: self.layout_nodes.clone(),
+        }
+        ._plus_layout_node(&node_id, Vec3::new(0.0, 0.0, 0.0))
     }
 
     pub fn plus_number_literal(&self, value: f32, pos: Vec3) -> Self {
-        self._plus_node(crate::ast::EAstNode::NumLiteral(value), pos)
+        let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
+        let (ast, output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, node_id) = ast.plus(crate::ast::EAstNode::NumLiteral {
+            value,
+            input_anchor: input_anchor_id,
+            output_anchor: output_anchor_id,
+        });
+        Self {
+            ast,
+            layout_nodes: self.layout_nodes.clone(),
+        }
+        ._plus_layout_node(&node_id, pos)
     }
 
     pub fn plus_bool_literal(&self, value: bool, pos: Vec3) -> Self {
-        self._plus_node(crate::ast::EAstNode::BoolLiteral(value), pos)
+        let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
+        let (ast, output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, node_id) = ast.plus(crate::ast::EAstNode::BoolLiteral {
+            value,
+            input_anchor: input_anchor_id,
+            output_anchor: output_anchor_id,
+        });
+        Self {
+            ast,
+            layout_nodes: self.layout_nodes.clone(),
+        }
+        ._plus_layout_node(&node_id, pos)
     }
 
     pub fn plus_function_call(
         &self,
-        function_declaration: FunctionDeclarationId,
+        function_declaration: (FunctionDeclarationId, &FunctionDeclaration),
         pos: Vec3,
     ) -> Self {
-        self._plus_node(
-            crate::ast::EAstNode::FunctionCall {
-                function_declaration_id: function_declaration,
-                input_arguments: vec![],
-            },
-            pos,
-        )
+        let (ast, input_anchor_ids) =
+            function_declaration
+                .1
+                .inputs
+                .iter()
+                .fold::<(crate::ast::Ast, Vec<crate::ast::AnchorId>), _>(
+                    (self.ast.clone(), vec![]),
+                    |(ast, input_anchor_ids), _| {
+                        let (ast, new_anchor_id) = ast.with_next_anchor_id();
+                        (
+                            ast,
+                            input_anchor_ids
+                                .into_iter()
+                                .chain(vec![new_anchor_id])
+                                .collect(),
+                        )
+                    },
+                );
+        let (ast, output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, node_id) = ast.plus(crate::ast::EAstNode::FunctionCall {
+            function_declaration_id: function_declaration.0,
+            input_anchors: input_anchor_ids,
+            output_anchor: output_anchor_id,
+        });
+        Self {
+            ast,
+            layout_nodes: self.layout_nodes.clone(),
+        }
+        ._plus_layout_node(&node_id, pos)
     }
 
     pub fn plus_match_true(&self, pos: Vec3) -> Self {
-        self._plus_node(
-            crate::ast::EAstNode::MatchTrue {
-                input_argument: None,
-            },
-            pos,
-        )
+        let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
+        let (ast, output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, node_id) = ast.plus(crate::ast::EAstNode::MatchTrue {
+            input_anchor: input_anchor_id,
+            output_anchor: output_anchor_id,
+        });
+        Self {
+            ast,
+            layout_nodes: self.layout_nodes.clone(),
+        }
+        ._plus_layout_node(&node_id, pos)
     }
 
     pub fn plus_match_false(&self, pos: Vec3) -> Self {
-        self._plus_node(
-            crate::ast::EAstNode::MatchFalse {
-                input_argument: None,
-            },
-            pos,
-        )
+        let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
+        let (ast, output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, node_id) = ast.plus(crate::ast::EAstNode::MatchFalse {
+            input_anchor: input_anchor_id,
+            output_anchor: output_anchor_id,
+        });
+        Self {
+            ast,
+            layout_nodes: self.layout_nodes.clone(),
+        }
+        ._plus_layout_node(&node_id, pos)
     }
 
-    fn _plus_node(&self, node: crate::ast::EAstNode, pos: Vec3) -> Self {
-        let id = self.ast.next_id();
+    fn _plus_layout_node(&self, node_id: &AstNodeId, pos: Vec3) -> Self {
         Self {
-            ast: self.ast.plus(node),
+            ast: self.ast.clone(),
             layout_nodes: self
                 .layout_nodes
                 .clone()
                 .into_iter()
-                .chain([(id.clone(), LayoutNode { node_id: id, pos })])
+                .chain([(
+                    node_id.clone(),
+                    LayoutNode {
+                        node_id: node_id.clone(),
+                        pos,
+                    },
+                )])
                 .collect(),
         }
     }
 
     pub fn edges(&self) -> Vec<LayoutEdge> {
         self.ast
-            .nodes
+            .edges
             .iter()
-            .flat_map(|(node_id, node)| match node {
-                crate::ast::EAstNode::Sink {
-                    input: Some(other_id),
-                } => vec![LayoutEdge {
-                    from_node_id: other_id.clone(),
-                    to_node_id: node_id.clone(),
-                    from_pos: self.layout_nodes.get(other_id).unwrap().pos,
-                    to_pos: self.layout_nodes.get(node_id).unwrap().pos,
-                }],
-                crate::ast::EAstNode::FunctionCall {
-                    input_arguments, ..
-                } => input_arguments
-                    .into_iter()
-                    .map(|input_argument_node_id| LayoutEdge {
-                        from_node_id: input_argument_node_id.clone(),
-                        to_node_id: node_id.clone(),
-                        from_pos: self.layout_nodes.get(input_argument_node_id).unwrap().pos,
-                        to_pos: self.layout_nodes.get(node_id).unwrap().pos,
-                    })
-                    .collect::<Vec<LayoutEdge>>(),
-                crate::ast::EAstNode::MatchTrue {
-                    input_argument: Some(other_id),
+            .map(|(from_anchor, to_anchor)| {
+                let from_node_id = self.ast.anchor_to_node.get(from_anchor).unwrap().clone();
+                let to_node_id = self.ast.anchor_to_node.get(to_anchor).unwrap().clone();
+                LayoutEdge {
+                    from_node_id: from_node_id.clone(),
+                    to_node_id: to_node_id.clone(),
+                    from_pos: self.layout_nodes.get(&from_node_id).unwrap().pos,
+                    to_pos: self.layout_nodes.get(&to_node_id).unwrap().pos,
                 }
-                | crate::ast::EAstNode::MatchFalse {
-                    input_argument: Some(other_id),
-                } => vec![LayoutEdge {
-                    from_node_id: other_id.clone(),
-                    to_node_id: node_id.clone(),
-                    from_pos: self.layout_nodes.get(other_id).unwrap().pos,
-                    to_pos: self.layout_nodes.get(node_id).unwrap().pos,
-                }],
-                crate::ast::EAstNode::MatchTrue {
-                    input_argument: None,
-                }
-                | crate::ast::EAstNode::MatchFalse {
-                    input_argument: None,
-                }
-                | crate::ast::EAstNode::BoolLiteral(_)
-                | crate::ast::EAstNode::NumLiteral(_)
-                | crate::ast::EAstNode::Sink { input: None } => vec![],
             })
             .collect()
     }

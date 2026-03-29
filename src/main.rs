@@ -182,9 +182,9 @@ fn node_color(node: &ast::EAstNode) -> Color {
         ast::EAstNode::FunctionCall { .. } => Color::srgb(0.306, 0.804, 0.769), // #4ECDC4
         ast::EAstNode::MatchTrue { .. } => Color::srgb(0.984, 0.573, 0.235), // #FB923C
         ast::EAstNode::MatchFalse { .. } => Color::srgb(0.133, 0.827, 0.933), // #22D3EE
-        ast::EAstNode::BoolLiteral(true) => Color::srgb(0.29, 0.87, 0.50), // #4ADE80
-        ast::EAstNode::BoolLiteral(false) => Color::srgb(0.973, 0.443, 0.443), // #F87171
-        ast::EAstNode::NumLiteral(_) => Color::srgb(0.91, 0.894, 0.871), // #E8E4DE
+        ast::EAstNode::BoolLiteral { value: true, .. } => Color::srgb(0.29, 0.87, 0.50), // #4ADE80
+        ast::EAstNode::BoolLiteral { value: false, .. } => Color::srgb(0.973, 0.443, 0.443), // #F87171
+        ast::EAstNode::NumLiteral { .. } => Color::srgb(0.91, 0.894, 0.871), // #E8E4DE
     }
 }
 
@@ -288,13 +288,13 @@ fn spawn_ast_nodes(
 
         // Pick shape based on AST type
         let pbr_bundle = match node {
-            ast::EAstNode::NumLiteral(_) => PbrBundle {
+            ast::EAstNode::NumLiteral { .. } => PbrBundle {
                 mesh: cube_mesh.clone(),
                 material,
                 transform: Transform::from_translation(node_pos),
                 ..default()
             },
-            ast::EAstNode::BoolLiteral(_) => PbrBundle {
+            ast::EAstNode::BoolLiteral { .. } => PbrBundle {
                 mesh: bool_mesh.clone(),
                 material,
                 transform: Transform::from_translation(node_pos),
@@ -341,8 +341,8 @@ fn spawn_ast_nodes(
         };
 
         let anchor_assets = match node {
-            ast::EAstNode::BoolLiteral(_)
-            | ast::EAstNode::NumLiteral(_)
+            ast::EAstNode::BoolLiteral { .. }
+            | ast::EAstNode::NumLiteral { .. }
             | ast::EAstNode::MatchTrue { .. }
             | ast::EAstNode::MatchFalse { .. } => AnchorAssets {
                 mesh: meshes.add(Sphere::new(0.06).mesh().ico(2).unwrap()),
@@ -424,8 +424,8 @@ fn spawn_ast_nodes(
         };
 
         let bundle_anchors = match node {
-            ast::EAstNode::BoolLiteral(_)
-            | ast::EAstNode::NumLiteral(_)
+            ast::EAstNode::BoolLiteral { .. }
+            | ast::EAstNode::NumLiteral { .. }
             | ast::EAstNode::MatchFalse { .. }
             | ast::EAstNode::MatchTrue { .. } => spawn_anchors(1, true, &anchor_assets),
             ast::EAstNode::FunctionCall {
@@ -744,7 +744,7 @@ fn handle_add_node_button(
                                     .function_declarations
                                     .iter()
                                     .find(|(_, d)| current_input_string.0 == d.name)
-                                    .map(|(id, _)| id.clone())
+                                    .map(|(id, decl)| (id.clone(), decl))
                                     .unwrap(),
                                 new_pos,
                             )
