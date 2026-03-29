@@ -7,7 +7,7 @@ mod mesh;
 use std::{collections::hash_map, f32::consts::PI};
 
 use ast::FunctionParameterDeclaration;
-use bevy::{input::keyboard::KeyboardInput, prelude::*};
+use bevy::{input::keyboard::KeyboardInput, math::VectorSpace, prelude::*};
 
 // ── WASM bridge ─────────────────────────────────────────────
 
@@ -153,6 +153,8 @@ struct AstSceneEntity;
 //Buttons
 #[derive(Component)]
 struct DeleteNodeButton;
+#[derive(Component)]
+struct ResetCameraButton;
 #[derive(Component, Clone)]
 enum EAstActionButton {
     AddNumberLiteralButton,
@@ -284,6 +286,7 @@ fn spawn_ast_nodes(
     let bool_mesh = meshes.add(mesh::create_bool_mesh(0.5, 1.0, 16));
 
     let mut node_entites = std::collections::HashMap::<ast::AstNodeId, Entity>::new();
+    let mut anchor_entities = std::collections::HashMap::<ast::AnchorId, Entity>::new();
 
     for (node_id, node) in &state.layout_ast.ast.nodes {
         let color = node_color(node);
@@ -445,10 +448,6 @@ fn spawn_ast_nodes(
                 _ => false,
             })
             .count();
-        let bundle_anchors = anchors
-            .into_iter()
-            .map(|(id, anchor)| spawn_anchor(id, anchor, input_anchor_count, &anchor_assets))
-            .collect::<Vec<_>>();
 
         let node_entity = commands
             .spawn((
@@ -460,13 +459,14 @@ fn spawn_ast_nodes(
             ))
             .id();
 
-        node_entites.insert(node_id.clone(), node_entity.clone());
-
-        bundle_anchors.into_iter().for_each(|(b, a)| {
-            commands.entity(node_entity).with_children(|parent| {
-                parent.spawn((b, a, anchor_assets.clone()));
+        commands.entity(node_entity).with_children(|parent| {
+            anchors.into_iter().for_each(|(id, anchor)| {
+                let (b, a) = spawn_anchor(id.clone(), anchor, input_anchor_count, &anchor_assets);
+                anchor_entities.insert(id, parent.spawn((b, a, anchor_assets.clone())).id());
             });
         });
+
+        node_entites.insert(node_id.clone(), node_entity.clone());
 
         //Value label
         spawn_world_label(
@@ -523,8 +523,8 @@ fn spawn_ast_nodes(
 
     for e in state.layout_ast.edges() {
         commands.spawn(Edge {
-            from_anchor: node_entites.get(&e.from_node_id).unwrap().clone(),
-            to_anchor: node_entites.get(&e.to_node_id).unwrap().clone(),
+            from_anchor: *anchor_entities.get(&e.from_anchor.anchor_id).unwrap(),
+            to_anchor: *anchor_entities.get(&e.to_anchor.anchor_id).unwrap(),
         });
     }
 
@@ -567,6 +567,13 @@ fn spawn_ast_nodes(
 
 fn spawn_ui(mut commands: Commands) {
     let y_offset = 12.0;
+    spawn_ui_button(
+        &mut commands,
+        "Reset Camera",
+        ResetCameraButton,
+        Vec2::new(12.0, y_offset),
+    );
+    let y_offset = y_offset + 36.0;
     // Outer container (clickable background)
     let initial = "";
     commands
@@ -679,6 +686,35 @@ fn spawn_ui_button<C: Component>(commands: &mut Commands, label: &str, component
         });
 }
 
+fn handle_reset_camera_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (With<Interaction>, With<ResetCameraButton>),
+    >,
+    mut text_q: Query<&mut Text>,
+    mut orbit: ResMut<camera::OrbitCamera>,
+) {
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut text = text_q.get_mut(children[0]).unwrap();
+
+        match *interaction {
+            Interaction::Pressed => {
+                orbit.theta = 0.6;
+                orbit.phi = 1.0;
+                orbit.target = Vec3::ZERO;
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
+                text.sections[0].style.color = Color::srgb(0.85, 0.85, 0.9);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
+                text.sections[0].style.color = Color::srgb(0.6, 0.6, 0.7);
+            }
+        }
+    }
+}
+
 fn handle_delete_node_button(
     mut interaction_q: Query<
         (&Interaction, &mut BackgroundColor, &Children),
@@ -786,6 +822,7 @@ fn handle_add_node_button(
     }
 }
 
+/* curved edges
 /// Draw edges using Gizmos (called every frame).
 fn draw_edges(mut gizmos: Gizmos, state: Res<AstState>) {
     let edges = &state.layout_ast.edges();
@@ -866,6 +903,7 @@ fn draw_edges(mut gizmos: Gizmos, state: Res<AstState>) {
         gizmos.line(end, arrow_base - perp2, color);
     }
 }
+*/
 
 /// Gentle pulsing animation for nodes.
 fn animate_nodes(time: Res<Time>, mut query: Query<(&AstNodeEntity, &mut Transform)>) {
@@ -1160,9 +1198,9 @@ fn text_input_keyboard(
     mut text_q: Query<&mut Text, With<TextInputDisplay>>,
     mut key_events: EventReader<KeyboardInput>,
     mut current_input_string: ResMut<CurrentInputString>,
-    mut state: ResMut<AstState>,
+    //mut state: ResMut<AstState>,
     mut orbit: ResMut<camera::OrbitCamera>,
-    mut rebuild: ResMut<NeedsRebuild>,
+    //    mut rebuild: ResMut<NeedsRebuild>,
     mut commands: Commands,
     scene_entities: Query<Entity, With<AstSceneEntity>>,
 ) {
@@ -1265,10 +1303,10 @@ fn text_input_keyboard(
                 commands.entity(entity).despawn_recursive();
             }
             */
-            rebuild.0 = true;
             //orbit.auto_rotate = true;
-            orbit.theta = 0.6;
-            orbit.phi = 1.0;
+            //rebuild.0 = true;
+            //orbit.theta = 0.6;
+            //orbit.phi = 1.0;
         }
     }
 }
@@ -1621,10 +1659,11 @@ fn main() {
                         draw_drag_preview,
                     )
                         .chain(),
-                    draw_edges,
+                    //draw_edges,
                     animate_nodes,
                     (
                         handle_delete_node_button,
+                        handle_reset_camera_button,
                         handle_add_node_button,
                         pick_nodes,
                     )

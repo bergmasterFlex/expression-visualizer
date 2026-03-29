@@ -1,6 +1,6 @@
 use bevy::prelude::*;
 
-use crate::ast::{AstNodeId, FunctionDeclaration, FunctionDeclarationId};
+use crate::ast::{self, AstNodeId, FunctionDeclaration, FunctionDeclarationId};
 
 #[derive(Debug, Clone)]
 pub struct LayoutNode {
@@ -10,12 +10,16 @@ pub struct LayoutNode {
 
 #[derive(Debug, Clone)]
 pub struct LayoutEdge {
-    pub from_node_id: crate::ast::AstNodeId,
-    pub from_anchor_id: crate::ast::AnchorId,
-    pub to_node_id: crate::ast::AstNodeId,
-    pub to_anchor_id: crate::ast::AnchorId,
-    pub from_pos: Vec3,
-    pub to_pos: Vec3,
+    pub from_anchor: LayoutAnchor,
+    pub to_anchor: LayoutAnchor,
+}
+
+#[derive(Debug, Clone)]
+pub struct LayoutAnchor {
+    pub anchor_id: crate::ast::AnchorId,
+    pub node_id: crate::ast::AstNodeId,
+    pub anchor: crate::ast::EAnchor,
+    pub pos: Vec3,
 }
 
 pub struct LayoutAst {
@@ -201,19 +205,27 @@ impl LayoutAst {
         self.ast
             .edges
             .iter()
-            .map(|(from_anchor_id, to_anchor_id)| {
-                let from_node_id = self.ast.anchor_to_node.get(from_anchor_id).unwrap().clone();
-                let to_node_id = self.ast.anchor_to_node.get(to_anchor_id).unwrap().clone();
-                LayoutEdge {
-                    from_node_id: from_node_id.clone(),
-                    from_anchor_id: from_anchor_id.clone(),
-                    to_node_id: to_node_id.clone(),
-                    to_anchor_id: to_anchor_id.clone(),
-                    from_pos: self.layout_nodes.get(&from_node_id).unwrap().pos,
-                    to_pos: self.layout_nodes.get(&to_node_id).unwrap().pos,
-                }
+            .flat_map(|(from_anchor_id, to_anchor_ids)| {
+                to_anchor_ids
+                    .clone()
+                    .into_iter()
+                    .map(|to_anchor_id| LayoutEdge {
+                        from_anchor: self.layout_anchor(from_anchor_id.clone()),
+                        to_anchor: self.layout_anchor(to_anchor_id.clone()),
+                    })
             })
             .collect()
+    }
+
+    pub fn layout_anchor(&self, anchor_id: ast::AnchorId) -> LayoutAnchor {
+        let anchor = self.ast.anchors.get(&anchor_id).unwrap();
+        let node_id = self.ast.anchor_to_node.get(&anchor_id).unwrap().clone();
+        LayoutAnchor {
+            anchor_id: anchor_id,
+            anchor: anchor.clone(),
+            node_id,
+            pos: Vec3::splat(1.0),
+        }
     }
 }
 

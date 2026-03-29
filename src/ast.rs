@@ -9,7 +9,7 @@ pub struct Ast {
     pub nodes: std::collections::HashMap<AstNodeId, EAstNode>,
     pub anchors: std::collections::HashMap<AnchorId, EAnchor>,
     pub anchor_to_node: std::collections::HashMap<AnchorId, AstNodeId>,
-    pub edges: std::collections::HashMap<AnchorId, AnchorId>,
+    pub edges: std::collections::HashMap<AnchorId, Vec<AnchorId>>,
 }
 
 impl Ast {
@@ -49,7 +49,12 @@ impl Ast {
                 .edges
                 .clone()
                 .into_iter()
-                .chain(vec![(from, to)])
+                .chain(vec![(
+                    from.clone(),
+                    self.edges.get(&from).map_or(vec![to.clone()], |anchors| {
+                        anchors.clone().into_iter().chain(vec![to]).collect()
+                    }),
+                )])
                 .collect(),
         }
     }
@@ -125,9 +130,10 @@ impl Ast {
     pub fn get_connected_nodes_to_anchor(&self, anchor: AnchorId) -> Vec<AstNodeId> {
         self.edges
             .iter()
+            .flat_map(|(from, tos)| tos.iter().map(|to| (from.clone(), to)))
             .filter_map(|(from, to)| {
                 if *to == anchor {
-                    Some(self.anchor_to_node.get(from).unwrap().clone())
+                    Some(self.anchor_to_node.get(&from).unwrap().clone())
                 } else {
                     None
                 }
@@ -139,7 +145,7 @@ impl Ast {
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct AnchorId(usize);
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum EAnchor {
     Input { order_num: usize, name: String },
     Output,
