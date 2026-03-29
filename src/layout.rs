@@ -11,7 +11,9 @@ pub struct LayoutNode {
 #[derive(Debug, Clone)]
 pub struct LayoutEdge {
     pub from_node_id: crate::ast::AstNodeId,
+    pub from_anchor_id: crate::ast::AnchorId,
     pub to_node_id: crate::ast::AstNodeId,
+    pub to_anchor_id: crate::ast::AnchorId,
     pub from_pos: Vec3,
     pub to_pos: Vec3,
 }
@@ -61,6 +63,13 @@ impl LayoutAst {
                     )
                 })
                 .collect(),
+        }
+    }
+
+    pub fn plus_edge(&self, from: crate::ast::AnchorId, to: crate::ast::AnchorId) -> Self {
+        Self {
+            ast: self.ast.plus_edge(from, to),
+            layout_nodes: self.layout_nodes.clone(),
         }
     }
 
@@ -192,12 +201,14 @@ impl LayoutAst {
         self.ast
             .edges
             .iter()
-            .map(|(from_anchor, to_anchor)| {
-                let from_node_id = self.ast.anchor_to_node.get(from_anchor).unwrap().clone();
-                let to_node_id = self.ast.anchor_to_node.get(to_anchor).unwrap().clone();
+            .map(|(from_anchor_id, to_anchor_id)| {
+                let from_node_id = self.ast.anchor_to_node.get(from_anchor_id).unwrap().clone();
+                let to_node_id = self.ast.anchor_to_node.get(to_anchor_id).unwrap().clone();
                 LayoutEdge {
                     from_node_id: from_node_id.clone(),
+                    from_anchor_id: from_anchor_id.clone(),
                     to_node_id: to_node_id.clone(),
+                    to_anchor_id: to_anchor_id.clone(),
                     from_pos: self.layout_nodes.get(&from_node_id).unwrap().pos,
                     to_pos: self.layout_nodes.get(&to_node_id).unwrap().pos,
                 }

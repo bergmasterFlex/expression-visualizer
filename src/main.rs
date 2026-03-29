@@ -4,7 +4,7 @@ mod grid;
 mod layout;
 mod mesh;
 
-use std::f32::consts::PI;
+use std::{collections::hash_map, f32::consts::PI};
 
 use ast::FunctionParameterDeclaration;
 use bevy::{input::keyboard::KeyboardInput, prelude::*};
@@ -85,13 +85,23 @@ pub struct AnchorHovered;
 #[derive(Component)]
 pub enum EAnchor {
     Input {
+        id: ast::AnchorId,
         num_inputs: usize,
         param_index: usize,
         relative_transform: Transform,
     },
     Output {
+        id: ast::AnchorId,
         relative_transform: Transform,
     },
+}
+
+impl EAnchor {
+    pub fn id(&self) -> ast::AnchorId {
+        match self {
+            EAnchor::Input { id, .. } | EAnchor::Output { id, .. } => id.clone(),
+        }
+    }
 }
 
 #[derive(Component)]
@@ -102,9 +112,11 @@ pub struct Edge {
 
 pub struct DragInfo {
     pub source_anchor: Entity,
+    pub source_anchor_id: ast::AnchorId,
     pub source_pos: Vec3,
     pub current_end: Vec3,
     pub target_anchor: Option<Entity>,
+    pub target_anchor_id: Option<ast::AnchorId>,
 }
 
 #[derive(Resource, Default)]
@@ -271,6 +283,8 @@ fn spawn_ast_nodes(
     let pyramide_mesh = meshes.add(mesh::create_cone_mesh(0.5, 1.0, 4));
     let bool_mesh = meshes.add(mesh::create_bool_mesh(0.5, 1.0, 16));
 
+    let mut node_entites = std::collections::HashMap::<ast::AstNodeId, Entity>::new();
+
     for (node_id, node) in &state.layout_ast.ast.nodes {
         let color = node_color(node);
         let emissive = node_emissive(&node);
@@ -423,26 +437,18 @@ fn spawn_ast_nodes(
             },
         };
 
-        let bundle_anchors = match node {
-            ast::EAstNode::BoolLiteral { .. }
-            | ast::EAstNode::NumLiteral { .. }
-            | ast::EAstNode::MatchFalse { .. }
-            | ast::EAstNode::MatchTrue { .. } => spawn_anchors(1, true, &anchor_assets),
-            ast::EAstNode::FunctionCall {
-                function_declaration_id,
-                ..
-            } => spawn_anchors(
-                state
-                    .function_declarations
-                    .get(function_declaration_id)
-                    .unwrap()
-                    .inputs
-                    .len(),
-                true,
-                &anchor_assets,
-            ),
-            ast::EAstNode::Sink { .. } => spawn_anchors(1, false, &anchor_assets),
-        };
+        let anchors = node.anchors();
+        let input_anchor_count = anchors
+            .iter()
+            .filter(|(_, a)| match a {
+                ast::EAnchor::Input { .. } => true,
+                _ => false,
+            })
+            .count();
+        let bundle_anchors = anchors
+            .into_iter()
+            .map(|(id, anchor)| spawn_anchor(id, anchor, input_anchor_count, &anchor_assets))
+            .collect::<Vec<_>>();
 
         let node_entity = commands
             .spawn((
@@ -453,6 +459,8 @@ fn spawn_ast_nodes(
                 AstSceneEntity,
             ))
             .id();
+
+        node_entites.insert(node_id.clone(), node_entity.clone());
 
         bundle_anchors.into_iter().for_each(|(b, a)| {
             commands.entity(node_entity).with_children(|parent| {
@@ -511,6 +519,13 @@ fn spawn_ast_nodes(
             Vec2::new(0.0, -22.0), // 22px above
             AstSceneEntity,
         );
+    }
+
+    for e in state.layout_ast.edges() {
+        commands.spawn(Edge {
+            from_anchor: node_entites.get(&e.from_node_id).unwrap().clone(),
+            to_anchor: node_entites.get(&e.to_node_id).unwrap().clone(),
+        });
     }
 
     /*
@@ -1332,58 +1347,58 @@ fn anchor_transformation(anchor: &EAnchor, assets: &AnchorAssets, is_hovered: bo
         (assets.tf_normal_pre, assets.tf_normal_post)
     };
     match anchor {
-        EAnchor::Output { relative_transform } => {
-            post_transform * *relative_transform * pre_transform
-        }
+        EAnchor::Output {
+            relative_transform, ..
+        } => post_transform * *relative_transform * pre_transform,
         EAnchor::Input {
             relative_transform, ..
         } => post_transform * *relative_transform * pre_transform,
     }
 }
 
-fn spawn_anchors(
+fn spawn_anchor(
+    anchor_id: ast::AnchorId,
+    anchor: ast::EAnchor,
     num_inputs: usize,
-    has_output: bool,
     assets: &AnchorAssets,
-) -> Vec<(PbrBundle, EAnchor)> {
-    let mut bundle_anchors = vec![];
-    let spread = 0.3;
-    let start_x = -(num_inputs as f32 - 1.0) * spread / 2.0;
-    // Input-Anchors oben entlang der X-Achse verteilen
-    for i in 0..num_inputs {
-        let x = start_x + i as f32 * spread;
-
-        let anchor = EAnchor::Input {
-            relative_transform: Transform::from_translation(Vec3::new(x, 0.0, 0.55)),
-            num_inputs: num_inputs,
-            param_index: i,
-        };
-        bundle_anchors.push((
-            PbrBundle {
-                mesh: assets.mesh.clone(),
-                material: assets.mat_normal.clone(),
-                transform: anchor_transformation(&anchor, assets, false),
-                ..default()
-            },
-            anchor,
-        ));
+) -> (PbrBundle, EAnchor) {
+    match anchor {
+        ast::EAnchor::Input { order_num, .. } => {
+            let spread = 0.3;
+            let start_x = -(num_inputs as f32 - 1.0) * spread / 2.0;
+            let x = start_x + order_num as f32 * spread;
+            let anchor = EAnchor::Input {
+                id: anchor_id,
+                relative_transform: Transform::from_translation(Vec3::new(x, 0.0, 0.55)),
+                num_inputs: num_inputs,
+                param_index: order_num,
+            };
+            (
+                PbrBundle {
+                    mesh: assets.mesh.clone(),
+                    material: assets.mat_normal.clone(),
+                    transform: anchor_transformation(&anchor, assets, false),
+                    ..default()
+                },
+                anchor,
+            )
+        }
+        ast::EAnchor::Output => {
+            let anchor = EAnchor::Output {
+                id: anchor_id,
+                relative_transform: Transform::from_translation(Vec3::new(0.0, 0.0, -0.55)),
+            };
+            (
+                PbrBundle {
+                    mesh: assets.mesh.clone(),
+                    material: assets.mat_normal.clone(),
+                    transform: anchor_transformation(&anchor, assets, false),
+                    ..default()
+                },
+                anchor,
+            )
+        }
     }
-    // Output-Anchor unten
-    if has_output {
-        let anchor = EAnchor::Output {
-            relative_transform: Transform::from_translation(Vec3::new(0.0, 0.0, -0.55)),
-        };
-        bundle_anchors.push((
-            PbrBundle {
-                mesh: assets.mesh.clone(),
-                material: assets.mat_normal.clone(),
-                transform: anchor_transformation(&anchor, assets, false),
-                ..default()
-            },
-            anchor,
-        ));
-    }
-    return bundle_anchors;
 }
 
 fn anchor_hover_system(
@@ -1480,17 +1495,19 @@ fn draw_drag_preview(drag: Res<DragState>, mut gizmos: Gizmos) {
 
 fn drag_start_system(
     mouse: Res<ButtonInput<MouseButton>>,
-    hovered: Query<(Entity, &GlobalTransform), (With<EAnchor>, With<AnchorHovered>)>,
+    hovered: Query<(Entity, &GlobalTransform, &EAnchor), (With<AnchorHovered>)>,
     mut drag: ResMut<DragState>,
 ) {
     if mouse.just_pressed(MouseButton::Left) {
-        if let Ok((entity, tf)) = hovered.get_single() {
+        if let Ok((entity, tf, anchor)) = hovered.get_single() {
             let pos = tf.translation();
             drag.active = Some(DragInfo {
                 source_anchor: entity,
+                source_anchor_id: anchor.id(),
                 source_pos: pos,
                 current_end: pos,
                 target_anchor: None,
+                target_anchor_id: None,
             });
         }
     }
@@ -1499,7 +1516,7 @@ fn drag_start_system(
 fn drag_update_system(
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform)>,
-    hovered: Query<(Entity, &GlobalTransform), (With<EAnchor>, With<AnchorHovered>)>,
+    hovered: Query<(Entity, &GlobalTransform, &EAnchor), (With<AnchorHovered>)>,
     mut drag: ResMut<DragState>,
 ) {
     let Some(ref mut info) = drag.active else {
@@ -1533,9 +1550,10 @@ fn drag_update_system(
 
     // Snap zu hovering target
     info.target_anchor = None;
-    if let Ok((entity, tf)) = hovered.get_single() {
+    if let Ok((entity, tf, anchor)) = hovered.get_single() {
         if entity != info.source_anchor {
             info.target_anchor = Some(entity);
+            info.target_anchor_id = Some(anchor.id());
             info.current_end = tf.translation();
         }
     }
@@ -1545,14 +1563,14 @@ fn drag_end_system(
     mouse: Res<ButtonInput<MouseButton>>,
     mut drag: ResMut<DragState>,
     mut commands: Commands,
+    mut rebuild: ResMut<NeedsRebuild>,
+    mut state: ResMut<AstState>,
 ) {
     if mouse.just_released(MouseButton::Left) {
         if let Some(info) = drag.active.take() {
-            if let Some(target) = info.target_anchor {
-                commands.spawn(Edge {
-                    from_anchor: info.source_anchor,
-                    to_anchor: target,
-                });
+            if let Some(target_id) = info.target_anchor_id {
+                state.layout_ast = state.layout_ast.plus_edge(info.source_anchor_id, target_id);
+                rebuild.0 = true;
             }
             // Kein target → Drag wird einfach verworfen
         }
@@ -1598,10 +1616,6 @@ fn main() {
             (
                 (
                     (
-                        anchor_hover_system,
-                        drag_start_system,
-                        drag_update_system,
-                        drag_end_system,
                         anchor_hover_visual_system,
                         draw_edges_gizmos,
                         draw_drag_preview,
@@ -1622,7 +1636,16 @@ fn main() {
                     text_input_keyboard,
                     handle_arrow_keys,
                 ),
-                (clear_scene, apply_deferred, rebuild_scene).chain(),
+                (
+                    anchor_hover_system,
+                    drag_start_system,
+                    drag_update_system,
+                    drag_end_system,
+                    clear_scene,
+                    apply_deferred,
+                    rebuild_scene,
+                )
+                    .chain(),
             )
                 .chain(),
         )

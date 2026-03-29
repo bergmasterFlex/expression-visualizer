@@ -1,3 +1,5 @@
+use bevy::render::render_graph::Edge;
+
 // ── AST node types ──────────────────────────────────────────
 //
 #[derive(Clone)]
@@ -33,6 +35,22 @@ impl Ast {
             anchors: std::collections::HashMap::new(),
             anchor_to_node: std::collections::HashMap::new(),
             edges: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn plus_edge(&self, from: AnchorId, to: AnchorId) -> Self {
+        Self {
+            next_node_id: self.next_node_id.clone(),
+            next_anchor_id: self.next_anchor_id.clone(),
+            anchors: self.anchors.clone(),
+            nodes: self.nodes.clone(),
+            anchor_to_node: self.anchor_to_node.clone(),
+            edges: self
+                .edges
+                .clone()
+                .into_iter()
+                .chain(vec![(from, to)])
+                .collect(),
         }
     }
 
