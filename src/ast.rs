@@ -165,12 +165,12 @@ pub enum EAstNode {
         output_anchor: AnchorId,
     },
     NumLiteral {
-        value: f32,
+        value: String,
         input_anchor: AnchorId,
         output_anchor: AnchorId,
     },
     BoolLiteral {
-        value: bool,
+        value: String,
         input_anchor: AnchorId,
         output_anchor: AnchorId,
     },

@@ -89,7 +89,7 @@ impl LayoutAst {
         ._plus_layout_node(&node_id, Vec3::new(0.0, 0.0, 0.0))
     }
 
-    pub fn plus_number_literal(&self, value: f32, pos: Vec3) -> Self {
+    pub fn plus_number_literal(&self, value: String, pos: Vec3) -> Self {
         let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
         let (ast, output_anchor_id) = ast.with_next_anchor_id();
         let (ast, node_id) = ast.plus(crate::ast::EAstNode::NumLiteral {
@@ -104,7 +104,7 @@ impl LayoutAst {
         ._plus_layout_node(&node_id, pos)
     }
 
-    pub fn plus_bool_literal(&self, value: bool, pos: Vec3) -> Self {
+    pub fn plus_bool_literal(&self, value: String, pos: Vec3) -> Self {
         let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
         let (ast, output_anchor_id) = ast.with_next_anchor_id();
         let (ast, node_id) = ast.plus(crate::ast::EAstNode::BoolLiteral {

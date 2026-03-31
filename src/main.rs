@@ -196,8 +196,10 @@ fn node_color(node: &ast::EAstNode) -> Color {
         ast::EAstNode::FunctionCall { .. } => Color::srgb(0.306, 0.804, 0.769), // #4ECDC4
         ast::EAstNode::MatchTrue { .. } => Color::srgb(0.984, 0.573, 0.235), // #FB923C
         ast::EAstNode::MatchFalse { .. } => Color::srgb(0.133, 0.827, 0.933), // #22D3EE
-        ast::EAstNode::BoolLiteral { value: true, .. } => Color::srgb(0.29, 0.87, 0.50), // #4ADE80
-        ast::EAstNode::BoolLiteral { value: false, .. } => Color::srgb(0.973, 0.443, 0.443), // #F87171
+        ast::EAstNode::BoolLiteral { value, .. } if *value == "true".to_string() => {
+            Color::srgb(0.29, 0.87, 0.50)
+        } // #4ADE80
+        ast::EAstNode::BoolLiteral { .. } => Color::srgb(0.973, 0.443, 0.443), // #F87171
         ast::EAstNode::NumLiteral { .. } => Color::srgb(0.91, 0.894, 0.871), // #E8E4DE
     }
 }
@@ -785,10 +787,10 @@ fn handle_add_node_button(
                     state.layout_ast = match action {
                         EAstActionButton::AddNumberLiteralButton => state
                             .layout_ast
-                            .plus_number_literal(current_input_string.0.parse().unwrap(), new_pos),
+                            .plus_number_literal(current_input_string.0.clone(), new_pos),
                         EAstActionButton::AddBoolLiteralButton => state
                             .layout_ast
-                            .plus_bool_literal(current_input_string.0.parse().unwrap(), new_pos),
+                            .plus_bool_literal(current_input_string.0.clone(), new_pos),
                         EAstActionButton::AddFunctionCallButton => {
                             state.layout_ast.plus_function_call(
                                 state
