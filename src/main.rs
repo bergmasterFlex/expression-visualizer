@@ -1,8 +1,10 @@
 mod ast;
 mod camera;
+mod eval;
 mod grid;
 mod layout;
 mod mesh;
+mod render;
 
 use std::{collections::hash_map, f32::consts::PI};
 
@@ -43,14 +45,14 @@ impl Default for AstState {
                         inputs: vec![
                             FunctionParameterDeclaration {
                                 name: "summand1".to_string(),
-                                r#type: ast::EType::Number,
+                                r#type: eval::EType::Int(None),
                             },
                             FunctionParameterDeclaration {
                                 name: "summand2".to_string(),
-                                r#type: ast::EType::Number,
+                                r#type: eval::EType::Int(None),
                             },
                         ],
-                        output_type: ast::EType::Number,
+                        output_type: eval::EType::Int(None),
                     },
                 ),
                 (
@@ -60,16 +62,16 @@ impl Default for AstState {
                         inputs: vec![
                             FunctionParameterDeclaration {
                                 name: "summand1".to_string(),
-                                r#type: ast::EType::Number,
+                                r#type: eval::EType::Int(None),
                             },
                             FunctionParameterDeclaration {
                                 name: "summand2".to_string(),
-                                r#type: ast::EType::Number,
+                                r#type: eval::EType::Int(None),
                             },
                         ],
-                        output_type: ast::EType::SumType(vec![
-                            ast::EType::Number,
-                            ast::EType::Error,
+                        output_type: eval::EType::SumType(vec![
+                            eval::EType::Float(None),
+                            eval::EType::x,
                         ]),
                     },
                 ),
@@ -139,7 +141,7 @@ pub struct AnchorAssets {
 /// Marker for AST node mesh entities (so we can despawn them on rebuild).
 #[derive(Component)]
 struct AstNodeEntity {
-    node_id: ast::AstNodeId,
+    node_id: ast::node::Id,
 }
 
 /// Flag resource that signals the scene needs rebuilding.
@@ -167,8 +169,8 @@ enum EAstActionButton {
 /// Stores which node is hovered / selected.
 #[derive(Resource, Default)]
 struct PickState {
-    hovered: Option<ast::AstNodeId>,  // node_id
-    selected: Option<ast::AstNodeId>, // node_id
+    hovered: Option<ast::node::Id>,  // node_id
+    selected: Option<ast::node::Id>, // node_id
 }
 
 /// UI text showing the selected node's info.
@@ -189,25 +191,6 @@ struct TextInputDisplay;
 struct TextInputBox;
 
 // ── Colors ──────────────────────────────────────────────────
-
-fn node_color(node: &ast::EAstNode) -> Color {
-    match node {
-        ast::EAstNode::Sink { .. } => Color::srgb(1.0, 0.0, 0.0), // #FF6B6B
-        ast::EAstNode::FunctionCall { .. } => Color::srgb(0.306, 0.804, 0.769), // #4ECDC4
-        ast::EAstNode::MatchTrue { .. } => Color::srgb(0.984, 0.573, 0.235), // #FB923C
-        ast::EAstNode::MatchFalse { .. } => Color::srgb(0.133, 0.827, 0.933), // #22D3EE
-        ast::EAstNode::BoolLiteral { value, .. } if *value == "true".to_string() => {
-            Color::srgb(0.29, 0.87, 0.50)
-        } // #4ADE80
-        ast::EAstNode::BoolLiteral { .. } => Color::srgb(0.973, 0.443, 0.443), // #F87171
-        ast::EAstNode::NumLiteral { .. } => Color::srgb(0.91, 0.894, 0.871), // #E8E4DE
-    }
-}
-
-fn node_emissive(node: &ast::EAstNode) -> LinearRgba {
-    let c = node_color(node).to_linear();
-    LinearRgba::new(c.red * 0.15, c.green * 0.15, c.blue * 0.15, 1.0)
-}
 
 // ── Systems ─────────────────────────────────────────────────
 
@@ -278,92 +261,16 @@ fn spawn_ast_nodes(
     mut materials: ResMut<Assets<StandardMaterial>>,
     state: Res<AstState>,
 ) {
-    let sphere_mesh = meshes.add(Sphere::new(0.32));
-    let cube_mesh = meshes.add(Cuboid::new(0.45, 0.45, 0.45));
-    let octa_mesh = meshes.add(mesh::octahedron_mesh(0.38));
-    let ring_mesh = meshes.add(Torus::new(0.225, 0.38));
-    let ring_big_mesh = meshes.add(Torus::new(0.025, 0.48));
-    let cone_mesh = meshes.add(mesh::create_cone_mesh(0.5, 1.0, 16));
-    let pyramide_mesh = meshes.add(mesh::create_cone_mesh(0.5, 1.0, 4));
-    let bool_mesh = meshes.add(mesh::create_bool_mesh(0.5, 1.0, 16));
-
-    let mut node_entites = std::collections::HashMap::<ast::AstNodeId, Entity>::new();
-    let mut anchor_entities = std::collections::HashMap::<ast::AnchorId, Entity>::new();
-
-    for (node_id, node) in &state.layout_ast.ast.nodes {
-        let color = node_color(node);
-        let emissive = node_emissive(&node);
-
-        let material = materials.add(StandardMaterial {
-            base_color: Color::srgb(0.05, 0.05, 0.10),
-            emissive,
-            metallic: 0.3,
-            perceptual_roughness: 0.6,
-            ..default()
-        });
-
-        let node_pos = state.layout_ast.layout_nodes.get(node_id).unwrap().pos;
-        let node_pos = node_pos * Vec3::new(3.0, 1.5, 3.0);
-
-        // Pick shape based on AST type
-        let pbr_bundle = match node {
-            ast::EAstNode::NumLiteral { .. } => PbrBundle {
-                mesh: cube_mesh.clone(),
-                material,
-                transform: Transform::from_translation(node_pos),
-                ..default()
-            },
-            ast::EAstNode::BoolLiteral { .. } => PbrBundle {
-                mesh: bool_mesh.clone(),
-                material,
-                transform: Transform::from_translation(node_pos),
-                ..default()
-            },
-            ast::EAstNode::MatchTrue { .. } => PbrBundle {
-                mesh: cone_mesh.clone(),
-                material,
-                transform: Transform::from_translation(node_pos),
-                ..default()
-            },
-            ast::EAstNode::MatchFalse { .. } => PbrBundle {
-                mesh: cone_mesh.clone(),
-                material,
-                transform: Transform::from_translation(node_pos)
-                    * Transform::from_rotation(Quat::from_axis_angle(Vec3::new(1.0, 0.0, 0.0), PI)),
-                ..default()
-            },
-            ast::EAstNode::FunctionCall { .. } => PbrBundle {
-                mesh: pyramide_mesh.clone(),
-                material,
-                transform: Transform::from_translation(node_pos)
-                    * Transform::from_rotation(Quat::from_axis_angle(
-                        Vec3::new(1.0, 0.0, 0.0),
-                        PI * -0.5,
-                    ))
-                    * Transform::from_rotation(Quat::from_axis_angle(
-                        Vec3::new(0.0, 1.0, 0.0),
-                        PI * 0.25,
-                    )),
-                ..default()
-            },
-            ast::EAstNode::Sink { .. } => PbrBundle {
-                mesh: ring_mesh.clone(),
-                material,
-                transform: Transform::from_scale(Vec3::new(2.0, 2.0, 2.0))
-                    * Transform::from_translation(node_pos)
-                    * Transform::from_rotation(Quat::from_axis_angle(
-                        Vec3::new(1.0, 0.0, 0.0),
-                        PI * 0.5,
-                    )),
-                ..default()
-            },
-        };
-
+    let mut node_entites = std::collections::HashMap::<ast::node::Id, Entity>::new();
+    let mut anchor_entities = std::collections::HashMap::<ast::node::Id, Entity>::new();
+    for (node_id, layout_node) in state.layout_ast.layout_nodes {
+        let node = state.layout_ast.ast.nodes.get(layout_node.node_id).unwrap();
+        let (mesh, material, transform) =
+            render::layoutnode_to_render_object(layout_node, &state.layout_ast.ast);
         let anchor_assets = match node {
-            ast::EAstNode::BoolLiteral { .. }
-            | ast::EAstNode::NumLiteral { .. }
-            | ast::EAstNode::MatchTrue { .. }
-            | ast::EAstNode::MatchFalse { .. } => AnchorAssets {
+            ast::node::ENode::TypeIntroduction { .. }
+            | ast::node::ENode::TypeElimination { .. }
+            | ast::node::ENode::Match { .. } => AnchorAssets {
                 mesh: meshes.add(Sphere::new(0.06).mesh().ico(2).unwrap()),
                 tf_normal_pre: Transform::IDENTITY,
                 tf_normal_post: Transform::IDENTITY,
@@ -382,7 +289,7 @@ fn spawn_ast_nodes(
                     ..default()
                 }),
             },
-            ast::EAstNode::FunctionCall { .. } => AnchorAssets {
+            ast::node::ENode::FunctionCall { .. } => AnchorAssets {
                 mesh: meshes.add(Sphere::new(0.06).mesh().ico(2).unwrap()),
                 tf_normal_pre: Transform::IDENTITY,
                 tf_normal_post: Transform::from_rotation(Quat::from_axis_angle(
@@ -413,7 +320,7 @@ fn spawn_ast_nodes(
                     ..default()
                 }),
             },
-            ast::EAstNode::Sink { .. } => AnchorAssets {
+            ast::node::ENode::Sink { .. } => AnchorAssets {
                 mesh: meshes.add(Sphere::new(0.06).mesh().ico(2).unwrap()),
                 tf_normal_pre: Transform::IDENTITY,
                 tf_normal_post: Transform::from_scale(Vec3::new(0.5, 0.5, 0.5))
@@ -453,7 +360,7 @@ fn spawn_ast_nodes(
 
         let node_entity = commands
             .spawn((
-                pbr_bundle,
+                PbrBundle(mesh, material, transform, ..default()),
                 AstNodeEntity {
                     node_id: node_id.clone(),
                 },
@@ -1047,6 +954,11 @@ fn pick_nodes(
     mouse: Res<ButtonInput<MouseButton>>,
     mut pick: ResMut<PickState>,
     node_q: Query<(&AstNodeEntity, &Transform)>,
+    /*
+    mut input_q: Query<(&mut TextInput, &Children), With<TextInputBox>>,
+    mut current_input_string: ResMut<CurrentInputString>,
+    */
+    state: Res<AstState>,
 ) {
     let Ok((camera, cam_gt)) = camera_q.get_single() else {
         return;
@@ -1090,6 +1002,36 @@ fn pick_nodes(
 
     if mouse.just_pressed(MouseButton::Left) {
         pick.selected = closest.map(|(id, _)| id);
+        /*
+        println!("selected!");
+        if let Some(selected_id) = &pick.selected {
+        println!("selected!2");
+
+                match state.layout_ast.ast.nodes.get(&selected_id) {
+                    Some(ast::EAstNode::BoolLiteral { value, .. })
+                    | Some(ast::EAstNode::NumLiteral { value, .. }) => {
+                        current_input_string.0 = value.to_string();
+                    }
+                    _ => (),
+                };
+            for (mut input, _) in input_q.iter_mut() {
+        println!("selected!3");
+                /**
+                if !input.focused {
+                    continue;
+                }
+                **/
+
+                match state.layout_ast.ast.nodes.get(&selected_id) {
+                    Some(ast::EAstNode::BoolLiteral { value, .. })
+                    | Some(ast::EAstNode::NumLiteral { value, .. }) => {
+                        input.value = value.to_string();
+                    }
+                    _ => (),
+                };
+            }
+        }
+        */
     }
 }
 

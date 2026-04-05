@@ -1,14 +1,12 @@
-use bevy::render::render_graph::Edge;
+pub mod node;
 
-// ── AST node types ──────────────────────────────────────────
-//
 #[derive(Clone)]
 pub struct Ast {
-    next_node_id: AstNodeId,
+    next_node_id: node::Id,
     next_anchor_id: AnchorId,
-    pub nodes: std::collections::HashMap<AstNodeId, EAstNode>,
+    pub nodes: std::collections::HashMap<node::Id, node::ENode>,
     pub anchors: std::collections::HashMap<AnchorId, EAnchor>,
-    pub anchor_to_node: std::collections::HashMap<AnchorId, AstNodeId>,
+    pub anchor_to_node: std::collections::HashMap<AnchorId, node::Id>,
     pub edges: std::collections::HashMap<AnchorId, Vec<AnchorId>>,
 }
 
@@ -29,7 +27,7 @@ impl Ast {
 
     pub fn empty() -> Self {
         Self {
-            next_node_id: AstNodeId(0),
+            next_node_id: node::Id(0),
             next_anchor_id: AnchorId(0),
             nodes: std::collections::HashMap::new(),
             anchors: std::collections::HashMap::new(),
@@ -59,11 +57,11 @@ impl Ast {
         }
     }
 
-    pub fn plus(&self, n: EAstNode) -> (Self, AstNodeId) {
+    pub fn plus(&self, n: node::ENode) -> (Self, node::Id) {
         let anchors = n.anchors();
         (
             Self {
-                next_node_id: AstNodeId(self.next_node_id.0 + 1),
+                next_node_id: node::Id(self.next_node_id.0 + 1),
                 next_anchor_id: self.next_anchor_id.clone(),
                 anchors: self
                     .anchors
@@ -93,7 +91,7 @@ impl Ast {
         )
     }
 
-    pub fn minus(&self, n_id: &AstNodeId) -> Self {
+    pub fn minus(&self, n_id: &node::Id) -> Self {
         let anchor_ids = self
             .nodes
             .get(n_id)
@@ -127,7 +125,7 @@ impl Ast {
         }
     }
 
-    pub fn get_connected_nodes_to_anchor(&self, anchor: AnchorId) -> Vec<AstNodeId> {
+    pub fn get_connected_nodes_to_anchor(&self, anchor: AnchorId) -> Vec<node::Id> {
         self.edges
             .iter()
             .flat_map(|(from, tos)| tos.iter().map(|to| (from.clone(), to)))
@@ -147,41 +145,8 @@ pub struct AnchorId(usize);
 
 #[derive(Clone, Debug)]
 pub enum EAnchor {
-    Input { order_num: usize, name: String },
+    Input { order_num: usize, name: Option<String> },
     Output,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub struct AstNodeId(usize);
-
-#[derive(Debug, Clone)]
-pub enum EAstNode {
-    Sink {
-        input_anchor: AnchorId,
-    },
-    FunctionCall {
-        function_declaration_id: FunctionDeclarationId,
-        input_anchors: Vec<AnchorId>,
-        output_anchor: AnchorId,
-    },
-    NumLiteral {
-        value: String,
-        input_anchor: AnchorId,
-        output_anchor: AnchorId,
-    },
-    BoolLiteral {
-        value: String,
-        input_anchor: AnchorId,
-        output_anchor: AnchorId,
-    },
-    MatchTrue {
-        input_anchor: AnchorId,
-        output_anchor: AnchorId,
-    },
-    MatchFalse {
-        input_anchor: AnchorId,
-        output_anchor: AnchorId,
-    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
@@ -190,157 +155,10 @@ pub struct FunctionDeclarationId(pub usize);
 pub struct FunctionDeclaration {
     pub name: String,
     pub inputs: Vec<FunctionParameterDeclaration>,
-    pub output_type: EType,
+    pub output_type: crate::eval::EType,
 }
 
 pub struct FunctionParameterDeclaration {
     pub name: String,
-    pub r#type: EType,
-}
-
-#[derive(Debug, Clone)]
-pub enum EType {
-    Number,
-    Bool,
-    SumType(Vec<EType>),
-    Error,
-}
-
-impl ToString for EType {
-    fn to_string(&self) -> String {
-        match self {
-            EType::Number => "number".to_string(),
-            EType::Bool => "bool".to_string(),
-            EType::SumType(sub_types) => sub_types
-                .iter()
-                .map(|sub_type| sub_type.to_string())
-                .collect::<Vec<_>>()
-                .join("|"),
-            EType::Error => "error".to_string(),
-        }
-    }
-}
-
-impl EAstNode {
-    pub fn label(
-        &self,
-        function_declarations: &std::collections::HashMap<
-            FunctionDeclarationId,
-            FunctionDeclaration,
-        >,
-    ) -> String {
-        match self {
-            EAstNode::Sink { .. } => "sink".to_string(),
-            EAstNode::FunctionCall {
-                function_declaration_id,
-                ..
-            } => function_declarations
-                .get(&function_declaration_id)
-                .unwrap()
-                .name
-                .to_string(),
-            EAstNode::BoolLiteral { value, .. } => value.to_string(),
-            EAstNode::NumLiteral { value, .. } => value.to_string(),
-            EAstNode::MatchTrue { .. } => "match true".to_string(),
-            EAstNode::MatchFalse { .. } => "match false".to_string(),
-        }
-    }
-
-    /// Type name for UI tooltips.
-    pub fn eval_type(
-        &self,
-        ast: &Ast,
-        function_declarations: &std::collections::HashMap<
-            FunctionDeclarationId,
-            FunctionDeclaration,
-        >,
-    ) -> EType {
-        match self {
-            EAstNode::Sink { input_anchor } => {
-                match ast
-                    .get_connected_nodes_to_anchor(input_anchor.clone())
-                    .first()
-                {
-                    Some(input_node_id) => ast
-                        .nodes
-                        .get(input_node_id)
-                        .unwrap()
-                        .eval_type(ast, function_declarations),
-                    None => EType::Error,
-                }
-            }
-            EAstNode::FunctionCall {
-                function_declaration_id,
-                ..
-            } => function_declarations
-                .get(&function_declaration_id)
-                .unwrap()
-                .output_type
-                .clone(),
-            EAstNode::BoolLiteral { .. } => EType::Bool,
-            EAstNode::NumLiteral { .. } => EType::Number,
-            EAstNode::MatchTrue { .. } => EType::Bool,
-            EAstNode::MatchFalse { .. } => EType::Bool,
-        }
-    }
-
-    pub fn anchors(&self) -> Vec<(AnchorId, EAnchor)> {
-        match self {
-            EAstNode::BoolLiteral {
-                input_anchor,
-                output_anchor,
-                ..
-            }
-            | EAstNode::NumLiteral {
-                input_anchor,
-                output_anchor,
-                ..
-            }
-            | EAstNode::MatchTrue {
-                input_anchor,
-                output_anchor,
-                ..
-            }
-            | EAstNode::MatchFalse {
-                input_anchor,
-                output_anchor,
-                ..
-            } => vec![
-                (
-                    input_anchor.clone(),
-                    EAnchor::Input {
-                        order_num: 0,
-                        name: "<cont>".to_string(),
-                    },
-                ),
-                (output_anchor.clone(), EAnchor::Output),
-            ],
-            EAstNode::FunctionCall {
-                input_anchors,
-                output_anchor,
-                ..
-            } => input_anchors
-                .clone()
-                .into_iter()
-                .enumerate()
-                .map(|(i, anchor_id)| {
-                    (
-                        anchor_id,
-                        EAnchor::Input {
-                            order_num: i,
-                            name: format!("param{}", i),
-                        },
-                    )
-                })
-                .chain(vec![(output_anchor.clone(), EAnchor::Output)])
-                .collect(),
-            EAstNode::Sink { input_anchor } => vec![(
-                input_anchor.clone(),
-                EAnchor::Input {
-                    order_num: 0,
-                    name: "<cont>".to_string(),
-                },
-            )],
-        }
-    }
+    pub r#type: crate::eval::EType,
 }

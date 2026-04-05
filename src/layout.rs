@@ -1,10 +1,8 @@
 use bevy::prelude::*;
 
-use crate::ast::{self, AstNodeId, FunctionDeclaration, FunctionDeclarationId};
-
 #[derive(Debug, Clone)]
 pub struct LayoutNode {
-    pub node_id: crate::ast::AstNodeId,
+    pub node_id: crate::ast::node::Id,
     pub pos: Vec3,
 }
 
@@ -17,14 +15,14 @@ pub struct LayoutEdge {
 #[derive(Debug, Clone)]
 pub struct LayoutAnchor {
     pub anchor_id: crate::ast::AnchorId,
-    pub node_id: crate::ast::AstNodeId,
+    pub node_id: crate::ast::node::Id,
     pub anchor: crate::ast::EAnchor,
     pub pos: Vec3,
 }
 
 pub struct LayoutAst {
     pub ast: crate::ast::Ast,
-    pub layout_nodes: std::collections::HashMap<crate::ast::AstNodeId, LayoutNode>,
+    pub layout_nodes: std::collections::HashMap<crate::ast::node::Id, LayoutNode>,
 }
 
 impl LayoutAst {
@@ -35,7 +33,7 @@ impl LayoutAst {
         }
     }
 
-    pub fn minus_node(&self, node_id: &AstNodeId) -> Self {
+    pub fn minus_node(&self, node_id: &crate::ast::node::Id) -> Self {
         Self {
             ast: self.ast.minus(node_id),
             layout_nodes: self
@@ -47,7 +45,7 @@ impl LayoutAst {
         }
     }
 
-    pub fn move_node_delta(&self, node_id: AstNodeId, delta_pos: Vec3) -> Self {
+    pub fn move_node_delta(&self, node_id: crate::ast::node::Id, delta_pos: Vec3) -> Self {
         Self {
             ast: self.ast.clone(),
             layout_nodes: self
@@ -79,7 +77,7 @@ impl LayoutAst {
 
     pub fn plus_sink(&self) -> Self {
         let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
-        let (ast, node_id) = ast.plus(crate::ast::EAstNode::Sink {
+        let (ast, node_id) = ast.plus(crate::ast::node::ENode::Sink {
             input_anchor: input_anchor_id,
         });
         Self {
@@ -89,12 +87,11 @@ impl LayoutAst {
         ._plus_layout_node(&node_id, Vec3::new(0.0, 0.0, 0.0))
     }
 
-    pub fn plus_number_literal(&self, value: String, pos: Vec3) -> Self {
+    pub fn plus_type_introduction(&self, r#type: crate::ast::node::EType, pos: Vec3) -> Self {
         let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
         let (ast, output_anchor_id) = ast.with_next_anchor_id();
-        let (ast, node_id) = ast.plus(crate::ast::EAstNode::NumLiteral {
-            value,
-            input_anchor: input_anchor_id,
+        let (ast, node_id) = ast.plus(crate::ast::node::ENode::TypeIntroduction {
+            r#type,
             output_anchor: output_anchor_id,
         });
         Self {
@@ -104,11 +101,11 @@ impl LayoutAst {
         ._plus_layout_node(&node_id, pos)
     }
 
-    pub fn plus_bool_literal(&self, value: String, pos: Vec3) -> Self {
+    pub fn plus_type_elimination(&self, r#type: crate::ast::node::EType, pos: Vec3) -> Self {
         let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
         let (ast, output_anchor_id) = ast.with_next_anchor_id();
-        let (ast, node_id) = ast.plus(crate::ast::EAstNode::BoolLiteral {
-            value,
+        let (ast, node_id) = ast.plus(crate::ast::node::ENode::TypeElimination {
+            r#type,
             input_anchor: input_anchor_id,
             output_anchor: output_anchor_id,
         });
@@ -121,7 +118,10 @@ impl LayoutAst {
 
     pub fn plus_function_call(
         &self,
-        function_declaration: (FunctionDeclarationId, &FunctionDeclaration),
+        function_declaration: (
+            crate::ast::FunctionDeclarationId,
+            &crate::ast::FunctionDeclaration,
+        ),
         pos: Vec3,
     ) -> Self {
         let (ast, input_anchor_ids) =
@@ -143,7 +143,7 @@ impl LayoutAst {
                     },
                 );
         let (ast, output_anchor_id) = ast.with_next_anchor_id();
-        let (ast, node_id) = ast.plus(crate::ast::EAstNode::FunctionCall {
+        let (ast, node_id) = ast.plus(crate::ast::node::ENode::FunctionCall {
             function_declaration_id: function_declaration.0,
             input_anchors: input_anchor_ids,
             output_anchor: output_anchor_id,
@@ -155,10 +155,10 @@ impl LayoutAst {
         ._plus_layout_node(&node_id, pos)
     }
 
-    pub fn plus_match_true(&self, pos: Vec3) -> Self {
+    pub fn plus_match(&self, pos: Vec3) -> Self {
         let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
         let (ast, output_anchor_id) = ast.with_next_anchor_id();
-        let (ast, node_id) = ast.plus(crate::ast::EAstNode::MatchTrue {
+        let (ast, node_id) = ast.plus(crate::ast::node::ENode::Match {
             input_anchor: input_anchor_id,
             output_anchor: output_anchor_id,
         });
@@ -169,21 +169,7 @@ impl LayoutAst {
         ._plus_layout_node(&node_id, pos)
     }
 
-    pub fn plus_match_false(&self, pos: Vec3) -> Self {
-        let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
-        let (ast, output_anchor_id) = ast.with_next_anchor_id();
-        let (ast, node_id) = ast.plus(crate::ast::EAstNode::MatchFalse {
-            input_anchor: input_anchor_id,
-            output_anchor: output_anchor_id,
-        });
-        Self {
-            ast,
-            layout_nodes: self.layout_nodes.clone(),
-        }
-        ._plus_layout_node(&node_id, pos)
-    }
-
-    fn _plus_layout_node(&self, node_id: &AstNodeId, pos: Vec3) -> Self {
+    fn _plus_layout_node(&self, node_id: &crate::ast::node::Id, pos: Vec3) -> Self {
         Self {
             ast: self.ast.clone(),
             layout_nodes: self
@@ -217,7 +203,7 @@ impl LayoutAst {
             .collect()
     }
 
-    pub fn layout_anchor(&self, anchor_id: ast::AnchorId) -> LayoutAnchor {
+    pub fn layout_anchor(&self, anchor_id: crate::ast::AnchorId) -> LayoutAnchor {
         let anchor = self.ast.anchors.get(&anchor_id).unwrap();
         let node_id = self.ast.anchor_to_node.get(&anchor_id).unwrap().clone();
         LayoutAnchor {
