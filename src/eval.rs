@@ -60,3 +60,80 @@ impl ToString for EType {
         }
     }
 }
+
+fn has_duplicates<T: Eq + std::hash::Hash>(v: &[T]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    v.iter().any(|item| !seen.insert(item))
+}
+
+/// Type name for UI tooltips.
+pub fn eval_type(
+    node: &crate::ast::node::ENode,
+    ast: &crate::ast::Ast,
+    function_declarations: &std::collections::HashMap<
+        crate::ast::FunctionDeclarationId,
+        crate::ast::FunctionDeclaration,
+    >,
+    visited_nodes: Vec<crate::ast::node::Id>,
+) -> Result<EType, String> {
+    if has_duplicates(&visited_nodes) {
+        return Err("infinite edge loop".to_string());
+    }
+    match node {
+        crate::ast::node::ENode::Sink { input_anchor } => {
+            match ast
+                .get_connected_nodes_to_anchor(input_anchor.clone())
+                .first()
+            {
+                Some(input_node_id) => eval_type(
+                    ast.nodes.get(input_node_id).unwrap(),
+                    ast,
+                    function_declarations,
+                    visited_nodes
+                        .iter()
+                        .cloned()
+                        .chain([input_node_id.clone()])
+                        .collect(),
+                ),
+                None => Err("no edge to sink input".to_string()),
+            }
+        }
+        crate::ast::node::ENode::FunctionCall {
+            function_declaration_id,
+            ..
+        } => Ok(function_declarations
+            .get(&function_declaration_id)
+            .unwrap()
+            .output_type
+            .clone()),
+        crate::ast::node::ENode::TypeIntroduction { r#type, .. }
+        | crate::ast::node::ENode::TypeElimination { r#type, .. } => Ok(match r#type {
+            crate::ast::node::EType::Bool { value } => EType::Bool(None),
+            crate::ast::node::EType::Int { value } => EType::Int(None),
+            crate::ast::node::EType::Float { value } => EType::Float(None),
+            crate::ast::node::EType::Char { value } => EType::Char(None),
+            crate::ast::node::EType::String { value } => EType::String(None),
+            crate::ast::node::EType::Any => EType::Any,
+            crate::ast::node::EType::Undefined => EType::Undefined,
+            crate::ast::node::EType::Exception { message } => EType::Exception,
+        }),
+        crate::ast::node::ENode::Match { input_anchor, .. } => {
+            match ast
+                .get_connected_nodes_to_anchor(input_anchor.clone())
+                .first()
+            {
+                Some(input_node_id) => eval_type(
+                    ast.nodes.get(input_node_id).unwrap(),
+                    ast,
+                    function_declarations,
+                    visited_nodes
+                        .iter()
+                        .cloned()
+                        .chain([input_node_id.clone()])
+                        .collect(),
+                ),
+                None => Err("no edge to match input".to_string()),
+            }
+        }
+    }
+}

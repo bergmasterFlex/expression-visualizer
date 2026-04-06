@@ -61,17 +61,17 @@ impl Default for AstState {
                         name: "/".to_string(),
                         inputs: vec![
                             FunctionParameterDeclaration {
-                                name: "summand1".to_string(),
+                                name: "dividend".to_string(),
                                 r#type: eval::EType::Int(None),
                             },
                             FunctionParameterDeclaration {
-                                name: "summand2".to_string(),
+                                name: "divisor".to_string(),
                                 r#type: eval::EType::Int(None),
                             },
                         ],
                         output_type: eval::EType::SumType(vec![
                             eval::EType::Float(None),
-                            eval::EType::x,
+                            eval::EType::Undefined,
                         ]),
                     },
                 ),
@@ -80,7 +80,6 @@ impl Default for AstState {
     }
 }
 
-/// Marker: cursor ist über diesem Anchor
 #[derive(Component)]
 pub struct AnchorHovered;
 
@@ -88,13 +87,11 @@ pub struct AnchorHovered;
 pub enum EAnchor {
     Input {
         id: ast::AnchorId,
-        num_inputs: usize,
-        param_index: usize,
-        relative_transform: Transform,
+        render_objects: render::RenderAnchor,
     },
     Output {
         id: ast::AnchorId,
-        relative_transform: Transform,
+        render_objects: render::RenderAnchor,
     },
 }
 
@@ -159,11 +156,11 @@ struct DeleteNodeButton;
 struct ResetCameraButton;
 #[derive(Component, Clone)]
 enum EAstActionButton {
-    AddNumberLiteralButton,
-    AddBoolLiteralButton,
+    AddIntIntroductionButton,
+    AddBoolIntroductionButton,
+    AddIntEliminationButton,
     AddFunctionCallButton,
-    AddMatchTrueButton,
-    AddMatchFalseButton,
+    AddMatchButton,
 }
 
 /// Stores which node is hovered / selected.
@@ -262,172 +259,68 @@ fn spawn_ast_nodes(
     state: Res<AstState>,
 ) {
     let mut node_entites = std::collections::HashMap::<ast::node::Id, Entity>::new();
-    let mut anchor_entities = std::collections::HashMap::<ast::node::Id, Entity>::new();
-    for (node_id, layout_node) in state.layout_ast.layout_nodes {
-        let node = state.layout_ast.ast.nodes.get(layout_node.node_id).unwrap();
-        let (mesh, material, transform) =
-            render::layoutnode_to_render_object(layout_node, &state.layout_ast.ast);
-        let anchor_assets = match node {
-            ast::node::ENode::TypeIntroduction { .. }
-            | ast::node::ENode::TypeElimination { .. }
-            | ast::node::ENode::Match { .. } => AnchorAssets {
-                mesh: meshes.add(Sphere::new(0.06).mesh().ico(2).unwrap()),
-                tf_normal_pre: Transform::IDENTITY,
-                tf_normal_post: Transform::IDENTITY,
-                tf_hovered_pre: Transform::from_scale(Vec3::splat(1.8)),
-                tf_hovered_post: Transform::IDENTITY,
-                mat_normal: materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.3, 0.6, 1.0),
-                    emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                    unlit: true,
-                    ..default()
-                }),
-                mat_hovered: materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.5, 0.9, 1.0),
-                    emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                    unlit: true,
-                    ..default()
-                }),
-            },
-            ast::node::ENode::FunctionCall { .. } => AnchorAssets {
-                mesh: meshes.add(Sphere::new(0.06).mesh().ico(2).unwrap()),
-                tf_normal_pre: Transform::IDENTITY,
-                tf_normal_post: Transform::from_rotation(Quat::from_axis_angle(
-                    Vec3::new(1.0, 0.0, 0.0),
-                    PI * 0.5,
-                )) * Transform::from_rotation(Quat::from_axis_angle(
-                    Vec3::new(0.0, 0.0, 1.0),
-                    PI * 0.25,
-                )),
-                tf_hovered_pre: Transform::from_scale(Vec3::splat(1.8)),
-                tf_hovered_post: Transform::from_rotation(Quat::from_axis_angle(
-                    Vec3::new(1.0, 0.0, 0.0),
-                    PI * 0.5,
-                )) * Transform::from_rotation(Quat::from_axis_angle(
-                    Vec3::new(0.0, 0.0, 1.0),
-                    PI * 0.25,
-                )),
-                mat_normal: materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.3, 0.6, 1.0),
-                    emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                    unlit: true,
-                    ..default()
-                }),
-                mat_hovered: materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.5, 0.9, 1.0),
-                    emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                    unlit: true,
-                    ..default()
-                }),
-            },
-            ast::node::ENode::Sink { .. } => AnchorAssets {
-                mesh: meshes.add(Sphere::new(0.06).mesh().ico(2).unwrap()),
-                tf_normal_pre: Transform::IDENTITY,
-                tf_normal_post: Transform::from_scale(Vec3::new(0.5, 0.5, 0.5))
-                    * Transform::from_rotation(Quat::from_axis_angle(
-                        Vec3::new(1.0, 0.0, 0.0),
-                        PI * -0.5,
-                    )),
-                tf_hovered_pre: Transform::from_scale(Vec3::splat(1.8)),
-                tf_hovered_post: Transform::from_scale(Vec3::new(0.5, 0.5, 0.5))
-                    * Transform::from_rotation(Quat::from_axis_angle(
-                        Vec3::new(1.0, 0.0, 0.0),
-                        PI * -0.5,
-                    )),
-                mat_normal: materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.3, 0.6, 1.0),
-                    emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                    unlit: true,
-                    ..default()
-                }),
-                mat_hovered: materials.add(StandardMaterial {
-                    base_color: Color::srgb(0.5, 0.9, 1.0),
-                    emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                    unlit: true,
-                    ..default()
-                }),
-            },
-        };
-
-        let anchors = node.anchors();
-        let input_anchor_count = anchors
-            .iter()
-            .filter(|(_, a)| match a {
-                ast::EAnchor::Input { .. } => true,
-                _ => false,
-            })
-            .count();
-
+    let mut anchor_entities = std::collections::HashMap::<ast::AnchorId, Entity>::new();
+    for (node_id, layout_node) in &state.layout_ast.layout_nodes {
+        let node = state
+            .layout_ast
+            .ast
+            .nodes
+            .get(&layout_node.node_id)
+            .unwrap();
+        let render_node = render::layoutnode_to_rendernode(
+            &layout_node,
+            &state.layout_ast.ast,
+            &state.function_declarations,
+        );
         let node_entity = commands
             .spawn((
-                PbrBundle(mesh, material, transform, ..default()),
+                PbrBundle {
+                    mesh: meshes.add(render_node.node.mesh),
+                    material: materials.add(render_node.node.material),
+                    transform: render_node.node.transform,
+                    ..default()
+                },
                 AstNodeEntity {
                     node_id: node_id.clone(),
                 },
                 AstSceneEntity,
             ))
             .id();
-
-        commands.entity(node_entity).with_children(|parent| {
-            anchors.into_iter().for_each(|(id, anchor)| {
-                let (b, a) = spawn_anchor(id.clone(), anchor, input_anchor_count, &anchor_assets);
-                anchor_entities.insert(id, parent.spawn((b, a, anchor_assets.clone())).id());
+        render_node
+            .anchors
+            .into_iter()
+            .for_each(|(anchor_id, render_anchor)| {
+                let layout_anchor = state.layout_ast.layout_anchor(anchor_id.clone());
+                anchor_entities.insert(
+                    anchor_id.clone(),
+                    commands
+                        .spawn((
+                            PbrBundle {
+                                mesh: meshes.add(render_anchor.normal.mesh.clone()),
+                                material: materials.add(render_anchor.normal.material.clone()),
+                                transform: render_node.node.transform,
+                                ..default()
+                            },
+                            match layout_anchor.anchor {
+                                ast::EAnchor::Input { .. } => EAnchor::Input {
+                                    id: anchor_id,
+                                    render_objects: render_anchor,
+                                },
+                                ast::EAnchor::Output => EAnchor::Output {
+                                    id: anchor_id,
+                                    render_objects: render_anchor,
+                                },
+                            },
+                        ))
+                        .id(),
+                );
             });
-        });
 
         node_entites.insert(node_id.clone(), node_entity.clone());
 
-        //Value label
-        spawn_world_label(
-            &mut commands,
-            &node.label(&state.function_declarations),
-            node_color(node),
-            18.0,
-            node_pos,
-            Vec2::ZERO,
-            AstSceneEntity,
-        );
-
-        // Type label (smaller, above)
-        spawn_world_label(
-            &mut commands,
-            node.eval_type(&state.layout_ast.ast, &state.function_declarations)
-                .to_string()
-                .as_ref(),
-            Color::srgba(0.3, 0.3, 0.37, 1.0),
-            14.0,
-            node_pos,
-            Vec2::new(0.0, -22.0), // 22px above
-            AstSceneEntity,
-        );
-
-        spawn_world_label(
-            &mut commands,
-            "X",
-            Color::srgba(1.0, 1.0, 1.0, 1.0),
-            18.0,
-            Vec3::new(10.0, 0.0, 0.0),
-            Vec2::new(0.0, -22.0), // 22px above
-            AstSceneEntity,
-        );
-        spawn_world_label(
-            &mut commands,
-            "Y",
-            Color::srgba(1.0, 1.0, 1.0, 1.0),
-            18.0,
-            Vec3::new(0.0, 10.0, 0.0),
-            Vec2::new(0.0, -22.0), // 22px above
-            AstSceneEntity,
-        );
-        spawn_world_label(
-            &mut commands,
-            "Z",
-            Color::srgba(1.0, 1.0, 1.0, 1.0),
-            18.0,
-            Vec3::new(0.0, 0.0, 10.0),
-            Vec2::new(0.0, -22.0), // 22px above
-            AstSceneEntity,
-        );
+        render_node.labels.into_iter().for_each(|l| {
+            spawn_world_label(&mut commands, l, AstSceneEntity);
+        });
     }
 
     for e in state.layout_ast.edges() {
@@ -532,36 +425,36 @@ fn spawn_ui(mut commands: Commands) {
     let y_offset = y_offset + 36.0;
     spawn_ui_button(
         &mut commands,
-        "Add Number",
-        EAstActionButton::AddNumberLiteralButton,
+        "Add Int Introduction",
+        EAstActionButton::AddIntIntroductionButton,
         Vec2::new(12.0, y_offset),
     );
     let y_offset = y_offset + 36.0;
     spawn_ui_button(
         &mut commands,
-        "Add Bool",
-        EAstActionButton::AddBoolLiteralButton,
+        "Add Bool Introduction",
+        EAstActionButton::AddBoolIntroductionButton,
         Vec2::new(12.0, y_offset),
     );
     let y_offset = y_offset + 36.0;
     spawn_ui_button(
         &mut commands,
-        "Add FunctionCall",
+        "Add Function Call",
         EAstActionButton::AddFunctionCallButton,
         Vec2::new(12.0, y_offset),
     );
     let y_offset = y_offset + 36.0;
     spawn_ui_button(
         &mut commands,
-        "Add MatchTrue",
-        EAstActionButton::AddMatchTrueButton,
+        "Add Match",
+        EAstActionButton::AddMatchButton,
         Vec2::new(12.0, y_offset),
     );
     let y_offset = y_offset + 36.0;
     spawn_ui_button(
         &mut commands,
-        "Add MatchFalse",
-        EAstActionButton::AddMatchFalseButton,
+        "Add Int Elimination",
+        EAstActionButton::AddIntEliminationButton,
         Vec2::new(12.0, y_offset),
     );
 }
@@ -692,12 +585,22 @@ fn handle_add_node_button(
                         .pos;
                     let new_pos = Vec3::new(selected_pos.x + 1.0, selected_pos.y, selected_pos.z);
                     state.layout_ast = match action {
-                        EAstActionButton::AddNumberLiteralButton => state
-                            .layout_ast
-                            .plus_number_literal(current_input_string.0.clone(), new_pos),
-                        EAstActionButton::AddBoolLiteralButton => state
-                            .layout_ast
-                            .plus_bool_literal(current_input_string.0.clone(), new_pos),
+                        EAstActionButton::AddIntIntroductionButton => {
+                            state.layout_ast.plus_type_introduction(
+                                ast::node::EType::Int {
+                                    value: Some(current_input_string.0.clone()),
+                                },
+                                new_pos,
+                            )
+                        }
+                        EAstActionButton::AddBoolIntroductionButton => {
+                            state.layout_ast.plus_type_introduction(
+                                ast::node::EType::Bool {
+                                    value: Some(current_input_string.0.clone()),
+                                },
+                                new_pos,
+                            )
+                        }
                         EAstActionButton::AddFunctionCallButton => {
                             state.layout_ast.plus_function_call(
                                 state
@@ -709,12 +612,19 @@ fn handle_add_node_button(
                                 new_pos,
                             )
                         }
-                        EAstActionButton::AddMatchTrueButton => {
-                            state.layout_ast.plus_match_true(new_pos)
+                        EAstActionButton::AddIntEliminationButton => {
+                            state.layout_ast.plus_type_elimination(
+                                ast::node::EType::Int {
+                                    value: if current_input_string.0.clone() == "".to_string() {
+                                        None
+                                    } else {
+                                        Some(current_input_string.0.clone())
+                                    },
+                                },
+                                new_pos,
+                            )
                         }
-                        EAstActionButton::AddMatchFalseButton => {
-                            state.layout_ast.plus_match_false(new_pos)
-                        }
+                        EAstActionButton::AddMatchButton => state.layout_ast.plus_match(new_pos),
                     };
                     rebuild.0 = true;
                 }
@@ -872,21 +782,17 @@ pub struct WorldLabel {
 /// Spawn a UI text label that tracks a world position.
 fn spawn_world_label(
     commands: &mut Commands,
-    text: &str,
-    color: Color,
-    font_size: f32,
-    world_pos: Vec3,
-    offset: Vec2,
+    render_label: render::RenderLabel,
     marker: impl Bundle,
 ) -> Entity {
     commands
         .spawn((
             TextBundle {
                 text: Text::from_section(
-                    text,
+                    render_label.text,
                     TextStyle {
-                        font_size,
-                        color,
+                        font_size: render_label.font_size,
+                        color: render_label.color,
                         ..default()
                     },
                 ),
@@ -897,7 +803,10 @@ fn spawn_world_label(
                 visibility: Visibility::Hidden,
                 ..default()
             },
-            WorldLabel { world_pos, offset },
+            WorldLabel {
+                world_pos: render_label.world_pos,
+                offset: render_label.offset,
+            },
             marker,
         ))
         .id()
@@ -979,7 +888,7 @@ fn pick_nodes(
 
     // Test intersection with each node (sphere test, radius 0.35)
     let radius = 0.35_f32;
-    let mut closest: Option<(ast::AstNodeId, f32)> = None;
+    let mut closest: Option<(ast::node::Id, f32)> = None;
 
     for (node_ent, transform) in node_q.iter() {
         let center = transform.translation;
@@ -1039,23 +948,13 @@ fn highlight_hovered(
     pick: Res<PickState>,
     node_q: Query<(&AstNodeEntity, &Handle<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    state: Res<AstState>,
 ) {
     for (node_ent, mat_handle) in node_q.iter() {
         let Some(mat) = materials.get_mut(mat_handle) else {
             continue;
         };
-        let Some((_, layout_node)) = state
-            .layout_ast
-            .ast
-            .nodes
-            .iter()
-            .find(|(n_id, _)| **n_id == node_ent.node_id)
-        else {
-            continue;
-        };
 
-        let base = node_emissive(layout_node);
+        let base = render::emissive_color(mat.base_color);
         let is_hovered = pick.hovered == Some(node_ent.node_id.clone());
         let is_selected = pick.selected == Some(node_ent.node_id.clone());
 
@@ -1089,10 +988,17 @@ fn update_selection_display(
             text.sections[0].value = format!(
                 "{} : {}",
                 node.label(&state.function_declarations),
-                node.eval_type(&state.layout_ast.ast, &state.function_declarations)
-                    .to_string()
+                match eval::eval_type(
+                    &node,
+                    &state.layout_ast.ast,
+                    &state.function_declarations,
+                    vec![]
+                ) {
+                    Ok(r#type) => r#type.to_string(),
+                    Err(message) => format!("error: {}", message),
+                }
             );
-            text.sections[0].style.color = node_color(&node);
+            text.sections[0].style.color = Color::WHITE
         }
     } else {
         text.sections[0].value.clear();
@@ -1322,67 +1228,6 @@ fn handle_arrow_keys(
     }
 }
 
-fn anchor_transformation(anchor: &EAnchor, assets: &AnchorAssets, is_hovered: bool) -> Transform {
-    let (pre_transform, post_transform) = if is_hovered {
-        (assets.tf_hovered_pre, assets.tf_hovered_post)
-    } else {
-        (assets.tf_normal_pre, assets.tf_normal_post)
-    };
-    match anchor {
-        EAnchor::Output {
-            relative_transform, ..
-        } => post_transform * *relative_transform * pre_transform,
-        EAnchor::Input {
-            relative_transform, ..
-        } => post_transform * *relative_transform * pre_transform,
-    }
-}
-
-fn spawn_anchor(
-    anchor_id: ast::AnchorId,
-    anchor: ast::EAnchor,
-    num_inputs: usize,
-    assets: &AnchorAssets,
-) -> (PbrBundle, EAnchor) {
-    match anchor {
-        ast::EAnchor::Input { order_num, .. } => {
-            let spread = 0.3;
-            let start_x = -(num_inputs as f32 - 1.0) * spread / 2.0;
-            let x = start_x + order_num as f32 * spread;
-            let anchor = EAnchor::Input {
-                id: anchor_id,
-                relative_transform: Transform::from_translation(Vec3::new(x, 0.0, 0.55)),
-                num_inputs: num_inputs,
-                param_index: order_num,
-            };
-            (
-                PbrBundle {
-                    mesh: assets.mesh.clone(),
-                    material: assets.mat_normal.clone(),
-                    transform: anchor_transformation(&anchor, assets, false),
-                    ..default()
-                },
-                anchor,
-            )
-        }
-        ast::EAnchor::Output => {
-            let anchor = EAnchor::Output {
-                id: anchor_id,
-                relative_transform: Transform::from_translation(Vec3::new(0.0, 0.0, -0.55)),
-            };
-            (
-                PbrBundle {
-                    mesh: assets.mesh.clone(),
-                    material: assets.mat_normal.clone(),
-                    transform: anchor_transformation(&anchor, assets, false),
-                    ..default()
-                },
-                anchor,
-            )
-        }
-    }
-}
-
 fn anchor_hover_system(
     mut commands: Commands,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
@@ -1444,7 +1289,15 @@ fn anchor_hover_visual_system(
         // Smooth scale
         //let s = tf.scale.x + (target_scale - tf.scale.x) * 0.18;
         //tf.scale = Vec3::splat(s);
-        *tf = anchor_transformation(anchor, assets, is_hovered);
+        *tf = match anchor {
+            EAnchor::Input { render_objects, .. } | EAnchor::Output { render_objects, .. } => {
+                if hovered.is_some() {
+                    render_objects.hovered.transform
+                } else {
+                    render_objects.normal.transform
+                }
+            }
+        };
 
         // Material swap (Handle-Vergleich ist billig)
         if *mat != *target_mat {
