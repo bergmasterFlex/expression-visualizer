@@ -168,6 +168,11 @@ enum EAstActionButton {
 struct PickState {
     hovered: Option<ast::node::Id>,  // node_id
     selected: Option<ast::node::Id>, // node_id
+    /// Cursor position at the last left-mouse press. Used to distinguish
+    /// click vs drag — a release within `CLICK_MOVE_THRESHOLD` of this counts
+    /// as a click and updates `selected`; further movement is treated as a
+    /// drag and leaves `selected` untouched.
+    press_cursor: Option<Vec2>,
 }
 
 /// UI text showing the selected node's info.
@@ -251,6 +256,31 @@ fn setup_scene(mut commands: Commands) {
     });
 }
 
+/// Spawn two transparent grey walls at z = -10 and z = +10,
+/// spanning x ∈ [-30, 30] and y ∈ [-2, 2].
+fn spawn_walls(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let wall_mesh = meshes.add(Cuboid::new(60.0, 6.0, 0.05));
+    let wall_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.5, 0.5, 0.5, 0.5),
+        alpha_mode: AlphaMode::Blend,
+        cull_mode: None,
+        ..default()
+    });
+
+    for z in [-12.0_f32, 12.0_f32] {
+        commands.spawn(PbrBundle {
+            mesh: wall_mesh.clone(),
+            material: wall_material.clone(),
+            transform: Transform::from_xyz(0.0, 0.0, z),
+            ..default()
+        });
+    }
+}
+
 /// Spawn the AST node meshes.
 fn spawn_ast_nodes(
     mut commands: Commands,
@@ -311,6 +341,7 @@ fn spawn_ast_nodes(
                                     render_objects: render_anchor,
                                 },
                             },
+                            AstSceneEntity,
                         ))
                         .id(),
                 );
@@ -324,10 +355,13 @@ fn spawn_ast_nodes(
     }
 
     for e in state.layout_ast.edges() {
-        commands.spawn(Edge {
-            from_anchor: *anchor_entities.get(&e.from_anchor.anchor_id).unwrap(),
-            to_anchor: *anchor_entities.get(&e.to_anchor.anchor_id).unwrap(),
-        });
+        commands.spawn((
+            Edge {
+                from_anchor: *anchor_entities.get(&e.from_anchor.anchor_id).unwrap(),
+                to_anchor: *anchor_entities.get(&e.to_anchor.anchor_id).unwrap(),
+            },
+            AstSceneEntity,
+        ));
     }
 
     /*
@@ -909,8 +943,19 @@ fn pick_nodes(
 
     pick.hovered = closest.clone().map(|(id, _)| id);
 
+    const CLICK_MOVE_THRESHOLD: f32 = 5.0;
     if mouse.just_pressed(MouseButton::Left) {
-        pick.selected = closest.map(|(id, _)| id);
+        pick.press_cursor = Some(cursor);
+    }
+    if mouse.just_released(MouseButton::Left) {
+        let is_click = pick
+            .press_cursor
+            .map(|p| (cursor - p).length() < CLICK_MOVE_THRESHOLD)
+            .unwrap_or(false);
+        pick.press_cursor = None;
+        if is_click {
+            pick.selected = closest.map(|(id, _)| id);
+        }
         /*
         println!("selected!");
         if let Some(selected_id) = &pick.selected {
@@ -1394,6 +1439,155 @@ fn drag_update_system(
     }
 }
 
+#[derive(Component, Clone, Copy)]
+enum CrosshairPart {
+    LineUp,
+    LineDown,
+    LineLeft,
+    LineRight,
+    TickUp,
+    TickDown,
+    TickLeft,
+    TickRight,
+}
+
+fn spawn_crosshair(mut commands: Commands) {
+    let color = Color::srgba(0.55, 0.54, 0.52, 0.22);
+
+    for part in [
+        CrosshairPart::LineUp,
+        CrosshairPart::LineDown,
+        CrosshairPart::LineLeft,
+        CrosshairPart::LineRight,
+        CrosshairPart::TickUp,
+        CrosshairPart::TickDown,
+        CrosshairPart::TickLeft,
+        CrosshairPart::TickRight,
+    ] {
+        commands.spawn((
+            NodeBundle {
+                style: Style {
+                    position_type: PositionType::Absolute,
+                    ..default()
+                },
+                background_color: color.into(),
+                visibility: Visibility::Hidden,
+                ..default()
+            },
+            part,
+        ));
+    }
+}
+
+fn update_crosshair(
+    pick: Res<PickState>,
+    camera_q: Query<(&Camera, &GlobalTransform), With<camera::OrbitCameraTag>>,
+    node_q: Query<(&AstNodeEntity, &GlobalTransform)>,
+    windows: Query<&Window>,
+    mut crosshair_q: Query<(&CrosshairPart, &mut Style, &mut Visibility)>,
+) {
+    let hide_all = |q: &mut Query<(&CrosshairPart, &mut Style, &mut Visibility)>| {
+        for (_, _, mut vis) in q.iter_mut() {
+            *vis = Visibility::Hidden;
+        }
+    };
+
+    let Some(selected_id) = pick.selected.clone() else {
+        hide_all(&mut crosshair_q);
+        return;
+    };
+    let Ok((camera, cam_tf)) = camera_q.get_single() else {
+        hide_all(&mut crosshair_q);
+        return;
+    };
+    let Ok(window) = windows.get_single() else {
+        hide_all(&mut crosshair_q);
+        return;
+    };
+    let Some(node_tf) = node_q
+        .iter()
+        .find(|(e, _)| e.node_id == selected_id)
+        .map(|(_, tf)| tf)
+    else {
+        hide_all(&mut crosshair_q);
+        return;
+    };
+    let Some(screen) = camera.world_to_viewport(cam_tf, node_tf.translation()) else {
+        hide_all(&mut crosshair_q);
+        return;
+    };
+
+    // Project a world-space sphere with constant radius onto the screen
+    // to get a perspective-correct, distance-aware box size.
+    const CROSSHAIR_RADIUS: f32 = 0.5;
+    let edge_world = node_tf.translation() + *cam_tf.right() * CROSSHAIR_RADIUS;
+    let Some(edge_screen) = camera.world_to_viewport(cam_tf, edge_world) else {
+        hide_all(&mut crosshair_q);
+        return;
+    };
+    let half: f32 = (edge_screen - screen).length();
+    let thickness: f32 = 2.0;
+    let w = window.width();
+    let h = window.height();
+
+    let tick_len = half;
+    let tick_half = tick_len * 0.5;
+
+    for (part, mut style, mut vis) in crosshair_q.iter_mut() {
+        *vis = Visibility::Visible;
+        match *part {
+            CrosshairPart::LineUp => {
+                style.left = Val::Px(screen.x - thickness * 0.5);
+                style.top = Val::Px(0.0);
+                style.width = Val::Px(thickness);
+                style.height = Val::Px((screen.y - half).max(0.0));
+            }
+            CrosshairPart::LineDown => {
+                style.left = Val::Px(screen.x - thickness * 0.5);
+                style.top = Val::Px(screen.y + half);
+                style.width = Val::Px(thickness);
+                style.height = Val::Px((h - screen.y - half).max(0.0));
+            }
+            CrosshairPart::LineLeft => {
+                style.left = Val::Px(0.0);
+                style.top = Val::Px(screen.y - thickness * 0.5);
+                style.width = Val::Px((screen.x - half).max(0.0));
+                style.height = Val::Px(thickness);
+            }
+            CrosshairPart::LineRight => {
+                style.left = Val::Px(screen.x + half);
+                style.top = Val::Px(screen.y - thickness * 0.5);
+                style.width = Val::Px((w - screen.x - half).max(0.0));
+                style.height = Val::Px(thickness);
+            }
+            CrosshairPart::TickUp => {
+                style.left = Val::Px(screen.x - tick_half);
+                style.top = Val::Px(screen.y - half - thickness * 0.5);
+                style.width = Val::Px(tick_len);
+                style.height = Val::Px(thickness);
+            }
+            CrosshairPart::TickDown => {
+                style.left = Val::Px(screen.x - tick_half);
+                style.top = Val::Px(screen.y + half - thickness * 0.5);
+                style.width = Val::Px(tick_len);
+                style.height = Val::Px(thickness);
+            }
+            CrosshairPart::TickLeft => {
+                style.left = Val::Px(screen.x - half - thickness * 0.5);
+                style.top = Val::Px(screen.y - tick_half);
+                style.width = Val::Px(thickness);
+                style.height = Val::Px(tick_len);
+            }
+            CrosshairPart::TickRight => {
+                style.left = Val::Px(screen.x + half - thickness * 0.5);
+                style.top = Val::Px(screen.y - tick_half);
+                style.width = Val::Px(thickness);
+                style.height = Val::Px(tick_len);
+            }
+        }
+    }
+}
+
 fn drag_end_system(
     mouse: Res<ButtonInput<MouseButton>>,
     mut drag: ResMut<DragState>,
@@ -1440,9 +1634,11 @@ fn main() {
             Startup,
             (
                 setup_scene,
+                spawn_walls,
                 spawn_ast_nodes,
                 spawn_ui,
                 spawn_selection_display,
+                spawn_crosshair,
             )
                 .chain(),
         )
@@ -1485,6 +1681,6 @@ fn main() {
             )
                 .chain(),
         )
-        .add_systems(Update, update_world_labels)
+        .add_systems(Update, (update_world_labels, update_crosshair))
         .run();
 }

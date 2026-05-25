@@ -11,8 +11,13 @@ struct GridParams {
 
 @group(2) @binding(0) var<uniform> params: GridParams;
 
+struct FragmentOutput {
+    @location(0) color: vec4<f32>,
+    @builtin(frag_depth) depth: f32,
+}
+
 @fragment
-fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fragment(in: VertexOutput) -> FragmentOutput {
     let world_pos = in.world_position.xz;
 
     let coord = world_pos / params.spacing;
@@ -33,5 +38,15 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let dist = length(world_pos);
     let fade = 1.0 - saturate((dist - params.fade_start) / (params.fade_end - params.fade_start));
 
-    return vec4<f32>(color.rgb, color.a * fade);
+    // Only write real depth at line-pixels: those occlude geometry behind
+    // them, producing crisp intersection edges. Plane-region pixels output
+    // far depth (0.0 under Bevy's reverse-Z) so transparent objects behind
+    // the grid stay alpha-blended through the plane bg.
+    let is_line = lines > 0.05 && fade > 0.01;
+    let out_depth = select(0.0, in.position.z, is_line);
+
+    return FragmentOutput(
+        vec4<f32>(color.rgb, color.a * fade),
+        out_depth,
+    );
 }

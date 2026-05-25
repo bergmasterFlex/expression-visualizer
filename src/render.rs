@@ -428,8 +428,8 @@ pub fn layoutnode_to_rendernode(
                         perceptual_roughness: 0.6,
                         ..default()
                     },
-                    transform: Transform::from_scale(Vec3::new(2.0, 2.0, 2.0))
-                        * node_pos_tf
+                    transform: node_pos_tf
+                        * Transform::from_scale(Vec3::new(2.0, 2.0, 2.0))
                         * Transform::from_rotation(Quat::from_axis_angle(
                             Vec3::new(1.0, 0.0, 0.0),
                             std::f32::consts::PI * 0.5,

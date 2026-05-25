@@ -58,6 +58,13 @@ impl Material for GridMaterial {
         _key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
         descriptor.primitive.cull_mode = None;
+        // Z-write is on so line-pixels (which write real depth in the shader)
+        // produce sharp intersection edges with other geometry. Plane-region
+        // pixels output far-depth, so transparent objects behind them stay
+        // visible.
+        if let Some(ds) = descriptor.depth_stencil.as_mut() {
+            ds.depth_write_enabled = true;
+        }
         Ok(())
     }
 }
@@ -90,8 +97,8 @@ fn spawn_grid(
     commands.spawn(MaterialMeshBundle {
         mesh: meshes.add(Plane3d::default().mesh().size(size, size).build()),
         material: materials.add(GridMaterial {
-            plane_color: LinearRgba::new(0.2, 0.2, 0.3, 0.05),
-            line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.15),
+            plane_color: LinearRgba::new(0.2, 0.2, 0.3, 0.18),
+            line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.4),
             spacing: config.spacing,
             fade_start: 15.0,
             fade_end: 100.0,
