@@ -756,6 +756,38 @@ fn handle_delete_node_button(
     }
 }
 
+fn handle_example_buttons(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children, &ExampleButton),
+        With<Interaction>,
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+    mut state: ResMut<AstState>,
+    mut rebuild: ResMut<NeedsRebuild>,
+    mut pick: ResMut<PickState>,
+) {
+    for (interaction, mut bg, children, _kind) in interaction_q.iter_mut() {
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
+
+        match *interaction {
+            Interaction::Pressed => {
+                state.layout_ast = layout::LayoutAst::empty();
+                pick.selected = None;
+                pick.hovered = None;
+                rebuild.0 = true;
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
+                color.0 = Color::srgb(0.6, 0.6, 0.7);
+            }
+        }
+    }
+}
+
 fn handle_add_node_button(
     mut interaction_q: Query<
         (
@@ -1864,6 +1896,7 @@ fn main() {
                         handle_delete_node_button,
                         handle_reset_camera_button,
                         handle_add_node_button,
+                        handle_example_buttons,
                         handle_tab_buttons,
                         update_mode_visibility,
                         pick_nodes,
