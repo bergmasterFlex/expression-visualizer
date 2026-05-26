@@ -77,6 +77,26 @@ impl Default for AstState {
                         ]),
                     },
                 ),
+                (
+                    ast::FunctionDeclarationId(2),
+                    ast::FunctionDeclaration {
+                        name: "charAt".to_string(),
+                        inputs: vec![
+                            FunctionParameterDeclaration {
+                                name: "str".to_string(),
+                                r#type: eval::EType::String(None),
+                            },
+                            FunctionParameterDeclaration {
+                                name: "i".to_string(),
+                                r#type: eval::EType::Int(None),
+                            },
+                        ],
+                        output_type: eval::EType::SumType(vec![
+                            eval::EType::Char(None),
+                            eval::EType::Undefined,
+                        ]),
+                    },
+                ),
             ]),
         }
     }
@@ -772,6 +792,15 @@ fn handle_example_buttons(
                 state.layout_ast = match kind {
                     ExampleButton::Sink => layout::LayoutAst::empty().plus_sink_example(),
                     ExampleButton::VarDecl => layout::LayoutAst::empty().plus_vardecl_example(),
+                    ExampleButton::FuncCall => {
+                        let decl = state
+                            .function_declarations
+                            .iter()
+                            .find(|(_, d)| d.name == "charAt")
+                            .map(|(id, decl)| (id.clone(), decl))
+                            .unwrap();
+                        layout::LayoutAst::empty().plus_funccall_example(decl)
+                    }
                     _ => layout::LayoutAst::empty().plus_sink_wall(),
                 };
                 pick.selected = None;

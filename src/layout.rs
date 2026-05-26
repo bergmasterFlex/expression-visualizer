@@ -122,6 +122,84 @@ impl LayoutAst {
         ._plus_layout_node(&ti_node_id, Vec3::new(0.0, 0.0, 0.0))
     }
 
+    /// Example scene for the "FuncCall" example button: a SinkWall at the back
+    /// wall, a FunctionCall node in the centre using the given declaration
+    /// (intended: `charAt`), and one TypeIntroduction per input wired in front
+    /// of the call. For inputs named `str` / `i` the TypeIntroductions get the
+    /// fixed sample values `"Hello World"` / `4`; any other parameter falls
+    /// back to a valueless `Any`.
+    pub fn plus_funccall_example(
+        &self,
+        function_declaration: (
+            crate::ast::FunctionDeclarationId,
+            &crate::ast::FunctionDeclaration,
+        ),
+    ) -> Self {
+        let (ast, sink_input_anchor_id) = self.ast.with_next_anchor_id();
+        let (ast, sink_node_id) = ast.plus(crate::ast::node::ENode::SinkWall {
+            input_anchor: sink_input_anchor_id.clone(),
+        });
+
+        let inputs = &function_declaration.1.inputs;
+        let (ast, fc_input_anchor_ids) = inputs.iter().fold(
+            (ast, Vec::<crate::ast::AnchorId>::new()),
+            |(ast, mut acc), _| {
+                let (ast, anchor_id) = ast.with_next_anchor_id();
+                acc.push(anchor_id);
+                (ast, acc)
+            },
+        );
+        let (ast, fc_output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, fc_node_id) = ast.plus(crate::ast::node::ENode::FunctionCall {
+            function_declaration_id: function_declaration.0,
+            input_anchors: fc_input_anchor_ids.clone(),
+            output_anchor: fc_output_anchor_id.clone(),
+        });
+        let ast = ast.plus_edge(fc_output_anchor_id, sink_input_anchor_id);
+
+        let input_count = inputs.len();
+        let (ast, ti_layout_specs) = inputs
+            .iter()
+            .zip(fc_input_anchor_ids.into_iter())
+            .enumerate()
+            .fold(
+                (ast, Vec::<(crate::ast::node::Id, f32)>::new()),
+                |(ast, mut acc), (i, (param, fc_input_anchor_id))| {
+                    let ty = match param.name.as_str() {
+                        "str" => crate::ast::node::EType::String {
+                            value: Some("Hello World".to_string()),
+                        },
+                        "i" => crate::ast::node::EType::Int {
+                            value: Some("4".to_string()),
+                        },
+                        _ => crate::ast::node::EType::Any,
+                    };
+                    let (ast, ti_output_anchor_id) = ast.with_next_anchor_id();
+                    let (ast, ti_node_id) = ast.plus(crate::ast::node::ENode::TypeIntroduction {
+                        r#type: ty,
+                        output_anchor: ti_output_anchor_id.clone(),
+                    });
+                    let ast = ast.plus_edge(ti_output_anchor_id, fc_input_anchor_id);
+                    let x = (i as f32) * 2.0 - (input_count as f32 - 1.0);
+                    acc.push((ti_node_id, x));
+                    (ast, acc)
+                },
+            );
+
+        let layout = Self {
+            ast,
+            layout_nodes: self.layout_nodes.clone(),
+        }
+        ._plus_layout_node(&sink_node_id, Vec3::new(0.0, 0.0, -4.0))
+        ._plus_layout_node(&fc_node_id, Vec3::new(0.0, 0.0, 0.0));
+
+        ti_layout_specs
+            .into_iter()
+            .fold(layout, |layout, (node_id, x)| {
+                layout._plus_layout_node(&node_id, Vec3::new(x, 0.0, 4.0))
+            })
+    }
+
     /// Example scene for the "VarDecl" example button: a SinkWall at the back
     /// wall plane with three VarDecl nodes ("0": string, "1": int, "2": bool)
     /// sitting at the front wall's z plane, spread across x = -1, 0, +1
