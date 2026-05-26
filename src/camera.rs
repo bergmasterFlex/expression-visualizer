@@ -51,8 +51,8 @@ impl Plugin for OrbitCameraPlugin {
 /// Handle mouse/touch input to update orbit state.
 fn orbit_input(
     mouse_buttons: Res<ButtonInput<MouseButton>>,
-    mut motion_events: EventReader<MouseMotion>,
-    mut scroll_events: EventReader<MouseWheel>,
+    mut motion_events: MessageReader<MouseMotion>,
+    mut scroll_events: MessageReader<MouseWheel>,
     mut orbit: ResMut<OrbitCamera>,
     drag: Res<crate::DragState>,
     time: Res<Time>,

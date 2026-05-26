@@ -1,5 +1,5 @@
 /// Build an octahedron mesh (6 verts, 8 faces).
-pub fn octahedron_mesh(size: f32) -> bevy::render::mesh::Mesh {
+pub fn octahedron_mesh(size: f32) -> bevy::mesh::Mesh {
     let v = [
         [0.0, size, 0.0],  // 0 top
         [0.0, -size, 0.0], // 1 bottom
@@ -26,13 +26,13 @@ pub fn octahedron_mesh(size: f32) -> bevy::render::mesh::Mesh {
     }
     let flat_indices: Vec<u32> = (0..positions.len() as u32).collect();
 
-    bevy::render::mesh::Mesh::new(
-        bevy::render::mesh::PrimitiveTopology::TriangleList,
-        bevy::render::render_asset::RenderAssetUsages::default(),
+    bevy::mesh::Mesh::new(
+        bevy::mesh::PrimitiveTopology::TriangleList,
+        bevy::asset::RenderAssetUsages::default(),
     )
-    .with_inserted_attribute(bevy::render::mesh::Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_attribute(bevy::render::mesh::Mesh::ATTRIBUTE_NORMAL, normals)
-    .with_inserted_indices(bevy::render::mesh::Indices::U32(flat_indices))
+    .with_inserted_attribute(bevy::mesh::Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(bevy::mesh::Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_indices(bevy::mesh::Indices::U32(flat_indices))
 }
 
 /// Creates a cone mesh pointing up (+Y) with the base centered at the origin.
@@ -40,7 +40,7 @@ pub fn octahedron_mesh(size: f32) -> bevy::render::mesh::Mesh {
 /// - `radius`: base radius
 /// - `height`: total height
 /// - `segments`: number of subdivisions around the base (higher = smoother)
-pub fn create_cone_mesh(radius: f32, height: f32, segments: u32) -> bevy::render::mesh::Mesh {
+pub fn create_cone_mesh(radius: f32, height: f32, segments: u32) -> bevy::mesh::Mesh {
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut uvs: Vec<[f32; 2]> = Vec::new();
@@ -115,20 +115,20 @@ pub fn create_cone_mesh(radius: f32, height: f32, segments: u32) -> bevy::render
         indices.push(idx);
     }
 
-    let mut mesh = bevy::render::mesh::Mesh::new(
-        bevy::render::mesh::PrimitiveTopology::TriangleList,
+    let mut mesh = bevy::mesh::Mesh::new(
+        bevy::mesh::PrimitiveTopology::TriangleList,
         bevy::utils::default(),
     );
-    mesh.insert_attribute(bevy::render::mesh::Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_attribute(bevy::render::mesh::Mesh::ATTRIBUTE_NORMAL, normals);
-    mesh.insert_attribute(bevy::render::mesh::Mesh::ATTRIBUTE_UV_0, uvs);
-    mesh.insert_indices(bevy::render::mesh::Indices::U32(indices));
+    mesh.insert_attribute(bevy::mesh::Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(bevy::mesh::Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(bevy::mesh::Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(bevy::mesh::Indices::U32(indices));
     mesh
 }
 
 /// Creates a "bool" type mesh: two cones sharing a base at the origin,
 /// one pointing up (+Y) and one pointing down (-Y).
-pub fn create_bool_mesh(radius: f32, half_height: f32, segments: u32) -> bevy::render::mesh::Mesh {
+pub fn create_bool_mesh(radius: f32, half_height: f32, segments: u32) -> bevy::mesh::Mesh {
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
     let mut uvs: Vec<[f32; 2]> = Vec::new();
@@ -187,13 +187,13 @@ pub fn create_bool_mesh(radius: f32, half_height: f32, segments: u32) -> bevy::r
     // Lower cone: base at origin, tip at -half_height
     add_cone_sides(-half_height, 0.0, true);
 
-    let mut mesh = bevy::render::mesh::Mesh::new(
-        bevy::render::mesh::PrimitiveTopology::TriangleList,
+    let mut mesh = bevy::mesh::Mesh::new(
+        bevy::mesh::PrimitiveTopology::TriangleList,
         bevy::utils::default(),
     );
-    mesh.insert_attribute(bevy::render::mesh::Mesh::ATTRIBUTE_POSITION, positions);
-    mesh.insert_attribute(bevy::render::mesh::Mesh::ATTRIBUTE_NORMAL, normals);
-    mesh.insert_attribute(bevy::render::mesh::Mesh::ATTRIBUTE_UV_0, uvs);
-    mesh.insert_indices(bevy::render::mesh::Indices::U32(indices));
+    mesh.insert_attribute(bevy::mesh::Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(bevy::mesh::Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(bevy::mesh::Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(bevy::mesh::Indices::U32(indices));
     mesh
 }

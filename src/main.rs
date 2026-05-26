@@ -9,6 +9,8 @@ mod render;
 use std::{collections::hash_map, f32::consts::PI};
 
 use ast::FunctionParameterDeclaration;
+use bevy::core_pipeline::oit::OrderIndependentTransparencySettings;
+use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::{input::keyboard::KeyboardInput, math::VectorSpace, prelude::*};
 
 // ── WASM bridge ─────────────────────────────────────────────
@@ -179,6 +181,10 @@ struct PickState {
 #[derive(Component)]
 struct SelectionDisplay;
 
+/// Marker for the FPS counter text in the top-right corner.
+#[derive(Component)]
+struct FpsDisplay;
+
 #[derive(Component)]
 struct TextInput {
     value: String,
@@ -198,62 +204,61 @@ struct TextInputBox;
 
 /// Initial scene setup: camera, lights, ambient.
 fn setup_scene(mut commands: Commands) {
-    // Camera
+    // Camera with order-independent transparency for correct intersection
+    // of the two walls and the grid. OIT requires MSAA off.
+    // The grid shader calls `oit_draw()` under #ifdef OIT_ENABLED to
+    // participate in the OIT layer buffer (see assets/shaders/grid.wgsl).
     commands.spawn((
-        Camera3dBundle {
-            transform: Transform::from_xyz(0.0, 5.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
-            camera: Camera {
-                clear_color: ClearColorConfig::Custom(Color::srgb(0.031, 0.031, 0.102)),
-                ..default()
-            },
+        Camera3d::default(),
+        Camera {
+            clear_color: ClearColorConfig::Custom(Color::srgb(0.031, 0.031, 0.102)),
             ..default()
         },
+        Transform::from_xyz(0.0, 5.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
+        OrderIndependentTransparencySettings::default(),
+        Msaa::Off,
         camera::OrbitCameraTag,
-        FogSettings {
-            color: Color::srgba(0.02, 0.02, 0.36, 1.0), // very dark blue-ish
+        DistanceFog {
+            color: Color::srgba(0.02, 0.02, 0.36, 1.0),
             falloff: FogFalloff::Exponential { density: 0.03 },
+            ..default()
+        },
+        AmbientLight {
+            color: Color::srgb(0.25, 0.25, 0.38),
+            brightness: 200.0,
             ..default()
         },
     ));
 
     // Directional light
-    commands.spawn(DirectionalLightBundle {
-        directional_light: DirectionalLight {
+    commands.spawn((
+        DirectionalLight {
             illuminance: 8000.0,
             shadows_enabled: false,
             ..default()
         },
-        transform: Transform::from_xyz(5.0, 10.0, 7.0).looking_at(Vec3::ZERO, Vec3::Y),
-        ..default()
-    });
-
-    // Ambient light
-    commands.insert_resource(AmbientLight {
-        color: Color::srgb(0.25, 0.25, 0.38),
-        brightness: 200.0,
-    });
+        Transform::from_xyz(5.0, 10.0, 7.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
 
     // Two colored point lights
-    commands.spawn(PointLightBundle {
-        point_light: PointLight {
+    commands.spawn((
+        PointLight {
             color: Color::srgb(0.133, 0.827, 0.933),
             intensity: 50_000.0,
             range: 30.0,
             ..default()
         },
-        transform: Transform::from_xyz(0.0, 5.0, 8.0),
-        ..default()
-    });
-    commands.spawn(PointLightBundle {
-        point_light: PointLight {
+        Transform::from_xyz(0.0, 5.0, 8.0),
+    ));
+    commands.spawn((
+        PointLight {
             color: Color::srgb(1.0, 0.42, 0.42),
             intensity: 30_000.0,
             range: 30.0,
             ..default()
         },
-        transform: Transform::from_xyz(0.0, 5.0, -8.0),
-        ..default()
-    });
+        Transform::from_xyz(0.0, 5.0, -8.0),
+    ));
 }
 
 /// Spawn two transparent grey walls at z = -10 and z = +10,
@@ -272,12 +277,11 @@ fn spawn_walls(
     });
 
     for z in [-12.0_f32, 12.0_f32] {
-        commands.spawn(PbrBundle {
-            mesh: wall_mesh.clone(),
-            material: wall_material.clone(),
-            transform: Transform::from_xyz(0.0, 0.0, z),
-            ..default()
-        });
+        commands.spawn((
+            Mesh3d(wall_mesh.clone()),
+            MeshMaterial3d(wall_material.clone()),
+            Transform::from_xyz(0.0, 0.0, z),
+        ));
     }
 }
 
@@ -304,12 +308,9 @@ fn spawn_ast_nodes(
         );
         let node_entity = commands
             .spawn((
-                PbrBundle {
-                    mesh: meshes.add(render_node.node.mesh),
-                    material: materials.add(render_node.node.material),
-                    transform: render_node.node.transform,
-                    ..default()
-                },
+                Mesh3d(meshes.add(render_node.node.mesh)),
+                MeshMaterial3d(materials.add(render_node.node.material)),
+                render_node.node.transform,
                 AstNodeEntity {
                     node_id: node_id.clone(),
                 },
@@ -325,12 +326,9 @@ fn spawn_ast_nodes(
                     anchor_id.clone(),
                     commands
                         .spawn((
-                            PbrBundle {
-                                mesh: meshes.add(render_anchor.normal.mesh.clone()),
-                                material: materials.add(render_anchor.normal.material.clone()),
-                                transform: render_node.node.transform,
-                                ..default()
-                            },
+                            Mesh3d(meshes.add(render_anchor.normal.mesh.clone())),
+                            MeshMaterial3d(materials.add(render_anchor.normal.material.clone())),
+                            render_node.node.transform,
                             match layout_anchor.anchor {
                                 ast::EAnchor::Input { .. } => EAnchor::Input {
                                     id: anchor_id,
@@ -414,21 +412,19 @@ fn spawn_ui(mut commands: Commands) {
     let initial = "";
     commands
         .spawn((
-            ButtonBundle {
-                style: Style {
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(y_offset),
-                    left: Val::Px(12.0), // next to reset button
-                    padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
-                    min_width: Val::Px(220.0),
-                    border: UiRect::all(Val::Px(1.5)),
-                    ..default()
-                },
-                background_color: Color::srgba(0.06, 0.06, 0.12, 0.9).into(),
-                border_color: Color::srgb(0.12, 0.12, 0.24).into(),
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(y_offset),
+                left: Val::Px(12.0), // next to reset button
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                min_width: Val::Px(220.0),
+                border: UiRect::all(Val::Px(1.5)),
                 border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
+            BackgroundColor(Color::srgba(0.06, 0.06, 0.12, 0.9)),
+            BorderColor::all(Color::srgb(0.12, 0.12, 0.24)),
             TextInputBox,
             TextInput {
                 value: initial.to_string(),
@@ -438,14 +434,12 @@ fn spawn_ui(mut commands: Commands) {
         ))
         .with_children(|parent| {
             parent.spawn((
-                TextBundle::from_section(
-                    initial,
-                    TextStyle {
-                        font_size: 14.0,
-                        color: Color::srgb(0.91, 0.89, 0.87),
-                        ..default()
-                    },
-                ),
+                Text::new(initial),
+                TextFont {
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.91, 0.89, 0.87)),
                 TextInputDisplay,
             ));
         });
@@ -493,31 +487,29 @@ fn spawn_ui(mut commands: Commands) {
     );
 }
 
-fn spawn_ui_button<C: Component>(commands: &mut Commands, label: &str, component: C, pos: Vec2) {
+fn spawn_ui_button<C: Bundle>(commands: &mut Commands, label: &str, component: C, pos: Vec2) {
     commands
         .spawn((
-            ButtonBundle {
-                style: Style {
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(pos.y),
-                    left: Val::Px(pos.x),
-                    padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
-                    ..default()
-                },
-                background_color: Color::srgba(0.16, 0.16, 0.22, 0.9).into(),
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(pos.y),
+                left: Val::Px(pos.x),
+                padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
                 border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
+            BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
             component,
         ))
         .with_children(|parent| {
-            parent.spawn(TextBundle::from_section(
-                label,
-                TextStyle {
+            parent.spawn((
+                Text::new(label),
+                TextFont {
                     font_size: 14.0,
-                    color: Color::srgb(0.6, 0.6, 0.7),
                     ..default()
                 },
+                TextColor(Color::srgb(0.6, 0.6, 0.7)),
             ));
         });
 }
@@ -527,11 +519,11 @@ fn handle_reset_camera_button(
         (&Interaction, &mut BackgroundColor, &Children),
         (With<Interaction>, With<ResetCameraButton>),
     >,
-    mut text_q: Query<&mut Text>,
+    mut text_color_q: Query<&mut TextColor>,
     mut orbit: ResMut<camera::OrbitCamera>,
 ) {
     for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut text = text_q.get_mut(children[0]).unwrap();
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
 
         match *interaction {
             Interaction::Pressed => {
@@ -541,11 +533,11 @@ fn handle_reset_camera_button(
             }
             Interaction::Hovered => {
                 bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                text.sections[0].style.color = Color::srgb(0.85, 0.85, 0.9);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
             }
             Interaction::None => {
                 bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                text.sections[0].style.color = Color::srgb(0.6, 0.6, 0.7);
+                color.0 = Color::srgb(0.6, 0.6, 0.7);
             }
         }
     }
@@ -556,7 +548,7 @@ fn handle_delete_node_button(
         (&Interaction, &mut BackgroundColor, &Children),
         (With<Interaction>, With<DeleteNodeButton>),
     >,
-    mut text_q: Query<&mut Text>,
+    mut text_color_q: Query<&mut TextColor>,
     mut state: ResMut<AstState>,
     mut orbit: ResMut<camera::OrbitCamera>,
     mut rebuild: ResMut<NeedsRebuild>,
@@ -565,7 +557,7 @@ fn handle_delete_node_button(
     scene_entities: Query<Entity, With<AstSceneEntity>>,
 ) {
     for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut text = text_q.get_mut(children[0]).unwrap();
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
 
         match *interaction {
             Interaction::Pressed => {
@@ -576,11 +568,11 @@ fn handle_delete_node_button(
             }
             Interaction::Hovered => {
                 bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                text.sections[0].style.color = Color::srgb(0.85, 0.85, 0.9);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
             }
             Interaction::None => {
                 bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                text.sections[0].style.color = Color::srgb(0.6, 0.6, 0.7);
+                color.0 = Color::srgb(0.6, 0.6, 0.7);
             }
         }
     }
@@ -596,7 +588,7 @@ fn handle_add_node_button(
         ),
         With<Interaction>,
     >,
-    mut text_q: Query<&mut Text>,
+    mut text_color_q: Query<&mut TextColor>,
     mut state: ResMut<AstState>,
     mut current_input_string: ResMut<CurrentInputString>,
     mut orbit: ResMut<camera::OrbitCamera>,
@@ -606,7 +598,7 @@ fn handle_add_node_button(
     scene_entities: Query<Entity, With<AstSceneEntity>>,
 ) {
     for (interaction, mut bg, children, action) in interaction_q.iter_mut() {
-        let mut text = text_q.get_mut(children[0]).unwrap();
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
 
         match *interaction {
             Interaction::Pressed => {
@@ -665,11 +657,11 @@ fn handle_add_node_button(
             }
             Interaction::Hovered => {
                 bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                text.sections[0].style.color = Color::srgb(0.85, 0.85, 0.9);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
             }
             Interaction::None => {
                 bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                text.sections[0].style.color = Color::srgb(0.6, 0.6, 0.7);
+                color.0 = Color::srgb(0.6, 0.6, 0.7);
             }
         }
     }
@@ -779,7 +771,7 @@ fn clear_scene(
 ) {
     if rebuild.0 {
         for entity in query_ast_entities.iter() {
-            commands.entity(entity).despawn_recursive();
+            commands.entity(entity).despawn();
         }
 
         let mesh_ids: Vec<_> = meshes.ids().collect();
@@ -821,22 +813,17 @@ fn spawn_world_label(
 ) -> Entity {
     commands
         .spawn((
-            TextBundle {
-                text: Text::from_section(
-                    render_label.text,
-                    TextStyle {
-                        font_size: render_label.font_size,
-                        color: render_label.color,
-                        ..default()
-                    },
-                ),
-                style: Style {
-                    position_type: PositionType::Absolute,
-                    ..default()
-                },
-                visibility: Visibility::Hidden,
+            Text::new(render_label.text),
+            TextFont {
+                font_size: render_label.font_size,
                 ..default()
             },
+            TextColor(render_label.color),
+            Node {
+                position_type: PositionType::Absolute,
+                ..default()
+            },
+            Visibility::Hidden,
             WorldLabel {
                 world_pos: render_label.world_pos,
                 offset: render_label.offset,
@@ -849,17 +836,17 @@ fn spawn_world_label(
 /// Each frame, project world positions → screen and reposition the text.
 fn update_world_labels(
     camera_q: Query<(&Camera, &GlobalTransform), With<camera::OrbitCameraTag>>,
-    mut label_q: Query<(&WorldLabel, &mut Style, &mut Visibility, &Node)>,
+    mut label_q: Query<(&WorldLabel, &mut Node, &mut Visibility, &ComputedNode)>,
 ) {
-    let Ok((camera, cam_gt)) = camera_q.get_single() else {
+    let Ok((camera, cam_gt)) = camera_q.single() else {
         return;
     };
 
-    for (label, mut style, mut vis, node) in label_q.iter_mut() {
-        if let Some(screen_pos) = camera.world_to_viewport(cam_gt, label.world_pos) {
-            let size = node.size();
-            style.left = Val::Px(screen_pos.x - size.x / 2.0 + label.offset.x);
-            style.top = Val::Px(screen_pos.y - size.y / 2.0 + label.offset.y);
+    for (label, mut node, mut vis, computed) in label_q.iter_mut() {
+        if let Ok(screen_pos) = camera.world_to_viewport(cam_gt, label.world_pos) {
+            let size = computed.size();
+            node.left = Val::Px(screen_pos.x - size.x / 2.0 + label.offset.x);
+            node.top = Val::Px(screen_pos.y - size.y / 2.0 + label.offset.y);
             *vis = Visibility::Visible;
         } else {
             // Behind camera
@@ -870,25 +857,60 @@ fn update_world_labels(
 
 fn spawn_selection_display(mut commands: Commands) {
     commands.spawn((
-        TextBundle {
-            text: Text::from_section(
-                "",
-                TextStyle {
-                    font_size: 16.0,
-                    color: Color::srgb(0.85, 0.85, 0.9),
-                    ..default()
-                },
-            ),
-            style: Style {
-                position_type: PositionType::Absolute,
-                top: Val::Px(14.0),
-                right: Val::Px(14.0),
-                ..default()
-            },
+        Text::new(""),
+        TextFont {
+            font_size: 16.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.85, 0.85, 0.9)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(34.0),
+            right: Val::Px(14.0),
             ..default()
         },
         SelectionDisplay,
     ));
+}
+
+fn spawn_fps_display(mut commands: Commands) {
+    commands.spawn((
+        Text::new("--"),
+        TextFont {
+            font_size: 12.0,
+            ..default()
+        },
+        TextColor(Color::srgba(0.5, 0.5, 0.6, 0.8)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(8.0),
+            right: Val::Px(12.0),
+            ..default()
+        },
+        FpsDisplay,
+    ));
+}
+
+fn update_fps_display(
+    diagnostics: Res<DiagnosticsStore>,
+    mut text_q: Query<&mut Text, With<FpsDisplay>>,
+) {
+    let Ok(mut text) = text_q.single_mut() else {
+        return;
+    };
+    let fps = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(|d| d.smoothed());
+    // Current (non-smoothed) frame time in ms — reveals stutter that
+    // the smoothed FPS number hides.
+    let ms = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .and_then(|d| d.value());
+    text.0 = match (fps, ms) {
+        (Some(f), Some(t)) => format!("{f:.0} fps · {t:.1}ms"),
+        (Some(f), None) => format!("{f:.0} fps"),
+        _ => "-- fps".into(),
+    };
 }
 
 fn pick_nodes(
@@ -903,10 +925,10 @@ fn pick_nodes(
     */
     state: Res<AstState>,
 ) {
-    let Ok((camera, cam_gt)) = camera_q.get_single() else {
+    let Ok((camera, cam_gt)) = camera_q.single() else {
         return;
     };
-    let Ok(window) = windows.get_single() else {
+    let Ok(window) = windows.single() else {
         return;
     };
     let Some(cursor) = window.cursor_position() else {
@@ -915,7 +937,7 @@ fn pick_nodes(
     };
 
     // Build ray from camera through cursor
-    let Some(ray) = camera.viewport_to_world(cam_gt, cursor) else {
+    let Ok(ray) = camera.viewport_to_world(cam_gt, cursor) else {
         pick.hovered = None;
         return;
     };
@@ -991,11 +1013,11 @@ fn pick_nodes(
 
 fn highlight_hovered(
     pick: Res<PickState>,
-    node_q: Query<(&AstNodeEntity, &Handle<StandardMaterial>)>,
+    node_q: Query<(&AstNodeEntity, &MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     for (node_ent, mat_handle) in node_q.iter() {
-        let Some(mat) = materials.get_mut(mat_handle) else {
+        let Some(mat) = materials.get_mut(&mat_handle.0) else {
             continue;
         };
 
@@ -1023,14 +1045,14 @@ fn highlight_hovered(
 fn update_selection_display(
     pick: Res<PickState>,
     state: Res<AstState>,
-    mut display_q: Query<&mut Text, With<SelectionDisplay>>,
+    mut display_q: Query<(&mut Text, &mut TextColor), With<SelectionDisplay>>,
 ) {
-    let Ok(mut text) = display_q.get_single_mut() else {
+    let Ok((mut text, mut color)) = display_q.single_mut() else {
         return;
     };
     if let Some(id) = &pick.selected {
         if let Some(node) = state.layout_ast.ast.nodes.get(&id) {
-            text.sections[0].value = format!(
+            text.0 = format!(
                 "{} : {}",
                 node.label(&state.function_declarations),
                 match eval::eval_type(
@@ -1043,22 +1065,28 @@ fn update_selection_display(
                     Err(message) => format!("error: {}", message),
                 }
             );
-            text.sections[0].style.color = Color::WHITE
+            color.0 = Color::WHITE;
         }
     } else {
-        text.sections[0].value.clear();
+        text.0.clear();
     }
 }
 
-fn update_cursor(pick: Res<PickState>, mut windows: Query<&mut Window>) {
-    let Ok(mut window) = windows.get_single_mut() else {
+fn update_cursor(
+    pick: Res<PickState>,
+    mut commands: Commands,
+    windows: Query<Entity, With<Window>>,
+) {
+    use bevy::window::SystemCursorIcon;
+    use bevy::window::CursorIcon;
+    let Ok(entity) = windows.single() else {
         return;
     };
-    window.cursor.icon = if pick.hovered.is_some() {
-        CursorIcon::Pointer
+    commands.entity(entity).insert(if pick.hovered.is_some() {
+        CursorIcon::System(SystemCursorIcon::Pointer)
     } else {
-        CursorIcon::Default
-    };
+        CursorIcon::System(SystemCursorIcon::Default)
+    });
 }
 
 fn text_input_focus(
@@ -1080,18 +1108,18 @@ fn text_input_focus(
         }
 
         // Visual feedback
-        border.0 = if input.focused {
+        *border = BorderColor::all(if input.focused {
             Color::srgb(0.133, 0.827, 0.933) // cyan when focused
         } else {
             Color::srgb(0.12, 0.12, 0.24)
-        };
+        });
     }
 }
 
 fn text_input_keyboard(
     mut input_q: Query<(&mut TextInput, &Children), With<TextInputBox>>,
     mut text_q: Query<&mut Text, With<TextInputDisplay>>,
-    mut key_events: EventReader<KeyboardInput>,
+    mut key_events: MessageReader<KeyboardInput>,
     mut current_input_string: ResMut<CurrentInputString>,
     //mut state: ResMut<AstState>,
     mut orbit: ResMut<camera::OrbitCamera>,
@@ -1178,7 +1206,7 @@ fn text_input_keyboard(
         // Update display text with blinking cursor
         if let Ok(mut text) = text_q.get_mut(children[0]) {
             let (before, after) = input.value.split_at(input.cursor);
-            text.sections[0].value = if input.focused {
+            text.0 = if input.focused {
                 format!("{}|{}", before, after)
             } else {
                 input.value.clone()
@@ -1195,7 +1223,7 @@ fn text_input_keyboard(
             state.edges = edges;
 
             for entity in scene_entities.iter() {
-                commands.entity(entity).despawn_recursive();
+                commands.entity(entity).despawn();
             }
             */
             //orbit.auto_rotate = true;
@@ -1285,20 +1313,20 @@ fn anchor_hover_system(
         commands.entity(e).remove::<AnchorHovered>();
     }
 
-    let Ok(window) = windows.get_single() else {
+    let Ok(window) = windows.single() else {
         return;
     };
     let Some(cursor) = window.cursor_position() else {
         return;
     };
-    let Ok((camera, cam_tf)) = camera_q.get_single() else {
+    let Ok((camera, cam_tf)) = camera_q.single() else {
         return;
     };
 
     let mut closest: Option<(Entity, f32)> = None;
 
     for (entity, global_tf) in &anchors {
-        let Some(screen_pos) = camera.world_to_viewport(cam_tf, global_tf.translation()) else {
+        let Ok(screen_pos) = camera.world_to_viewport(cam_tf, global_tf.translation()) else {
             continue;
         };
 
@@ -1319,7 +1347,7 @@ fn anchor_hover_visual_system(
     mut anchors: Query<(
         &EAnchor,
         &mut Transform,
-        &mut Handle<StandardMaterial>,
+        &mut MeshMaterial3d<StandardMaterial>,
         Option<&AnchorHovered>,
         &AnchorAssets,
     )>,
@@ -1345,8 +1373,8 @@ fn anchor_hover_visual_system(
         };
 
         // Material swap (Handle-Vergleich ist billig)
-        if *mat != *target_mat {
-            *mat = target_mat.clone();
+        if mat.0 != *target_mat {
+            mat.0 = target_mat.clone();
         }
     }
 }
@@ -1366,9 +1394,9 @@ fn draw_edges_gizmos(edges: Query<&Edge>, transforms: Query<&GlobalTransform>, m
 fn draw_drag_preview(drag: Res<DragState>, mut gizmos: Gizmos) {
     let Some(ref info) = drag.active else { return };
     let color = if info.target_anchor.is_some() {
-        Color::rgb(0.3, 1.0, 0.4) // grün = eingeschnappt
+        Color::srgb(0.3, 1.0, 0.4) // grün = eingeschnappt
     } else {
-        Color::rgb(1.0, 0.9, 0.3) // gelb = dragging
+        Color::srgb(1.0, 0.9, 0.3) // gelb = dragging
     };
     gizmos.line(info.source_pos, info.current_end, color);
 }
@@ -1379,7 +1407,7 @@ fn drag_start_system(
     mut drag: ResMut<DragState>,
 ) {
     if mouse.just_pressed(MouseButton::Left) {
-        if let Ok((entity, tf, anchor)) = hovered.get_single() {
+        if let Ok((entity, tf, anchor)) = hovered.single() {
             let pos = tf.translation();
             drag.active = Some(DragInfo {
                 source_anchor: entity,
@@ -1403,18 +1431,18 @@ fn drag_update_system(
         return;
     };
 
-    let Ok(window) = windows.get_single() else {
+    let Ok(window) = windows.single() else {
         return;
     };
     let Some(cursor) = window.cursor_position() else {
         return;
     };
-    let Ok((camera, cam_tf)) = camera_q.get_single() else {
+    let Ok((camera, cam_tf)) = camera_q.single() else {
         return;
     };
 
     // Ray durch Cursor
-    let Some(ray) = camera.viewport_to_world(cam_tf, cursor) else {
+    let Ok(ray) = camera.viewport_to_world(cam_tf, cursor) else {
         return;
     };
 
@@ -1430,7 +1458,7 @@ fn drag_update_system(
 
     // Snap zu hovering target
     info.target_anchor = None;
-    if let Ok((entity, tf, anchor)) = hovered.get_single() {
+    if let Ok((entity, tf, anchor)) = hovered.single() {
         if entity != info.source_anchor {
             info.target_anchor = Some(entity);
             info.target_anchor_id = Some(anchor.id());
@@ -1465,15 +1493,12 @@ fn spawn_crosshair(mut commands: Commands) {
         CrosshairPart::TickRight,
     ] {
         commands.spawn((
-            NodeBundle {
-                style: Style {
-                    position_type: PositionType::Absolute,
-                    ..default()
-                },
-                background_color: color.into(),
-                visibility: Visibility::Hidden,
+            Node {
+                position_type: PositionType::Absolute,
                 ..default()
             },
+            BackgroundColor(color),
+            Visibility::Hidden,
             part,
         ));
     }
@@ -1484,9 +1509,9 @@ fn update_crosshair(
     camera_q: Query<(&Camera, &GlobalTransform), With<camera::OrbitCameraTag>>,
     node_q: Query<(&AstNodeEntity, &GlobalTransform)>,
     windows: Query<&Window>,
-    mut crosshair_q: Query<(&CrosshairPart, &mut Style, &mut Visibility)>,
+    mut crosshair_q: Query<(&CrosshairPart, &mut Node, &mut Visibility)>,
 ) {
-    let hide_all = |q: &mut Query<(&CrosshairPart, &mut Style, &mut Visibility)>| {
+    let hide_all = |q: &mut Query<(&CrosshairPart, &mut Node, &mut Visibility)>| {
         for (_, _, mut vis) in q.iter_mut() {
             *vis = Visibility::Hidden;
         }
@@ -1496,11 +1521,11 @@ fn update_crosshair(
         hide_all(&mut crosshair_q);
         return;
     };
-    let Ok((camera, cam_tf)) = camera_q.get_single() else {
+    let Ok((camera, cam_tf)) = camera_q.single() else {
         hide_all(&mut crosshair_q);
         return;
     };
-    let Ok(window) = windows.get_single() else {
+    let Ok(window) = windows.single() else {
         hide_all(&mut crosshair_q);
         return;
     };
@@ -1512,7 +1537,7 @@ fn update_crosshair(
         hide_all(&mut crosshair_q);
         return;
     };
-    let Some(screen) = camera.world_to_viewport(cam_tf, node_tf.translation()) else {
+    let Ok(screen) = camera.world_to_viewport(cam_tf, node_tf.translation()) else {
         hide_all(&mut crosshair_q);
         return;
     };
@@ -1521,7 +1546,7 @@ fn update_crosshair(
     // to get a perspective-correct, distance-aware box size.
     const CROSSHAIR_RADIUS: f32 = 0.5;
     let edge_world = node_tf.translation() + *cam_tf.right() * CROSSHAIR_RADIUS;
-    let Some(edge_screen) = camera.world_to_viewport(cam_tf, edge_world) else {
+    let Ok(edge_screen) = camera.world_to_viewport(cam_tf, edge_world) else {
         hide_all(&mut crosshair_q);
         return;
     };
@@ -1617,12 +1642,13 @@ fn main() {
                     canvas: Some("#bevy-canvas".into()),
                     fit_canvas_to_parent: true,
                     prevent_default_event_handling: true,
-                    present_mode: bevy::window::PresentMode::AutoNoVsync,
+                    present_mode: bevy::window::PresentMode::AutoVsync,
                     ..default()
                 }),
                 ..default()
             }),
             camera::OrbitCameraPlugin,
+            FrameTimeDiagnosticsPlugin::default(),
         ))
         .add_plugins(grid::GridPlugin)
         .init_resource::<AstState>()
@@ -1638,6 +1664,7 @@ fn main() {
                 spawn_ast_nodes,
                 spawn_ui,
                 spawn_selection_display,
+                spawn_fps_display,
                 spawn_crosshair,
             )
                 .chain(),
@@ -1674,13 +1701,13 @@ fn main() {
                     drag_update_system,
                     drag_end_system,
                     clear_scene,
-                    apply_deferred,
+                    ApplyDeferred,
                     rebuild_scene,
                 )
                     .chain(),
             )
                 .chain(),
         )
-        .add_systems(Update, (update_world_labels, update_crosshair))
+        .add_systems(Update, (update_world_labels, update_crosshair, update_fps_display))
         .run();
 }

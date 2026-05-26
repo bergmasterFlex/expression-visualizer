@@ -610,12 +610,9 @@ pub fn layoutnode_to_rendernode(
             ..default()
         });
         commands.spawn((
-            PbrBundle {
-                mesh: plane_mesh.clone(),
-                material: mat,
-                transform: Transform::from_xyz(0.0, 0.0, z),
-                ..default()
-            },
+            Mesh3d(plane_mesh.clone()),
+            MeshMaterial3d(mat),
+            Transform::from_xyz(0.0, 0.0, z),
             AstSceneEntity,
         ));
     }

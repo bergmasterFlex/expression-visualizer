@@ -1,5 +1,9 @@
 #import bevy_pbr::forward_io::VertexOutput
 
+#ifdef OIT_ENABLED
+#import bevy_core_pipeline::oit::oit_draw
+#endif
+
 struct GridParams {
     plane_color: vec4<f32>,
     line_color: vec4<f32>,
@@ -9,15 +13,10 @@ struct GridParams {
     line_thickness: f32,
 }
 
-@group(2) @binding(0) var<uniform> params: GridParams;
-
-struct FragmentOutput {
-    @location(0) color: vec4<f32>,
-    @builtin(frag_depth) depth: f32,
-}
+@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: GridParams;
 
 @fragment
-fn fragment(in: VertexOutput) -> FragmentOutput {
+fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let world_pos = in.world_position.xz;
 
     let coord = world_pos / params.spacing;
@@ -38,15 +37,14 @@ fn fragment(in: VertexOutput) -> FragmentOutput {
     let dist = length(world_pos);
     let fade = 1.0 - saturate((dist - params.fade_start) / (params.fade_end - params.fade_start));
 
-    // Only write real depth at line-pixels: those occlude geometry behind
-    // them, producing crisp intersection edges. Plane-region pixels output
-    // far depth (0.0 under Bevy's reverse-Z) so transparent objects behind
-    // the grid stay alpha-blended through the plane bg.
-    let is_line = lines > 0.05 && fade > 0.01;
-    let out_depth = select(0.0, in.position.z, is_line);
+    let out_color = vec4<f32>(color.rgb, color.a * fade);
 
-    return FragmentOutput(
-        vec4<f32>(color.rgb, color.a * fade),
-        out_depth,
-    );
+#ifdef OIT_ENABLED
+    // Submit fragment to OIT layer buffer, then discard so the regular
+    // forward pass doesn't also write blended color.
+    oit_draw(in.position, out_color);
+    discard;
+#endif
+
+    return out_color;
 }

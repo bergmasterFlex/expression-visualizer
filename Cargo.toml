@@ -2,10 +2,10 @@
 name = "bevy-ast-3d"
 version = "0.1.0"
 edition = "2021"
-description = "3D AST visualizer with evaluation-order layout, built with Bevy + WebGL2"
+description = "3D AST visualizer with evaluation-order layout, built with Bevy + WebGPU (OIT)"
 
 [dependencies]
-bevy = { version = "0.14", features = ["webgl2"] }
+bevy = { version = "0.18", features = ["webgpu"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

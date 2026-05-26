@@ -1,9 +1,10 @@
-use bevy::asset::load_internal_asset;
+use bevy::asset::{load_internal_asset, uuid_handle};
 use bevy::prelude::*;
 use bevy::render::render_resource::*;
+use bevy::shader::ShaderRef;
 use bevy::reflect::TypePath;
 use bevy::pbr::{MaterialPipeline, MaterialPipelineKey};
-use bevy::render::mesh::MeshVertexBufferLayoutRef;
+use bevy::mesh::MeshVertexBufferLayoutRef;
 
 // --- Configuration ---
 
@@ -24,7 +25,7 @@ impl Default for GridConfig {
 
 // --- Shader Material ---
 
-pub const GRID_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(0x47524944_4D415400); // can be any aribtrary unique numer
+pub const GRID_SHADER_HANDLE: Handle<Shader> = uuid_handle!("47524944-4d41-4000-8000-000000000001");
 
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
 pub struct GridMaterial {
@@ -52,19 +53,12 @@ impl Material for GridMaterial {
     }
 
     fn specialize(
-        _pipeline: &MaterialPipeline<Self>,
+        _pipeline: &MaterialPipeline,
         descriptor: &mut RenderPipelineDescriptor,
         _layout: &MeshVertexBufferLayoutRef,
         _key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
         descriptor.primitive.cull_mode = None;
-        // Z-write is on so line-pixels (which write real depth in the shader)
-        // produce sharp intersection edges with other geometry. Plane-region
-        // pixels output far-depth, so transparent objects behind them stay
-        // visible.
-        if let Some(ds) = descriptor.depth_stencil.as_mut() {
-            ds.depth_write_enabled = true;
-        }
         Ok(())
     }
 }
@@ -94,16 +88,15 @@ fn spawn_grid(
     config: Res<GridConfig>,
 ) {
     let size = config.half_extent * 2.0;
-    commands.spawn(MaterialMeshBundle {
-        mesh: meshes.add(Plane3d::default().mesh().size(size, size).build()),
-        material: materials.add(GridMaterial {
+    commands.spawn((
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(size, size).build())),
+        MeshMaterial3d(materials.add(GridMaterial {
             plane_color: LinearRgba::new(0.2, 0.2, 0.3, 0.18),
             line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.4),
             spacing: config.spacing,
             fade_start: 15.0,
             fade_end: 100.0,
             line_thickness: 0.6
-        }),
-        ..default()
-    });
+        })),
+    ));
 }
