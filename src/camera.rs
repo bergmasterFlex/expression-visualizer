@@ -25,9 +25,9 @@ pub struct OrbitCamera {
 impl Default for OrbitCamera {
     fn default() -> Self {
         Self {
-            theta: 0.6,
+            theta: 1.4,
             phi: 1.0,
-            radius: 12.0,
+            radius: 20.0,
             target: Vec3::new(0.0, 0.0, 0.0),
             auto_speed: 0.15,
         }
