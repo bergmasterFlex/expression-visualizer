@@ -129,11 +129,19 @@ pub fn create_cone_mesh(radius: f32, height: f32, segments: u32) -> bevy::mesh::
 /// Build a square pyramid mesh with the base in the XY plane at z = 0
 /// and the apex at (0, 0, -depth). Flat shading via per-face normals.
 pub fn square_pyramid_z_mesh(base: f32, depth: f32) -> bevy::mesh::Mesh {
-    let h = base / 2.0;
-    let p0 = [-h, -h, 0.0];
-    let p1 = [h, -h, 0.0];
-    let p2 = [h, h, 0.0];
-    let p3 = [-h, h, 0.0];
+    rect_pyramid_z_mesh(base, base, depth)
+}
+
+/// Build a rectangular pyramid mesh with a base_x × base_y rectangle in the
+/// XY plane at z = 0 and the apex at (0, 0, -depth). Flat shading via
+/// per-face normals.
+pub fn rect_pyramid_z_mesh(base_x: f32, base_y: f32, depth: f32) -> bevy::mesh::Mesh {
+    let hx = base_x / 2.0;
+    let hy = base_y / 2.0;
+    let p0 = [-hx, -hy, 0.0];
+    let p1 = [hx, -hy, 0.0];
+    let p2 = [hx, hy, 0.0];
+    let p3 = [-hx, hy, 0.0];
     let tip = [0.0, 0.0, -depth];
 
     // Side faces wound so outward normals point away from the central axis;

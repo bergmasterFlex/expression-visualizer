@@ -100,7 +100,7 @@ pub fn layoutnode_to_rendernode(
                                 ..default()
                             },
                             transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, 0.55)),
+                                * Transform::from_translation(Vec3::new(0.0, 0.0, -0.225)),
                         },
                         hovered: RenderObject {
                             mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
@@ -111,7 +111,7 @@ pub fn layoutnode_to_rendernode(
                                 ..default()
                             },
                             transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, 0.55))
+                                * Transform::from_translation(Vec3::new(0.0, 0.0, -0.225))
                                 * Transform::from_scale(Vec3::splat(1.8)),
                         },
                     },
@@ -326,28 +326,24 @@ pub fn layoutnode_to_rendernode(
             ..
         } => RenderNode {
             node: RenderObject {
-                mesh: crate::mesh::create_cone_mesh(0.5, 1.0, 4),
+                mesh: crate::mesh::rect_pyramid_z_mesh(
+                    input_anchors.len() as f32 * 0.5,
+                    std::f32::consts::FRAC_1_SQRT_2,
+                    1.0,
+                ),
                 material: StandardMaterial {
                     base_color: Color::srgb(0.5, 0.9, 1.0),
                     emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
                     unlit: true,
                     ..default()
                 },
-                transform: node_pos_tf
-                    * Transform::from_rotation(Quat::from_axis_angle(
-                        Vec3::new(1.0, 0.0, 0.0),
-                        std::f32::consts::PI * -0.5,
-                    ))
-                    * Transform::from_rotation(Quat::from_axis_angle(
-                        Vec3::new(0.0, 1.0, 0.0),
-                        std::f32::consts::PI * 0.25,
-                    )),
+                transform: node_pos_tf,
             },
             anchors: input_anchors
                 .iter()
                 .enumerate()
                 .map(|(i_anchor, anchor_id)| {
-                    let spread = 0.3;
+                    let spread = 0.5;
                     let start_x = -(input_anchors.len() as f32 - 1.0) * spread / 2.0;
                     let x = start_x + i_anchor as f32 * spread;
                     (
@@ -362,7 +358,7 @@ pub fn layoutnode_to_rendernode(
                                     ..default()
                                 },
                                 transform: node_pos_tf
-                                    * Transform::from_translation(Vec3::new(x, 0.0, 0.55)),
+                                    * Transform::from_translation(Vec3::new(x, 0.0, 0.0)),
                             },
                             hovered: RenderObject {
                                 mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
@@ -373,7 +369,7 @@ pub fn layoutnode_to_rendernode(
                                     ..default()
                                 },
                                 transform: node_pos_tf
-                                    * Transform::from_translation(Vec3::new(x, 0.0, 0.55))
+                                    * Transform::from_translation(Vec3::new(x, 0.0, 0.0))
                                     * Transform::from_scale(Vec3::splat(1.8)),
                             },
                         },
@@ -391,7 +387,7 @@ pub fn layoutnode_to_rendernode(
                                 ..default()
                             },
                             transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, -0.55)),
+                                * Transform::from_translation(Vec3::new(0.0, 0.0, -1.0)),
                         },
                         hovered: RenderObject {
                             mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
@@ -402,7 +398,7 @@ pub fn layoutnode_to_rendernode(
                                 ..default()
                             },
                             transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, -0.55))
+                                * Transform::from_translation(Vec3::new(0.0, 0.0, -1.0))
                                 * Transform::from_scale(Vec3::splat(1.8)),
                         },
                     },
@@ -442,7 +438,7 @@ pub fn layoutnode_to_rendernode(
                                 ..default()
                             },
                             transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, 0.55)),
+                                * Transform::from_translation(Vec3::new(0.0, 0.0, -0.225)),
                         },
                         hovered: RenderObject {
                             mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
@@ -453,7 +449,7 @@ pub fn layoutnode_to_rendernode(
                                 ..default()
                             },
                             transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, 0.55))
+                                * Transform::from_translation(Vec3::new(0.0, 0.0, -0.225))
                                 * Transform::from_scale(Vec3::splat(1.8)),
                         },
                     },

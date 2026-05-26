@@ -374,7 +374,7 @@ fn spawn_ast_nodes(
                         .spawn((
                             Mesh3d(meshes.add(render_anchor.normal.mesh.clone())),
                             MeshMaterial3d(materials.add(render_anchor.normal.material.clone())),
-                            render_node.node.transform,
+                            render_anchor.normal.transform,
                             match layout_anchor.anchor {
                                 ast::EAnchor::Input { .. } => EAnchor::Input {
                                     id: anchor_id,
