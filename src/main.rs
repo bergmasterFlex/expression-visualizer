@@ -165,6 +165,34 @@ enum EAstActionButton {
     AddMatchButton,
 }
 
+#[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
+enum UiMode {
+    #[default]
+    Playground,
+    Examples,
+}
+
+#[derive(Component)]
+struct PlaygroundTab;
+#[derive(Component)]
+struct ExamplesTab;
+#[derive(Component)]
+struct PlaygroundOnly;
+#[derive(Component)]
+struct ExamplesOnly;
+
+#[derive(Component, Clone)]
+enum ExampleButton {
+    Sink,
+    FuncCall,
+    Match,
+    Pattern,
+    TypeCast,
+    VarDecl,
+    ConstDecl,
+    TypeClass,
+}
+
 /// Stores which node is hovered / selected.
 #[derive(Resource, Default)]
 struct PickState {
@@ -400,15 +428,33 @@ fn spawn_ast_nodes(
 }
 
 fn spawn_ui(mut commands: Commands) {
-    let y_offset = 12.0;
+    // Top tab row: Playground / Examples (radio-group behavior).
+    let tab_width = 100.0;
+    spawn_tab_button(
+        &mut commands,
+        "Playground",
+        PlaygroundTab,
+        Vec2::new(12.0, 12.0),
+        tab_width,
+    );
+    spawn_tab_button(
+        &mut commands,
+        "Examples",
+        ExamplesTab,
+        Vec2::new(12.0 + tab_width + 8.0, 12.0),
+        tab_width,
+    );
+
+    // Playground-mode controls.
+    let mut y_offset = 48.0;
     spawn_ui_button(
         &mut commands,
         "Reset Camera",
-        ResetCameraButton,
+        (ResetCameraButton, PlaygroundOnly),
         Vec2::new(12.0, y_offset),
+        Display::Flex,
     );
-    let y_offset = y_offset + 36.0;
-    // Outer container (clickable background)
+    y_offset += 36.0;
     let initial = "";
     commands
         .spawn((
@@ -416,7 +462,7 @@ fn spawn_ui(mut commands: Commands) {
             Node {
                 position_type: PositionType::Absolute,
                 top: Val::Px(y_offset),
-                left: Val::Px(12.0), // next to reset button
+                left: Val::Px(12.0),
                 padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
                 min_width: Val::Px(220.0),
                 border: UiRect::all(Val::Px(1.5)),
@@ -431,6 +477,7 @@ fn spawn_ui(mut commands: Commands) {
                 focused: false,
                 cursor: initial.len(),
             },
+            PlaygroundOnly,
         ))
         .with_children(|parent| {
             parent.spawn((
@@ -443,51 +490,61 @@ fn spawn_ui(mut commands: Commands) {
                 TextInputDisplay,
             ));
         });
-    let y_offset = y_offset + 36.0;
+    y_offset += 36.0;
     spawn_ui_button(
         &mut commands,
         "Delete Node",
-        DeleteNodeButton,
+        (DeleteNodeButton, PlaygroundOnly),
         Vec2::new(12.0, y_offset),
+        Display::Flex,
     );
-    let y_offset = y_offset + 36.0;
-    spawn_ui_button(
-        &mut commands,
-        "Add Int Introduction",
-        EAstActionButton::AddIntIntroductionButton,
-        Vec2::new(12.0, y_offset),
-    );
-    let y_offset = y_offset + 36.0;
-    spawn_ui_button(
-        &mut commands,
-        "Add Bool Introduction",
-        EAstActionButton::AddBoolIntroductionButton,
-        Vec2::new(12.0, y_offset),
-    );
-    let y_offset = y_offset + 36.0;
-    spawn_ui_button(
-        &mut commands,
-        "Add Function Call",
-        EAstActionButton::AddFunctionCallButton,
-        Vec2::new(12.0, y_offset),
-    );
-    let y_offset = y_offset + 36.0;
-    spawn_ui_button(
-        &mut commands,
-        "Add Match",
-        EAstActionButton::AddMatchButton,
-        Vec2::new(12.0, y_offset),
-    );
-    let y_offset = y_offset + 36.0;
-    spawn_ui_button(
-        &mut commands,
-        "Add Int Elimination",
-        EAstActionButton::AddIntEliminationButton,
-        Vec2::new(12.0, y_offset),
-    );
+    for (label, action) in [
+        ("Add Int Introduction", EAstActionButton::AddIntIntroductionButton),
+        ("Add Bool Introduction", EAstActionButton::AddBoolIntroductionButton),
+        ("Add Function Call", EAstActionButton::AddFunctionCallButton),
+        ("Add Match", EAstActionButton::AddMatchButton),
+        ("Add Int Elimination", EAstActionButton::AddIntEliminationButton),
+    ] {
+        y_offset += 36.0;
+        spawn_ui_button(
+            &mut commands,
+            label,
+            (action, PlaygroundOnly),
+            Vec2::new(12.0, y_offset),
+            Display::Flex,
+        );
+    }
+
+    // Examples-mode buttons (initially hidden; update_mode_visibility keeps them in sync).
+    let mut y_offset = 48.0;
+    for (label, kind) in [
+        ("Sink", ExampleButton::Sink),
+        ("FuncCall", ExampleButton::FuncCall),
+        ("Match", ExampleButton::Match),
+        ("Pattern", ExampleButton::Pattern),
+        ("TypeCast", ExampleButton::TypeCast),
+        ("VarDecl", ExampleButton::VarDecl),
+        ("ConstDecl", ExampleButton::ConstDecl),
+        ("TypeClass", ExampleButton::TypeClass),
+    ] {
+        spawn_ui_button(
+            &mut commands,
+            label,
+            (kind, ExamplesOnly),
+            Vec2::new(12.0, y_offset),
+            Display::None,
+        );
+        y_offset += 36.0;
+    }
 }
 
-fn spawn_ui_button<C: Bundle>(commands: &mut Commands, label: &str, component: C, pos: Vec2) {
+fn spawn_ui_button<C: Bundle>(
+    commands: &mut Commands,
+    label: &str,
+    component: C,
+    pos: Vec2,
+    initial_display: Display,
+) {
     commands
         .spawn((
             Button,
@@ -497,6 +554,7 @@ fn spawn_ui_button<C: Bundle>(commands: &mut Commands, label: &str, component: C
                 left: Val::Px(pos.x),
                 padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
                 border_radius: BorderRadius::all(Val::Px(6.0)),
+                display: initial_display,
                 ..default()
             },
             BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
@@ -512,6 +570,126 @@ fn spawn_ui_button<C: Bundle>(commands: &mut Commands, label: &str, component: C
                 TextColor(Color::srgb(0.6, 0.6, 0.7)),
             ));
         });
+}
+
+fn spawn_tab_button<C: Bundle>(
+    commands: &mut Commands,
+    label: &str,
+    component: C,
+    pos: Vec2,
+    width: f32,
+) {
+    commands
+        .spawn((
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(pos.y),
+                left: Val::Px(pos.x),
+                width: Val::Px(width),
+                padding: UiRect::axes(Val::Px(8.0), Val::Px(8.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+            component,
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new(label),
+                TextFont {
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.6, 0.6, 0.7)),
+            ));
+        });
+}
+
+fn tab_colors(interaction: Interaction, is_active: bool) -> (Color, Color) {
+    if is_active {
+        return (
+            Color::srgba(0.18, 0.36, 0.5, 0.95),
+            Color::srgb(0.95, 0.95, 1.0),
+        );
+    }
+    match interaction {
+        Interaction::Hovered | Interaction::Pressed => (
+            Color::srgba(0.2, 0.2, 0.3, 0.95),
+            Color::srgb(0.85, 0.85, 0.9),
+        ),
+        Interaction::None => (
+            Color::srgba(0.16, 0.16, 0.22, 0.9),
+            Color::srgb(0.6, 0.6, 0.7),
+        ),
+    }
+}
+
+fn handle_tab_buttons(
+    mut playground_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (With<PlaygroundTab>, Without<ExamplesTab>),
+    >,
+    mut examples_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (With<ExamplesTab>, Without<PlaygroundTab>),
+    >,
+    mut text_q: Query<&mut TextColor>,
+    mut mode: ResMut<UiMode>,
+) {
+    for (interaction, _, _) in playground_q.iter() {
+        if *interaction == Interaction::Pressed {
+            *mode = UiMode::Playground;
+        }
+    }
+    for (interaction, _, _) in examples_q.iter() {
+        if *interaction == Interaction::Pressed {
+            *mode = UiMode::Examples;
+        }
+    }
+
+    let mode_now = *mode;
+    for (interaction, mut bg, children) in playground_q.iter_mut() {
+        let (b, t) = tab_colors(*interaction, mode_now == UiMode::Playground);
+        bg.0 = b;
+        if let Ok(mut c) = text_q.get_mut(children[0]) {
+            c.0 = t;
+        }
+    }
+    for (interaction, mut bg, children) in examples_q.iter_mut() {
+        let (b, t) = tab_colors(*interaction, mode_now == UiMode::Examples);
+        bg.0 = b;
+        if let Ok(mut c) = text_q.get_mut(children[0]) {
+            c.0 = t;
+        }
+    }
+}
+
+fn update_mode_visibility(
+    mode: Res<UiMode>,
+    mut playground_q: Query<&mut Node, (With<PlaygroundOnly>, Without<ExamplesOnly>)>,
+    mut examples_q: Query<&mut Node, (With<ExamplesOnly>, Without<PlaygroundOnly>)>,
+    mut text_inputs: Query<&mut TextInput>,
+) {
+    if !mode.is_changed() {
+        return;
+    }
+    let (playground_display, examples_display) = match *mode {
+        UiMode::Playground => (Display::Flex, Display::None),
+        UiMode::Examples => (Display::None, Display::Flex),
+    };
+    for mut node in playground_q.iter_mut() {
+        node.display = playground_display;
+    }
+    for mut node in examples_q.iter_mut() {
+        node.display = examples_display;
+    }
+    if *mode != UiMode::Playground {
+        for mut input in text_inputs.iter_mut() {
+            input.focused = false;
+        }
+    }
 }
 
 fn handle_reset_camera_button(
@@ -1656,6 +1834,7 @@ fn main() {
         .init_resource::<NeedsRebuild>()
         .init_resource::<PickState>()
         .init_resource::<DragState>()
+        .init_resource::<UiMode>()
         .add_systems(
             Startup,
             (
@@ -1685,6 +1864,8 @@ fn main() {
                         handle_delete_node_button,
                         handle_reset_camera_button,
                         handle_add_node_button,
+                        handle_tab_buttons,
+                        update_mode_visibility,
                         pick_nodes,
                     )
                         .chain(),
