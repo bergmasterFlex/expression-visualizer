@@ -200,6 +200,120 @@ impl LayoutAst {
             })
     }
 
+    /// Example scene for the "Match" example button: a MatchFront wall, two
+    /// MatchBack pyramids, and three vertically stacked MatchGrids. The nodes
+    /// have no input/output anchors — purely visual layout containers.
+    pub fn plus_match_example(&self) -> Self {
+        let (ast, sink_input_anchor_id) = self.ast.with_next_anchor_id();
+        let (ast, sink_node_id) = ast.plus(crate::ast::node::ENode::SinkWall {
+            input_anchor: sink_input_anchor_id.clone(),
+        });
+        let (ast, mf_node_id) = ast.plus(crate::ast::node::ENode::MatchFront {
+            levels: 3,
+            width: 2,
+        });
+        let mb_levels = 3usize;
+        let (ast, mb1_input_anchor_ids) =
+            (0..mb_levels).fold((ast, Vec::<crate::ast::AnchorId>::new()), |(ast, mut acc), _| {
+                let (ast, anchor_id) = ast.with_next_anchor_id();
+                acc.push(anchor_id);
+                (ast, acc)
+            });
+        let (ast, mb1_output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, mb1_node_id) = ast.plus(crate::ast::node::ENode::MatchBack {
+            levels: mb_levels,
+            input_anchors: mb1_input_anchor_ids.clone(),
+            output_anchor: mb1_output_anchor_id.clone(),
+        });
+        let (ast, mb2_input_anchor_ids) =
+            (0..mb_levels).fold((ast, Vec::<crate::ast::AnchorId>::new()), |(ast, mut acc), _| {
+                let (ast, anchor_id) = ast.with_next_anchor_id();
+                acc.push(anchor_id);
+                (ast, acc)
+            });
+        let (ast, mb2_output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, mb2_node_id) = ast.plus(crate::ast::node::ENode::MatchBack {
+            levels: mb_levels,
+            input_anchors: mb2_input_anchor_ids.clone(),
+            output_anchor: mb2_output_anchor_id.clone(),
+        });
+        let (ast, mg1_node_id) = ast.plus(crate::ast::node::ENode::MatchGrid {
+            width: 3,
+            depth: 2,
+        });
+        let (ast, mg2_node_id) = ast.plus(crate::ast::node::ENode::MatchGrid {
+            width: 3,
+            depth: 2,
+        });
+        let (ast, mg3_node_id) = ast.plus(crate::ast::node::ENode::MatchGrid {
+            width: 3,
+            depth: 2,
+        });
+        let (ast, vd_output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, vd_node_id) = ast.plus(crate::ast::node::ENode::VarDecl {
+            name: "s".to_string(),
+            r#type: crate::ast::node::EType::String { value: None },
+            output_anchor: vd_output_anchor_id.clone(),
+        });
+        let (ast, te_top_input_anchor_id) = ast.with_next_anchor_id();
+        let (ast, te_top_output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, te_top_node_id) = ast.plus(crate::ast::node::ENode::TypeElimination {
+            r#type: crate::ast::node::EType::Int { value: None },
+            input_anchor: te_top_input_anchor_id.clone(),
+            output_anchor: te_top_output_anchor_id.clone(),
+        });
+        let (ast, te_mid_input_anchor_id) = ast.with_next_anchor_id();
+        let (ast, te_mid_output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, te_mid_node_id) = ast.plus(crate::ast::node::ENode::TypeElimination {
+            r#type: crate::ast::node::EType::String {
+                value: Some("World".to_string()),
+            },
+            input_anchor: te_mid_input_anchor_id.clone(),
+            output_anchor: te_mid_output_anchor_id.clone(),
+        });
+        let (ast, te_bot_input_anchor_id) = ast.with_next_anchor_id();
+        let (ast, te_bot_output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, te_bot_node_id) = ast.plus(crate::ast::node::ENode::TypeElimination {
+            r#type: crate::ast::node::EType::String { value: None },
+            input_anchor: te_bot_input_anchor_id.clone(),
+            output_anchor: te_bot_output_anchor_id.clone(),
+        });
+        let ast = ast.plus_edge(mb1_output_anchor_id, sink_input_anchor_id.clone());
+        let ast = ast.plus_edge(mb2_output_anchor_id, sink_input_anchor_id);
+        let ast = ast.plus_edge(vd_output_anchor_id.clone(), te_top_input_anchor_id);
+        let ast = ast.plus_edge(vd_output_anchor_id.clone(), te_mid_input_anchor_id);
+        let ast = ast.plus_edge(vd_output_anchor_id, te_bot_input_anchor_id);
+        let ast = ast.plus_edge(te_bot_output_anchor_id.clone(), mb1_input_anchor_ids[0].clone());
+        let ast = ast.plus_edge(te_bot_output_anchor_id, mb2_input_anchor_ids[0].clone());
+        let ast = ast.plus_edge(te_mid_output_anchor_id.clone(), mb1_input_anchor_ids[1].clone());
+        let ast = ast.plus_edge(te_mid_output_anchor_id, mb2_input_anchor_ids[1].clone());
+        let ast = ast.plus_edge(te_top_output_anchor_id, mb2_input_anchor_ids[2].clone());
+        let (ast, ti_output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, ti_node_id) = ast.plus(crate::ast::node::ENode::TypeIntroduction {
+            r#type: crate::ast::node::EType::Int {
+                value: Some("3".to_string()),
+            },
+            output_anchor: ti_output_anchor_id.clone(),
+        });
+        let ast = ast.plus_edge(ti_output_anchor_id, mb1_input_anchor_ids[2].clone());
+        Self {
+            ast,
+            layout_nodes: self.layout_nodes.clone(),
+        }
+        ._plus_layout_node(&sink_node_id, Vec3::new(0.0, 0.0, -12.0))
+        ._plus_layout_node(&mf_node_id, Vec3::new(0.0, 0.0, -2.0))
+        ._plus_layout_node(&mb1_node_id, Vec3::new(0.0, 0.0, -4.0))
+        ._plus_layout_node(&mb2_node_id, Vec3::new(2.0, 0.0, -4.0))
+        ._plus_layout_node(&mg1_node_id, Vec3::new(0.0, 0.0, -2.0))
+        ._plus_layout_node(&mg2_node_id, Vec3::new(0.0, 1.0, -2.0))
+        ._plus_layout_node(&mg3_node_id, Vec3::new(0.0, 2.0, -2.0))
+        ._plus_layout_node(&vd_node_id, Vec3::new(0.0, 0.0, 4.0))
+        ._plus_layout_node(&te_bot_node_id, Vec3::new(0.0, 0.0, -2.0))
+        ._plus_layout_node(&te_mid_node_id, Vec3::new(0.0, 2.0, -2.0))
+        ._plus_layout_node(&te_top_node_id, Vec3::new(0.0, 4.0, -2.0))
+        ._plus_layout_node(&ti_node_id, Vec3::new(-5.0, 0.0, 0.0))
+    }
+
     /// Example scene for the "VarDecl" example button: a SinkWall at the back
     /// wall plane with three VarDecl nodes ("0": string, "1": int, "2": bool)
     /// sitting at the front wall's z plane, spread across x = -1, 0, +1

@@ -32,6 +32,19 @@ pub enum ENode {
         r#type: EType,
         output_anchor: super::AnchorId,
     },
+    MatchFront {
+        levels: usize,
+        width: usize,
+    },
+    MatchBack {
+        levels: usize,
+        input_anchors: Vec<super::AnchorId>,
+        output_anchor: super::AnchorId,
+    },
+    MatchGrid {
+        width: usize,
+        depth: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +83,9 @@ impl ENode {
             }
             ENode::Match { .. } => "match true".to_string(),
             ENode::VarDecl { name, r#type, .. } => format!("{}: {}", name, r#type.to_string()),
+            ENode::MatchFront { .. } => "match front".to_string(),
+            ENode::MatchBack { .. } => "match back".to_string(),
+            ENode::MatchGrid { .. } => "match grid".to_string(),
         }
     }
 
@@ -141,6 +157,26 @@ impl ENode {
             ENode::VarDecl { output_anchor, .. } => {
                 vec![(output_anchor.clone(), super::EAnchor::Output)]
             }
+            ENode::MatchFront { .. } | ENode::MatchGrid { .. } => vec![],
+            ENode::MatchBack {
+                input_anchors,
+                output_anchor,
+                ..
+            } => input_anchors
+                .clone()
+                .into_iter()
+                .enumerate()
+                .map(|(i, anchor_id)| {
+                    (
+                        anchor_id,
+                        super::EAnchor::Input {
+                            order_num: i,
+                            name: None,
+                        },
+                    )
+                })
+                .chain(vec![(output_anchor.clone(), super::EAnchor::Output)])
+                .collect(),
         }
     }
 }

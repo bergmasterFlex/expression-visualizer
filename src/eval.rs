@@ -137,5 +137,8 @@ pub fn eval_type(
                 None => Err("no edge to match input".to_string()),
             }
         }
+        crate::ast::node::ENode::MatchFront { .. } => Err("match front has no type".to_string()),
+        crate::ast::node::ENode::MatchBack { .. } => Err("match back has no type".to_string()),
+        crate::ast::node::ENode::MatchGrid { .. } => Err("match grid has no type".to_string()),
     }
 }

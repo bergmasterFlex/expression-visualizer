@@ -178,7 +178,7 @@ pub fn layoutnode_to_rendernode(
                                     ..default()
                                 },
                                 transform: node_pos_tf
-                                    * Transform::from_translation(Vec3::new(0.0, 0.0, -0.55)),
+                                    * Transform::from_translation(Vec3::new(0.0, 0.0, 0.55)),
                             },
                             hovered: RenderObject {
                                 mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
@@ -189,7 +189,7 @@ pub fn layoutnode_to_rendernode(
                                     ..default()
                                 },
                                 transform: node_pos_tf
-                                    * Transform::from_translation(Vec3::new(0.0, 0.0, -0.55))
+                                    * Transform::from_translation(Vec3::new(0.0, 0.0, 0.55))
                                     * Transform::from_scale(Vec3::splat(1.8)),
                             },
                         },
@@ -206,7 +206,7 @@ pub fn layoutnode_to_rendernode(
                                     ..default()
                                 },
                                 transform: node_pos_tf
-                                    * Transform::from_translation(Vec3::new(0.0, 0.0, 0.55)),
+                                    * Transform::from_translation(Vec3::new(0.0, 0.0, -0.55)),
                             },
                             hovered: RenderObject {
                                 mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
@@ -217,7 +217,7 @@ pub fn layoutnode_to_rendernode(
                                     ..default()
                                 },
                                 transform: node_pos_tf
-                                    * Transform::from_translation(Vec3::new(0.0, 0.0, 0.55))
+                                    * Transform::from_translation(Vec3::new(0.0, 0.0, -0.55))
                                     * Transform::from_scale(Vec3::splat(1.8)),
                             },
                         },
@@ -557,6 +557,131 @@ pub fn layoutnode_to_rendernode(
                 }],
             }
         }
+        crate::ast::node::ENode::MatchFront { levels, width } => {
+            let w = *width as f32;
+            let l = *levels as f32;
+            RenderNode {
+                node: RenderObject {
+                    mesh: Cuboid::new(w * 6.0 - 3.0, l * 3.0, 0.05).mesh().build(),
+                    material: StandardMaterial {
+                        base_color: Color::srgba(0.5, 0.5, 0.5, 0.5),
+                        alpha_mode: AlphaMode::Blend,
+                        cull_mode: None,
+                        ..default()
+                    },
+                    transform: node_pos_tf
+                        * Transform::from_translation(Vec3::new(
+                            w * 3.0 - 3.0,
+                            l * 1.5 - 1.5,
+                            0.0,
+                        )),
+                },
+                anchors: std::collections::HashMap::new(),
+                labels: vec![],
+            }
+        }
+        crate::ast::node::ENode::MatchBack {
+            levels,
+            input_anchors,
+            output_anchor,
+        } => {
+            let top_y = *levels as f32 * 3.0 - 1.5;
+            // Base CCW viewed from +z (since tip sits at -z).
+            let base = [
+                [-1.5, -1.5, 0.0],
+                [1.5, -1.5, 0.0],
+                [1.5, top_y, 0.0],
+                [-1.5, top_y, 0.0],
+            ];
+            let tip = [0.0, 0.0, -3.0];
+            let input_spread = 3.0;
+            let anchors = input_anchors
+                .iter()
+                .enumerate()
+                .map(|(i, anchor_id)| {
+                    let y = i as f32 * input_spread;
+                    (
+                        anchor_id.clone(),
+                        RenderAnchor {
+                            normal: RenderObject {
+                                mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
+                                material: StandardMaterial {
+                                    base_color: Color::srgb(0.3, 0.6, 1.0),
+                                    emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
+                                    unlit: true,
+                                    ..default()
+                                },
+                                transform: node_pos_tf
+                                    * Transform::from_translation(Vec3::new(0.0, y, 0.0)),
+                            },
+                            hovered: RenderObject {
+                                mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
+                                material: StandardMaterial {
+                                    base_color: Color::srgb(0.5, 0.9, 1.0),
+                                    emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
+                                    unlit: true,
+                                    ..default()
+                                },
+                                transform: node_pos_tf
+                                    * Transform::from_translation(Vec3::new(0.0, y, 0.0))
+                                    * Transform::from_scale(Vec3::splat(1.8)),
+                            },
+                        },
+                    )
+                })
+                .chain([(
+                    output_anchor.clone(),
+                    RenderAnchor {
+                        normal: RenderObject {
+                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
+                            material: StandardMaterial {
+                                base_color: Color::srgb(0.3, 0.6, 1.0),
+                                emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
+                                unlit: true,
+                                ..default()
+                            },
+                            transform: node_pos_tf
+                                * Transform::from_translation(Vec3::new(0.0, 0.0, -3.0)),
+                        },
+                        hovered: RenderObject {
+                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
+                            material: StandardMaterial {
+                                base_color: Color::srgb(0.5, 0.9, 1.0),
+                                emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
+                                unlit: true,
+                                ..default()
+                            },
+                            transform: node_pos_tf
+                                * Transform::from_translation(Vec3::new(0.0, 0.0, -3.0))
+                                * Transform::from_scale(Vec3::splat(1.8)),
+                        },
+                    },
+                )])
+                .collect();
+            RenderNode {
+                node: RenderObject {
+                    mesh: crate::mesh::pyramid_5pt_mesh(base, tip),
+                    material: StandardMaterial {
+                        base_color: Color::srgba(0.5, 0.5, 0.5, 0.5),
+                        alpha_mode: AlphaMode::Blend,
+                        cull_mode: None,
+                        ..default()
+                    },
+                    transform: node_pos_tf,
+                },
+                anchors,
+                labels: vec![],
+            }
+        }
+        crate::ast::node::ENode::MatchGrid { .. } => RenderNode {
+            node: RenderObject {
+                mesh: Cuboid::new(0.0, 0.0, 0.0).mesh().build(),
+                material: StandardMaterial::default(),
+                transform: node_pos_tf,
+            },
+            anchors: std::collections::HashMap::new(),
+            labels: vec![],
+        },
     };
 
     /*

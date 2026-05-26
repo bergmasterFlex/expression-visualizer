@@ -336,6 +336,7 @@ fn spawn_ast_nodes(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials_grid: ResMut<Assets<grid::GridMaterial>>,
     state: Res<AstState>,
 ) {
     let mut node_entites = std::collections::HashMap::<ast::node::Id, Entity>::new();
@@ -347,6 +348,34 @@ fn spawn_ast_nodes(
             .nodes
             .get(&layout_node.node_id)
             .unwrap();
+        if let ast::node::ENode::MatchGrid { width, depth } = node {
+            let world_pos = layout_node.pos * Vec3::new(3.0, 3.0, 3.0);
+            let size_x = *width as f32 * 3.0;
+            let size_z = *depth as f32 * 3.0;
+            let tf = Transform::from_translation(
+                world_pos + Vec3::new(size_x / 2.0 - 1.5, 0.0, -size_z / 2.0),
+            );
+            let entity = commands
+                .spawn((
+                    Mesh3d(meshes.add(Plane3d::default().mesh().size(size_x, size_z).build())),
+                    MeshMaterial3d(materials_grid.add(grid::GridMaterial {
+                        plane_color: LinearRgba::new(0.07, 0.07, 0.1, 0.55),
+                        line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.4),
+                        spacing: 3.0,
+                        fade_start: 15.0,
+                        fade_end: 100.0,
+                        line_thickness: 1.5,
+                    })),
+                    tf,
+                    AstNodeEntity {
+                        node_id: node_id.clone(),
+                    },
+                    AstSceneEntity,
+                ))
+                .id();
+            node_entites.insert(node_id.clone(), entity);
+            continue;
+        }
         let render_node = render::layoutnode_to_rendernode(
             &layout_node,
             &state.layout_ast.ast,
@@ -801,6 +830,7 @@ fn handle_example_buttons(
                             .unwrap();
                         layout::LayoutAst::empty().plus_funccall_example(decl)
                     }
+                    ExampleButton::Match => layout::LayoutAst::empty().plus_match_example(),
                     _ => layout::LayoutAst::empty().plus_sink_wall(),
                 };
                 pick.selected = None;
@@ -1030,12 +1060,13 @@ fn rebuild_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut materials_grid: ResMut<Assets<grid::GridMaterial>>,
     state: Res<AstState>,
     mut rebuild: ResMut<NeedsRebuild>,
     query_ast_entities: Query<Entity, With<AstSceneEntity>>,
 ) {
     if rebuild.0 {
-        spawn_ast_nodes(commands, meshes, materials, state);
+        spawn_ast_nodes(commands, meshes, materials, materials_grid, state);
         rebuild.0 = false;
     }
 }
