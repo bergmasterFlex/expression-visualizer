@@ -108,7 +108,8 @@ pub fn eval_type(
             .output_type
             .clone()),
         crate::ast::node::ENode::TypeIntroduction { r#type, .. }
-        | crate::ast::node::ENode::TypeElimination { r#type, .. } => Ok(match r#type {
+        | crate::ast::node::ENode::TypeElimination { r#type, .. }
+        | crate::ast::node::ENode::VarDecl { r#type, .. } => Ok(match r#type {
             crate::ast::node::EType::Bool { value } => EType::Bool(None),
             crate::ast::node::EType::Int { value } => EType::Int(None),
             crate::ast::node::EType::Float { value } => EType::Float(None),

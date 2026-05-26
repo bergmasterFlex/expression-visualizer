@@ -122,6 +122,62 @@ impl LayoutAst {
         ._plus_layout_node(&ti_node_id, Vec3::new(0.0, 0.0, 0.0))
     }
 
+    /// Example scene for the "VarDecl" example button: a SinkWall at the back
+    /// wall plane with three VarDecl nodes ("0": string, "1": int, "2": bool)
+    /// sitting at the front wall's z plane, spread across x = -1, 0, +1
+    /// (world x = -3, 0, +3), all wired into the SinkWall's input.
+    pub fn plus_vardecl_example(&self) -> Self {
+        let (ast, sink_input_anchor_id) = self.ast.with_next_anchor_id();
+        let (ast, sink_node_id) = ast.plus(crate::ast::node::ENode::SinkWall {
+            input_anchor: sink_input_anchor_id.clone(),
+        });
+
+        let vardecl_specs: Vec<(String, crate::ast::node::EType, f32)> = vec![
+            (
+                "0".to_string(),
+                crate::ast::node::EType::String { value: None },
+                -1.0,
+            ),
+            (
+                "1".to_string(),
+                crate::ast::node::EType::Int { value: None },
+                0.0,
+            ),
+            (
+                "2".to_string(),
+                crate::ast::node::EType::Bool { value: None },
+                1.0,
+            ),
+        ];
+
+        let (ast, vardecl_nodes) = vardecl_specs.into_iter().fold(
+            (ast, Vec::<(crate::ast::node::Id, f32)>::new()),
+            |(ast, mut acc), (name, ty, x)| {
+                let (ast, vd_output_anchor_id) = ast.with_next_anchor_id();
+                let (ast, vd_node_id) = ast.plus(crate::ast::node::ENode::VarDecl {
+                    name,
+                    r#type: ty,
+                    output_anchor: vd_output_anchor_id.clone(),
+                });
+                let ast = ast.plus_edge(vd_output_anchor_id, sink_input_anchor_id.clone());
+                acc.push((vd_node_id, x));
+                (ast, acc)
+            },
+        );
+
+        let layout = Self {
+            ast,
+            layout_nodes: self.layout_nodes.clone(),
+        }
+        ._plus_layout_node(&sink_node_id, Vec3::new(0.0, 0.0, -4.0));
+
+        vardecl_nodes
+            .into_iter()
+            .fold(layout, |layout, (node_id, x)| {
+                layout._plus_layout_node(&node_id, Vec3::new(x, 0.0, 4.0))
+            })
+    }
+
     pub fn plus_type_introduction(&self, r#type: crate::ast::node::EType, pos: Vec3) -> Self {
         let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
         let (ast, output_anchor_id) = ast.with_next_anchor_id();

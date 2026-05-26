@@ -771,6 +771,7 @@ fn handle_example_buttons(
             Interaction::Pressed => {
                 state.layout_ast = match kind {
                     ExampleButton::Sink => layout::LayoutAst::empty().plus_sink_example(),
+                    ExampleButton::VarDecl => layout::LayoutAst::empty().plus_vardecl_example(),
                     _ => layout::LayoutAst::empty().plus_sink_wall(),
                 };
                 pick.selected = None;

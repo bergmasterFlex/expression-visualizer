@@ -27,6 +27,11 @@ pub enum ENode {
         input_anchor: super::AnchorId,
         output_anchor: super::AnchorId,
     },
+    VarDecl {
+        name: String,
+        r#type: EType,
+        output_anchor: super::AnchorId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +69,7 @@ impl ENode {
                 r#type.to_string()
             }
             ENode::Match { .. } => "match true".to_string(),
+            ENode::VarDecl { name, r#type, .. } => format!("{}: {}", name, r#type.to_string()),
         }
     }
 
@@ -132,6 +138,9 @@ impl ENode {
                 ),
                 (output_anchor.clone(), super::EAnchor::Output),
             ],
+            ENode::VarDecl { output_anchor, .. } => {
+                vec![(output_anchor.clone(), super::EAnchor::Output)]
+            }
         }
     }
 }
