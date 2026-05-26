@@ -87,6 +87,41 @@ impl LayoutAst {
         ._plus_layout_node(&node_id, Vec3::new(0.0, 0.0, 0.0))
     }
 
+    pub fn plus_sink_wall(&self) -> Self {
+        let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
+        let (ast, node_id) = ast.plus(crate::ast::node::ENode::SinkWall {
+            input_anchor: input_anchor_id,
+        });
+        Self {
+            ast,
+            layout_nodes: self.layout_nodes.clone(),
+        }
+        ._plus_layout_node(&node_id, Vec3::new(0.0, 0.0, -4.0))
+    }
+
+    /// Example scene for the "Sink" example button: a SinkWall connected
+    /// to an Int(3) TypeIntroduction node sitting at the origin.
+    pub fn plus_sink_example(&self) -> Self {
+        let (ast, sink_input_anchor_id) = self.ast.with_next_anchor_id();
+        let (ast, sink_node_id) = ast.plus(crate::ast::node::ENode::SinkWall {
+            input_anchor: sink_input_anchor_id.clone(),
+        });
+        let (ast, ti_output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, ti_node_id) = ast.plus(crate::ast::node::ENode::TypeIntroduction {
+            r#type: crate::ast::node::EType::Int {
+                value: Some("3".to_string()),
+            },
+            output_anchor: ti_output_anchor_id.clone(),
+        });
+        let ast = ast.plus_edge(ti_output_anchor_id, sink_input_anchor_id);
+        Self {
+            ast,
+            layout_nodes: self.layout_nodes.clone(),
+        }
+        ._plus_layout_node(&sink_node_id, Vec3::new(0.0, 0.0, -4.0))
+        ._plus_layout_node(&ti_node_id, Vec3::new(0.0, 0.0, 0.0))
+    }
+
     pub fn plus_type_introduction(&self, r#type: crate::ast::node::EType, pos: Vec3) -> Self {
         let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
         let (ast, output_anchor_id) = ast.with_next_anchor_id();

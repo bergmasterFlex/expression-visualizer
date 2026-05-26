@@ -289,14 +289,14 @@ fn setup_scene(mut commands: Commands) {
     ));
 }
 
-/// Spawn two transparent grey walls at z = -10 and z = +10,
-/// spanning x ∈ [-30, 30] and y ∈ [-2, 2].
+/// Spawn the transparent grey front wall at z = +12,
+/// spanning x ∈ [-30, 30] and y ∈ [-3, 3].
 fn spawn_walls(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let wall_mesh = meshes.add(Cuboid::new(60.0, 6.0, 0.05));
+    let wall_mesh = meshes.add(Cuboid::new(40.0, 6.0, 0.05));
     let wall_material = materials.add(StandardMaterial {
         base_color: Color::srgba(0.5, 0.5, 0.5, 0.5),
         alpha_mode: AlphaMode::Blend,
@@ -304,13 +304,11 @@ fn spawn_walls(
         ..default()
     });
 
-    for z in [-12.0_f32, 12.0_f32] {
-        commands.spawn((
-            Mesh3d(wall_mesh.clone()),
-            MeshMaterial3d(wall_material.clone()),
-            Transform::from_xyz(0.0, 0.0, z),
-        ));
-    }
+    commands.spawn((
+        Mesh3d(wall_mesh),
+        MeshMaterial3d(wall_material),
+        Transform::from_xyz(0.0, 0.0, 12.0),
+    ));
 }
 
 /// Spawn the AST node meshes.
@@ -766,12 +764,15 @@ fn handle_example_buttons(
     mut rebuild: ResMut<NeedsRebuild>,
     mut pick: ResMut<PickState>,
 ) {
-    for (interaction, mut bg, children, _kind) in interaction_q.iter_mut() {
+    for (interaction, mut bg, children, kind) in interaction_q.iter_mut() {
         let mut color = text_color_q.get_mut(children[0]).unwrap();
 
         match *interaction {
             Interaction::Pressed => {
-                state.layout_ast = layout::LayoutAst::empty();
+                state.layout_ast = match kind {
+                    ExampleButton::Sink => layout::LayoutAst::empty().plus_sink_example(),
+                    _ => layout::LayoutAst::empty().plus_sink_wall(),
+                };
                 pick.selected = None;
                 pick.hovered = None;
                 rebuild.0 = true;

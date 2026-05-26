@@ -126,6 +126,58 @@ pub fn create_cone_mesh(radius: f32, height: f32, segments: u32) -> bevy::mesh::
     mesh
 }
 
+/// Build a square pyramid mesh with the base in the XY plane at z = 0
+/// and the apex at (0, 0, -depth). Flat shading via per-face normals.
+pub fn square_pyramid_z_mesh(base: f32, depth: f32) -> bevy::mesh::Mesh {
+    let h = base / 2.0;
+    let p0 = [-h, -h, 0.0];
+    let p1 = [h, -h, 0.0];
+    let p2 = [h, h, 0.0];
+    let p3 = [-h, h, 0.0];
+    let tip = [0.0, 0.0, -depth];
+
+    // Side faces wound so outward normals point away from the central axis;
+    // base faces wound so the outward normal points +Z (toward the camera).
+    let face_tris: [[[f32; 3]; 3]; 6] = [
+        [p0, tip, p1],
+        [p1, tip, p2],
+        [p2, tip, p3],
+        [p3, tip, p0],
+        [p0, p1, p2],
+        [p0, p2, p3],
+    ];
+
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(18);
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(18);
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(18);
+    for tri in face_tris.iter() {
+        let a = bevy::math::Vec3::from(tri[0]);
+        let b = bevy::math::Vec3::from(tri[1]);
+        let c = bevy::math::Vec3::from(tri[2]);
+        let n = (b - a).cross(c - a).normalize().to_array();
+        positions.push(tri[0]);
+        positions.push(tri[1]);
+        positions.push(tri[2]);
+        normals.push(n);
+        normals.push(n);
+        normals.push(n);
+        uvs.push([0.0, 0.0]);
+        uvs.push([1.0, 0.0]);
+        uvs.push([0.5, 1.0]);
+    }
+    let indices: Vec<u32> = (0..positions.len() as u32).collect();
+
+    let mut mesh = bevy::mesh::Mesh::new(
+        bevy::mesh::PrimitiveTopology::TriangleList,
+        bevy::asset::RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(bevy::mesh::Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(bevy::mesh::Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(bevy::mesh::Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_indices(bevy::mesh::Indices::U32(indices));
+    mesh
+}
+
 /// Creates a "bool" type mesh: two cones sharing a base at the origin,
 /// one pointing up (+Y) and one pointing down (-Y).
 pub fn create_bool_mesh(radius: f32, half_height: f32, segments: u32) -> bevy::mesh::Mesh {

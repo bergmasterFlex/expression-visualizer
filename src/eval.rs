@@ -80,7 +80,8 @@ pub fn eval_type(
         return Err("infinite edge loop".to_string());
     }
     match node {
-        crate::ast::node::ENode::Sink { input_anchor } => {
+        crate::ast::node::ENode::Sink { input_anchor }
+        | crate::ast::node::ENode::SinkWall { input_anchor } => {
             match ast
                 .get_connected_nodes_to_anchor(input_anchor.clone())
                 .first()

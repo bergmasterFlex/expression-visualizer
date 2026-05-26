@@ -416,6 +416,44 @@ pub fn layoutnode_to_rendernode(
                 offset: Vec2::ZERO,
             }],
         },
+        crate::ast::node::ENode::SinkWall { input_anchor } => RenderNode {
+            node: RenderObject {
+                mesh: crate::mesh::square_pyramid_z_mesh(6.0, 9.0),
+                material: StandardMaterial {
+                    base_color: Color::srgba(0.5, 0.5, 0.5, 0.5),
+                    alpha_mode: AlphaMode::Blend,
+                    cull_mode: None,
+                    ..default()
+                },
+                transform: node_pos_tf,
+            },
+            anchors: std::collections::HashMap::from([(
+                input_anchor.clone(),
+                RenderAnchor {
+                    normal: RenderObject {
+                        mesh: Sphere::new(0.12).mesh().ico(2).unwrap(),
+                        material: StandardMaterial {
+                            base_color: Color::srgb(0.3, 0.6, 1.0),
+                            emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
+                            unlit: true,
+                            ..default()
+                        },
+                        transform: node_pos_tf,
+                    },
+                    hovered: RenderObject {
+                        mesh: Sphere::new(0.12).mesh().ico(2).unwrap(),
+                        material: StandardMaterial {
+                            base_color: Color::srgb(0.5, 0.9, 1.0),
+                            emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
+                            unlit: true,
+                            ..default()
+                        },
+                        transform: node_pos_tf * Transform::from_scale(Vec3::splat(1.8)),
+                    },
+                },
+            )]),
+            labels: vec![],
+        },
         crate::ast::node::ENode::Sink { input_anchor } => {
             let color = Color::srgb(0.9, 0.0, 0.0);
             RenderNode {
