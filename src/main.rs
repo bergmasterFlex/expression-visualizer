@@ -821,6 +821,7 @@ fn handle_example_buttons(
                 state.layout_ast = match kind {
                     ExampleButton::Sink => layout::LayoutAst::empty().plus_sink_example(),
                     ExampleButton::VarDecl => layout::LayoutAst::empty().plus_vardecl_example(),
+                    ExampleButton::ConstDecl => layout::LayoutAst::empty().plus_constdecl_example(),
                     ExampleButton::FuncCall => {
                         let decl = state
                             .function_declarations

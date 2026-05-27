@@ -122,6 +122,29 @@ impl LayoutAst {
         ._plus_layout_node(&ti_node_id, Vec3::new(0.0, 0.0, 0.0))
     }
 
+    /// Example scene for the "ConstDecl" example button: a SinkWall connected
+    /// to a Float(3.141) TypeIntroduction node sitting at the origin.
+    pub fn plus_constdecl_example(&self) -> Self {
+        let (ast, sink_input_anchor_id) = self.ast.with_next_anchor_id();
+        let (ast, sink_node_id) = ast.plus(crate::ast::node::ENode::SinkWall {
+            input_anchor: sink_input_anchor_id.clone(),
+        });
+        let (ast, ti_output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, ti_node_id) = ast.plus(crate::ast::node::ENode::TypeIntroduction {
+            r#type: crate::ast::node::EType::Float {
+                value: Some("3.141".to_string()),
+            },
+            output_anchor: ti_output_anchor_id.clone(),
+        });
+        let ast = ast.plus_edge(ti_output_anchor_id, sink_input_anchor_id);
+        Self {
+            ast,
+            layout_nodes: self.layout_nodes.clone(),
+        }
+        ._plus_layout_node(&sink_node_id, Vec3::new(0.0, 0.0, -4.0))
+        ._plus_layout_node(&ti_node_id, Vec3::new(0.0, 0.0, 0.0))
+    }
+
     /// Example scene for the "FuncCall" example button: a SinkWall at the back
     /// wall, a FunctionCall node in the centre using the given declaration
     /// (intended: `charAt`), and one TypeIntroduction per input wired in front
