@@ -1,5 +1,13 @@
 pub mod node;
 
+use bevy::prelude::Color;
+
+#[derive(Clone, Debug)]
+pub struct Edge {
+    pub to: AnchorId,
+    pub color: Color,
+}
+
 #[derive(Clone)]
 pub struct Ast {
     next_node_id: node::Id,
@@ -7,7 +15,7 @@ pub struct Ast {
     pub nodes: std::collections::HashMap<node::Id, node::ENode>,
     pub anchors: std::collections::HashMap<AnchorId, EAnchor>,
     pub anchor_to_node: std::collections::HashMap<AnchorId, node::Id>,
-    pub edges: std::collections::HashMap<AnchorId, Vec<AnchorId>>,
+    pub edges: std::collections::HashMap<AnchorId, Vec<Edge>>,
 }
 
 impl Ast {
@@ -37,6 +45,11 @@ impl Ast {
     }
 
     pub fn plus_edge(&self, from: AnchorId, to: AnchorId) -> Self {
+        self.plus_edge_colored(from, to, crate::colors::WHITE)
+    }
+
+    pub fn plus_edge_colored(&self, from: AnchorId, to: AnchorId, color: Color) -> Self {
+        let edge = Edge { to, color };
         Self {
             next_node_id: self.next_node_id.clone(),
             next_anchor_id: self.next_anchor_id.clone(),
@@ -49,8 +62,8 @@ impl Ast {
                 .into_iter()
                 .chain(vec![(
                     from.clone(),
-                    self.edges.get(&from).map_or(vec![to.clone()], |anchors| {
-                        anchors.clone().into_iter().chain(vec![to]).collect()
+                    self.edges.get(&from).map_or(vec![edge.clone()], |edges| {
+                        edges.clone().into_iter().chain(vec![edge]).collect()
                     }),
                 )])
                 .collect(),
@@ -128,9 +141,9 @@ impl Ast {
     pub fn get_connected_nodes_to_anchor(&self, anchor: AnchorId) -> Vec<node::Id> {
         self.edges
             .iter()
-            .flat_map(|(from, tos)| tos.iter().map(|to| (from.clone(), to)))
-            .filter_map(|(from, to)| {
-                if *to == anchor {
+            .flat_map(|(from, edges)| edges.iter().map(|e| (from.clone(), e)))
+            .filter_map(|(from, edge)| {
+                if edge.to == anchor {
                     Some(self.anchor_to_node.get(&from).unwrap().clone())
                 } else {
                     None

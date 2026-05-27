@@ -10,6 +10,7 @@ pub struct LayoutNode {
 pub struct LayoutEdge {
     pub from_anchor: LayoutAnchor,
     pub to_anchor: LayoutAnchor,
+    pub color: Color,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +72,18 @@ impl LayoutAst {
     pub fn plus_edge(&self, from: crate::ast::AnchorId, to: crate::ast::AnchorId) -> Self {
         Self {
             ast: self.ast.plus_edge(from, to),
+            layout_nodes: self.layout_nodes.clone(),
+        }
+    }
+
+    pub fn plus_edge_colored(
+        &self,
+        from: crate::ast::AnchorId,
+        to: crate::ast::AnchorId,
+        color: Color,
+    ) -> Self {
+        Self {
+            ast: self.ast.plus_edge_colored(from, to, color),
             layout_nodes: self.layout_nodes.clone(),
         }
     }
@@ -497,14 +510,12 @@ impl LayoutAst {
         self.ast
             .edges
             .iter()
-            .flat_map(|(from_anchor_id, to_anchor_ids)| {
-                to_anchor_ids
-                    .clone()
-                    .into_iter()
-                    .map(|to_anchor_id| LayoutEdge {
-                        from_anchor: self.layout_anchor(from_anchor_id.clone()),
-                        to_anchor: self.layout_anchor(to_anchor_id.clone()),
-                    })
+            .flat_map(|(from_anchor_id, edges)| {
+                edges.clone().into_iter().map(|edge| LayoutEdge {
+                    from_anchor: self.layout_anchor(from_anchor_id.clone()),
+                    to_anchor: self.layout_anchor(edge.to.clone()),
+                    color: edge.color,
+                })
             })
             .collect()
     }

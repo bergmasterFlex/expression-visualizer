@@ -1,5 +1,6 @@
 mod ast;
 mod camera;
+mod colors;
 mod eval;
 mod grid;
 mod layout;
@@ -129,6 +130,7 @@ impl EAnchor {
 pub struct Edge {
     pub from_anchor: Entity,
     pub to_anchor: Entity,
+    pub color: Color,
 }
 
 pub struct DragInfo {
@@ -432,6 +434,7 @@ fn spawn_ast_nodes(
             Edge {
                 from_anchor: *anchor_entities.get(&e.from_anchor.anchor_id).unwrap(),
                 to_anchor: *anchor_entities.get(&e.to_anchor.anchor_id).unwrap(),
+                color: e.color,
             },
             AstSceneEntity,
         ));
@@ -1660,7 +1663,7 @@ fn draw_edges_gizmos(edges: Query<&Edge>, transforms: Query<&GlobalTransform>, m
         ) else {
             continue;
         };
-        gizmos.line(from.translation(), to.translation(), Color::WHITE);
+        gizmos.line(from.translation(), to.translation(), edge.color);
     }
 }
 
