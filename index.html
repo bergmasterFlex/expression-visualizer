@@ -15,12 +15,16 @@
       const fill  = el.querySelector('.boot-bar-fill');
       const bar   = el.querySelector('.boot-bar');
       const mb = b => (b / 1048576).toFixed(1);
+      const pctEl = el.querySelector('.boot-pct');
       if (total && received <= total * 1.05) {
         const pct = Math.min(100, (received / total) * 100);
-        stats.textContent = `${mb(received)} / ${mb(total)} MB  (${pct | 0}%)`;
+        pctEl.textContent = `${pct | 0}%`;
+        pctEl.style.display = '';
+        stats.textContent = `${mb(received)} / ${mb(total)} MB`;
         fill.style.width = pct + '%';
         bar.style.display = '';
       } else {
+        pctEl.style.display = 'none';
         stats.textContent = `${mb(received)} MB`;
         bar.style.display = 'none';
       }
@@ -118,7 +122,13 @@
       border-radius: 50%;
       animation: boot-spin 0.9s linear infinite;
     }
-    #boot-loader .boot-text { font-size: 13px; color: #E8E4DE; }
+    #boot-loader .boot-text { font-size: 12px; color: #4A4A5E; }
+    #boot-loader .boot-pct {
+      font-size: 28px; font-weight: 700;
+      color: #E8E4DE;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: -0.5px;
+    }
     #boot-loader .boot-bar {
       width: 240px; height: 6px;
       background: #1a1a2e; border-radius: 3px;
@@ -141,6 +151,7 @@
   <div id="boot-loader" role="status" aria-live="polite">
     <div class="boot-spinner"></div>
     <div class="boot-text">Loading WASM bundle…</div>
+    <div class="boot-pct">0%</div>
     <div class="boot-bar"><div class="boot-bar-fill"></div></div>
     <div class="boot-stats">0.0 MB</div>
   </div>
