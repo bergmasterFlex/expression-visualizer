@@ -7,11 +7,10 @@
   <script>
   (() => {
     const WASM_RE = /_bg\.wasm(\?|$)/;
-    // Approximate unpacked WASM size. Used as a floor for the progress total
-    // because nginx ships Content-Length as the *gzipped* size while the
-    // ReadableStream yields decompressed bytes — without a floor, the bar
-    // would jump past 100 % once we've read more than the gzipped length.
-    const ASSUMED_TOTAL = 95 * 1024 * 1024;
+    // Fallback total used only when Content-Length is missing.
+    // Typically Content-Length is present and matches the bytes we read
+    // (gzipped or not), so this is just a guard rail.
+    const FALLBACK_TOTAL = 95 * 1024 * 1024;
     const origFetch = window.fetch.bind(window);
     const update = (received, headerTotal) => {
       const el = document.getElementById('boot-loader');
@@ -20,7 +19,7 @@
       const fill  = el.querySelector('.boot-bar-fill');
       const pctEl = el.querySelector('.boot-pct');
       const mb = b => (b / 1048576).toFixed(1);
-      const effTotal = Math.max(ASSUMED_TOTAL, headerTotal || 0, received);
+      const effTotal = Math.max(headerTotal || FALLBACK_TOTAL, received);
       const pct = Math.min(100, (received / effTotal) * 100);
       pctEl.textContent = `${pct | 0}%`;
       fill.style.width = pct + '%';
