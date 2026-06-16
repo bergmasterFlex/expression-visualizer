@@ -7,19 +7,21 @@
   <script>
   (() => {
     const WASM_RE = /_bg\.wasm(\?|$)/;
-    // Fallback total used only when Content-Length is missing.
-    // Typically Content-Length is present and matches the bytes we read
-    // (gzipped or not), so this is just a guard rail.
-    const FALLBACK_TOTAL = 95 * 1024 * 1024;
+    // Approximate gzipped WASM transfer size. nginx serves the bundle with
+    // on-the-fly gzip + chunked transfer encoding, so the stream yields the
+    // compressed bytes (~26 MB) and Content-Length is absent. The Math.max
+    // with `received` caps the bar at 100 % if the bundle ever grows past
+    // this estimate — the MB readout will keep climbing in that case.
+    const APPROX_TOTAL = 26 * 1024 * 1024;
     const origFetch = window.fetch.bind(window);
-    const update = (received, headerTotal) => {
+    const update = (received) => {
       const el = document.getElementById('boot-loader');
       if (!el) return;
       const stats = el.querySelector('.boot-stats');
       const fill  = el.querySelector('.boot-bar-fill');
       const pctEl = el.querySelector('.boot-pct');
       const mb = b => (b / 1048576).toFixed(1);
-      const effTotal = Math.max(headerTotal || FALLBACK_TOTAL, received);
+      const effTotal = Math.max(APPROX_TOTAL, received);
       const pct = Math.min(100, (received / effTotal) * 100);
       pctEl.textContent = `${pct | 0}%`;
       fill.style.width = pct + '%';
@@ -30,7 +32,6 @@
       if (!WASM_RE.test(url || '')) return origFetch(input, init);
       return origFetch(input, init).then(async (res) => {
         if (!res.ok || !res.body) return res;
-        const total = Number(res.headers.get('Content-Length')) || 0;
         const reader = res.body.getReader();
         const chunks = [];
         let received = 0;
@@ -39,7 +40,7 @@
           if (done) break;
           chunks.push(value);
           received += value.length;
-          update(received, total);
+          update(received);
         }
         return new Response(new Blob(chunks, { type: 'application/wasm' }), {
           status: res.status, statusText: res.statusText, headers: res.headers,
