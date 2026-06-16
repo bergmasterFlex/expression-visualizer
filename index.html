@@ -4,6 +4,56 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>AST Visualizer 3D — Bevy + WebGPU</title>
+  <script>
+  (() => {
+    const WASM_RE = /_bg\.wasm(\?|$)/;
+    const origFetch = window.fetch.bind(window);
+    const update = (received, total) => {
+      const el = document.getElementById('boot-loader');
+      if (!el) return;
+      const stats = el.querySelector('.boot-stats');
+      const fill  = el.querySelector('.boot-bar-fill');
+      const bar   = el.querySelector('.boot-bar');
+      const mb = b => (b / 1048576).toFixed(1);
+      if (total && received <= total * 1.05) {
+        const pct = Math.min(100, (received / total) * 100);
+        stats.textContent = `${mb(received)} / ${mb(total)} MB  (${pct | 0}%)`;
+        fill.style.width = pct + '%';
+        bar.style.display = '';
+      } else {
+        stats.textContent = `${mb(received)} MB`;
+        bar.style.display = 'none';
+      }
+    };
+    window.fetch = (input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (!WASM_RE.test(url || '')) return origFetch(input, init);
+      return origFetch(input, init).then(async (res) => {
+        if (!res.ok || !res.body) return res;
+        const total = Number(res.headers.get('Content-Length')) || 0;
+        const reader = res.body.getReader();
+        const chunks = [];
+        let received = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          received += value.length;
+          update(received, total);
+        }
+        return new Response(new Blob(chunks, { type: 'application/wasm' }), {
+          status: res.status, statusText: res.statusText, headers: res.headers,
+        });
+      });
+    };
+    addEventListener('TrunkApplicationStarted', () => {
+      const el = document.getElementById('boot-loader');
+      if (!el) return;
+      el.style.opacity = '0';
+      setTimeout(() => el.remove(), 400);
+    });
+  })();
+  </script>
   <link data-trunk rel="rust" data-wasm-opt="s" />
   <style>
     @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700;800&display=swap');
@@ -50,9 +100,51 @@
       pointer-events: auto;
     }
     .input-row label { color: #4A4A5E; font-size: 11px; }
+
+    /* ── Boot loader (visible until WASM init finishes) ───────── */
+    #boot-loader {
+      position: fixed; inset: 0; z-index: 100;
+      background: #08081a;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 14px;
+      color: #E8E4DE;
+      transition: opacity 0.4s ease-out;
+    }
+    #boot-loader .boot-spinner {
+      width: 28px; height: 28px;
+      border: 2px solid #22D3EE40;
+      border-top-color: #22D3EE;
+      border-radius: 50%;
+      animation: boot-spin 0.9s linear infinite;
+    }
+    #boot-loader .boot-text { font-size: 13px; color: #E8E4DE; }
+    #boot-loader .boot-bar {
+      width: 240px; height: 6px;
+      background: #1a1a2e; border-radius: 3px;
+      overflow: hidden;
+    }
+    #boot-loader .boot-bar-fill {
+      height: 100%; width: 0%;
+      background: #22D3EE;
+      transition: width 120ms linear;
+    }
+    #boot-loader .boot-stats {
+      font-size: 11px; color: #3A3A50;
+      font-variant-numeric: tabular-nums;
+    }
+    @keyframes boot-spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
+  <!-- Boot loader: visible until TrunkApplicationStarted fires -->
+  <div id="boot-loader" role="status" aria-live="polite">
+    <div class="boot-spinner"></div>
+    <div class="boot-text">Loading WASM bundle…</div>
+    <div class="boot-bar"><div class="boot-bar-fill"></div></div>
+    <div class="boot-stats">0.0 MB</div>
+  </div>
+
   <!-- Bevy renders into this canvas -->
   <canvas id="bevy-canvas"></canvas>
 
