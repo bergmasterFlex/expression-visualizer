@@ -7,27 +7,24 @@
   <script>
   (() => {
     const WASM_RE = /_bg\.wasm(\?|$)/;
+    // Approximate unpacked WASM size. Used as a floor for the progress total
+    // because nginx ships Content-Length as the *gzipped* size while the
+    // ReadableStream yields decompressed bytes — without a floor, the bar
+    // would jump past 100 % once we've read more than the gzipped length.
+    const ASSUMED_TOTAL = 95 * 1024 * 1024;
     const origFetch = window.fetch.bind(window);
-    const update = (received, total) => {
+    const update = (received, headerTotal) => {
       const el = document.getElementById('boot-loader');
       if (!el) return;
       const stats = el.querySelector('.boot-stats');
       const fill  = el.querySelector('.boot-bar-fill');
-      const bar   = el.querySelector('.boot-bar');
-      const mb = b => (b / 1048576).toFixed(1);
       const pctEl = el.querySelector('.boot-pct');
-      if (total && received <= total * 1.05) {
-        const pct = Math.min(100, (received / total) * 100);
-        pctEl.textContent = `${pct | 0}%`;
-        pctEl.style.display = '';
-        stats.textContent = `${mb(received)} / ${mb(total)} MB`;
-        fill.style.width = pct + '%';
-        bar.style.display = '';
-      } else {
-        pctEl.style.display = 'none';
-        stats.textContent = `${mb(received)} MB`;
-        bar.style.display = 'none';
-      }
+      const mb = b => (b / 1048576).toFixed(1);
+      const effTotal = Math.max(ASSUMED_TOTAL, headerTotal || 0, received);
+      const pct = Math.min(100, (received / effTotal) * 100);
+      pctEl.textContent = `${pct | 0}%`;
+      fill.style.width = pct + '%';
+      stats.textContent = `${mb(received)} MB`;
     };
     window.fetch = (input, init) => {
       const url = typeof input === 'string' ? input : input.url;
