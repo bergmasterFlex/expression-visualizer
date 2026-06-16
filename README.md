@@ -2,7 +2,7 @@
 
 A 3D Abstract Syntax Tree visualizer for a
 operator support, built with **Rust** and **Bevy**, compiled to **Native**
-or **WebAssembly** with **WebGL2**.
+or **WebAssembly** with **WebGPU**.
 
 ## Features
 Todo
@@ -10,7 +10,7 @@ Todo
 
 ## Build & Run
 
-### WebGL (browser)
+### WebGPU (browser)
 
 ```sh
 trunk serve --release

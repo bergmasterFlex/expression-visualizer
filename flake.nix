@@ -1,5 +1,5 @@
 {
-  description = "3D AST Visualizer — Bevy + WebGL/WASM";
+  description = "3D AST Visualizer — Bevy + WebGPU/WASM";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -34,10 +34,10 @@
         # doesn't need these — browsers don't link against alsa/x11.
         bevyNativeDeps = with pkgs; [
           # X11
-          xorg.libX11
-          xorg.libXcursor
-          xorg.libXi
-          xorg.libXrandr
+          libx11
+          libxcursor
+          libxi
+          libxrandr
           # Wayland
           libxkbcommon
           wayland

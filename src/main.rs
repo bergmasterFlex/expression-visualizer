@@ -1914,7 +1914,7 @@ fn main() {
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: "AST Visualizer 3D — Bevy + WebGL".into(),
+                    title: "AST Visualizer 3D — Bevy + WebGPU".into(),
                     canvas: Some("#bevy-canvas".into()),
                     fit_canvas_to_parent: true,
                     prevent_default_event_handling: true,
