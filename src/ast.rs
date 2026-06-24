@@ -158,7 +158,10 @@ pub struct AnchorId(usize);
 
 #[derive(Clone, Debug)]
 pub enum EAnchor {
-    Input { order_num: usize, name: Option<String> },
+    Input {
+        order_num: usize,
+        name: Option<String>,
+    },
     Output,
 }
 

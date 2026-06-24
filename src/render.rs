@@ -570,11 +570,7 @@ pub fn layoutnode_to_rendernode(
                         ..default()
                     },
                     transform: node_pos_tf
-                        * Transform::from_translation(Vec3::new(
-                            w * 3.0 - 3.0,
-                            l * 1.5 - 1.5,
-                            0.0,
-                        )),
+                        * Transform::from_translation(Vec3::new(w * 3.0 - 3.0, l * 1.5 - 1.5, 0.0)),
                 },
                 anchors: std::collections::HashMap::new(),
                 labels: vec![],

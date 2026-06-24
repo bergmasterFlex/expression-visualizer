@@ -248,6 +248,89 @@ struct TextInputDisplay;
 #[derive(Component)]
 struct TextInputBox;
 
+// ── Stepwise evaluation ─────────────────────────────────────
+
+#[derive(Clone, Default)]
+enum EvalPhase {
+    #[default]
+    Idle,
+    ErrorModal(String),
+    VarDeclPrompt {
+        /// Stable node_id order; values mirror what the user has typed so far.
+        inputs: Vec<(ast::node::Id, String)>,
+    },
+    Running {
+        steps: Vec<std::collections::HashMap<ast::node::Id, String>>,
+        current: usize,
+    },
+}
+
+#[derive(Resource)]
+struct EvalState {
+    phase: EvalPhase,
+    rng: rand::rngs::SmallRng,
+}
+
+impl Default for EvalState {
+    fn default() -> Self {
+        use rand::SeedableRng;
+        Self {
+            phase: EvalPhase::Idle,
+            rng: rand::rngs::SmallRng::from_os_rng(),
+        }
+    }
+}
+
+fn is_evaluating(eval: &EvalState) -> bool {
+    !matches!(eval.phase, EvalPhase::Idle)
+}
+
+fn modal_is_open(eval: &EvalState) -> bool {
+    matches!(
+        eval.phase,
+        EvalPhase::ErrorModal(_) | EvalPhase::VarDeclPrompt { .. }
+    )
+}
+
+#[derive(Component)]
+struct EvaluateButton;
+
+/// Tags any entity that belongs to the currently-displayed modal so we can
+/// nuke the whole subtree on phase transition.
+#[derive(Component)]
+struct ModalEntity;
+
+#[derive(Component)]
+struct ModalOkButton;
+#[derive(Component)]
+struct ModalCancelButton;
+#[derive(Component)]
+struct ModalEvaluateButton;
+
+/// Marker on a TextInputBox inside the VarDecl modal so we can collect
+/// typed values per VarDecl when the user confirms.
+#[derive(Component)]
+struct ModalVarDeclInput {
+    node_id: ast::node::Id,
+}
+
+/// Tags entities that make up the Prev/Next/Exit bottom bar.
+#[derive(Component)]
+struct EvalStepBarEntity;
+
+#[derive(Component)]
+struct PrevStepButton;
+#[derive(Component)]
+struct NextStepButton;
+#[derive(Component)]
+struct ExitEvaluationButton;
+
+/// World-space text node showing a node's current evaluated value.
+#[derive(Component)]
+struct ValueLabel {
+    node_id: ast::node::Id,
+}
+
 // ── Colors ──────────────────────────────────────────────────
 
 // ── Systems ─────────────────────────────────────────────────
@@ -549,11 +632,20 @@ fn spawn_ui(mut commands: Commands) {
         Display::Flex,
     );
     for (label, action) in [
-        ("Add Int Introduction", EAstActionButton::AddIntIntroductionButton),
-        ("Add Bool Introduction", EAstActionButton::AddBoolIntroductionButton),
+        (
+            "Add Int Introduction",
+            EAstActionButton::AddIntIntroductionButton,
+        ),
+        (
+            "Add Bool Introduction",
+            EAstActionButton::AddBoolIntroductionButton,
+        ),
         ("Add Function Call", EAstActionButton::AddFunctionCallButton),
         ("Add Match", EAstActionButton::AddMatchButton),
-        ("Add Int Elimination", EAstActionButton::AddIntEliminationButton),
+        (
+            "Add Int Elimination",
+            EAstActionButton::AddIntEliminationButton,
+        ),
     ] {
         y_offset += 36.0;
         spawn_ui_button(
@@ -586,6 +678,51 @@ fn spawn_ui(mut commands: Commands) {
         );
         y_offset += 36.0;
     }
+
+    // "Evaluate" button at the bottom-right corner — visible in both
+    // Playground and Examples modes.
+    spawn_corner_button(
+        &mut commands,
+        "Evaluate",
+        EvaluateButton,
+        Val::Px(12.0),
+        Val::Px(12.0),
+    );
+}
+
+fn spawn_corner_button<C: Bundle>(
+    commands: &mut Commands,
+    label: &str,
+    component: C,
+    right: Val,
+    bottom: Val,
+) {
+    commands
+        .spawn((
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Auto,
+                left: Val::Auto,
+                right,
+                bottom,
+                padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+            component,
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new(label),
+                TextFont {
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.6, 0.6, 0.7)),
+            ));
+        });
 }
 
 fn spawn_ui_button<C: Bundle>(
@@ -687,7 +824,11 @@ fn handle_tab_buttons(
     >,
     mut text_q: Query<&mut TextColor>,
     mut mode: ResMut<UiMode>,
+    eval: Res<EvalState>,
 ) {
+    if is_evaluating(&eval) {
+        return;
+    }
     for (interaction, _, _) in playground_q.iter() {
         if *interaction == Interaction::Pressed {
             *mode = UiMode::Playground;
@@ -783,7 +924,11 @@ fn handle_delete_node_button(
     mut pick: ResMut<PickState>,
     mut commands: Commands,
     scene_entities: Query<Entity, With<AstSceneEntity>>,
+    eval: Res<EvalState>,
 ) {
+    if is_evaluating(&eval) {
+        return;
+    }
     for (interaction, mut bg, children) in interaction_q.iter_mut() {
         let mut color = text_color_q.get_mut(children[0]).unwrap();
 
@@ -808,14 +953,23 @@ fn handle_delete_node_button(
 
 fn handle_example_buttons(
     mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children, &ExampleButton),
+        (
+            &Interaction,
+            &mut BackgroundColor,
+            &Children,
+            &ExampleButton,
+        ),
         With<Interaction>,
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut state: ResMut<AstState>,
     mut rebuild: ResMut<NeedsRebuild>,
     mut pick: ResMut<PickState>,
+    eval: Res<EvalState>,
 ) {
+    if is_evaluating(&eval) {
+        return;
+    }
     for (interaction, mut bg, children, kind) in interaction_q.iter_mut() {
         let mut color = text_color_q.get_mut(children[0]).unwrap();
 
@@ -871,7 +1025,11 @@ fn handle_add_node_button(
     mut pick: ResMut<PickState>,
     mut commands: Commands,
     scene_entities: Query<Entity, With<AstSceneEntity>>,
+    eval: Res<EvalState>,
 ) {
+    if is_evaluating(&eval) {
+        return;
+    }
     for (interaction, mut bg, children, action) in interaction_q.iter_mut() {
         let mut color = text_color_q.get_mut(children[0]).unwrap();
 
@@ -939,6 +1097,620 @@ fn handle_add_node_button(
                 color.0 = Color::srgb(0.6, 0.6, 0.7);
             }
         }
+    }
+}
+
+fn handle_evaluate_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (With<Interaction>, With<EvaluateButton>),
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+    mut eval: ResMut<EvalState>,
+    state: Res<AstState>,
+) {
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
+        match *interaction {
+            Interaction::Pressed => {
+                if is_evaluating(&eval) {
+                    // Already showing a modal or running — ignore.
+                    continue;
+                }
+                let ast = &state.layout_ast.ast;
+                if !eval::sink_has_input(ast) {
+                    eval.phase = EvalPhase::ErrorModal(
+                        "Cannot evaluate, because no node is connected to the sink".to_string(),
+                    );
+                    continue;
+                }
+                let var_decls = eval::collect_var_decls(ast);
+                if !var_decls.is_empty() {
+                    eval.phase = EvalPhase::VarDeclPrompt {
+                        inputs: var_decls
+                            .into_iter()
+                            .map(|(id, _name)| (id, String::new()))
+                            .collect(),
+                    };
+                } else {
+                    let initial =
+                        eval::initial_values(ast, &std::collections::HashMap::new(), &mut eval.rng);
+                    eval.phase = EvalPhase::Running {
+                        steps: vec![initial],
+                        current: 0,
+                    };
+                }
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
+                color.0 = Color::srgb(0.6, 0.6, 0.7);
+            }
+        }
+    }
+}
+
+/// Identifier of the currently displayed modal kind, used by sync_modal_ui
+/// to detect phase transitions without comparing full enum payloads.
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
+enum ModalKind {
+    #[default]
+    None,
+    Error,
+    VarDeclPrompt,
+}
+
+fn modal_kind(phase: &EvalPhase) -> ModalKind {
+    match phase {
+        EvalPhase::ErrorModal(_) => ModalKind::Error,
+        EvalPhase::VarDeclPrompt { .. } => ModalKind::VarDeclPrompt,
+        _ => ModalKind::None,
+    }
+}
+
+fn sync_modal_ui(
+    mut commands: Commands,
+    eval: Res<EvalState>,
+    state: Res<AstState>,
+    modal_q: Query<Entity, With<ModalEntity>>,
+    mut last_kind: Local<ModalKind>,
+) {
+    let kind_now = modal_kind(&eval.phase);
+    if kind_now == *last_kind {
+        return;
+    }
+    *last_kind = kind_now;
+    // Tear down the previous modal.
+    for e in modal_q.iter() {
+        commands.entity(e).despawn();
+    }
+
+    match &eval.phase {
+        EvalPhase::ErrorModal(msg) => {
+            spawn_error_modal(&mut commands, msg.clone());
+        }
+        EvalPhase::VarDeclPrompt { inputs } => {
+            let ast = &state.layout_ast.ast;
+            let rows: Vec<(ast::node::Id, String)> = inputs
+                .iter()
+                .map(|(id, _)| {
+                    let name = match ast.nodes.get(id) {
+                        Some(ast::node::ENode::VarDecl { name, .. }) => name.clone(),
+                        _ => "?".to_string(),
+                    };
+                    (id.clone(), name)
+                })
+                .collect();
+            spawn_vardecl_modal(&mut commands, rows);
+        }
+        _ => {}
+    }
+}
+
+fn spawn_error_modal(commands: &mut Commands, msg: String) {
+    commands
+        .spawn((
+            backdrop_node(),
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            GlobalZIndex(50),
+            ModalEntity,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                panel_node(),
+                BackgroundColor(Color::srgba(0.10, 0.10, 0.16, 0.98)),
+                BorderColor::all(Color::srgb(0.25, 0.25, 0.4)),
+                ModalEntity,
+            ))
+            .with_children(|panel| {
+                panel.spawn((
+                    Text::new(msg),
+                    TextFont {
+                        font_size: 16.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.95, 0.95, 1.0)),
+                    Node {
+                        margin: UiRect::all(Val::Px(12.0)),
+                        ..default()
+                    },
+                    ModalEntity,
+                ));
+                panel
+                    .spawn((
+                        Button,
+                        modal_button_node(),
+                        BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
+                        ModalOkButton,
+                        ModalEntity,
+                    ))
+                    .with_children(|b| {
+                        b.spawn((
+                            Text::new("OK"),
+                            TextFont {
+                                font_size: 14.0,
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                        ));
+                    });
+            });
+        });
+}
+
+fn spawn_vardecl_modal(commands: &mut Commands, rows: Vec<(ast::node::Id, String)>) {
+    commands
+        .spawn((
+            backdrop_node(),
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            GlobalZIndex(50),
+            ModalEntity,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                panel_node(),
+                BackgroundColor(Color::srgba(0.10, 0.10, 0.16, 0.98)),
+                BorderColor::all(Color::srgb(0.25, 0.25, 0.4)),
+                ModalEntity,
+            ))
+            .with_children(|panel| {
+                panel.spawn((
+                    Text::new("Enter values for the variable declarations:"),
+                    TextFont {
+                        font_size: 16.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.95, 0.95, 1.0)),
+                    Node {
+                        margin: UiRect::all(Val::Px(8.0)),
+                        ..default()
+                    },
+                    ModalEntity,
+                ));
+                for (node_id, name) in rows {
+                    panel
+                        .spawn((
+                            Node {
+                                flex_direction: FlexDirection::Row,
+                                align_items: AlignItems::Center,
+                                margin: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                                ..default()
+                            },
+                            ModalEntity,
+                        ))
+                        .with_children(|row| {
+                            row.spawn((
+                                Text::new(format!("{}:", name)),
+                                TextFont {
+                                    font_size: 14.0,
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                                Node {
+                                    width: Val::Px(120.0),
+                                    ..default()
+                                },
+                                ModalEntity,
+                            ));
+                            row.spawn((
+                                Button,
+                                Node {
+                                    padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                                    min_width: Val::Px(180.0),
+                                    border: UiRect::all(Val::Px(1.5)),
+                                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(Color::srgba(0.06, 0.06, 0.12, 0.95)),
+                                BorderColor::all(Color::srgb(0.12, 0.12, 0.24)),
+                                TextInputBox,
+                                TextInput {
+                                    value: String::new(),
+                                    focused: false,
+                                    cursor: 0,
+                                },
+                                ModalVarDeclInput { node_id },
+                                ModalEntity,
+                            ))
+                            .with_children(|input| {
+                                input.spawn((
+                                    Text::new(""),
+                                    TextFont {
+                                        font_size: 14.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::srgb(0.91, 0.89, 0.87)),
+                                    TextInputDisplay,
+                                    ModalEntity,
+                                ));
+                            });
+                        });
+                }
+                panel
+                    .spawn((
+                        Node {
+                            flex_direction: FlexDirection::Row,
+                            justify_content: JustifyContent::FlexEnd,
+                            margin: UiRect::all(Val::Px(8.0)),
+                            ..default()
+                        },
+                        ModalEntity,
+                    ))
+                    .with_children(|btns| {
+                        btns.spawn((
+                            Button,
+                            modal_button_node(),
+                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
+                            ModalCancelButton,
+                            ModalEntity,
+                        ))
+                        .with_children(|b| {
+                            b.spawn((
+                                Text::new("Cancel"),
+                                TextFont {
+                                    font_size: 14.0,
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                            ));
+                        });
+                        btns.spawn((
+                            Button,
+                            modal_button_node(),
+                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
+                            ModalEvaluateButton,
+                            ModalEntity,
+                        ))
+                        .with_children(|b| {
+                            b.spawn((
+                                Text::new("Evaluate"),
+                                TextFont {
+                                    font_size: 14.0,
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                            ));
+                        });
+                    });
+            });
+        });
+}
+
+fn backdrop_node() -> Node {
+    Node {
+        position_type: PositionType::Absolute,
+        top: Val::Px(0.0),
+        left: Val::Px(0.0),
+        width: Val::Percent(100.0),
+        height: Val::Percent(100.0),
+        justify_content: JustifyContent::Center,
+        align_items: AlignItems::Center,
+        ..default()
+    }
+}
+
+fn panel_node() -> Node {
+    Node {
+        flex_direction: FlexDirection::Column,
+        align_items: AlignItems::Stretch,
+        padding: UiRect::all(Val::Px(16.0)),
+        min_width: Val::Px(360.0),
+        border_radius: BorderRadius::all(Val::Px(8.0)),
+        border: UiRect::all(Val::Px(1.0)),
+        ..default()
+    }
+}
+
+fn modal_button_node() -> Node {
+    Node {
+        padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+        margin: UiRect::axes(Val::Px(6.0), Val::Px(0.0)),
+        border_radius: BorderRadius::all(Val::Px(6.0)),
+        ..default()
+    }
+}
+
+fn handle_modal_ok_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (With<Interaction>, With<ModalOkButton>),
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+    mut eval: ResMut<EvalState>,
+) {
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
+        match *interaction {
+            Interaction::Pressed => {
+                eval.phase = EvalPhase::Idle;
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
+                color.0 = Color::srgb(1.0, 1.0, 1.0);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+        }
+    }
+}
+
+fn handle_modal_cancel_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (With<Interaction>, With<ModalCancelButton>),
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+    mut eval: ResMut<EvalState>,
+) {
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
+        match *interaction {
+            Interaction::Pressed => {
+                eval.phase = EvalPhase::Idle;
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
+                color.0 = Color::srgb(1.0, 1.0, 1.0);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+        }
+    }
+}
+
+fn handle_modal_evaluate_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (With<Interaction>, With<ModalEvaluateButton>),
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+    mut eval: ResMut<EvalState>,
+    state: Res<AstState>,
+    input_q: Query<(&ModalVarDeclInput, &TextInput)>,
+) {
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
+        match *interaction {
+            Interaction::Pressed => {
+                let mut user_values: std::collections::HashMap<ast::node::Id, String> =
+                    std::collections::HashMap::new();
+                for (m, input) in input_q.iter() {
+                    user_values.insert(m.node_id.clone(), input.value.clone());
+                }
+                let initial =
+                    eval::initial_values(&state.layout_ast.ast, &user_values, &mut eval.rng);
+                eval.phase = EvalPhase::Running {
+                    steps: vec![initial],
+                    current: 0,
+                };
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
+                color.0 = Color::srgb(1.0, 1.0, 1.0);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+        }
+    }
+}
+
+fn sync_eval_step_bar(
+    mut commands: Commands,
+    eval: Res<EvalState>,
+    bar_q: Query<Entity, With<EvalStepBarEntity>>,
+    mut was_running: Local<bool>,
+) {
+    let running_now = matches!(eval.phase, EvalPhase::Running { .. });
+    if running_now == *was_running {
+        return;
+    }
+    for e in bar_q.iter() {
+        commands.entity(e).despawn();
+    }
+    *was_running = running_now;
+    if !running_now {
+        return;
+    }
+    // Spawn Prev / Next / Exit, right-aligned bottom.
+    spawn_corner_button(
+        &mut commands,
+        "Exit Evaluation",
+        (ExitEvaluationButton, EvalStepBarEntity),
+        Val::Px(12.0),
+        Val::Px(12.0),
+    );
+    spawn_corner_button(
+        &mut commands,
+        "Next",
+        (NextStepButton, EvalStepBarEntity),
+        Val::Px(170.0),
+        Val::Px(12.0),
+    );
+    spawn_corner_button(
+        &mut commands,
+        "Prev",
+        (PrevStepButton, EvalStepBarEntity),
+        Val::Px(240.0),
+        Val::Px(12.0),
+    );
+}
+
+fn handle_eval_step_buttons(
+    prev_q: Query<&Interaction, (With<PrevStepButton>, Changed<Interaction>)>,
+    next_q: Query<&Interaction, (With<NextStepButton>, Changed<Interaction>)>,
+    exit_q: Query<&Interaction, (With<ExitEvaluationButton>, Changed<Interaction>)>,
+    mut eval: ResMut<EvalState>,
+    state: Res<AstState>,
+) {
+    if exit_q.iter().any(|i| *i == Interaction::Pressed) {
+        eval.phase = EvalPhase::Idle;
+        return;
+    }
+    if prev_q.iter().any(|i| *i == Interaction::Pressed) {
+        if let EvalPhase::Running { current, .. } = &mut eval.phase {
+            if *current > 0 {
+                *current -= 1;
+            }
+        }
+    }
+    if next_q.iter().any(|i| *i == Interaction::Pressed) {
+        // Split borrow: take a mutable reference to the whole struct, then
+        // disjoint-borrow `phase` and `rng` simultaneously.
+        let EvalState { phase, rng } = &mut *eval;
+        if let EvalPhase::Running { steps, current } = phase {
+            if let Some(snapshot) = eval::step_next(&state.layout_ast.ast, &steps[*current], rng) {
+                steps.truncate(*current + 1);
+                steps.push(snapshot);
+                *current += 1;
+            }
+        }
+    }
+}
+
+fn update_step_button_visuals(
+    eval: Res<EvalState>,
+    state: Res<AstState>,
+    mut prev_q: Query<
+        (&mut BackgroundColor, &Children),
+        (With<PrevStepButton>, Without<NextStepButton>),
+    >,
+    mut next_q: Query<
+        (&mut BackgroundColor, &Children),
+        (With<NextStepButton>, Without<PrevStepButton>),
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+) {
+    let (prev_enabled, next_enabled) = match &eval.phase {
+        EvalPhase::Running { steps, current } => {
+            let next_possible = eval::can_step_next(&state.layout_ast.ast, &steps[*current]);
+            (*current > 0, next_possible)
+        }
+        _ => (false, false),
+    };
+    let apply = |enabled: bool, bg: &mut BackgroundColor, text_color: &mut TextColor| {
+        if enabled {
+            bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
+            text_color.0 = Color::srgb(0.85, 0.85, 0.9);
+        } else {
+            bg.0 = Color::srgba(0.10, 0.10, 0.13, 0.9);
+            text_color.0 = Color::srgb(0.35, 0.35, 0.4);
+        }
+    };
+    for (mut bg, children) in prev_q.iter_mut() {
+        if let Ok(mut c) = text_color_q.get_mut(children[0]) {
+            apply(prev_enabled, &mut *bg, &mut *c);
+        }
+    }
+    for (mut bg, children) in next_q.iter_mut() {
+        if let Ok(mut c) = text_color_q.get_mut(children[0]) {
+            apply(next_enabled, &mut *bg, &mut *c);
+        }
+    }
+}
+
+fn sync_evaluate_button_visibility(
+    eval: Res<EvalState>,
+    mut q: Query<&mut Node, With<EvaluateButton>>,
+) {
+    let running = matches!(eval.phase, EvalPhase::Running { .. });
+    let desired = if running {
+        Display::None
+    } else {
+        Display::Flex
+    };
+    for mut node in q.iter_mut() {
+        if node.display != desired {
+            node.display = desired;
+        }
+    }
+}
+
+fn sync_value_labels(
+    mut commands: Commands,
+    eval: Res<EvalState>,
+    state: Res<AstState>,
+    mut existing_q: Query<(Entity, &ValueLabel, &mut Text)>,
+) {
+    let snapshot: Option<&std::collections::HashMap<ast::node::Id, String>> = match &eval.phase {
+        EvalPhase::Running { steps, current } => Some(&steps[*current]),
+        _ => None,
+    };
+    let Some(snapshot) = snapshot else {
+        for (entity, _, _) in existing_q.iter() {
+            commands.entity(entity).despawn();
+        }
+        return;
+    };
+
+    let mut kept: std::collections::HashSet<ast::node::Id> = std::collections::HashSet::new();
+    for (entity, label, mut text) in existing_q.iter_mut() {
+        if let Some(value) = snapshot.get(&label.node_id) {
+            if text.0 != *value {
+                text.0 = value.clone();
+            }
+            kept.insert(label.node_id.clone());
+        } else {
+            commands.entity(entity).despawn();
+        }
+    }
+
+    for (id, value) in snapshot.iter() {
+        if kept.contains(id) {
+            continue;
+        }
+        let Some(layout_node) = state.layout_ast.layout_nodes.get(id) else {
+            continue;
+        };
+        let world_pos = layout_node.pos * Vec3::new(3.0, 1.5, 3.0);
+        commands.spawn((
+            Text::new(value.clone()),
+            TextFont {
+                font_size: 28.0,
+                ..default()
+            },
+            TextColor(Color::srgb(1.0, 0.95, 0.3)),
+            Node {
+                position_type: PositionType::Absolute,
+                ..default()
+            },
+            Visibility::Hidden,
+            WorldLabel {
+                world_pos,
+                offset: Vec2::new(60.0, 0.0),
+            },
+            ValueLabel {
+                node_id: id.clone(),
+            },
+        ));
     }
 }
 
@@ -1200,7 +1972,11 @@ fn pick_nodes(
     mut current_input_string: ResMut<CurrentInputString>,
     */
     state: Res<AstState>,
+    eval: Res<EvalState>,
 ) {
+    if modal_is_open(&eval) {
+        return;
+    }
     let Ok((camera, cam_gt)) = camera_q.single() else {
         return;
     };
@@ -1353,8 +2129,8 @@ fn update_cursor(
     mut commands: Commands,
     windows: Query<Entity, With<Window>>,
 ) {
-    use bevy::window::SystemCursorIcon;
     use bevy::window::CursorIcon;
+    use bevy::window::SystemCursorIcon;
     let Ok(entity) = windows.single() else {
         return;
     };
@@ -1366,13 +2142,29 @@ fn update_cursor(
 }
 
 fn text_input_focus(
-    mut input_q: Query<(&Interaction, &mut TextInput, &mut BorderColor), With<TextInputBox>>,
+    mut input_q: Query<
+        (
+            &Interaction,
+            &mut TextInput,
+            &mut BorderColor,
+            Option<&ModalEntity>,
+        ),
+        With<TextInputBox>,
+    >,
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
+    eval: Res<EvalState>,
 ) {
     let clicked_outside = mouse.just_pressed(MouseButton::Left);
+    let evaluating = is_evaluating(&eval);
 
-    for (interaction, mut input, mut border) in input_q.iter_mut() {
+    for (interaction, mut input, mut border, modal_tag) in input_q.iter_mut() {
+        // During evaluation only modal inputs may take focus.
+        if evaluating && modal_tag.is_none() {
+            input.focused = false;
+            *border = BorderColor::all(Color::srgb(0.12, 0.12, 0.24));
+            continue;
+        }
         if *interaction == Interaction::Pressed {
             input.focused = true;
         } else if clicked_outside && *interaction == Interaction::None {
@@ -1515,7 +2307,11 @@ fn handle_arrow_keys(
     mut state: ResMut<AstState>,
     mut pick: ResMut<PickState>,
     mut rebuild: ResMut<NeedsRebuild>,
+    eval: Res<EvalState>,
 ) {
+    if is_evaluating(&eval) {
+        return;
+    }
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     if keys.just_pressed(KeyCode::ArrowUp) {
         if shift {
@@ -1681,7 +2477,11 @@ fn drag_start_system(
     mouse: Res<ButtonInput<MouseButton>>,
     hovered: Query<(Entity, &GlobalTransform, &EAnchor), (With<AnchorHovered>)>,
     mut drag: ResMut<DragState>,
+    eval: Res<EvalState>,
 ) {
+    if is_evaluating(&eval) {
+        return;
+    }
     if mouse.just_pressed(MouseButton::Left) {
         if let Ok((entity, tf, anchor)) = hovered.single() {
             let pos = tf.translation();
@@ -1702,7 +2502,11 @@ fn drag_update_system(
     camera_q: Query<(&Camera, &GlobalTransform)>,
     hovered: Query<(Entity, &GlobalTransform, &EAnchor), (With<AnchorHovered>)>,
     mut drag: ResMut<DragState>,
+    eval: Res<EvalState>,
 ) {
+    if is_evaluating(&eval) {
+        return;
+    }
     let Some(ref mut info) = drag.active else {
         return;
     };
@@ -1895,7 +2699,12 @@ fn drag_end_system(
     mut commands: Commands,
     mut rebuild: ResMut<NeedsRebuild>,
     mut state: ResMut<AstState>,
+    eval: Res<EvalState>,
 ) {
+    if is_evaluating(&eval) {
+        drag.active = None;
+        return;
+    }
     if mouse.just_released(MouseButton::Left) {
         if let Some(info) = drag.active.take() {
             if let Some(target_id) = info.target_anchor_id {
@@ -1933,6 +2742,7 @@ fn main() {
         .init_resource::<PickState>()
         .init_resource::<DragState>()
         .init_resource::<UiMode>()
+        .init_resource::<EvalState>()
         .add_systems(
             Startup,
             (
@@ -1988,6 +2798,25 @@ fn main() {
             )
                 .chain(),
         )
-        .add_systems(Update, (update_world_labels, update_crosshair, update_fps_display))
+        .add_systems(
+            Update,
+            (update_world_labels, update_crosshair, update_fps_display),
+        )
+        .add_systems(
+            Update,
+            (
+                handle_evaluate_button,
+                handle_modal_ok_button,
+                handle_modal_cancel_button,
+                handle_modal_evaluate_button,
+                handle_eval_step_buttons,
+                sync_modal_ui,
+                sync_eval_step_bar,
+                sync_evaluate_button_visibility,
+                update_step_button_visuals,
+                sync_value_labels,
+            )
+                .chain(),
+        )
         .run();
 }

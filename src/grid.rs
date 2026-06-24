@@ -1,10 +1,10 @@
 use bevy::asset::{load_internal_asset, uuid_handle};
+use bevy::mesh::MeshVertexBufferLayoutRef;
+use bevy::pbr::{MaterialPipeline, MaterialPipelineKey};
 use bevy::prelude::*;
+use bevy::reflect::TypePath;
 use bevy::render::render_resource::*;
 use bevy::shader::ShaderRef;
-use bevy::reflect::TypePath;
-use bevy::pbr::{MaterialPipeline, MaterialPipelineKey};
-use bevy::mesh::MeshVertexBufferLayoutRef;
 
 // --- Configuration ---
 
@@ -45,7 +45,7 @@ pub struct GridMaterial {
 
 impl Material for GridMaterial {
     fn fragment_shader() -> ShaderRef {
-         GRID_SHADER_HANDLE.into()
+        GRID_SHADER_HANDLE.into()
     }
 
     fn alpha_mode(&self) -> AlphaMode {
@@ -69,7 +69,7 @@ pub struct GridPlugin;
 
 impl Plugin for GridPlugin {
     fn build(&self, app: &mut App) {
-         load_internal_asset!(
+        load_internal_asset!(
             app,
             GRID_SHADER_HANDLE,
             "../assets/shaders/grid.wgsl",
@@ -96,7 +96,7 @@ fn spawn_grid(
             spacing: config.spacing,
             fade_start: 15.0,
             fade_end: 100.0,
-            line_thickness: 0.6
+            line_thickness: 0.6,
         })),
     ));
 }

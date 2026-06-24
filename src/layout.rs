@@ -249,42 +249,40 @@ impl LayoutAst {
             width: 2,
         });
         let mb_levels = 3usize;
-        let (ast, mb1_input_anchor_ids) =
-            (0..mb_levels).fold((ast, Vec::<crate::ast::AnchorId>::new()), |(ast, mut acc), _| {
+        let (ast, mb1_input_anchor_ids) = (0..mb_levels).fold(
+            (ast, Vec::<crate::ast::AnchorId>::new()),
+            |(ast, mut acc), _| {
                 let (ast, anchor_id) = ast.with_next_anchor_id();
                 acc.push(anchor_id);
                 (ast, acc)
-            });
+            },
+        );
         let (ast, mb1_output_anchor_id) = ast.with_next_anchor_id();
         let (ast, mb1_node_id) = ast.plus(crate::ast::node::ENode::MatchBack {
             levels: mb_levels,
             input_anchors: mb1_input_anchor_ids.clone(),
             output_anchor: mb1_output_anchor_id.clone(),
         });
-        let (ast, mb2_input_anchor_ids) =
-            (0..mb_levels).fold((ast, Vec::<crate::ast::AnchorId>::new()), |(ast, mut acc), _| {
+        let (ast, mb2_input_anchor_ids) = (0..mb_levels).fold(
+            (ast, Vec::<crate::ast::AnchorId>::new()),
+            |(ast, mut acc), _| {
                 let (ast, anchor_id) = ast.with_next_anchor_id();
                 acc.push(anchor_id);
                 (ast, acc)
-            });
+            },
+        );
         let (ast, mb2_output_anchor_id) = ast.with_next_anchor_id();
         let (ast, mb2_node_id) = ast.plus(crate::ast::node::ENode::MatchBack {
             levels: mb_levels,
             input_anchors: mb2_input_anchor_ids.clone(),
             output_anchor: mb2_output_anchor_id.clone(),
         });
-        let (ast, mg1_node_id) = ast.plus(crate::ast::node::ENode::MatchGrid {
-            width: 3,
-            depth: 2,
-        });
-        let (ast, mg2_node_id) = ast.plus(crate::ast::node::ENode::MatchGrid {
-            width: 3,
-            depth: 2,
-        });
-        let (ast, mg3_node_id) = ast.plus(crate::ast::node::ENode::MatchGrid {
-            width: 3,
-            depth: 2,
-        });
+        let (ast, mg1_node_id) =
+            ast.plus(crate::ast::node::ENode::MatchGrid { width: 3, depth: 2 });
+        let (ast, mg2_node_id) =
+            ast.plus(crate::ast::node::ENode::MatchGrid { width: 3, depth: 2 });
+        let (ast, mg3_node_id) =
+            ast.plus(crate::ast::node::ENode::MatchGrid { width: 3, depth: 2 });
         let (ast, vd_output_anchor_id) = ast.with_next_anchor_id();
         let (ast, vd_node_id) = ast.plus(crate::ast::node::ENode::VarDecl {
             name: "s".to_string(),
@@ -319,9 +317,15 @@ impl LayoutAst {
         let ast = ast.plus_edge(vd_output_anchor_id.clone(), te_top_input_anchor_id);
         let ast = ast.plus_edge(vd_output_anchor_id.clone(), te_mid_input_anchor_id);
         let ast = ast.plus_edge(vd_output_anchor_id, te_bot_input_anchor_id);
-        let ast = ast.plus_edge(te_bot_output_anchor_id.clone(), mb1_input_anchor_ids[0].clone());
+        let ast = ast.plus_edge(
+            te_bot_output_anchor_id.clone(),
+            mb1_input_anchor_ids[0].clone(),
+        );
         let ast = ast.plus_edge(te_bot_output_anchor_id, mb2_input_anchor_ids[0].clone());
-        let ast = ast.plus_edge(te_mid_output_anchor_id.clone(), mb1_input_anchor_ids[1].clone());
+        let ast = ast.plus_edge(
+            te_mid_output_anchor_id.clone(),
+            mb1_input_anchor_ids[1].clone(),
+        );
         let ast = ast.plus_edge(te_mid_output_anchor_id, mb2_input_anchor_ids[1].clone());
         let ast = ast.plus_edge(te_top_output_anchor_id, mb2_input_anchor_ids[2].clone());
         let (ast, ti_output_anchor_id) = ast.with_next_anchor_id();
