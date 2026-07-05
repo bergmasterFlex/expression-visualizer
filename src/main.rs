@@ -167,7 +167,7 @@ struct AstSceneEntity;
 #[derive(Component)]
 struct DeleteNodeButton;
 #[derive(Component)]
-struct ResetCameraButton;
+struct HamburgerButton;
 #[derive(Component, Clone)]
 enum EAstActionButton {
     AddIntIntroductionButton,
@@ -187,11 +187,15 @@ enum UiMode {
 #[derive(Resource)]
 struct StartMenu {
     showing: bool,
+    has_cancel: bool,
 }
 
 impl Default for StartMenu {
     fn default() -> Self {
-        Self { showing: true }
+        Self {
+            showing: true,
+            has_cancel: false,
+        }
     }
 }
 
@@ -201,15 +205,15 @@ struct StartMenuEntity;
 struct StartMenuNewButton;
 #[derive(Component)]
 struct StartMenuLoadExampleButton;
+#[derive(Component)]
+struct StartMenuCancelButton;
+#[derive(Component)]
+struct StartMenuControlsButton;
 
 /// Marker for UI entities that should be hidden while the start menu is open.
 #[derive(Component)]
 struct HideDuringStartMenu;
 
-#[derive(Component)]
-struct PlaygroundTab;
-#[derive(Component)]
-struct ExamplesTab;
 #[derive(Component)]
 struct PlaygroundOnly;
 #[derive(Component)]
@@ -286,6 +290,7 @@ enum EvalPhase {
     #[default]
     Idle,
     ErrorModal(String),
+    ControlsModal,
     VarDeclPrompt {
         /// Stable node_id order; values mirror what the user has typed so far.
         inputs: Vec<(ast::node::Id, String)>,
@@ -319,7 +324,7 @@ fn is_evaluating(eval: &EvalState) -> bool {
 fn modal_is_open(eval: &EvalState) -> bool {
     matches!(
         eval.phase,
-        EvalPhase::ErrorModal(_) | EvalPhase::VarDeclPrompt { .. }
+        EvalPhase::ErrorModal(_) | EvalPhase::ControlsModal | EvalPhase::VarDeclPrompt { .. }
     )
 }
 
@@ -337,6 +342,8 @@ struct ModalOkButton;
 struct ModalCancelButton;
 #[derive(Component)]
 struct ModalEvaluateButton;
+#[derive(Component)]
+struct ControlsModalOkButton;
 
 /// Marker on a TextInputBox inside the VarDecl modal so we can collect
 /// typed values per VarDecl when the user confirms.
@@ -595,33 +602,11 @@ fn spawn_ast_nodes(
 }
 
 fn spawn_ui(mut commands: Commands) {
-    // Top tab row: Playground / Examples (radio-group behavior).
-    let tab_width = 100.0;
-    spawn_tab_button(
-        &mut commands,
-        "Playground",
-        PlaygroundTab,
-        Vec2::new(12.0, 12.0),
-        tab_width,
-    );
-    spawn_tab_button(
-        &mut commands,
-        "Examples",
-        ExamplesTab,
-        Vec2::new(12.0 + tab_width + 8.0, 12.0),
-        tab_width,
-    );
+    // Hamburger menu button (top-left) — opens the menu modal.
+    spawn_hamburger_button(&mut commands, Vec2::new(12.0, 12.0));
 
     // Playground-mode controls.
-    let mut y_offset = 48.0;
-    spawn_ui_button(
-        &mut commands,
-        "Reset Camera",
-        (ResetCameraButton, PlaygroundOnly),
-        Vec2::new(12.0, y_offset),
-        Display::Flex,
-    );
-    y_offset += 36.0;
+    let mut y_offset = 60.0;
     let initial = "";
     commands
         .spawn((
@@ -693,7 +678,7 @@ fn spawn_ui(mut commands: Commands) {
     }
 
     // Examples-mode buttons (initially hidden; update_mode_visibility keeps them in sync).
-    let mut y_offset = 48.0;
+    let mut y_offset = 60.0;
     for (label, kind) in [
         ("Sink", ExampleButton::Sink),
         ("FuncCall", ExampleButton::FuncCall),
@@ -796,13 +781,13 @@ fn spawn_ui_button<C: Bundle>(
         });
 }
 
-fn spawn_tab_button<C: Bundle>(
-    commands: &mut Commands,
-    label: &str,
-    component: C,
-    pos: Vec2,
-    width: f32,
-) {
+fn spawn_hamburger_button(commands: &mut Commands, pos: Vec2) {
+    let bar = || Node {
+        width: Val::Px(20.0),
+        height: Val::Px(2.5),
+        margin: UiRect::vertical(Val::Px(2.0)),
+        ..default()
+    };
     commands
         .spawn((
             Button,
@@ -810,89 +795,24 @@ fn spawn_tab_button<C: Bundle>(
                 position_type: PositionType::Absolute,
                 top: Val::Px(pos.y),
                 left: Val::Px(pos.x),
-                width: Val::Px(width),
-                padding: UiRect::axes(Val::Px(8.0), Val::Px(8.0)),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
+                width: Val::Px(36.0),
+                height: Val::Px(36.0),
+                flex_direction: FlexDirection::Column,
                 justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
             BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
-            component,
+            HamburgerButton,
             HideDuringStartMenu,
         ))
         .with_children(|parent| {
-            parent.spawn((
-                Text::new(label),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.6, 0.6, 0.7)),
-            ));
+            let bar_color = Color::srgb(0.85, 0.85, 0.9);
+            parent.spawn((bar(), BackgroundColor(bar_color)));
+            parent.spawn((bar(), BackgroundColor(bar_color)));
+            parent.spawn((bar(), BackgroundColor(bar_color)));
         });
-}
-
-fn tab_colors(interaction: Interaction, is_active: bool) -> (Color, Color) {
-    if is_active {
-        return (
-            Color::srgba(0.18, 0.36, 0.5, 0.95),
-            Color::srgb(0.95, 0.95, 1.0),
-        );
-    }
-    match interaction {
-        Interaction::Hovered | Interaction::Pressed => (
-            Color::srgba(0.2, 0.2, 0.3, 0.95),
-            Color::srgb(0.85, 0.85, 0.9),
-        ),
-        Interaction::None => (
-            Color::srgba(0.16, 0.16, 0.22, 0.9),
-            Color::srgb(0.6, 0.6, 0.7),
-        ),
-    }
-}
-
-fn handle_tab_buttons(
-    mut playground_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (With<PlaygroundTab>, Without<ExamplesTab>),
-    >,
-    mut examples_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (With<ExamplesTab>, Without<PlaygroundTab>),
-    >,
-    mut text_q: Query<&mut TextColor>,
-    mut mode: ResMut<UiMode>,
-    eval: Res<EvalState>,
-) {
-    if is_evaluating(&eval) {
-        return;
-    }
-    for (interaction, _, _) in playground_q.iter() {
-        if *interaction == Interaction::Pressed {
-            *mode = UiMode::Playground;
-        }
-    }
-    for (interaction, _, _) in examples_q.iter() {
-        if *interaction == Interaction::Pressed {
-            *mode = UiMode::Examples;
-        }
-    }
-
-    let mode_now = *mode;
-    for (interaction, mut bg, children) in playground_q.iter_mut() {
-        let (b, t) = tab_colors(*interaction, mode_now == UiMode::Playground);
-        bg.0 = b;
-        if let Ok(mut c) = text_q.get_mut(children[0]) {
-            c.0 = t;
-        }
-    }
-    for (interaction, mut bg, children) in examples_q.iter_mut() {
-        let (b, t) = tab_colors(*interaction, mode_now == UiMode::Examples);
-        bg.0 = b;
-        if let Ok(mut c) = text_q.get_mut(children[0]) {
-            c.0 = t;
-        }
-    }
 }
 
 fn update_mode_visibility(
@@ -921,36 +841,6 @@ fn update_mode_visibility(
     if *mode != UiMode::Playground {
         for mut input in text_inputs.iter_mut() {
             input.focused = false;
-        }
-    }
-}
-
-fn handle_reset_camera_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (With<Interaction>, With<ResetCameraButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
-    orbit: Res<camera::OrbitCamera>,
-    mut tween: ResMut<camera::CameraTween>,
-    pick: Res<PickState>,
-) {
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-
-        match *interaction {
-            Interaction::Pressed => {
-                let world = render::layout_to_world(pick.selected_pos.as_vec3());
-                tween.focus_on(&orbit, world);
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                color.0 = Color::srgb(0.6, 0.6, 0.7);
-            }
         }
     }
 }
@@ -1195,12 +1085,14 @@ enum ModalKind {
     #[default]
     None,
     Error,
+    Controls,
     VarDeclPrompt,
 }
 
 fn modal_kind(phase: &EvalPhase) -> ModalKind {
     match phase {
         EvalPhase::ErrorModal(_) => ModalKind::Error,
+        EvalPhase::ControlsModal => ModalKind::Controls,
         EvalPhase::VarDeclPrompt { .. } => ModalKind::VarDeclPrompt,
         _ => ModalKind::None,
     }
@@ -1226,6 +1118,9 @@ fn sync_modal_ui(
     match &eval.phase {
         EvalPhase::ErrorModal(msg) => {
             spawn_error_modal(&mut commands, msg.clone());
+        }
+        EvalPhase::ControlsModal => {
+            spawn_controls_modal(&mut commands);
         }
         EvalPhase::VarDeclPrompt { inputs } => {
             let ast = &state.layout_ast.ast;
@@ -1294,6 +1189,148 @@ fn spawn_error_modal(commands: &mut Commands, msg: String) {
                     });
             });
         });
+}
+
+fn spawn_controls_modal(commands: &mut Commands) {
+    let mouse_bindings: &[(&str, &str)] = &[
+        ("Left click", "Select node / grid position"),
+        ("Left drag on anchor", "Connect nodes"),
+        ("Ctrl + Left drag", "Orbit camera"),
+        ("Ctrl + Right drag", "Pan camera"),
+        ("Ctrl + Scroll", "Zoom"),
+    ];
+    let key_bindings: &[(&str, &str)] = &[
+        ("Arrow keys", "Move selection along the grid"),
+        ("Ctrl + Arrow", "Move the selected node"),
+        (
+            "Ctrl + Shift + Up/Down",
+            "Move the selected node vertically",
+        ),
+        ("Escape", "Unfocus text input"),
+    ];
+
+    commands
+        .spawn((
+            backdrop_node(),
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            GlobalZIndex(50),
+            ModalEntity,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                panel_node(),
+                BackgroundColor(Color::srgba(0.10, 0.10, 0.16, 0.98)),
+                BorderColor::all(Color::srgb(0.25, 0.25, 0.4)),
+                ModalEntity,
+            ))
+            .with_children(|panel| {
+                panel.spawn((
+                    Text::new("Controls"),
+                    TextFont {
+                        font_size: 20.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.95, 0.95, 1.0)),
+                    Node {
+                        margin: UiRect::all(Val::Px(12.0)),
+                        align_self: AlignSelf::Center,
+                        ..default()
+                    },
+                    ModalEntity,
+                ));
+
+                spawn_controls_section(panel, "Mouse", mouse_bindings);
+                spawn_controls_section(panel, "Keyboard", key_bindings);
+
+                panel
+                    .spawn((
+                        Node {
+                            flex_direction: FlexDirection::Row,
+                            justify_content: JustifyContent::Center,
+                            margin: UiRect::all(Val::Px(8.0)),
+                            ..default()
+                        },
+                        ModalEntity,
+                    ))
+                    .with_children(|btns| {
+                        btns.spawn((
+                            Button,
+                            modal_button_node(),
+                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
+                            ControlsModalOkButton,
+                            ModalEntity,
+                        ))
+                        .with_children(|b| {
+                            b.spawn((
+                                Text::new("OK"),
+                                TextFont {
+                                    font_size: 14.0,
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                                ModalEntity,
+                            ));
+                        });
+                    });
+            });
+        });
+}
+
+fn spawn_controls_section(panel: &mut ChildSpawnerCommands, title: &str, rows: &[(&str, &str)]) {
+    panel.spawn((
+        Text::new(title),
+        TextFont {
+            font_size: 15.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.75, 0.75, 0.9)),
+        Node {
+            margin: UiRect {
+                left: Val::Px(12.0),
+                right: Val::Px(12.0),
+                top: Val::Px(8.0),
+                bottom: Val::Px(4.0),
+            },
+            ..default()
+        },
+        ModalEntity,
+    ));
+    for (binding, desc) in rows {
+        panel
+            .spawn((
+                Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    margin: UiRect::axes(Val::Px(12.0), Val::Px(2.0)),
+                    ..default()
+                },
+                ModalEntity,
+            ))
+            .with_children(|row| {
+                row.spawn((
+                    Text::new(*binding),
+                    TextFont {
+                        font_size: 14.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.9, 0.9, 0.7)),
+                    Node {
+                        width: Val::Px(200.0),
+                        ..default()
+                    },
+                    ModalEntity,
+                ));
+                row.spawn((
+                    Text::new(*desc),
+                    TextFont {
+                        font_size: 14.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                    ModalEntity,
+                ));
+            });
+    }
 }
 
 fn spawn_vardecl_modal(commands: &mut Commands, rows: Vec<(ast::node::Id, String)>) {
@@ -1468,7 +1505,11 @@ fn modal_button_node() -> Node {
     }
 }
 
-fn spawn_start_menu(mut commands: Commands) {
+fn spawn_start_menu(mut commands: Commands, start_menu: Res<StartMenu>) {
+    spawn_start_menu_ui(&mut commands, start_menu.has_cancel);
+}
+
+fn spawn_start_menu_ui(commands: &mut Commands, has_cancel: bool) {
     commands
         .spawn((
             backdrop_node(),
@@ -1545,6 +1586,44 @@ fn spawn_start_menu(mut commands: Commands) {
                                 StartMenuEntity,
                             ));
                         });
+                        btns.spawn((
+                            Button,
+                            modal_button_node(),
+                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
+                            StartMenuControlsButton,
+                            StartMenuEntity,
+                        ))
+                        .with_children(|b| {
+                            b.spawn((
+                                Text::new("Controls"),
+                                TextFont {
+                                    font_size: 14.0,
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                                StartMenuEntity,
+                            ));
+                        });
+                        if has_cancel {
+                            btns.spawn((
+                                Button,
+                                modal_button_node(),
+                                BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
+                                StartMenuCancelButton,
+                                StartMenuEntity,
+                            ))
+                            .with_children(|b| {
+                                b.spawn((
+                                    Text::new("Cancel"),
+                                    TextFont {
+                                        font_size: 14.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                                    StartMenuEntity,
+                                ));
+                            });
+                        }
                     });
             });
         });
@@ -1565,10 +1644,11 @@ fn handle_start_menu_new_button(
         let mut color = text_color_q.get_mut(children[0]).unwrap();
         match *interaction {
             Interaction::Pressed => {
-                state.layout_ast = layout::LayoutAst::empty().plus_sink();
+                state.layout_ast = layout::LayoutAst::empty();
                 *mode = UiMode::Playground;
                 rebuild.0 = true;
                 start_menu.showing = false;
+                start_menu.has_cancel = false;
             }
             Interaction::Hovered => {
                 bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
@@ -1601,6 +1681,7 @@ fn handle_start_menu_load_example_button(
                 *mode = UiMode::Examples;
                 rebuild.0 = true;
                 start_menu.showing = false;
+                start_menu.has_cancel = false;
             }
             Interaction::Hovered => {
                 bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
@@ -1609,6 +1690,88 @@ fn handle_start_menu_load_example_button(
             Interaction::None => {
                 bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
                 color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+        }
+    }
+}
+
+fn handle_start_menu_controls_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (With<Interaction>, With<StartMenuControlsButton>),
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+    mut start_menu: ResMut<StartMenu>,
+    mut eval: ResMut<EvalState>,
+) {
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
+        match *interaction {
+            Interaction::Pressed => {
+                start_menu.showing = false;
+                eval.phase = EvalPhase::ControlsModal;
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
+                color.0 = Color::srgb(1.0, 1.0, 1.0);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+        }
+    }
+}
+
+fn handle_start_menu_cancel_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (With<Interaction>, With<StartMenuCancelButton>),
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+    mut start_menu: ResMut<StartMenu>,
+) {
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
+        match *interaction {
+            Interaction::Pressed => {
+                start_menu.showing = false;
+                start_menu.has_cancel = false;
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
+                color.0 = Color::srgb(1.0, 1.0, 1.0);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+        }
+    }
+}
+
+fn handle_hamburger_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor),
+        (Changed<Interaction>, With<HamburgerButton>),
+    >,
+    mut start_menu: ResMut<StartMenu>,
+    eval: Res<EvalState>,
+) {
+    if is_evaluating(&eval) {
+        return;
+    }
+    for (interaction, mut bg) in interaction_q.iter_mut() {
+        match *interaction {
+            Interaction::Pressed => {
+                start_menu.showing = true;
+                start_menu.has_cancel = true;
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
             }
         }
     }
@@ -1624,12 +1787,19 @@ fn sync_start_menu_ui(
     if *last_showing == Some(start_menu.showing) {
         return;
     }
+    let was_showing = *last_showing;
     *last_showing = Some(start_menu.showing);
 
     if !start_menu.showing {
         for e in menu_entities.iter() {
             commands.entity(e).despawn();
         }
+    } else if was_showing == Some(false) {
+        // Re-open after a Cancel/close — respawn the menu.
+        for e in menu_entities.iter() {
+            commands.entity(e).despawn();
+        }
+        spawn_start_menu_ui(&mut commands, start_menu.has_cancel);
     }
     let d = if start_menu.showing {
         Display::None
@@ -1654,6 +1824,34 @@ fn handle_modal_ok_button(
         match *interaction {
             Interaction::Pressed => {
                 eval.phase = EvalPhase::Idle;
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
+                color.0 = Color::srgb(1.0, 1.0, 1.0);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+        }
+    }
+}
+
+fn handle_controls_modal_ok_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (With<Interaction>, With<ControlsModalOkButton>),
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+    mut eval: ResMut<EvalState>,
+    mut start_menu: ResMut<StartMenu>,
+) {
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
+        match *interaction {
+            Interaction::Pressed => {
+                eval.phase = EvalPhase::Idle;
+                start_menu.showing = true;
             }
             Interaction::Hovered => {
                 bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
@@ -3025,12 +3223,13 @@ fn main() {
                     animate_nodes,
                     (
                         handle_delete_node_button,
-                        handle_reset_camera_button,
                         handle_add_node_button,
                         handle_example_buttons,
-                        handle_tab_buttons,
+                        handle_hamburger_button,
                         handle_start_menu_new_button,
                         handle_start_menu_load_example_button,
+                        handle_start_menu_controls_button,
+                        handle_start_menu_cancel_button,
                         sync_start_menu_ui,
                         update_mode_visibility,
                         pick_nodes,
@@ -3067,6 +3266,7 @@ fn main() {
             (
                 handle_evaluate_button,
                 handle_modal_ok_button,
+                handle_controls_modal_ok_button,
                 handle_modal_cancel_button,
                 handle_modal_evaluate_button,
                 handle_eval_step_buttons,
