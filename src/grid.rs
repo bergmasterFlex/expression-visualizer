@@ -12,6 +12,10 @@ use bevy::shader::ShaderRef;
 pub struct GridConfig {
     pub spacing: f32,
     pub half_extent: f32,
+    /// Distance (in world units) from origin where the grid starts fading
+    /// out. Also the radius within which grid crossings can be hovered.
+    pub fade_start: f32,
+    pub fade_end: f32,
 }
 
 impl Default for GridConfig {
@@ -19,6 +23,8 @@ impl Default for GridConfig {
         Self {
             spacing: 3.0,
             half_extent: 200.0,
+            fade_start: 15.0,
+            fade_end: 100.0,
         }
     }
 }
@@ -41,6 +47,15 @@ pub struct GridMaterial {
     pub fade_end: f32,
     #[uniform(0)]
     pub line_thickness: f32,
+    /// World-space (x, z) of the grid crossing under the cursor.
+    #[uniform(0)]
+    pub hover_pos: Vec2,
+    /// 1.0 when a grid crossing is hovered, 0.0 otherwise.
+    #[uniform(0)]
+    pub hover_active: f32,
+    /// Padding to keep the uniform block 16-byte aligned.
+    #[uniform(0)]
+    pub _pad: f32,
 }
 
 impl Material for GridMaterial {
@@ -94,9 +109,12 @@ fn spawn_grid(
             plane_color: LinearRgba::new(0.2, 0.2, 0.3, 0.18),
             line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.4),
             spacing: config.spacing,
-            fade_start: 15.0,
-            fade_end: 100.0,
+            fade_start: config.fade_start,
+            fade_end: config.fade_end,
             line_thickness: 0.6,
+            hover_pos: Vec2::ZERO,
+            hover_active: 0.0,
+            _pad: 0.0,
         })),
     ));
 }

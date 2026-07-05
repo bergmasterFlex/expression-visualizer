@@ -11,6 +11,9 @@ struct GridParams {
     fade_start: f32,
     fade_end: f32,
     line_thickness: f32,
+    hover_pos: vec2<f32>,
+    hover_active: f32,
+    _pad: f32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: GridParams;
@@ -32,7 +35,23 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let grid_color = mix(params.plane_color, params.line_color, lines);
     let avg_color = mix(params.plane_color, params.line_color, 0.3);
-    let color = mix(grid_color, avg_color, density_blend);
+    var color = mix(grid_color, avg_color, density_blend);
+
+    // Hover feedback: locally brighten grid lines around the hovered
+    // crossing and add a faint disc on the plane.
+    if params.hover_active > 0.5 {
+        let hover_d = length(world_pos - params.hover_pos);
+        // Line brightening — falls off over ~1.5 world units.
+        let line_boost = (1.0 - smoothstep(0.0, 1.5, hover_d)) * lines * 0.9;
+        color = vec4<f32>(color.rgb + params.line_color.rgb * line_boost, color.a);
+        // Faint disc — visible within ~0.6 world units.
+        let disc = 1.0 - smoothstep(0.0, 0.6, hover_d);
+        let disc_alpha = disc * 0.25;
+        color = vec4<f32>(
+            mix(color.rgb, params.line_color.rgb, disc_alpha),
+            color.a + disc_alpha,
+        );
+    }
 
     let dist = length(world_pos);
     let fade = 1.0 - saturate((dist - params.fade_start) / (params.fade_end - params.fade_start));

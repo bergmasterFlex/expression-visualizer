@@ -2,6 +2,14 @@ use bevy::prelude::*;
 
 use crate::ast::FunctionDeclaration;
 
+/// Scale factor from layout coordinates to world coordinates.
+pub const LAYOUT_SCALE: Vec3 = Vec3::new(3.0, 1.5, 3.0);
+
+/// Convert a layout position to a world-space position.
+pub fn layout_to_world(pos: Vec3) -> Vec3 {
+    pos * LAYOUT_SCALE
+}
+
 pub struct RenderObject {
     pub mesh: Mesh,
     pub material: StandardMaterial,

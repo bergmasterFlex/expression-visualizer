@@ -46,6 +46,17 @@ impl LayoutAst {
         }
     }
 
+    /// Returns the node whose layout position rounds to `pos`, if any.
+    pub fn node_at(&self, pos: IVec3) -> Option<crate::ast::node::Id> {
+        self.layout_nodes.iter().find_map(|(id, ln)| {
+            if ln.pos.round().as_ivec3() == pos {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn move_node_delta(&self, node_id: crate::ast::node::Id, delta_pos: Vec3) -> Self {
         Self {
             ast: self.ast.clone(),

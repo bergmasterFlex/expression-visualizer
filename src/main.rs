@@ -227,16 +227,35 @@ enum ExampleButton {
     TypeClass,
 }
 
-/// Stores which node is hovered / selected.
-#[derive(Resource, Default)]
+/// Stores the currently selected grid position and hover state.
+///
+/// Selection is a grid position (always some), not a node. A node is
+/// considered selected iff its layout position rounds to `selected_pos`.
+#[derive(Resource)]
 struct PickState {
-    hovered: Option<ast::node::Id>,  // node_id
-    selected: Option<ast::node::Id>, // node_id
+    /// Currently selected grid position (layout coordinates, always set).
+    selected_pos: IVec3,
+    /// Node under the cursor (ray-sphere hit), if any.
+    hovered_node: Option<ast::node::Id>,
+    /// Grid crossing under the cursor (ray hit on y=0 plane), if within
+    /// the visible grid extent and no node was hit.
+    hovered_pos: Option<IVec3>,
     /// Cursor position at the last left-mouse press. Used to distinguish
-    /// click vs drag — a release within `CLICK_MOVE_THRESHOLD` of this counts
-    /// as a click and updates `selected`; further movement is treated as a
-    /// drag and leaves `selected` untouched.
+    /// click vs drag — a release within `CLICK_MOVE_THRESHOLD` of this
+    /// counts as a click and updates the selection; further movement is
+    /// treated as a drag and leaves selection untouched.
     press_cursor: Option<Vec2>,
+}
+
+impl Default for PickState {
+    fn default() -> Self {
+        Self {
+            selected_pos: IVec3::ZERO,
+            hovered_node: None,
+            hovered_pos: None,
+            press_cursor: None,
+        }
+    }
 }
 
 /// UI text showing the selected node's info.
@@ -462,6 +481,9 @@ fn spawn_ast_nodes(
                         fade_start: 15.0,
                         fade_end: 100.0,
                         line_thickness: 1.5,
+                        hover_pos: Vec2::ZERO,
+                        hover_active: 0.0,
+                        _pad: 0.0,
                     })),
                     tf,
                     AstNodeEntity {
@@ -909,16 +931,17 @@ fn handle_reset_camera_button(
         (With<Interaction>, With<ResetCameraButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
-    mut orbit: ResMut<camera::OrbitCamera>,
+    orbit: Res<camera::OrbitCamera>,
+    mut tween: ResMut<camera::CameraTween>,
+    pick: Res<PickState>,
 ) {
     for (interaction, mut bg, children) in interaction_q.iter_mut() {
         let mut color = text_color_q.get_mut(children[0]).unwrap();
 
         match *interaction {
             Interaction::Pressed => {
-                orbit.theta = 0.6;
-                orbit.phi = 1.0;
-                orbit.target = Vec3::ZERO;
+                let world = render::layout_to_world(pick.selected_pos.as_vec3());
+                tween.focus_on(&orbit, world);
             }
             Interaction::Hovered => {
                 bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
@@ -954,8 +977,8 @@ fn handle_delete_node_button(
 
         match *interaction {
             Interaction::Pressed => {
-                if let Some(selected_node_id) = &pick.selected {
-                    state.layout_ast = state.layout_ast.minus_node(&selected_node_id.clone());
+                if let Some(selected_node_id) = state.layout_ast.node_at(pick.selected_pos) {
+                    state.layout_ast = state.layout_ast.minus_node(&selected_node_id);
                     rebuild.0 = true;
                 }
             }
@@ -1011,8 +1034,9 @@ fn handle_example_buttons(
                     ExampleButton::Match => layout::LayoutAst::empty().plus_match_example(),
                     _ => layout::LayoutAst::empty().plus_sink_wall(),
                 };
-                pick.selected = None;
-                pick.hovered = None;
+                pick.selected_pos = IVec3::ZERO;
+                pick.hovered_node = None;
+                pick.hovered_pos = None;
                 rebuild.0 = true;
             }
             Interaction::Hovered => {
@@ -1055,58 +1079,49 @@ fn handle_add_node_button(
 
         match *interaction {
             Interaction::Pressed => {
-                if let Some(selected_node_id) = &pick.selected {
-                    let selected_pos = state
-                        .layout_ast
-                        .layout_nodes
-                        .get(selected_node_id)
-                        .unwrap()
-                        .pos;
-                    let new_pos = Vec3::new(selected_pos.x + 1.0, selected_pos.y, selected_pos.z);
-                    state.layout_ast = match action {
-                        EAstActionButton::AddIntIntroductionButton => {
-                            state.layout_ast.plus_type_introduction(
-                                ast::node::EType::Int {
-                                    value: Some(current_input_string.0.clone()),
+                let base = pick.selected_pos.as_vec3();
+                let new_pos = Vec3::new(base.x + 1.0, base.y, base.z);
+                state.layout_ast = match action {
+                    EAstActionButton::AddIntIntroductionButton => {
+                        state.layout_ast.plus_type_introduction(
+                            ast::node::EType::Int {
+                                value: Some(current_input_string.0.clone()),
+                            },
+                            new_pos,
+                        )
+                    }
+                    EAstActionButton::AddBoolIntroductionButton => {
+                        state.layout_ast.plus_type_introduction(
+                            ast::node::EType::Bool {
+                                value: Some(current_input_string.0.clone()),
+                            },
+                            new_pos,
+                        )
+                    }
+                    EAstActionButton::AddFunctionCallButton => state.layout_ast.plus_function_call(
+                        state
+                            .function_declarations
+                            .iter()
+                            .find(|(_, d)| current_input_string.0 == d.name)
+                            .map(|(id, decl)| (id.clone(), decl))
+                            .unwrap(),
+                        new_pos,
+                    ),
+                    EAstActionButton::AddIntEliminationButton => {
+                        state.layout_ast.plus_type_elimination(
+                            ast::node::EType::Int {
+                                value: if current_input_string.0.clone() == "".to_string() {
+                                    None
+                                } else {
+                                    Some(current_input_string.0.clone())
                                 },
-                                new_pos,
-                            )
-                        }
-                        EAstActionButton::AddBoolIntroductionButton => {
-                            state.layout_ast.plus_type_introduction(
-                                ast::node::EType::Bool {
-                                    value: Some(current_input_string.0.clone()),
-                                },
-                                new_pos,
-                            )
-                        }
-                        EAstActionButton::AddFunctionCallButton => {
-                            state.layout_ast.plus_function_call(
-                                state
-                                    .function_declarations
-                                    .iter()
-                                    .find(|(_, d)| current_input_string.0 == d.name)
-                                    .map(|(id, decl)| (id.clone(), decl))
-                                    .unwrap(),
-                                new_pos,
-                            )
-                        }
-                        EAstActionButton::AddIntEliminationButton => {
-                            state.layout_ast.plus_type_elimination(
-                                ast::node::EType::Int {
-                                    value: if current_input_string.0.clone() == "".to_string() {
-                                        None
-                                    } else {
-                                        Some(current_input_string.0.clone())
-                                    },
-                                },
-                                new_pos,
-                            )
-                        }
-                        EAstActionButton::AddMatchButton => state.layout_ast.plus_match(new_pos),
-                    };
-                    rebuild.0 = true;
-                }
+                            },
+                            new_pos,
+                        )
+                    }
+                    EAstActionButton::AddMatchButton => state.layout_ast.plus_match(new_pos),
+                };
+                rebuild.0 = true;
             }
             Interaction::Hovered => {
                 bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
@@ -2162,13 +2177,17 @@ fn pick_nodes(
     mouse: Res<ButtonInput<MouseButton>>,
     mut pick: ResMut<PickState>,
     node_q: Query<(&AstNodeEntity, &Transform)>,
-    /*
-    mut input_q: Query<(&mut TextInput, &Children), With<TextInputBox>>,
-    mut current_input_string: ResMut<CurrentInputString>,
-    */
     state: Res<AstState>,
+    grid_config: Res<grid::GridConfig>,
+    start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
 ) {
+    if start_menu.showing {
+        pick.hovered_node = None;
+        pick.hovered_pos = None;
+        pick.press_cursor = None;
+        return;
+    }
     if modal_is_open(&eval) {
         return;
     }
@@ -2179,38 +2198,50 @@ fn pick_nodes(
         return;
     };
     let Some(cursor) = window.cursor_position() else {
-        pick.hovered = None;
+        pick.hovered_node = None;
+        pick.hovered_pos = None;
         return;
     };
 
-    // Build ray from camera through cursor
     let Ok(ray) = camera.viewport_to_world(cam_gt, cursor) else {
-        pick.hovered = None;
+        pick.hovered_node = None;
+        pick.hovered_pos = None;
         return;
     };
 
-    // Test intersection with each node (sphere test, radius 0.35)
+    // Ray-sphere test against nodes (radius 0.35).
     let radius = 0.35_f32;
     let mut closest: Option<(ast::node::Id, f32)> = None;
-
     for (node_ent, transform) in node_q.iter() {
         let center = transform.translation;
         let oc = ray.origin - center;
         let b = oc.dot(*ray.direction);
         let c = oc.dot(oc) - radius * radius;
         let disc = b * b - c;
-
         if disc >= 0.0 {
             let t = -b - disc.sqrt();
-            if t > 0.0 {
-                if closest.is_none() || t < closest.clone().unwrap().1 {
-                    closest = Some((node_ent.node_id.clone(), t));
-                }
+            if t > 0.0 && closest.as_ref().map_or(true, |(_, tc)| t < *tc) {
+                closest = Some((node_ent.node_id.clone(), t));
             }
         }
     }
+    pick.hovered_node = closest.as_ref().map(|(id, _)| id.clone());
 
-    pick.hovered = closest.clone().map(|(id, _)| id);
+    // Ray-plane test against y=0 for grid hover. Skip if a node is hovered.
+    let mut grid_hit: Option<IVec3> = None;
+    if closest.is_none() && ray.direction.y.abs() > 1e-4 {
+        let t = -ray.origin.y / ray.direction.y;
+        if t > 0.0 {
+            let hit = ray.origin + *ray.direction * t;
+            if Vec2::new(hit.x, hit.z).length() <= grid_config.fade_start {
+                let spacing = grid_config.spacing;
+                let gx = (hit.x / spacing).round() as i32;
+                let gz = (hit.z / spacing).round() as i32;
+                grid_hit = Some(IVec3::new(gx, 0, gz));
+            }
+        }
+    }
+    pick.hovered_pos = grid_hit;
 
     const CLICK_MOVE_THRESHOLD: f32 = 5.0;
     if mouse.just_pressed(MouseButton::Left) {
@@ -2223,54 +2254,34 @@ fn pick_nodes(
             .unwrap_or(false);
         pick.press_cursor = None;
         if is_click {
-            pick.selected = closest.map(|(id, _)| id);
-        }
-        /*
-        println!("selected!");
-        if let Some(selected_id) = &pick.selected {
-        println!("selected!2");
-
-                match state.layout_ast.ast.nodes.get(&selected_id) {
-                    Some(ast::EAstNode::BoolLiteral { value, .. })
-                    | Some(ast::EAstNode::NumLiteral { value, .. }) => {
-                        current_input_string.0 = value.to_string();
-                    }
-                    _ => (),
-                };
-            for (mut input, _) in input_q.iter_mut() {
-        println!("selected!3");
-                /**
-                if !input.focused {
-                    continue;
+            if let Some((node_id, _)) = closest {
+                if let Some(ln) = state.layout_ast.layout_nodes.get(&node_id) {
+                    pick.selected_pos = ln.pos.round().as_ivec3();
                 }
-                **/
-
-                match state.layout_ast.ast.nodes.get(&selected_id) {
-                    Some(ast::EAstNode::BoolLiteral { value, .. })
-                    | Some(ast::EAstNode::NumLiteral { value, .. }) => {
-                        input.value = value.to_string();
-                    }
-                    _ => (),
-                };
+            } else if let Some(pos) = grid_hit {
+                pick.selected_pos = pos;
             }
+            // Click into truly empty space (beyond visible grid) leaves
+            // the selection unchanged.
         }
-        */
     }
 }
 
 fn highlight_hovered(
     pick: Res<PickState>,
+    state: Res<AstState>,
     node_q: Query<(&AstNodeEntity, &MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
+    let selected_node = state.layout_ast.node_at(pick.selected_pos);
     for (node_ent, mat_handle) in node_q.iter() {
         let Some(mat) = materials.get_mut(&mat_handle.0) else {
             continue;
         };
 
         let base = render::emissive_color(mat.base_color);
-        let is_hovered = pick.hovered == Some(node_ent.node_id.clone());
-        let is_selected = pick.selected == Some(node_ent.node_id.clone());
+        let is_hovered = pick.hovered_node.as_ref() == Some(&node_ent.node_id);
+        let is_selected = selected_node.as_ref() == Some(&node_ent.node_id);
 
         let intensity = if is_hovered {
             4.0
@@ -2297,7 +2308,7 @@ fn update_selection_display(
     let Ok((mut text, mut color)) = display_q.single_mut() else {
         return;
     };
-    if let Some(id) = &pick.selected {
+    if let Some(id) = state.layout_ast.node_at(pick.selected_pos) {
         if let Some(node) = state.layout_ast.ast.nodes.get(&id) {
             text.0 = format!(
                 "{} : {}",
@@ -2315,7 +2326,32 @@ fn update_selection_display(
             color.0 = Color::WHITE;
         }
     } else {
-        text.0.clear();
+        text.0 = format!(
+            "({}, {}, {})",
+            pick.selected_pos.x, pick.selected_pos.y, pick.selected_pos.z
+        );
+        color.0 = Color::srgb(0.55, 0.55, 0.6);
+    }
+}
+
+fn update_grid_hover_material(
+    pick: Res<PickState>,
+    grid_config: Res<grid::GridConfig>,
+    mut materials: ResMut<Assets<grid::GridMaterial>>,
+) {
+    let (pos, active) = match pick.hovered_pos {
+        Some(p) => (
+            Vec2::new(
+                p.x as f32 * grid_config.spacing,
+                p.z as f32 * grid_config.spacing,
+            ),
+            1.0,
+        ),
+        None => (Vec2::ZERO, 0.0),
+    };
+    for (_, mat) in materials.iter_mut() {
+        mat.hover_pos = pos;
+        mat.hover_active = active;
     }
 }
 
@@ -2329,11 +2365,13 @@ fn update_cursor(
     let Ok(entity) = windows.single() else {
         return;
     };
-    commands.entity(entity).insert(if pick.hovered.is_some() {
-        CursorIcon::System(SystemCursorIcon::Pointer)
-    } else {
-        CursorIcon::System(SystemCursorIcon::Default)
-    });
+    commands
+        .entity(entity)
+        .insert(if pick.hovered_node.is_some() {
+            CursorIcon::System(SystemCursorIcon::Pointer)
+        } else {
+            CursorIcon::System(SystemCursorIcon::Default)
+        });
 }
 
 fn text_input_focus(
@@ -2497,6 +2535,29 @@ fn text_input_keyboard(
     }
 }
 
+/// Detect a change in `PickState::selected_pos` and start a camera
+/// auto-focus tween toward the new position. The first observation
+/// (fresh `Local`) does not trigger, so app startup doesn't jump.
+fn trigger_camera_focus_on_selection_change(
+    pick: Res<PickState>,
+    orbit: Res<camera::OrbitCamera>,
+    mut tween: ResMut<camera::CameraTween>,
+    mut last_pos: Local<Option<IVec3>>,
+    start_menu: Res<StartMenu>,
+) {
+    if start_menu.showing {
+        return;
+    }
+    let current = pick.selected_pos;
+    if *last_pos != Some(current) {
+        if last_pos.is_some() {
+            let world = render::layout_to_world(current.as_vec3());
+            tween.focus_on(&orbit, world);
+        }
+        *last_pos = Some(current);
+    }
+}
+
 fn handle_arrow_keys(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<AstState>,
@@ -2507,64 +2568,57 @@ fn handle_arrow_keys(
     if is_evaluating(&eval) {
         return;
     }
+    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-    if keys.just_pressed(KeyCode::ArrowUp) {
-        if shift {
-            if let Some(selected_node_id) = &pick.selected {
-                state.layout_ast = state
-                    .layout_ast
-                    .move_node_delta(selected_node_id.clone(), Vec3::new(0.0, 1.0, 0.0));
-                rebuild.0 = true;
-            }
+
+    // Direction of each arrow in layout coordinates.
+    let delta = if keys.just_pressed(KeyCode::ArrowUp) {
+        if ctrl && shift {
+            Some(IVec3::new(0, 1, 0))
+        } else if !shift {
+            Some(IVec3::new(-1, 0, 0))
         } else {
-            if let Some(selected_node_id) = &pick.selected {
-                state.layout_ast = state
-                    .layout_ast
-                    .move_node_delta(selected_node_id.clone(), Vec3::new(-1.0, 0.0, 0.0));
-                rebuild.0 = true;
-            }
+            None
         }
-    }
-    if keys.just_pressed(KeyCode::ArrowDown) {
-        if shift {
-            if let Some(selected_node_id) = &pick.selected {
-                state.layout_ast = state
-                    .layout_ast
-                    .move_node_delta(selected_node_id.clone(), Vec3::new(0.0, -1.0, 0.0));
-                rebuild.0 = true;
-            }
+    } else if keys.just_pressed(KeyCode::ArrowDown) {
+        if ctrl && shift {
+            Some(IVec3::new(0, -1, 0))
+        } else if !shift {
+            Some(IVec3::new(1, 0, 0))
         } else {
-            if let Some(selected_node_id) = &pick.selected {
-                state.layout_ast = state
-                    .layout_ast
-                    .move_node_delta(selected_node_id.clone(), Vec3::new(1.0, 0.0, 0.0));
-                rebuild.0 = true;
-            }
+            None
         }
-    }
-    if keys.just_pressed(KeyCode::ArrowLeft) {
-        if shift {
-            // Shift + Left
+    } else if keys.just_pressed(KeyCode::ArrowLeft) {
+        if !shift {
+            Some(IVec3::new(0, 0, 1))
         } else {
-            if let Some(selected_node_id) = &pick.selected {
-                state.layout_ast = state
-                    .layout_ast
-                    .move_node_delta(selected_node_id.clone(), Vec3::new(0.0, 0.0, 1.0));
-                rebuild.0 = true;
-            }
+            None
         }
-    }
-    if keys.just_pressed(KeyCode::ArrowRight) {
-        if shift {
-            // Shift + Right
+    } else if keys.just_pressed(KeyCode::ArrowRight) {
+        if !shift {
+            Some(IVec3::new(0, 0, -1))
         } else {
-            if let Some(selected_node_id) = &pick.selected {
-                state.layout_ast = state
-                    .layout_ast
-                    .move_node_delta(selected_node_id.clone(), Vec3::new(0.0, 0.0, -1.0));
-                rebuild.0 = true;
-            }
+            None
         }
+    } else {
+        None
+    };
+
+    let Some(delta) = delta else {
+        return;
+    };
+
+    if ctrl {
+        // Move the node under the current selection (if any) and keep
+        // the selection anchored to it.
+        if let Some(node_id) = state.layout_ast.node_at(pick.selected_pos) {
+            state.layout_ast = state.layout_ast.move_node_delta(node_id, delta.as_vec3());
+            pick.selected_pos += delta;
+            rebuild.0 = true;
+        }
+    } else {
+        // Plain arrow: navigate the selection between grid crossings.
+        pick.selected_pos += delta;
     }
 }
 
@@ -2781,6 +2835,7 @@ fn spawn_crosshair(mut commands: Commands) {
 
 fn update_crosshair(
     pick: Res<PickState>,
+    state: Res<AstState>,
     camera_q: Query<(&Camera, &GlobalTransform), With<camera::OrbitCameraTag>>,
     node_q: Query<(&AstNodeEntity, &GlobalTransform)>,
     windows: Query<&Window>,
@@ -2792,10 +2847,6 @@ fn update_crosshair(
         }
     };
 
-    let Some(selected_id) = pick.selected.clone() else {
-        hide_all(&mut crosshair_q);
-        return;
-    };
     let Ok((camera, cam_tf)) = camera_q.single() else {
         hide_all(&mut crosshair_q);
         return;
@@ -2804,15 +2855,22 @@ fn update_crosshair(
         hide_all(&mut crosshair_q);
         return;
     };
-    let Some(node_tf) = node_q
-        .iter()
-        .find(|(e, _)| e.node_id == selected_id)
-        .map(|(_, tf)| tf)
-    else {
-        hide_all(&mut crosshair_q);
-        return;
-    };
-    let Ok(screen) = camera.world_to_viewport(cam_tf, node_tf.translation()) else {
+
+    // Anchor world position: use node transform if a node lives at the
+    // selected position (accounts for any drift), otherwise derive from
+    // the layout-scaled selected_pos.
+    let anchor_world = state
+        .layout_ast
+        .node_at(pick.selected_pos)
+        .and_then(|id| {
+            node_q
+                .iter()
+                .find(|(e, _)| e.node_id == id)
+                .map(|(_, tf)| tf.translation())
+        })
+        .unwrap_or_else(|| render::layout_to_world(pick.selected_pos.as_vec3()));
+
+    let Ok(screen) = camera.world_to_viewport(cam_tf, anchor_world) else {
         hide_all(&mut crosshair_q);
         return;
     };
@@ -2820,7 +2878,7 @@ fn update_crosshair(
     // Project a world-space sphere with constant radius onto the screen
     // to get a perspective-correct, distance-aware box size.
     const CROSSHAIR_RADIUS: f32 = 0.5;
-    let edge_world = node_tf.translation() + *cam_tf.right() * CROSSHAIR_RADIUS;
+    let edge_world = anchor_world + *cam_tf.right() * CROSSHAIR_RADIUS;
     let Ok(edge_screen) = camera.world_to_viewport(cam_tf, edge_world) else {
         hide_all(&mut crosshair_q);
         return;
@@ -2980,10 +3038,12 @@ fn main() {
                         .chain(),
                     highlight_hovered,
                     update_selection_display,
+                    update_grid_hover_material,
                     update_cursor,
                     text_input_focus,
                     text_input_keyboard,
                     handle_arrow_keys,
+                    trigger_camera_focus_on_selection_change,
                 ),
                 (
                     anchor_hover_system,
