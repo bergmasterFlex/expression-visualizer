@@ -175,8 +175,7 @@ fn neighbours_of_anchor(
     ast: &crate::ast::Ast,
     anchor: &crate::ast::AnchorId,
 ) -> Vec<crate::ast::node::Id> {
-    let mut out: Vec<crate::ast::node::Id> =
-        ast.get_connected_nodes_to_anchor(anchor.clone());
+    let mut out: Vec<crate::ast::node::Id> = ast.get_connected_nodes_to_anchor(anchor.clone());
     if let Some(edges) = ast.edges.get(anchor) {
         for e in edges {
             if let Some(n) = ast.anchor_to_node.get(&e.to) {

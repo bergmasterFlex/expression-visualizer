@@ -14,16 +14,6 @@ use bevy::core_pipeline::oit::OrderIndependentTransparencySettings;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::{input::keyboard::KeyboardInput, math::VectorSpace, prelude::*};
 
-// ── WASM bridge ─────────────────────────────────────────────
-
-#[cfg(target_arch = "wasm32")]
-fn read_expression_from_js() -> Option<String> {
-    use wasm_bindgen::JsValue;
-    let window = web_sys::window()?;
-    let val = js_sys::Reflect::get(&window, &JsValue::from_str("astExpression")).ok()?;
-    val.as_string()
-}
-
 // ── Resources ───────────────────────────────────────────────
 
 #[derive(Resource)]
@@ -39,7 +29,7 @@ struct CurrentInputString(String);
 impl Default for AstState {
     fn default() -> Self {
         Self {
-            layout_ast: layout::LayoutAst::empty().plus_sink(),
+            layout_ast: layout::LayoutAst::empty(),
             function_declarations: std::collections::HashMap::from([
                 (
                     ast::FunctionDeclarationId(0),
@@ -193,6 +183,28 @@ enum UiMode {
     Playground,
     Examples,
 }
+
+#[derive(Resource)]
+struct StartMenu {
+    showing: bool,
+}
+
+impl Default for StartMenu {
+    fn default() -> Self {
+        Self { showing: true }
+    }
+}
+
+#[derive(Component)]
+struct StartMenuEntity;
+#[derive(Component)]
+struct StartMenuNewButton;
+#[derive(Component)]
+struct StartMenuLoadExampleButton;
+
+/// Marker for UI entities that should be hidden while the start menu is open.
+#[derive(Component)]
+struct HideDuringStartMenu;
 
 #[derive(Component)]
 struct PlaygroundTab;
@@ -605,6 +617,7 @@ fn spawn_ui(mut commands: Commands) {
             BackgroundColor(Color::srgba(0.06, 0.06, 0.12, 0.9)),
             BorderColor::all(Color::srgb(0.12, 0.12, 0.24)),
             TextInputBox,
+            HideDuringStartMenu,
             TextInput {
                 value: initial.to_string(),
                 focused: false,
@@ -712,6 +725,7 @@ fn spawn_corner_button<C: Bundle>(
             },
             BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
             component,
+            HideDuringStartMenu,
         ))
         .with_children(|parent| {
             parent.spawn((
@@ -746,6 +760,7 @@ fn spawn_ui_button<C: Bundle>(
             },
             BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
             component,
+            HideDuringStartMenu,
         ))
         .with_children(|parent| {
             parent.spawn((
@@ -781,6 +796,7 @@ fn spawn_tab_button<C: Bundle>(
             },
             BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
             component,
+            HideDuringStartMenu,
         ))
         .with_children(|parent| {
             parent.spawn((
@@ -859,11 +875,15 @@ fn handle_tab_buttons(
 
 fn update_mode_visibility(
     mode: Res<UiMode>,
+    start_menu: Res<StartMenu>,
     mut playground_q: Query<&mut Node, (With<PlaygroundOnly>, Without<ExamplesOnly>)>,
     mut examples_q: Query<&mut Node, (With<ExamplesOnly>, Without<PlaygroundOnly>)>,
     mut text_inputs: Query<&mut TextInput>,
 ) {
-    if !mode.is_changed() {
+    if start_menu.showing {
+        return;
+    }
+    if !mode.is_changed() && !start_menu.is_changed() {
         return;
     }
     let (playground_display, examples_display) = match *mode {
@@ -1433,6 +1453,179 @@ fn modal_button_node() -> Node {
     }
 }
 
+fn spawn_start_menu(mut commands: Commands) {
+    commands
+        .spawn((
+            backdrop_node(),
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            GlobalZIndex(50),
+            StartMenuEntity,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                panel_node(),
+                BackgroundColor(Color::srgba(0.10, 0.10, 0.16, 0.98)),
+                BorderColor::all(Color::srgb(0.25, 0.25, 0.4)),
+                StartMenuEntity,
+            ))
+            .with_children(|panel| {
+                panel.spawn((
+                    Text::new("Expression Visualizer"),
+                    TextFont {
+                        font_size: 24.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(0.95, 0.95, 1.0)),
+                    Node {
+                        margin: UiRect::all(Val::Px(12.0)),
+                        align_self: AlignSelf::Center,
+                        ..default()
+                    },
+                    StartMenuEntity,
+                ));
+                panel
+                    .spawn((
+                        Node {
+                            flex_direction: FlexDirection::Row,
+                            justify_content: JustifyContent::Center,
+                            margin: UiRect::all(Val::Px(8.0)),
+                            ..default()
+                        },
+                        StartMenuEntity,
+                    ))
+                    .with_children(|btns| {
+                        btns.spawn((
+                            Button,
+                            modal_button_node(),
+                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
+                            StartMenuNewButton,
+                            StartMenuEntity,
+                        ))
+                        .with_children(|b| {
+                            b.spawn((
+                                Text::new("New"),
+                                TextFont {
+                                    font_size: 14.0,
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                                StartMenuEntity,
+                            ));
+                        });
+                        btns.spawn((
+                            Button,
+                            modal_button_node(),
+                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
+                            StartMenuLoadExampleButton,
+                            StartMenuEntity,
+                        ))
+                        .with_children(|b| {
+                            b.spawn((
+                                Text::new("Load Example"),
+                                TextFont {
+                                    font_size: 14.0,
+                                    ..default()
+                                },
+                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                                StartMenuEntity,
+                            ));
+                        });
+                    });
+            });
+        });
+}
+
+fn handle_start_menu_new_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (With<Interaction>, With<StartMenuNewButton>),
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+    mut state: ResMut<AstState>,
+    mut mode: ResMut<UiMode>,
+    mut rebuild: ResMut<NeedsRebuild>,
+    mut start_menu: ResMut<StartMenu>,
+) {
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
+        match *interaction {
+            Interaction::Pressed => {
+                state.layout_ast = layout::LayoutAst::empty().plus_sink();
+                *mode = UiMode::Playground;
+                rebuild.0 = true;
+                start_menu.showing = false;
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
+                color.0 = Color::srgb(1.0, 1.0, 1.0);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+        }
+    }
+}
+
+fn handle_start_menu_load_example_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (With<Interaction>, With<StartMenuLoadExampleButton>),
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+    mut state: ResMut<AstState>,
+    mut mode: ResMut<UiMode>,
+    mut rebuild: ResMut<NeedsRebuild>,
+    mut start_menu: ResMut<StartMenu>,
+) {
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
+        match *interaction {
+            Interaction::Pressed => {
+                state.layout_ast = layout::LayoutAst::empty().plus_sink_example();
+                *mode = UiMode::Examples;
+                rebuild.0 = true;
+                start_menu.showing = false;
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
+                color.0 = Color::srgb(1.0, 1.0, 1.0);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+        }
+    }
+}
+
+fn sync_start_menu_ui(
+    mut commands: Commands,
+    start_menu: Res<StartMenu>,
+    menu_entities: Query<Entity, With<StartMenuEntity>>,
+    mut hideable: Query<&mut Node, With<HideDuringStartMenu>>,
+    mut last_showing: Local<Option<bool>>,
+) {
+    if *last_showing == Some(start_menu.showing) {
+        return;
+    }
+    *last_showing = Some(start_menu.showing);
+
+    if !start_menu.showing {
+        for e in menu_entities.iter() {
+            commands.entity(e).despawn();
+        }
+    }
+    let d = if start_menu.showing {
+        Display::None
+    } else {
+        Display::Flex
+    };
+    for mut n in hideable.iter_mut() {
+        n.display = d;
+    }
+}
+
 fn handle_modal_ok_button(
     mut interaction_q: Query<
         (&Interaction, &mut BackgroundColor, &Children),
@@ -1639,10 +1832,11 @@ fn update_step_button_visuals(
 
 fn sync_evaluate_button_visibility(
     eval: Res<EvalState>,
+    start_menu: Res<StartMenu>,
     mut q: Query<&mut Node, With<EvaluateButton>>,
 ) {
     let running = matches!(eval.phase, EvalPhase::Running { .. });
-    let desired = if running {
+    let desired = if start_menu.showing || running {
         Display::None
     } else {
         Display::Flex
@@ -1918,6 +2112,7 @@ fn spawn_selection_display(mut commands: Commands) {
             ..default()
         },
         SelectionDisplay,
+        HideDuringStartMenu,
     ));
 }
 
@@ -2743,6 +2938,7 @@ fn main() {
         .init_resource::<DragState>()
         .init_resource::<UiMode>()
         .init_resource::<EvalState>()
+        .init_resource::<StartMenu>()
         .add_systems(
             Startup,
             (
@@ -2753,6 +2949,7 @@ fn main() {
                 spawn_selection_display,
                 spawn_fps_display,
                 spawn_crosshair,
+                spawn_start_menu,
             )
                 .chain(),
         )
@@ -2774,6 +2971,9 @@ fn main() {
                         handle_add_node_button,
                         handle_example_buttons,
                         handle_tab_buttons,
+                        handle_start_menu_new_button,
+                        handle_start_menu_load_example_button,
+                        sync_start_menu_ui,
                         update_mode_visibility,
                         pick_nodes,
                     )
