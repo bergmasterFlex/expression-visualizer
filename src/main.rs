@@ -653,8 +653,8 @@ fn spawn_ui(mut commands: Commands) {
     );
     for (label, action) in [
         ("Add ConstDecl", EAstActionButton::AddConstDeclButton),
-        ("VarDecl", EAstActionButton::AddVarDeclButton),
-        ("Add Function Call", EAstActionButton::AddFunctionCallButton),
+        ("Add VarDecl", EAstActionButton::AddVarDeclButton),
+        ("Add FunctionCall", EAstActionButton::AddFunctionCallButton),
         ("Add Match", EAstActionButton::AddMatchFrontButton),
         ("Add TypeCast", EAstActionButton::AddTypeCastButton),
     ] {
