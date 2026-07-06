@@ -818,14 +818,15 @@ fn spawn_hamburger_button(commands: &mut Commands, pos: Vec2) {
 fn update_mode_visibility(
     mode: Res<UiMode>,
     start_menu: Res<StartMenu>,
+    eval: Res<EvalState>,
     mut playground_q: Query<&mut Node, (With<PlaygroundOnly>, Without<ExamplesOnly>)>,
     mut examples_q: Query<&mut Node, (With<ExamplesOnly>, Without<PlaygroundOnly>)>,
     mut text_inputs: Query<&mut TextInput>,
 ) {
-    if start_menu.showing {
+    if start_menu.showing || modal_is_open(&eval) {
         return;
     }
-    if !mode.is_changed() && !start_menu.is_changed() {
+    if !mode.is_changed() && !start_menu.is_changed() && !eval.is_changed() {
         return;
     }
     let (playground_display, examples_display) = match *mode {
@@ -1780,32 +1781,35 @@ fn handle_hamburger_button(
 fn sync_start_menu_ui(
     mut commands: Commands,
     start_menu: Res<StartMenu>,
+    eval: Res<EvalState>,
     menu_entities: Query<Entity, With<StartMenuEntity>>,
     mut hideable: Query<&mut Node, With<HideDuringStartMenu>>,
     mut last_showing: Local<Option<bool>>,
+    mut last_hidden: Local<Option<bool>>,
 ) {
-    if *last_showing == Some(start_menu.showing) {
+    if *last_showing != Some(start_menu.showing) {
+        let was_showing = *last_showing;
+        *last_showing = Some(start_menu.showing);
+
+        if !start_menu.showing {
+            for e in menu_entities.iter() {
+                commands.entity(e).despawn();
+            }
+        } else if was_showing == Some(false) {
+            // Re-open after a Cancel/close — respawn the menu.
+            for e in menu_entities.iter() {
+                commands.entity(e).despawn();
+            }
+            spawn_start_menu_ui(&mut commands, start_menu.has_cancel);
+        }
+    }
+
+    let hidden = start_menu.showing || modal_is_open(&eval);
+    if *last_hidden == Some(hidden) {
         return;
     }
-    let was_showing = *last_showing;
-    *last_showing = Some(start_menu.showing);
-
-    if !start_menu.showing {
-        for e in menu_entities.iter() {
-            commands.entity(e).despawn();
-        }
-    } else if was_showing == Some(false) {
-        // Re-open after a Cancel/close — respawn the menu.
-        for e in menu_entities.iter() {
-            commands.entity(e).despawn();
-        }
-        spawn_start_menu_ui(&mut commands, start_menu.has_cancel);
-    }
-    let d = if start_menu.showing {
-        Display::None
-    } else {
-        Display::Flex
-    };
+    *last_hidden = Some(hidden);
+    let d = if hidden { Display::None } else { Display::Flex };
     for mut n in hideable.iter_mut() {
         n.display = d;
     }
@@ -2049,7 +2053,7 @@ fn sync_evaluate_button_visibility(
     mut q: Query<&mut Node, With<EvaluateButton>>,
 ) {
     let running = matches!(eval.phase, EvalPhase::Running { .. });
-    let desired = if start_menu.showing || running {
+    let desired = if start_menu.showing || running || modal_is_open(&eval) {
         Display::None
     } else {
         Display::Flex
