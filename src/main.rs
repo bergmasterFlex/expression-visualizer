@@ -847,39 +847,62 @@ fn update_mode_visibility(
 }
 
 fn handle_delete_node_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (Changed<Interaction>, With<DeleteNodeButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<DeleteNodeButton>)>,
     mut state: ResMut<AstState>,
-    mut orbit: ResMut<camera::OrbitCamera>,
     mut rebuild: ResMut<NeedsRebuild>,
-    mut pick: ResMut<PickState>,
-    mut commands: Commands,
-    scene_entities: Query<Entity, With<AstSceneEntity>>,
+    pick: Res<PickState>,
     eval: Res<EvalState>,
 ) {
     if is_evaluating(&eval) {
         return;
     }
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-
-        match *interaction {
-            Interaction::Pressed => {
-                if let Some(selected_node_id) = state.layout_ast.node_at(pick.selected_pos) {
-                    state.layout_ast = state.layout_ast.minus_node(&selected_node_id);
-                    rebuild.0 = true;
-                }
+    for interaction in interaction_q.iter() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        if let Some(selected_node_id) = state.layout_ast.node_at(pick.selected_pos) {
+            let is_sink_wall = matches!(
+                state.layout_ast.ast.nodes.get(&selected_node_id),
+                Some(ast::node::ENode::SinkWall { .. })
+            );
+            if !is_sink_wall {
+                state.layout_ast = state.layout_ast.minus_node(&selected_node_id);
+                rebuild.0 = true;
             }
-            Interaction::Hovered => {
+        }
+    }
+}
+
+fn update_delete_button_visuals(
+    pick: Res<PickState>,
+    state: Res<AstState>,
+    mut button_q: Query<(&Interaction, &mut BackgroundColor, &Children), With<DeleteNodeButton>>,
+    mut text_color_q: Query<&mut TextColor>,
+) {
+    let enabled = match state.layout_ast.node_at(pick.selected_pos) {
+        Some(id) => !matches!(
+            state.layout_ast.ast.nodes.get(&id),
+            Some(ast::node::ENode::SinkWall { .. })
+        ),
+        None => false,
+    };
+    for (interaction, mut bg, children) in button_q.iter_mut() {
+        let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
+            continue;
+        };
+        if !enabled {
+            bg.0 = Color::srgba(0.10, 0.10, 0.13, 0.9);
+            text_color.0 = Color::srgb(0.35, 0.35, 0.4);
+            continue;
+        }
+        match *interaction {
+            Interaction::Hovered | Interaction::Pressed => {
                 bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
+                text_color.0 = Color::srgb(0.85, 0.85, 0.9);
             }
             Interaction::None => {
                 bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                color.0 = Color::srgb(0.6, 0.6, 0.7);
+                text_color.0 = Color::srgb(0.6, 0.6, 0.7);
             }
         }
     }
@@ -1644,7 +1667,7 @@ fn handle_start_menu_new_button(
         let mut color = text_color_q.get_mut(children[0]).unwrap();
         match *interaction {
             Interaction::Pressed => {
-                state.layout_ast = layout::LayoutAst::empty();
+                state.layout_ast = layout::LayoutAst::empty().plus_sink_wall();
                 *mode = UiMode::Playground;
                 rebuild.0 = true;
                 start_menu.showing = false;
@@ -3277,6 +3300,7 @@ fn main() {
                 sync_eval_step_bar,
                 sync_evaluate_button_visibility,
                 update_step_button_visuals,
+                update_delete_button_visuals,
                 sync_value_labels,
             )
                 .chain(),
