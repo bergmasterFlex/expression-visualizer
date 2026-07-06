@@ -509,62 +509,6 @@ pub fn layoutnode_to_rendernode(
             )]),
             labels: vec![],
         },
-        crate::ast::node::ENode::Sink { input_anchor } => {
-            let color = Color::srgb(0.9, 0.0, 0.0);
-            RenderNode {
-                node: RenderObject {
-                    mesh: Torus::new(0.225, 0.38).mesh().build(),
-                    material: StandardMaterial {
-                        base_color: color,
-                        emissive: emissive_color(color),
-                        metallic: 0.3,
-                        perceptual_roughness: 0.6,
-                        ..default()
-                    },
-                    transform: node_pos_tf
-                        * Transform::from_scale(Vec3::new(2.0, 2.0, 2.0))
-                        * Transform::from_rotation(Quat::from_axis_angle(
-                            Vec3::new(1.0, 0.0, 0.0),
-                            std::f32::consts::PI * 0.5,
-                        )),
-                },
-                anchors: std::collections::HashMap::from([(
-                    input_anchor.clone(),
-                    RenderAnchor {
-                        normal: RenderObject {
-                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                            material: StandardMaterial {
-                                base_color: Color::srgb(0.3, 0.6, 1.0),
-                                emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                                unlit: true,
-                                ..default()
-                            },
-                            transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, -0.55)),
-                        },
-                        hovered: RenderObject {
-                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                            material: StandardMaterial {
-                                base_color: Color::srgb(0.5, 0.9, 1.0),
-                                emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                                unlit: true,
-                                ..default()
-                            },
-                            transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, -0.55))
-                                * Transform::from_scale(Vec3::splat(1.8)),
-                        },
-                    },
-                )]),
-                labels: vec![RenderLabel {
-                    text: node.label(function_declarations),
-                    color: Color::WHITE,
-                    font_size: 18.0,
-                    world_pos: node_pos,
-                    offset: Vec2::ZERO,
-                }],
-            }
-        }
         crate::ast::node::ENode::MatchFront { levels, width } => {
             let w = *width as f32;
             let l = *levels as f32;

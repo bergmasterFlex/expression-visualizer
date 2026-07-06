@@ -3,9 +3,6 @@ pub struct Id(pub usize);
 
 #[derive(Debug, Clone)]
 pub enum ENode {
-    Sink {
-        input_anchor: super::AnchorId,
-    },
     SinkWall {
         input_anchor: super::AnchorId,
     },
@@ -68,7 +65,6 @@ impl ENode {
         >,
     ) -> String {
         match self {
-            ENode::Sink { .. } => "sink".to_string(),
             ENode::SinkWall { .. } => "sink wall".to_string(),
             ENode::FunctionCall {
                 function_declaration_id,
@@ -110,13 +106,6 @@ impl ENode {
                 })
                 .chain(vec![(output_anchor.clone(), super::EAnchor::Output)])
                 .collect(),
-            ENode::Sink { input_anchor } => vec![(
-                input_anchor.clone(),
-                super::EAnchor::Input {
-                    order_num: 0,
-                    name: None,
-                },
-            )],
             ENode::SinkWall { input_anchor } => vec![(
                 input_anchor.clone(),
                 super::EAnchor::Input {

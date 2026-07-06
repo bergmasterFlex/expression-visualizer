@@ -80,8 +80,7 @@ pub fn eval_type(
         return Err("infinite edge loop".to_string());
     }
     match node {
-        crate::ast::node::ENode::Sink { input_anchor }
-        | crate::ast::node::ENode::SinkWall { input_anchor } => {
+        crate::ast::node::ENode::SinkWall { input_anchor } => {
             match ast
                 .get_connected_nodes_to_anchor(input_anchor.clone())
                 .first()
@@ -186,11 +185,10 @@ fn neighbours_of_anchor(
     out
 }
 
-/// True if any Sink (or SinkWall) has at least one edge on its input anchor.
+/// True if any SinkWall has at least one edge on its input anchor.
 pub fn sink_has_input(ast: &crate::ast::Ast) -> bool {
     ast.nodes.values().any(|node| match node {
-        crate::ast::node::ENode::Sink { input_anchor }
-        | crate::ast::node::ENode::SinkWall { input_anchor } => {
+        crate::ast::node::ENode::SinkWall { input_anchor } => {
             !neighbours_of_anchor(ast, input_anchor).is_empty()
         }
         _ => false,
