@@ -999,7 +999,7 @@ fn handle_add_node_button(
                         state
                             .function_declarations
                             .iter()
-                            .find(|(_, d)| current_input_string.0 == d.name)
+                            .find(|(_, d)| d.name == "+")
                             .map(|(id, decl)| (id.clone(), decl))
                             .unwrap(),
                         new_pos,
