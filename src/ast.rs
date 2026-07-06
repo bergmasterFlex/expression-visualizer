@@ -134,7 +134,23 @@ impl Ast {
                 .into_iter()
                 .filter(|(id, _)| !anchor_ids.contains(id))
                 .collect(),
-            edges: self.edges.clone(),
+            edges: self
+                .edges
+                .clone()
+                .into_iter()
+                .filter(|(from, _)| !anchor_ids.contains(from))
+                .filter_map(|(from, edges)| {
+                    let kept: Vec<Edge> = edges
+                        .into_iter()
+                        .filter(|e| !anchor_ids.contains(&e.to))
+                        .collect();
+                    if kept.is_empty() {
+                        None
+                    } else {
+                        Some((from, kept))
+                    }
+                })
+                .collect(),
         }
     }
 
