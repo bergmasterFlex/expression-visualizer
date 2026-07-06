@@ -970,8 +970,7 @@ fn handle_add_node_button(
 
         match *interaction {
             Interaction::Pressed => {
-                let base = pick.selected_pos.as_vec3();
-                let new_pos = Vec3::new(base.x + 1.0, base.y, base.z);
+                let new_pos = pick.selected_pos.as_vec3();
                 state.layout_ast = match action {
                     EAstActionButton::AddIntIntroductionButton => {
                         state.layout_ast.plus_type_introduction(
