@@ -849,7 +849,7 @@ fn update_mode_visibility(
 fn handle_delete_node_button(
     mut interaction_q: Query<
         (&Interaction, &mut BackgroundColor, &Children),
-        (With<Interaction>, With<DeleteNodeButton>),
+        (Changed<Interaction>, With<DeleteNodeButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut state: ResMut<AstState>,
@@ -893,7 +893,7 @@ fn handle_example_buttons(
             &Children,
             &ExampleButton,
         ),
-        With<Interaction>,
+        (Changed<Interaction>, With<ExampleButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut state: ResMut<AstState>,
@@ -950,7 +950,7 @@ fn handle_add_node_button(
             &Children,
             &EAstActionButton,
         ),
-        With<Interaction>,
+        (Changed<Interaction>, With<EAstActionButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut state: ResMut<AstState>,
@@ -1029,7 +1029,7 @@ fn handle_add_node_button(
 fn handle_evaluate_button(
     mut interaction_q: Query<
         (&Interaction, &mut BackgroundColor, &Children),
-        (With<Interaction>, With<EvaluateButton>),
+        (Changed<Interaction>, With<EvaluateButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut eval: ResMut<EvalState>,
@@ -1633,7 +1633,7 @@ fn spawn_start_menu_ui(commands: &mut Commands, has_cancel: bool) {
 fn handle_start_menu_new_button(
     mut interaction_q: Query<
         (&Interaction, &mut BackgroundColor, &Children),
-        (With<Interaction>, With<StartMenuNewButton>),
+        (Changed<Interaction>, With<StartMenuNewButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut state: ResMut<AstState>,
@@ -1666,7 +1666,7 @@ fn handle_start_menu_new_button(
 fn handle_start_menu_load_example_button(
     mut interaction_q: Query<
         (&Interaction, &mut BackgroundColor, &Children),
-        (With<Interaction>, With<StartMenuLoadExampleButton>),
+        (Changed<Interaction>, With<StartMenuLoadExampleButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut state: ResMut<AstState>,
@@ -1699,7 +1699,7 @@ fn handle_start_menu_load_example_button(
 fn handle_start_menu_controls_button(
     mut interaction_q: Query<
         (&Interaction, &mut BackgroundColor, &Children),
-        (With<Interaction>, With<StartMenuControlsButton>),
+        (Changed<Interaction>, With<StartMenuControlsButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut start_menu: ResMut<StartMenu>,
@@ -1727,7 +1727,7 @@ fn handle_start_menu_controls_button(
 fn handle_start_menu_cancel_button(
     mut interaction_q: Query<
         (&Interaction, &mut BackgroundColor, &Children),
-        (With<Interaction>, With<StartMenuCancelButton>),
+        (Changed<Interaction>, With<StartMenuCancelButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut start_menu: ResMut<StartMenu>,
@@ -1818,7 +1818,7 @@ fn sync_start_menu_ui(
 fn handle_modal_ok_button(
     mut interaction_q: Query<
         (&Interaction, &mut BackgroundColor, &Children),
-        (With<Interaction>, With<ModalOkButton>),
+        (Changed<Interaction>, With<ModalOkButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut eval: ResMut<EvalState>,
@@ -1844,7 +1844,7 @@ fn handle_modal_ok_button(
 fn handle_controls_modal_ok_button(
     mut interaction_q: Query<
         (&Interaction, &mut BackgroundColor, &Children),
-        (With<Interaction>, With<ControlsModalOkButton>),
+        (Changed<Interaction>, With<ControlsModalOkButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut eval: ResMut<EvalState>,
@@ -1872,7 +1872,7 @@ fn handle_controls_modal_ok_button(
 fn handle_modal_cancel_button(
     mut interaction_q: Query<
         (&Interaction, &mut BackgroundColor, &Children),
-        (With<Interaction>, With<ModalCancelButton>),
+        (Changed<Interaction>, With<ModalCancelButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut eval: ResMut<EvalState>,
@@ -1898,7 +1898,7 @@ fn handle_modal_cancel_button(
 fn handle_modal_evaluate_button(
     mut interaction_q: Query<
         (&Interaction, &mut BackgroundColor, &Children),
-        (With<Interaction>, With<ModalEvaluateButton>),
+        (Changed<Interaction>, With<ModalEvaluateButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut eval: ResMut<EvalState>,
