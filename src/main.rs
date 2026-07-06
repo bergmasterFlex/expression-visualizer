@@ -170,11 +170,11 @@ struct DeleteNodeButton;
 struct HamburgerButton;
 #[derive(Component, Clone)]
 enum EAstActionButton {
-    AddIntIntroductionButton,
-    AddBoolIntroductionButton,
-    AddIntEliminationButton,
+    AddConstDeclButton,
+    AddVarDeclButton,
+    AddTypeCastButton,
     AddFunctionCallButton,
-    AddMatchButton,
+    AddMatchFrontButton,
 }
 
 #[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
@@ -652,20 +652,11 @@ fn spawn_ui(mut commands: Commands) {
         Display::Flex,
     );
     for (label, action) in [
-        (
-            "Add Int Introduction",
-            EAstActionButton::AddIntIntroductionButton,
-        ),
-        (
-            "Add Bool Introduction",
-            EAstActionButton::AddBoolIntroductionButton,
-        ),
+        ("Add ConstDecl", EAstActionButton::AddConstDeclButton),
+        ("VarDecl", EAstActionButton::AddVarDeclButton),
         ("Add Function Call", EAstActionButton::AddFunctionCallButton),
-        ("Add Match", EAstActionButton::AddMatchButton),
-        (
-            "Add Int Elimination",
-            EAstActionButton::AddIntEliminationButton,
-        ),
+        ("Add Match", EAstActionButton::AddMatchFrontButton),
+        ("Add TypeCast", EAstActionButton::AddTypeCastButton),
     ] {
         y_offset += 36.0;
         spawn_ui_button(
@@ -995,7 +986,7 @@ fn handle_add_node_button(
             Interaction::Pressed => {
                 let new_pos = pick.selected_pos.as_vec3();
                 state.layout_ast = match action {
-                    EAstActionButton::AddIntIntroductionButton => {
+                    EAstActionButton::AddConstDeclButton => {
                         state.layout_ast.plus_type_introduction(
                             ast::node::EType::Int {
                                 value: Some(current_input_string.0.clone()),
@@ -1003,14 +994,7 @@ fn handle_add_node_button(
                             new_pos,
                         )
                     }
-                    EAstActionButton::AddBoolIntroductionButton => {
-                        state.layout_ast.plus_type_introduction(
-                            ast::node::EType::Bool {
-                                value: Some(current_input_string.0.clone()),
-                            },
-                            new_pos,
-                        )
-                    }
+                    EAstActionButton::AddVarDeclButton => state.layout_ast.plus_var_decl(new_pos),
                     EAstActionButton::AddFunctionCallButton => state.layout_ast.plus_function_call(
                         state
                             .function_declarations
@@ -1020,19 +1004,19 @@ fn handle_add_node_button(
                             .unwrap(),
                         new_pos,
                     ),
-                    EAstActionButton::AddIntEliminationButton => {
-                        state.layout_ast.plus_type_elimination(
-                            ast::node::EType::Int {
-                                value: if current_input_string.0.clone() == "".to_string() {
-                                    None
-                                } else {
-                                    Some(current_input_string.0.clone())
-                                },
+                    EAstActionButton::AddTypeCastButton => state.layout_ast.plus_type_elimination(
+                        ast::node::EType::Int {
+                            value: if current_input_string.0.clone() == "".to_string() {
+                                None
+                            } else {
+                                Some(current_input_string.0.clone())
                             },
-                            new_pos,
-                        )
+                        },
+                        new_pos,
+                    ),
+                    EAstActionButton::AddMatchFrontButton => {
+                        state.layout_ast.plus_match_front(new_pos)
                     }
-                    EAstActionButton::AddMatchButton => state.layout_ast.plus_match(new_pos),
                 };
                 rebuild.0 = true;
             }

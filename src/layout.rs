@@ -477,11 +477,23 @@ impl LayoutAst {
         ._plus_layout_node(&node_id, pos)
     }
 
-    pub fn plus_match(&self, pos: Vec3) -> Self {
-        let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
-        let (ast, output_anchor_id) = ast.with_next_anchor_id();
-        let (ast, node_id) = ast.plus(crate::ast::node::ENode::Match {
-            input_anchor: input_anchor_id,
+    pub fn plus_match_front(&self, pos: Vec3) -> Self {
+        let (ast, node_id) = self.ast.plus(crate::ast::node::ENode::MatchFront {
+            levels: 3,
+            width: 2,
+        });
+        Self {
+            ast,
+            layout_nodes: self.layout_nodes.clone(),
+        }
+        ._plus_layout_node(&node_id, pos)
+    }
+
+    pub fn plus_var_decl(&self, pos: Vec3) -> Self {
+        let (ast, output_anchor_id) = self.ast.with_next_anchor_id();
+        let (ast, node_id) = ast.plus(crate::ast::node::ENode::VarDecl {
+            name: "v".to_string(),
+            r#type: crate::ast::node::EType::Any,
             output_anchor: output_anchor_id,
         });
         Self {

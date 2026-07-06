@@ -20,10 +20,6 @@ pub enum ENode {
         input_anchor: super::AnchorId,
         output_anchor: super::AnchorId,
     },
-    Match {
-        input_anchor: super::AnchorId,
-        output_anchor: super::AnchorId,
-    },
     VarDecl {
         name: String,
         r#type: EType,
@@ -77,7 +73,6 @@ impl ENode {
             ENode::TypeIntroduction { r#type, .. } | ENode::TypeElimination { r#type, .. } => {
                 r#type.to_string()
             }
-            ENode::Match { .. } => "match true".to_string(),
             ENode::VarDecl { name, r#type, .. } => format!("{}: {}", name, r#type.to_string()),
             ENode::MatchFront { .. } => "match front".to_string(),
             ENode::MatchBack { .. } => "match back".to_string(),
@@ -120,19 +115,6 @@ impl ENode {
                 input_anchor,
                 output_anchor,
                 ..
-            } => vec![
-                (
-                    input_anchor.clone(),
-                    super::EAnchor::Input {
-                        order_num: 0,
-                        name: None,
-                    },
-                ),
-                (output_anchor.clone(), super::EAnchor::Output),
-            ],
-            ENode::Match {
-                input_anchor,
-                output_anchor,
             } => vec![
                 (
                     input_anchor.clone(),

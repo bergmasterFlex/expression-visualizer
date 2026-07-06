@@ -118,24 +118,6 @@ pub fn eval_type(
             crate::ast::node::EType::Undefined => EType::Undefined,
             crate::ast::node::EType::Exception { message } => EType::Exception,
         }),
-        crate::ast::node::ENode::Match { input_anchor, .. } => {
-            match ast
-                .get_connected_nodes_to_anchor(input_anchor.clone())
-                .first()
-            {
-                Some(input_node_id) => eval_type(
-                    ast.nodes.get(input_node_id).unwrap(),
-                    ast,
-                    function_declarations,
-                    visited_nodes
-                        .iter()
-                        .cloned()
-                        .chain([input_node_id.clone()])
-                        .collect(),
-                ),
-                None => Err("no edge to match input".to_string()),
-            }
-        }
         crate::ast::node::ENode::MatchFront { .. } => Err("match front has no type".to_string()),
         crate::ast::node::ENode::MatchBack { .. } => Err("match back has no type".to_string()),
         crate::ast::node::ENode::MatchGrid { .. } => Err("match grid has no type".to_string()),
