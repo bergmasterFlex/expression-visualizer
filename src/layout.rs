@@ -477,6 +477,18 @@ impl LayoutAst {
         ._plus_layout_node(&node_id, pos)
     }
 
+    pub fn with_function_call_replaced(
+        &self,
+        node_id: &crate::ast::node::Id,
+        new_fn: (
+            crate::ast::FunctionDeclarationId,
+            &crate::ast::FunctionDeclaration,
+        ),
+    ) -> Self {
+        let pos = self.layout_nodes.get(node_id).unwrap().pos;
+        self.minus_node(node_id).plus_function_call(new_fn, pos)
+    }
+
     pub fn plus_match_front(&self, pos: Vec3) -> Self {
         let (ast, node_id) = self.ast.plus(crate::ast::node::ENode::MatchFront {
             levels: 3,

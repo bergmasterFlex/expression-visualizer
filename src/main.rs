@@ -23,9 +23,6 @@ struct AstState {
         std::collections::HashMap<ast::FunctionDeclarationId, ast::FunctionDeclaration>,
 }
 
-#[derive(Resource, Default)]
-struct CurrentInputString(String);
-
 impl Default for AstState {
     fn default() -> Self {
         Self {
@@ -249,6 +246,11 @@ struct PickState {
     /// counts as a click and updates the selection; further movement is
     /// treated as a drag and leaves selection untouched.
     press_cursor: Option<Vec2>,
+    /// True if the last left-mouse press landed on a `Button` UI element.
+    /// The release-time grid selection is suppressed in that case so
+    /// clicking a dropdown/text-input/checkbox doesn't move the selection
+    /// to whatever grid cell the ray passes through behind the panel.
+    press_over_ui: bool,
 }
 
 impl Default for PickState {
@@ -258,6 +260,7 @@ impl Default for PickState {
             hovered_node: None,
             hovered_pos: None,
             press_cursor: None,
+            press_over_ui: false,
         }
     }
 }
@@ -367,6 +370,153 @@ struct ExitEvaluationButton;
 #[derive(Component)]
 struct ValueLabel {
     node_id: ast::node::Id,
+}
+
+// ── Node editor panel ───────────────────────────────────────
+
+#[derive(Component)]
+struct NodeEditorPanel;
+
+/// Tag on every descendant of the editor panel that is rebuilt when the
+/// selection or dropdown state changes.
+#[derive(Component)]
+struct NodeEditorEntity;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NodeEditorField {
+    VarDeclName,
+    Value,
+}
+
+#[derive(Component)]
+struct NodeEditorTextInput {
+    node_id: ast::node::Id,
+    field: NodeEditorField,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DropdownKind {
+    Type,
+    Function,
+    BoolValue,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypeChoice {
+    String,
+    Char,
+    Bool,
+    Int,
+    Float,
+    Undefined,
+}
+
+const TYPE_CHOICES: [TypeChoice; 6] = [
+    TypeChoice::String,
+    TypeChoice::Char,
+    TypeChoice::Bool,
+    TypeChoice::Int,
+    TypeChoice::Float,
+    TypeChoice::Undefined,
+];
+
+#[derive(Clone, PartialEq, Eq)]
+enum DropdownChoice {
+    Type(TypeChoice),
+    Function(ast::FunctionDeclarationId),
+    BoolValue(bool),
+}
+
+#[derive(Component)]
+struct Dropdown {
+    node_id: ast::node::Id,
+    kind: DropdownKind,
+}
+
+#[derive(Component)]
+struct DropdownOption {
+    node_id: ast::node::Id,
+    kind: DropdownKind,
+    choice: DropdownChoice,
+}
+
+#[derive(Component)]
+struct ValueEnableCheckbox {
+    node_id: ast::node::Id,
+}
+
+/// At most one dropdown is open at a time; `open` identifies which one by
+/// `(node_id, kind)` — stable across panel rebuilds.
+#[derive(Resource, Default)]
+struct DropdownState {
+    open: Option<(ast::node::Id, DropdownKind)>,
+}
+
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
+enum NodeVariantKind {
+    #[default]
+    None,
+    TypeIntroduction,
+    TypeElimination,
+    VarDecl,
+    FunctionCall,
+    Other,
+}
+
+fn variant_kind(node: Option<&ast::node::ENode>) -> NodeVariantKind {
+    match node {
+        None => NodeVariantKind::None,
+        Some(ast::node::ENode::TypeIntroduction { .. }) => NodeVariantKind::TypeIntroduction,
+        Some(ast::node::ENode::TypeElimination { .. }) => NodeVariantKind::TypeElimination,
+        Some(ast::node::ENode::VarDecl { .. }) => NodeVariantKind::VarDecl,
+        Some(ast::node::ENode::FunctionCall { .. }) => NodeVariantKind::FunctionCall,
+        Some(_) => NodeVariantKind::Other,
+    }
+}
+
+fn type_choice_of(t: &ast::node::EType) -> Option<TypeChoice> {
+    match t {
+        ast::node::EType::Bool { .. } => Some(TypeChoice::Bool),
+        ast::node::EType::Int { .. } => Some(TypeChoice::Int),
+        ast::node::EType::Float { .. } => Some(TypeChoice::Float),
+        ast::node::EType::String { .. } => Some(TypeChoice::String),
+        ast::node::EType::Char { .. } => Some(TypeChoice::Char),
+        ast::node::EType::Undefined => Some(TypeChoice::Undefined),
+        ast::node::EType::Any | ast::node::EType::Exception { .. } => None,
+    }
+}
+
+fn type_choice_label(t: TypeChoice) -> &'static str {
+    match t {
+        TypeChoice::String => "string",
+        TypeChoice::Char => "char",
+        TypeChoice::Bool => "bool",
+        TypeChoice::Int => "int",
+        TypeChoice::Float => "float",
+        TypeChoice::Undefined => "undefined",
+    }
+}
+
+fn value_of_etype(t: &ast::node::EType) -> Option<String> {
+    match t {
+        ast::node::EType::Bool { value }
+        | ast::node::EType::Int { value }
+        | ast::node::EType::Float { value }
+        | ast::node::EType::String { value }
+        | ast::node::EType::Char { value } => value.clone(),
+        _ => None,
+    }
+}
+
+fn make_etype(choice: TypeChoice, value: Option<String>) -> ast::node::EType {
+    match choice {
+        TypeChoice::Bool => ast::node::EType::Bool { value },
+        TypeChoice::Int => ast::node::EType::Int { value },
+        TypeChoice::Float => ast::node::EType::Float { value },
+        TypeChoice::String => ast::node::EType::String { value },
+        TypeChoice::Char => ast::node::EType::Char { value },
+        TypeChoice::Undefined => ast::node::EType::Undefined,
+    }
 }
 
 // ── Colors ──────────────────────────────────────────────────
@@ -607,43 +757,6 @@ fn spawn_ui(mut commands: Commands) {
 
     // Playground-mode controls.
     let mut y_offset = 60.0;
-    let initial = "";
-    commands
-        .spawn((
-            Button,
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(y_offset),
-                left: Val::Px(12.0),
-                padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
-                min_width: Val::Px(220.0),
-                border: UiRect::all(Val::Px(1.5)),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
-                ..default()
-            },
-            BackgroundColor(Color::srgba(0.06, 0.06, 0.12, 0.9)),
-            BorderColor::all(Color::srgb(0.12, 0.12, 0.24)),
-            TextInputBox,
-            HideDuringStartMenu,
-            TextInput {
-                value: initial.to_string(),
-                focused: false,
-                cursor: initial.len(),
-            },
-            PlaygroundOnly,
-        ))
-        .with_children(|parent| {
-            parent.spawn((
-                Text::new(initial),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
-                TextColor(Color::srgb(0.91, 0.89, 0.87)),
-                TextInputDisplay,
-            ));
-        });
-    y_offset += 36.0;
     spawn_ui_button(
         &mut commands,
         "Delete Node",
@@ -968,7 +1081,6 @@ fn handle_add_node_button(
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut state: ResMut<AstState>,
-    mut current_input_string: ResMut<CurrentInputString>,
     mut orbit: ResMut<camera::OrbitCamera>,
     mut rebuild: ResMut<NeedsRebuild>,
     mut pick: ResMut<PickState>,
@@ -986,14 +1098,9 @@ fn handle_add_node_button(
             Interaction::Pressed => {
                 let new_pos = pick.selected_pos.as_vec3();
                 state.layout_ast = match action {
-                    EAstActionButton::AddConstDeclButton => {
-                        state.layout_ast.plus_type_introduction(
-                            ast::node::EType::Int {
-                                value: Some(current_input_string.0.clone()),
-                            },
-                            new_pos,
-                        )
-                    }
+                    EAstActionButton::AddConstDeclButton => state
+                        .layout_ast
+                        .plus_type_introduction(ast::node::EType::Int { value: None }, new_pos),
                     EAstActionButton::AddVarDeclButton => state.layout_ast.plus_var_decl(new_pos),
                     EAstActionButton::AddFunctionCallButton => state.layout_ast.plus_function_call(
                         state
@@ -1004,16 +1111,9 @@ fn handle_add_node_button(
                             .unwrap(),
                         new_pos,
                     ),
-                    EAstActionButton::AddTypeCastButton => state.layout_ast.plus_type_elimination(
-                        ast::node::EType::Int {
-                            value: if current_input_string.0.clone() == "".to_string() {
-                                None
-                            } else {
-                                Some(current_input_string.0.clone())
-                            },
-                        },
-                        new_pos,
-                    ),
+                    EAstActionButton::AddTypeCastButton => state
+                        .layout_ast
+                        .plus_type_elimination(ast::node::EType::Int { value: None }, new_pos),
                     EAstActionButton::AddMatchFrontButton => {
                         state.layout_ast.plus_match_front(new_pos)
                     }
@@ -1027,6 +1127,712 @@ fn handle_add_node_button(
             Interaction::None => {
                 bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
                 color.0 = Color::srgb(0.6, 0.6, 0.7);
+            }
+        }
+    }
+}
+
+// ── Node editor UI ──────────────────────────────────────────
+
+fn spawn_node_editor_panel(mut commands: Commands) {
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(60.0),
+            right: Val::Px(14.0),
+            width: Val::Px(280.0),
+            flex_direction: FlexDirection::Column,
+            padding: UiRect::all(Val::Px(10.0)),
+            border_radius: BorderRadius::all(Val::Px(6.0)),
+            row_gap: Val::Px(6.0),
+            display: Display::None,
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.10, 0.10, 0.16, 0.9)),
+        Button,
+        NodeEditorPanel,
+    ));
+}
+
+#[derive(Default, PartialEq, Eq, Clone)]
+struct NodeEditorFingerprint {
+    node_id: Option<ast::node::Id>,
+    variant: NodeVariantKind,
+    type_choice: Option<TypeChoice>,
+    typeelim_has_value: bool,
+    func_id: Option<ast::FunctionDeclarationId>,
+    dropdown_open: Option<(ast::node::Id, DropdownKind)>,
+    visible: bool,
+}
+
+fn sync_node_editor_ui(
+    mut commands: Commands,
+    state: Res<AstState>,
+    pick: Res<PickState>,
+    dropdown_state: Res<DropdownState>,
+    ui_mode: Res<UiMode>,
+    start_menu: Res<StartMenu>,
+    eval: Res<EvalState>,
+    mut panel_q: Query<(Entity, &mut Node), With<NodeEditorPanel>>,
+    editor_children_q: Query<Entity, With<NodeEditorEntity>>,
+    mut cache: Local<NodeEditorFingerprint>,
+) {
+    let node_id = state.layout_ast.node_at(pick.selected_pos);
+    let node = node_id
+        .as_ref()
+        .and_then(|id| state.layout_ast.ast.nodes.get(id));
+    let variant = variant_kind(node);
+    let type_choice = node.and_then(|n| match n {
+        ast::node::ENode::TypeIntroduction { r#type, .. }
+        | ast::node::ENode::TypeElimination { r#type, .. } => type_choice_of(r#type),
+        _ => None,
+    });
+    let typeelim_has_value = match node {
+        Some(ast::node::ENode::TypeElimination { r#type, .. }) => value_of_etype(r#type).is_some(),
+        _ => false,
+    };
+    let func_id = match node {
+        Some(ast::node::ENode::FunctionCall {
+            function_declaration_id,
+            ..
+        }) => Some(function_declaration_id.clone()),
+        _ => None,
+    };
+
+    let editable = matches!(
+        variant,
+        NodeVariantKind::TypeIntroduction
+            | NodeVariantKind::TypeElimination
+            | NodeVariantKind::VarDecl
+            | NodeVariantKind::FunctionCall
+    );
+    let visible =
+        editable && *ui_mode == UiMode::Playground && !start_menu.showing && !is_evaluating(&eval);
+
+    let fp = NodeEditorFingerprint {
+        node_id: node_id.clone(),
+        variant,
+        type_choice,
+        typeelim_has_value,
+        func_id: func_id.clone(),
+        dropdown_open: dropdown_state.open.clone(),
+        visible,
+    };
+
+    if *cache == fp {
+        return;
+    }
+    *cache = fp;
+
+    for e in editor_children_q.iter() {
+        commands.entity(e).despawn();
+    }
+
+    let Ok((panel_entity, mut panel_node)) = panel_q.single_mut() else {
+        return;
+    };
+    panel_node.display = if visible {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    if !visible {
+        return;
+    }
+
+    let node = node.unwrap();
+    let node_id = node_id.unwrap();
+
+    commands
+        .entity(panel_entity)
+        .with_children(|panel| match node {
+            ast::node::ENode::TypeIntroduction { r#type, .. } => {
+                spawn_editor_label(panel, "ConstDecl");
+                spawn_labeled_row(panel, "Type", |slot| {
+                    spawn_type_dropdown(slot, &node_id, r#type, &dropdown_state.open);
+                });
+                if !matches!(r#type, ast::node::EType::Undefined) {
+                    spawn_labeled_row(panel, "Value", |slot| {
+                        spawn_value_widget(slot, &node_id, r#type, true, &dropdown_state.open);
+                    });
+                }
+            }
+            ast::node::ENode::VarDecl { name, r#type, .. } => {
+                spawn_labeled_row(panel, "Name", |slot| {
+                    spawn_name_input(slot, &node_id, name);
+                });
+                spawn_labeled_row(panel, "Type", |slot| {
+                    spawn_type_dropdown(slot, &node_id, r#type, &dropdown_state.open);
+                });
+            }
+            ast::node::ENode::TypeElimination { r#type, .. } => {
+                spawn_editor_label(panel, "TypeCast");
+                spawn_labeled_row(panel, "Type", |slot| {
+                    spawn_type_dropdown(slot, &node_id, r#type, &dropdown_state.open);
+                });
+                if !matches!(r#type, ast::node::EType::Undefined) {
+                    spawn_labeled_row(panel, "Value", |slot| {
+                        spawn_typeelim_checkbox_and_value(
+                            slot,
+                            &node_id,
+                            r#type,
+                            &dropdown_state.open,
+                        );
+                    });
+                }
+            }
+            ast::node::ENode::FunctionCall {
+                function_declaration_id,
+                ..
+            } => {
+                spawn_labeled_row(panel, "Function", |slot| {
+                    spawn_function_dropdown(
+                        slot,
+                        &node_id,
+                        function_declaration_id,
+                        &state.function_declarations,
+                        &dropdown_state.open,
+                    );
+                });
+            }
+            _ => {}
+        });
+}
+
+fn spawn_editor_label(panel: &mut ChildSpawnerCommands, text: &str) {
+    panel.spawn((
+        Text::new(text),
+        TextFont {
+            font_size: 15.0,
+            ..default()
+        },
+        TextColor(Color::srgb(0.75, 0.75, 0.9)),
+        NodeEditorEntity,
+    ));
+}
+
+fn spawn_labeled_row(
+    panel: &mut ChildSpawnerCommands,
+    label: &str,
+    widget: impl FnOnce(&mut ChildSpawnerCommands),
+) {
+    panel
+        .spawn((
+            Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(8.0),
+                ..default()
+            },
+            NodeEditorEntity,
+        ))
+        .with_children(|row| {
+            row.spawn((
+                Text::new(label.to_string()),
+                TextFont {
+                    font_size: 13.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.6, 0.6, 0.7)),
+                Node {
+                    width: Val::Px(70.0),
+                    flex_shrink: 0.0,
+                    ..default()
+                },
+                NodeEditorEntity,
+            ));
+            row.spawn((
+                Node {
+                    flex_grow: 1.0,
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(6.0),
+                    ..default()
+                },
+                NodeEditorEntity,
+            ))
+            .with_children(widget);
+        });
+}
+
+fn spawn_name_input(panel: &mut ChildSpawnerCommands, node_id: &ast::node::Id, current: &str) {
+    panel
+        .spawn((
+            Button,
+            editor_text_input_node(),
+            BackgroundColor(Color::srgba(0.06, 0.06, 0.12, 0.95)),
+            BorderColor::all(Color::srgb(0.12, 0.12, 0.24)),
+            TextInputBox,
+            TextInput {
+                value: current.to_string(),
+                focused: false,
+                cursor: current.len(),
+            },
+            NodeEditorTextInput {
+                node_id: node_id.clone(),
+                field: NodeEditorField::VarDeclName,
+            },
+            NodeEditorEntity,
+        ))
+        .with_children(|p| {
+            p.spawn((
+                Text::new(current.to_string()),
+                TextFont {
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.91, 0.89, 0.87)),
+                TextInputDisplay,
+                NodeEditorEntity,
+            ));
+        });
+}
+
+fn spawn_type_dropdown(
+    panel: &mut ChildSpawnerCommands,
+    node_id: &ast::node::Id,
+    current: &ast::node::EType,
+    open: &Option<(ast::node::Id, DropdownKind)>,
+) {
+    let current_choice = type_choice_of(current);
+    let label = current_choice.map(type_choice_label).unwrap_or("?");
+    spawn_dropdown_root(panel, node_id, DropdownKind::Type, label, open, |options| {
+        for tc in TYPE_CHOICES {
+            let is_current = Some(tc) == current_choice;
+            spawn_dropdown_option(
+                options,
+                node_id,
+                DropdownKind::Type,
+                DropdownChoice::Type(tc),
+                type_choice_label(tc),
+                is_current,
+            );
+        }
+    });
+}
+
+fn spawn_function_dropdown(
+    panel: &mut ChildSpawnerCommands,
+    node_id: &ast::node::Id,
+    current: &ast::FunctionDeclarationId,
+    declarations: &std::collections::HashMap<ast::FunctionDeclarationId, ast::FunctionDeclaration>,
+    open: &Option<(ast::node::Id, DropdownKind)>,
+) {
+    let label = declarations
+        .get(current)
+        .map(|d| d.name.as_str())
+        .unwrap_or("?");
+    let mut entries: Vec<(ast::FunctionDeclarationId, String)> = declarations
+        .iter()
+        .map(|(id, d)| (id.clone(), d.name.clone()))
+        .collect();
+    entries.sort_by(|a, b| a.1.cmp(&b.1));
+
+    spawn_dropdown_root(
+        panel,
+        node_id,
+        DropdownKind::Function,
+        label,
+        open,
+        |options| {
+            for (id, name) in &entries {
+                let is_current = id == current;
+                spawn_dropdown_option(
+                    options,
+                    node_id,
+                    DropdownKind::Function,
+                    DropdownChoice::Function(id.clone()),
+                    name,
+                    is_current,
+                );
+            }
+        },
+    );
+}
+
+fn spawn_value_widget(
+    panel: &mut ChildSpawnerCommands,
+    node_id: &ast::node::Id,
+    current: &ast::node::EType,
+    enabled: bool,
+    open: &Option<(ast::node::Id, DropdownKind)>,
+) {
+    match current {
+        ast::node::EType::Undefined => {}
+        ast::node::EType::Bool { value } => {
+            let current_bool = value.as_deref() == Some("true");
+            let label = value.as_deref().unwrap_or("bool");
+            spawn_dropdown_root(
+                panel,
+                node_id,
+                DropdownKind::BoolValue,
+                label,
+                open,
+                |options| {
+                    for v in [true, false] {
+                        spawn_dropdown_option(
+                            options,
+                            node_id,
+                            DropdownKind::BoolValue,
+                            DropdownChoice::BoolValue(v),
+                            if v { "true" } else { "false" },
+                            value.is_some() && v == current_bool,
+                        );
+                    }
+                },
+            );
+        }
+        _ => {
+            let initial = value_of_etype(current).unwrap_or_default();
+            let (bg, border, fg) = if enabled {
+                (
+                    Color::srgba(0.06, 0.06, 0.12, 0.95),
+                    Color::srgb(0.12, 0.12, 0.24),
+                    Color::srgb(0.91, 0.89, 0.87),
+                )
+            } else {
+                (
+                    Color::srgba(0.06, 0.06, 0.12, 0.6),
+                    Color::srgb(0.12, 0.12, 0.24),
+                    Color::srgb(0.45, 0.45, 0.5),
+                )
+            };
+            let mut e = panel.spawn((
+                Button,
+                editor_text_input_node(),
+                BackgroundColor(bg),
+                BorderColor::all(border),
+                TextInput {
+                    value: initial.clone(),
+                    focused: false,
+                    cursor: initial.len(),
+                },
+                NodeEditorTextInput {
+                    node_id: node_id.clone(),
+                    field: NodeEditorField::Value,
+                },
+                NodeEditorEntity,
+            ));
+            if enabled {
+                e.insert(TextInputBox);
+            }
+            e.with_children(|p| {
+                p.spawn((
+                    Text::new(initial),
+                    TextFont {
+                        font_size: 14.0,
+                        ..default()
+                    },
+                    TextColor(fg),
+                    TextInputDisplay,
+                    NodeEditorEntity,
+                ));
+            });
+        }
+    }
+}
+
+fn spawn_typeelim_checkbox_and_value(
+    row: &mut ChildSpawnerCommands,
+    node_id: &ast::node::Id,
+    current: &ast::node::EType,
+    open: &Option<(ast::node::Id, DropdownKind)>,
+) {
+    let enabled = value_of_etype(current).is_some();
+    row.spawn((
+        Button,
+        Node {
+            width: Val::Px(16.0),
+            height: Val::Px(16.0),
+            border: UiRect::all(Val::Px(1.5)),
+            border_radius: BorderRadius::all(Val::Px(3.0)),
+            flex_shrink: 0.0,
+            ..default()
+        },
+        BackgroundColor(if enabled {
+            Color::srgb(0.133, 0.827, 0.933)
+        } else {
+            Color::srgba(0.06, 0.06, 0.12, 0.95)
+        }),
+        BorderColor::all(Color::srgb(0.35, 0.35, 0.5)),
+        ValueEnableCheckbox {
+            node_id: node_id.clone(),
+        },
+        NodeEditorEntity,
+    ));
+    spawn_value_widget(row, node_id, current, enabled, open);
+}
+
+fn spawn_dropdown_root(
+    panel: &mut ChildSpawnerCommands,
+    node_id: &ast::node::Id,
+    kind: DropdownKind,
+    label: &str,
+    open: &Option<(ast::node::Id, DropdownKind)>,
+    spawn_options: impl FnOnce(&mut ChildSpawnerCommands),
+) {
+    let is_open = matches!(open, Some((oid, ok)) if oid == node_id && *ok == kind);
+    let mut root = panel.spawn((
+        Node {
+            flex_direction: FlexDirection::Column,
+            flex_grow: 1.0,
+            ..default()
+        },
+        NodeEditorEntity,
+    ));
+    root.with_children(|dd| {
+        dd.spawn((
+            Button,
+            Node {
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+                border: UiRect::all(Val::Px(1.5)),
+                border_radius: BorderRadius::all(Val::Px(4.0)),
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                flex_direction: FlexDirection::Row,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.06, 0.06, 0.12, 0.95)),
+            BorderColor::all(Color::srgb(0.12, 0.12, 0.24)),
+            Dropdown {
+                node_id: node_id.clone(),
+                kind,
+            },
+            NodeEditorEntity,
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(label.to_string()),
+                TextFont {
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.91, 0.89, 0.87)),
+                NodeEditorEntity,
+            ));
+            b.spawn((
+                Text::new(if is_open { "▴" } else { "▾" }),
+                TextFont {
+                    font_size: 12.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.6, 0.6, 0.7)),
+                NodeEditorEntity,
+            ));
+        });
+        if is_open {
+            dd.spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    margin: UiRect::top(Val::Px(2.0)),
+                    padding: UiRect::all(Val::Px(2.0)),
+                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.08, 0.08, 0.14, 0.98)),
+                NodeEditorEntity,
+            ))
+            .with_children(|options| {
+                spawn_options(options);
+            });
+        }
+    });
+}
+
+fn spawn_dropdown_option(
+    options: &mut ChildSpawnerCommands,
+    node_id: &ast::node::Id,
+    kind: DropdownKind,
+    choice: DropdownChoice,
+    label: &str,
+    is_current: bool,
+) {
+    options
+        .spawn((
+            Button,
+            Node {
+                padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                border_radius: BorderRadius::all(Val::Px(3.0)),
+                justify_content: JustifyContent::SpaceBetween,
+                flex_direction: FlexDirection::Row,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.0)),
+            DropdownOption {
+                node_id: node_id.clone(),
+                kind,
+                choice,
+            },
+            NodeEditorEntity,
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(label.to_string()),
+                TextFont {
+                    font_size: 14.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                NodeEditorEntity,
+            ));
+            b.spawn((
+                Text::new(if is_current { "✓" } else { " " }),
+                TextFont {
+                    font_size: 13.0,
+                    ..default()
+                },
+                TextColor(Color::srgb(0.133, 0.827, 0.933)),
+                NodeEditorEntity,
+            ));
+        });
+}
+
+fn editor_text_input_node() -> Node {
+    Node {
+        padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+        border: UiRect::all(Val::Px(1.5)),
+        border_radius: BorderRadius::all(Val::Px(4.0)),
+        flex_grow: 1.0,
+        min_width: Val::Px(0.0),
+        ..default()
+    }
+}
+
+fn handle_dropdown_click(
+    interaction_q: Query<(&Interaction, &Dropdown), Changed<Interaction>>,
+    mut dropdown_state: ResMut<DropdownState>,
+) {
+    for (interaction, dd) in interaction_q.iter() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        let key = (dd.node_id.clone(), dd.kind);
+        dropdown_state.open = if dropdown_state.open.as_ref() == Some(&key) {
+            None
+        } else {
+            Some(key)
+        };
+    }
+}
+
+fn handle_dropdown_option_click(
+    interaction_q: Query<(&Interaction, &DropdownOption), Changed<Interaction>>,
+    mut state: ResMut<AstState>,
+    mut dropdown_state: ResMut<DropdownState>,
+    mut rebuild: ResMut<NeedsRebuild>,
+) {
+    for (interaction, option) in interaction_q.iter() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        match &option.choice {
+            DropdownChoice::Type(new_choice) => {
+                let node = state.layout_ast.ast.nodes.get_mut(&option.node_id);
+                match node {
+                    Some(ast::node::ENode::TypeIntroduction { r#type, .. })
+                    | Some(ast::node::ENode::TypeElimination { r#type, .. })
+                    | Some(ast::node::ENode::VarDecl { r#type, .. }) => {
+                        let value = value_of_etype(r#type);
+                        *r#type = make_etype(*new_choice, value);
+                        rebuild.0 = true;
+                    }
+                    _ => {}
+                }
+            }
+            DropdownChoice::BoolValue(v) => {
+                let node = state.layout_ast.ast.nodes.get_mut(&option.node_id);
+                match node {
+                    Some(ast::node::ENode::TypeIntroduction { r#type, .. })
+                    | Some(ast::node::ENode::TypeElimination { r#type, .. })
+                    | Some(ast::node::ENode::VarDecl { r#type, .. }) => {
+                        if let ast::node::EType::Bool { value } = r#type {
+                            *value = Some(if *v { "true" } else { "false" }.to_string());
+                            rebuild.0 = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            DropdownChoice::Function(new_fn_id) => {
+                let decl = state.function_declarations.get(new_fn_id).cloned();
+                if let Some(new_decl) = decl {
+                    let new_layout = state.layout_ast.with_function_call_replaced(
+                        &option.node_id,
+                        (new_fn_id.clone(), &new_decl),
+                    );
+                    state.layout_ast = new_layout;
+                    rebuild.0 = true;
+                }
+            }
+        }
+        dropdown_state.open = None;
+    }
+}
+
+fn handle_value_enable_checkbox(
+    interaction_q: Query<(&Interaction, &ValueEnableCheckbox), Changed<Interaction>>,
+    mut state: ResMut<AstState>,
+    mut rebuild: ResMut<NeedsRebuild>,
+) {
+    for (interaction, cb) in interaction_q.iter() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        if let Some(ast::node::ENode::TypeElimination { r#type, .. }) =
+            state.layout_ast.ast.nodes.get_mut(&cb.node_id)
+        {
+            let current = value_of_etype(r#type);
+            let toggled: Option<String> = if current.is_some() {
+                None
+            } else {
+                Some(String::new())
+            };
+            if let Some(choice) = type_choice_of(r#type) {
+                *r#type = make_etype(choice, toggled);
+                rebuild.0 = true;
+            }
+        }
+    }
+}
+
+fn handle_node_editor_text_input(
+    input_q: Query<(&NodeEditorTextInput, &TextInput), Changed<TextInput>>,
+    mut state: ResMut<AstState>,
+    mut rebuild: ResMut<NeedsRebuild>,
+) {
+    for (editor_input, input) in input_q.iter() {
+        let Some(node) = state.layout_ast.ast.nodes.get_mut(&editor_input.node_id) else {
+            continue;
+        };
+        match editor_input.field {
+            NodeEditorField::VarDeclName => {
+                if let ast::node::ENode::VarDecl { name, .. } = node {
+                    if *name != input.value {
+                        *name = input.value.clone();
+                        rebuild.0 = true;
+                    }
+                }
+            }
+            NodeEditorField::Value => {
+                let r#type = match node {
+                    ast::node::ENode::TypeIntroduction { r#type, .. }
+                    | ast::node::ENode::TypeElimination { r#type, .. }
+                    | ast::node::ENode::VarDecl { r#type, .. } => r#type,
+                    _ => continue,
+                };
+                let Some(choice) = type_choice_of(r#type) else {
+                    continue;
+                };
+                // Ignore the initial spawn's Added-tick: an empty input against
+                // a None value is not a user edit.
+                if input.value.is_empty() && value_of_etype(r#type).is_none() {
+                    continue;
+                }
+                let new_value = Some(input.value.clone());
+                if value_of_etype(r#type) != new_value {
+                    *r#type = make_etype(choice, new_value);
+                    rebuild.0 = true;
+                }
             }
         }
     }
@@ -2389,11 +3195,13 @@ fn pick_nodes(
     grid_config: Res<grid::GridConfig>,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
+    ui_interactions: Query<&Interaction, With<Button>>,
 ) {
     if start_menu.showing {
         pick.hovered_node = None;
         pick.hovered_pos = None;
         pick.press_cursor = None;
+        pick.press_over_ui = false;
         return;
     }
     if modal_is_open(&eval) {
@@ -2417,27 +3225,36 @@ fn pick_nodes(
         return;
     };
 
+    // Cursor sitting over any UI element (button, dropdown, input, checkbox,
+    // or the editor panel background) suppresses grid hover and click-to-select.
+    let over_ui = ui_interactions
+        .iter()
+        .any(|i| matches!(*i, Interaction::Hovered | Interaction::Pressed));
+
     // Ray-sphere test against nodes (radius 0.35).
     let radius = 0.35_f32;
     let mut closest: Option<(ast::node::Id, f32)> = None;
-    for (node_ent, transform) in node_q.iter() {
-        let center = transform.translation;
-        let oc = ray.origin - center;
-        let b = oc.dot(*ray.direction);
-        let c = oc.dot(oc) - radius * radius;
-        let disc = b * b - c;
-        if disc >= 0.0 {
-            let t = -b - disc.sqrt();
-            if t > 0.0 && closest.as_ref().map_or(true, |(_, tc)| t < *tc) {
-                closest = Some((node_ent.node_id.clone(), t));
+    if !over_ui {
+        for (node_ent, transform) in node_q.iter() {
+            let center = transform.translation;
+            let oc = ray.origin - center;
+            let b = oc.dot(*ray.direction);
+            let c = oc.dot(oc) - radius * radius;
+            let disc = b * b - c;
+            if disc >= 0.0 {
+                let t = -b - disc.sqrt();
+                if t > 0.0 && closest.as_ref().map_or(true, |(_, tc)| t < *tc) {
+                    closest = Some((node_ent.node_id.clone(), t));
+                }
             }
         }
     }
     pick.hovered_node = closest.as_ref().map(|(id, _)| id.clone());
 
-    // Ray-plane test against y=0 for grid hover. Skip if a node is hovered.
+    // Ray-plane test against y=0 for grid hover. Skip if a node is hovered
+    // or the cursor is over a UI element.
     let mut grid_hit: Option<IVec3> = None;
-    if closest.is_none() && ray.direction.y.abs() > 1e-4 {
+    if !over_ui && closest.is_none() && ray.direction.y.abs() > 1e-4 {
         let t = -ray.origin.y / ray.direction.y;
         if t > 0.0 {
             let hit = ray.origin + *ray.direction * t;
@@ -2454,14 +3271,17 @@ fn pick_nodes(
     const CLICK_MOVE_THRESHOLD: f32 = 5.0;
     if mouse.just_pressed(MouseButton::Left) {
         pick.press_cursor = Some(cursor);
+        pick.press_over_ui = over_ui;
     }
     if mouse.just_released(MouseButton::Left) {
         let is_click = pick
             .press_cursor
             .map(|p| (cursor - p).length() < CLICK_MOVE_THRESHOLD)
             .unwrap_or(false);
+        let press_over_ui = pick.press_over_ui;
         pick.press_cursor = None;
-        if is_click {
+        pick.press_over_ui = false;
+        if is_click && !press_over_ui && !over_ui {
             if let Some((node_id, _)) = closest {
                 if let Some(ln) = state.layout_ast.layout_nodes.get(&node_id) {
                     pick.selected_pos = ln.pos.round().as_ivec3();
@@ -2629,7 +3449,6 @@ fn text_input_keyboard(
     mut input_q: Query<(&mut TextInput, &Children), With<TextInputBox>>,
     mut text_q: Query<&mut Text, With<TextInputDisplay>>,
     mut key_events: MessageReader<KeyboardInput>,
-    mut current_input_string: ResMut<CurrentInputString>,
     //mut state: ResMut<AstState>,
     mut orbit: ResMut<camera::OrbitCamera>,
     //    mut rebuild: ResMut<NeedsRebuild>,
@@ -2709,8 +3528,6 @@ fn text_input_keyboard(
                 _ => {}
             }
         }
-
-        current_input_string.0 = input.value.to_string();
 
         // Update display text with blinking cursor
         if let Ok(mut text) = text_q.get_mut(children[0]) {
@@ -3198,13 +4015,13 @@ fn main() {
         ))
         .add_plugins(grid::GridPlugin)
         .init_resource::<AstState>()
-        .init_resource::<CurrentInputString>()
         .init_resource::<NeedsRebuild>()
         .init_resource::<PickState>()
         .init_resource::<DragState>()
         .init_resource::<UiMode>()
         .init_resource::<EvalState>()
         .init_resource::<StartMenu>()
+        .init_resource::<DropdownState>()
         .add_systems(
             Startup,
             (
@@ -3213,6 +4030,7 @@ fn main() {
                 spawn_ast_nodes,
                 spawn_ui,
                 spawn_selection_display,
+                spawn_node_editor_panel,
                 spawn_fps_display,
                 spawn_crosshair,
                 spawn_start_menu,
@@ -3286,6 +4104,17 @@ fn main() {
                 update_step_button_visuals,
                 update_delete_button_visuals,
                 sync_value_labels,
+            )
+                .chain(),
+        )
+        .add_systems(
+            Update,
+            (
+                handle_dropdown_click,
+                handle_dropdown_option_click,
+                handle_value_enable_checkbox,
+                handle_node_editor_text_input,
+                sync_node_editor_ui,
             )
                 .chain(),
         )
