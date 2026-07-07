@@ -521,6 +521,23 @@ fn make_etype(choice: TypeChoice, value: Option<String>) -> ast::node::EType {
 
 // ── Colors ──────────────────────────────────────────────────
 
+// ── Fonts ───────────────────────────────────────────────────
+
+#[derive(Resource, Clone)]
+struct UiFont(Handle<Font>);
+
+fn load_ui_font(mut commands: Commands, asset_server: Res<AssetServer>) {
+    commands.insert_resource(UiFont(asset_server.load("fonts/JetBrainsMono-Regular.ttf")));
+}
+
+fn text_font(font: &Handle<Font>, size: f32) -> TextFont {
+    TextFont {
+        font: font.clone(),
+        font_size: size,
+        ..default()
+    }
+}
+
 // ── Systems ─────────────────────────────────────────────────
 
 /// Initial scene setup: camera, lights, ambient.
@@ -611,6 +628,7 @@ fn spawn_ast_nodes(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut materials_grid: ResMut<Assets<grid::GridMaterial>>,
     state: Res<AstState>,
+    ui_font: Res<UiFont>,
 ) {
     let mut node_entites = std::collections::HashMap::<ast::node::Id, Entity>::new();
     let mut anchor_entities = std::collections::HashMap::<ast::AnchorId, Entity>::new();
@@ -699,7 +717,7 @@ fn spawn_ast_nodes(
         node_entites.insert(node_id.clone(), node_entity.clone());
 
         render_node.labels.into_iter().for_each(|l| {
-            spawn_world_label(&mut commands, l, AstSceneEntity);
+            spawn_world_label(&mut commands, &ui_font.0, l, AstSceneEntity);
         });
     }
 
@@ -751,7 +769,7 @@ fn spawn_ast_nodes(
     */
 }
 
-fn spawn_ui(mut commands: Commands) {
+fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
     // Hamburger menu button (top-left) — opens the menu modal.
     spawn_hamburger_button(&mut commands, Vec2::new(12.0, 12.0));
 
@@ -759,6 +777,7 @@ fn spawn_ui(mut commands: Commands) {
     let mut y_offset = 60.0;
     spawn_ui_button(
         &mut commands,
+        &ui_font.0,
         "Delete Node",
         (DeleteNodeButton, PlaygroundOnly),
         Vec2::new(12.0, y_offset),
@@ -774,6 +793,7 @@ fn spawn_ui(mut commands: Commands) {
         y_offset += 36.0;
         spawn_ui_button(
             &mut commands,
+            &ui_font.0,
             label,
             (action, PlaygroundOnly),
             Vec2::new(12.0, y_offset),
@@ -795,6 +815,7 @@ fn spawn_ui(mut commands: Commands) {
     ] {
         spawn_ui_button(
             &mut commands,
+            &ui_font.0,
             label,
             (kind, ExamplesOnly),
             Vec2::new(12.0, y_offset),
@@ -807,6 +828,7 @@ fn spawn_ui(mut commands: Commands) {
     // Playground and Examples modes.
     spawn_corner_button(
         &mut commands,
+        &ui_font.0,
         "Evaluate",
         EvaluateButton,
         Val::Px(12.0),
@@ -816,6 +838,7 @@ fn spawn_ui(mut commands: Commands) {
 
 fn spawn_corner_button<C: Bundle>(
     commands: &mut Commands,
+    font: &Handle<Font>,
     label: &str,
     component: C,
     right: Val,
@@ -841,10 +864,7 @@ fn spawn_corner_button<C: Bundle>(
         .with_children(|parent| {
             parent.spawn((
                 Text::new(label),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
+                text_font(font, 14.0),
                 TextColor(Color::srgb(0.6, 0.6, 0.7)),
             ));
         });
@@ -852,6 +872,7 @@ fn spawn_corner_button<C: Bundle>(
 
 fn spawn_ui_button<C: Bundle>(
     commands: &mut Commands,
+    font: &Handle<Font>,
     label: &str,
     component: C,
     pos: Vec2,
@@ -876,10 +897,7 @@ fn spawn_ui_button<C: Bundle>(
         .with_children(|parent| {
             parent.spawn((
                 Text::new(label),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
+                text_font(font, 14.0),
                 TextColor(Color::srgb(0.6, 0.6, 0.7)),
             ));
         });
@@ -1173,6 +1191,7 @@ fn sync_node_editor_ui(
     ui_mode: Res<UiMode>,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
+    ui_font: Res<UiFont>,
     mut panel_q: Query<(Entity, &mut Node), With<NodeEditorPanel>>,
     editor_children_q: Query<Entity, With<NodeEditorEntity>>,
     mut cache: Local<NodeEditorFingerprint>,
@@ -1243,37 +1262,46 @@ fn sync_node_editor_ui(
     let node = node.unwrap();
     let node_id = node_id.unwrap();
 
+    let font = &ui_font.0;
     commands
         .entity(panel_entity)
         .with_children(|panel| match node {
             ast::node::ENode::TypeIntroduction { r#type, .. } => {
-                spawn_editor_label(panel, "ConstDecl");
-                spawn_labeled_row(panel, "Type", |slot| {
-                    spawn_type_dropdown(slot, &node_id, r#type, &dropdown_state.open);
+                spawn_editor_label(panel, font, "ConstDecl");
+                spawn_labeled_row(panel, font, "Type", |slot| {
+                    spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
                 if !matches!(r#type, ast::node::EType::Undefined) {
-                    spawn_labeled_row(panel, "Value", |slot| {
-                        spawn_value_widget(slot, &node_id, r#type, true, &dropdown_state.open);
+                    spawn_labeled_row(panel, font, "Value", |slot| {
+                        spawn_value_widget(
+                            slot,
+                            font,
+                            &node_id,
+                            r#type,
+                            true,
+                            &dropdown_state.open,
+                        );
                     });
                 }
             }
             ast::node::ENode::VarDecl { name, r#type, .. } => {
-                spawn_labeled_row(panel, "Name", |slot| {
-                    spawn_name_input(slot, &node_id, name);
+                spawn_labeled_row(panel, font, "Name", |slot| {
+                    spawn_name_input(slot, font, &node_id, name);
                 });
-                spawn_labeled_row(panel, "Type", |slot| {
-                    spawn_type_dropdown(slot, &node_id, r#type, &dropdown_state.open);
+                spawn_labeled_row(panel, font, "Type", |slot| {
+                    spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
             }
             ast::node::ENode::TypeElimination { r#type, .. } => {
-                spawn_editor_label(panel, "TypeCast");
-                spawn_labeled_row(panel, "Type", |slot| {
-                    spawn_type_dropdown(slot, &node_id, r#type, &dropdown_state.open);
+                spawn_editor_label(panel, font, "TypeCast");
+                spawn_labeled_row(panel, font, "Type", |slot| {
+                    spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
                 if !matches!(r#type, ast::node::EType::Undefined) {
-                    spawn_labeled_row(panel, "Value", |slot| {
+                    spawn_labeled_row(panel, font, "Value", |slot| {
                         spawn_typeelim_checkbox_and_value(
                             slot,
+                            font,
                             &node_id,
                             r#type,
                             &dropdown_state.open,
@@ -1285,9 +1313,10 @@ fn sync_node_editor_ui(
                 function_declaration_id,
                 ..
             } => {
-                spawn_labeled_row(panel, "Function", |slot| {
+                spawn_labeled_row(panel, font, "Function", |slot| {
                     spawn_function_dropdown(
                         slot,
+                        font,
                         &node_id,
                         function_declaration_id,
                         &state.function_declarations,
@@ -1299,13 +1328,10 @@ fn sync_node_editor_ui(
         });
 }
 
-fn spawn_editor_label(panel: &mut ChildSpawnerCommands, text: &str) {
+fn spawn_editor_label(panel: &mut ChildSpawnerCommands, font: &Handle<Font>, text: &str) {
     panel.spawn((
         Text::new(text),
-        TextFont {
-            font_size: 15.0,
-            ..default()
-        },
+        text_font(font, 15.0),
         TextColor(Color::srgb(0.75, 0.75, 0.9)),
         NodeEditorEntity,
     ));
@@ -1313,6 +1339,7 @@ fn spawn_editor_label(panel: &mut ChildSpawnerCommands, text: &str) {
 
 fn spawn_labeled_row(
     panel: &mut ChildSpawnerCommands,
+    font: &Handle<Font>,
     label: &str,
     widget: impl FnOnce(&mut ChildSpawnerCommands),
 ) {
@@ -1329,10 +1356,7 @@ fn spawn_labeled_row(
         .with_children(|row| {
             row.spawn((
                 Text::new(label.to_string()),
-                TextFont {
-                    font_size: 13.0,
-                    ..default()
-                },
+                text_font(font, 13.0),
                 TextColor(Color::srgb(0.6, 0.6, 0.7)),
                 Node {
                     width: Val::Px(70.0),
@@ -1355,7 +1379,12 @@ fn spawn_labeled_row(
         });
 }
 
-fn spawn_name_input(panel: &mut ChildSpawnerCommands, node_id: &ast::node::Id, current: &str) {
+fn spawn_name_input(
+    panel: &mut ChildSpawnerCommands,
+    font: &Handle<Font>,
+    node_id: &ast::node::Id,
+    current: &str,
+) {
     panel
         .spawn((
             Button,
@@ -1377,10 +1406,7 @@ fn spawn_name_input(panel: &mut ChildSpawnerCommands, node_id: &ast::node::Id, c
         .with_children(|p| {
             p.spawn((
                 Text::new(current.to_string()),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
+                text_font(font, 14.0),
                 TextColor(Color::srgb(0.91, 0.89, 0.87)),
                 TextInputDisplay,
                 NodeEditorEntity,
@@ -1390,29 +1416,40 @@ fn spawn_name_input(panel: &mut ChildSpawnerCommands, node_id: &ast::node::Id, c
 
 fn spawn_type_dropdown(
     panel: &mut ChildSpawnerCommands,
+    font: &Handle<Font>,
     node_id: &ast::node::Id,
     current: &ast::node::EType,
     open: &Option<(ast::node::Id, DropdownKind)>,
 ) {
     let current_choice = type_choice_of(current);
     let label = current_choice.map(type_choice_label).unwrap_or("?");
-    spawn_dropdown_root(panel, node_id, DropdownKind::Type, label, open, |options| {
-        for tc in TYPE_CHOICES {
-            let is_current = Some(tc) == current_choice;
-            spawn_dropdown_option(
-                options,
-                node_id,
-                DropdownKind::Type,
-                DropdownChoice::Type(tc),
-                type_choice_label(tc),
-                is_current,
-            );
-        }
-    });
+    spawn_dropdown_root(
+        panel,
+        font,
+        node_id,
+        DropdownKind::Type,
+        label,
+        open,
+        |options| {
+            for tc in TYPE_CHOICES {
+                let is_current = Some(tc) == current_choice;
+                spawn_dropdown_option(
+                    options,
+                    font,
+                    node_id,
+                    DropdownKind::Type,
+                    DropdownChoice::Type(tc),
+                    type_choice_label(tc),
+                    is_current,
+                );
+            }
+        },
+    );
 }
 
 fn spawn_function_dropdown(
     panel: &mut ChildSpawnerCommands,
+    font: &Handle<Font>,
     node_id: &ast::node::Id,
     current: &ast::FunctionDeclarationId,
     declarations: &std::collections::HashMap<ast::FunctionDeclarationId, ast::FunctionDeclaration>,
@@ -1430,6 +1467,7 @@ fn spawn_function_dropdown(
 
     spawn_dropdown_root(
         panel,
+        font,
         node_id,
         DropdownKind::Function,
         label,
@@ -1439,6 +1477,7 @@ fn spawn_function_dropdown(
                 let is_current = id == current;
                 spawn_dropdown_option(
                     options,
+                    font,
                     node_id,
                     DropdownKind::Function,
                     DropdownChoice::Function(id.clone()),
@@ -1452,6 +1491,7 @@ fn spawn_function_dropdown(
 
 fn spawn_value_widget(
     panel: &mut ChildSpawnerCommands,
+    font: &Handle<Font>,
     node_id: &ast::node::Id,
     current: &ast::node::EType,
     enabled: bool,
@@ -1464,6 +1504,7 @@ fn spawn_value_widget(
             let label = value.as_deref().unwrap_or("bool");
             spawn_dropdown_root(
                 panel,
+                font,
                 node_id,
                 DropdownKind::BoolValue,
                 label,
@@ -1472,6 +1513,7 @@ fn spawn_value_widget(
                     for v in [true, false] {
                         spawn_dropdown_option(
                             options,
+                            font,
                             node_id,
                             DropdownKind::BoolValue,
                             DropdownChoice::BoolValue(v),
@@ -1519,10 +1561,7 @@ fn spawn_value_widget(
             e.with_children(|p| {
                 p.spawn((
                     Text::new(initial),
-                    TextFont {
-                        font_size: 14.0,
-                        ..default()
-                    },
+                    text_font(font, 14.0),
                     TextColor(fg),
                     TextInputDisplay,
                     NodeEditorEntity,
@@ -1534,6 +1573,7 @@ fn spawn_value_widget(
 
 fn spawn_typeelim_checkbox_and_value(
     row: &mut ChildSpawnerCommands,
+    font: &Handle<Font>,
     node_id: &ast::node::Id,
     current: &ast::node::EType,
     open: &Option<(ast::node::Id, DropdownKind)>,
@@ -1560,11 +1600,12 @@ fn spawn_typeelim_checkbox_and_value(
         },
         NodeEditorEntity,
     ));
-    spawn_value_widget(row, node_id, current, enabled, open);
+    spawn_value_widget(row, font, node_id, current, enabled, open);
 }
 
 fn spawn_dropdown_root(
     panel: &mut ChildSpawnerCommands,
+    font: &Handle<Font>,
     node_id: &ast::node::Id,
     kind: DropdownKind,
     label: &str,
@@ -1603,19 +1644,13 @@ fn spawn_dropdown_root(
         .with_children(|b| {
             b.spawn((
                 Text::new(label.to_string()),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
+                text_font(font, 14.0),
                 TextColor(Color::srgb(0.91, 0.89, 0.87)),
                 NodeEditorEntity,
             ));
             b.spawn((
                 Text::new(if is_open { "▴" } else { "▾" }),
-                TextFont {
-                    font_size: 12.0,
-                    ..default()
-                },
+                text_font(font, 12.0),
                 TextColor(Color::srgb(0.6, 0.6, 0.7)),
                 NodeEditorEntity,
             ));
@@ -1641,6 +1676,7 @@ fn spawn_dropdown_root(
 
 fn spawn_dropdown_option(
     options: &mut ChildSpawnerCommands,
+    font: &Handle<Font>,
     node_id: &ast::node::Id,
     kind: DropdownKind,
     choice: DropdownChoice,
@@ -1668,19 +1704,13 @@ fn spawn_dropdown_option(
         .with_children(|b| {
             b.spawn((
                 Text::new(label.to_string()),
-                TextFont {
-                    font_size: 14.0,
-                    ..default()
-                },
+                text_font(font, 14.0),
                 TextColor(Color::srgb(0.85, 0.85, 0.9)),
                 NodeEditorEntity,
             ));
             b.spawn((
                 Text::new(if is_current { "✓" } else { " " }),
-                TextFont {
-                    font_size: 13.0,
-                    ..default()
-                },
+                text_font(font, 13.0),
                 TextColor(Color::srgb(0.133, 0.827, 0.933)),
                 NodeEditorEntity,
             ));
@@ -1915,6 +1945,7 @@ fn sync_modal_ui(
     mut commands: Commands,
     eval: Res<EvalState>,
     state: Res<AstState>,
+    ui_font: Res<UiFont>,
     modal_q: Query<Entity, With<ModalEntity>>,
     mut last_kind: Local<ModalKind>,
 ) {
@@ -1930,10 +1961,10 @@ fn sync_modal_ui(
 
     match &eval.phase {
         EvalPhase::ErrorModal(msg) => {
-            spawn_error_modal(&mut commands, msg.clone());
+            spawn_error_modal(&mut commands, &ui_font.0, msg.clone());
         }
         EvalPhase::ControlsModal => {
-            spawn_controls_modal(&mut commands);
+            spawn_controls_modal(&mut commands, &ui_font.0);
         }
         EvalPhase::VarDeclPrompt { inputs } => {
             let ast = &state.layout_ast.ast;
@@ -1947,13 +1978,13 @@ fn sync_modal_ui(
                     (id.clone(), name)
                 })
                 .collect();
-            spawn_vardecl_modal(&mut commands, rows);
+            spawn_vardecl_modal(&mut commands, &ui_font.0, rows);
         }
         _ => {}
     }
 }
 
-fn spawn_error_modal(commands: &mut Commands, msg: String) {
+fn spawn_error_modal(commands: &mut Commands, font: &Handle<Font>, msg: String) {
     commands
         .spawn((
             backdrop_node(),
@@ -1971,10 +2002,7 @@ fn spawn_error_modal(commands: &mut Commands, msg: String) {
             .with_children(|panel| {
                 panel.spawn((
                     Text::new(msg),
-                    TextFont {
-                        font_size: 16.0,
-                        ..default()
-                    },
+                    text_font(font, 16.0),
                     TextColor(Color::srgb(0.95, 0.95, 1.0)),
                     Node {
                         margin: UiRect::all(Val::Px(12.0)),
@@ -1993,10 +2021,7 @@ fn spawn_error_modal(commands: &mut Commands, msg: String) {
                     .with_children(|b| {
                         b.spawn((
                             Text::new("OK"),
-                            TextFont {
-                                font_size: 14.0,
-                                ..default()
-                            },
+                            text_font(font, 14.0),
                             TextColor(Color::srgb(0.85, 0.85, 0.9)),
                         ));
                     });
@@ -2004,7 +2029,7 @@ fn spawn_error_modal(commands: &mut Commands, msg: String) {
         });
 }
 
-fn spawn_controls_modal(commands: &mut Commands) {
+fn spawn_controls_modal(commands: &mut Commands, font: &Handle<Font>) {
     let mouse_bindings: &[(&str, &str)] = &[
         ("Left click", "Select node / grid position"),
         ("Left drag on anchor", "Connect nodes"),
@@ -2039,10 +2064,7 @@ fn spawn_controls_modal(commands: &mut Commands) {
             .with_children(|panel| {
                 panel.spawn((
                     Text::new("Controls"),
-                    TextFont {
-                        font_size: 20.0,
-                        ..default()
-                    },
+                    text_font(font, 20.0),
                     TextColor(Color::srgb(0.95, 0.95, 1.0)),
                     Node {
                         margin: UiRect::all(Val::Px(12.0)),
@@ -2052,8 +2074,8 @@ fn spawn_controls_modal(commands: &mut Commands) {
                     ModalEntity,
                 ));
 
-                spawn_controls_section(panel, "Mouse", mouse_bindings);
-                spawn_controls_section(panel, "Keyboard", key_bindings);
+                spawn_controls_section(panel, font, "Mouse", mouse_bindings);
+                spawn_controls_section(panel, font, "Keyboard", key_bindings);
 
                 panel
                     .spawn((
@@ -2076,10 +2098,7 @@ fn spawn_controls_modal(commands: &mut Commands) {
                         .with_children(|b| {
                             b.spawn((
                                 Text::new("OK"),
-                                TextFont {
-                                    font_size: 14.0,
-                                    ..default()
-                                },
+                                text_font(font, 14.0),
                                 TextColor(Color::srgb(0.85, 0.85, 0.9)),
                                 ModalEntity,
                             ));
@@ -2089,13 +2108,15 @@ fn spawn_controls_modal(commands: &mut Commands) {
         });
 }
 
-fn spawn_controls_section(panel: &mut ChildSpawnerCommands, title: &str, rows: &[(&str, &str)]) {
+fn spawn_controls_section(
+    panel: &mut ChildSpawnerCommands,
+    font: &Handle<Font>,
+    title: &str,
+    rows: &[(&str, &str)],
+) {
     panel.spawn((
         Text::new(title),
-        TextFont {
-            font_size: 15.0,
-            ..default()
-        },
+        text_font(font, 15.0),
         TextColor(Color::srgb(0.75, 0.75, 0.9)),
         Node {
             margin: UiRect {
@@ -2122,10 +2143,7 @@ fn spawn_controls_section(panel: &mut ChildSpawnerCommands, title: &str, rows: &
             .with_children(|row| {
                 row.spawn((
                     Text::new(*binding),
-                    TextFont {
-                        font_size: 14.0,
-                        ..default()
-                    },
+                    text_font(font, 14.0),
                     TextColor(Color::srgb(0.9, 0.9, 0.7)),
                     Node {
                         width: Val::Px(200.0),
@@ -2135,10 +2153,7 @@ fn spawn_controls_section(panel: &mut ChildSpawnerCommands, title: &str, rows: &
                 ));
                 row.spawn((
                     Text::new(*desc),
-                    TextFont {
-                        font_size: 14.0,
-                        ..default()
-                    },
+                    text_font(font, 14.0),
                     TextColor(Color::srgb(0.85, 0.85, 0.9)),
                     ModalEntity,
                 ));
@@ -2146,7 +2161,11 @@ fn spawn_controls_section(panel: &mut ChildSpawnerCommands, title: &str, rows: &
     }
 }
 
-fn spawn_vardecl_modal(commands: &mut Commands, rows: Vec<(ast::node::Id, String)>) {
+fn spawn_vardecl_modal(
+    commands: &mut Commands,
+    font: &Handle<Font>,
+    rows: Vec<(ast::node::Id, String)>,
+) {
     commands
         .spawn((
             backdrop_node(),
@@ -2164,10 +2183,7 @@ fn spawn_vardecl_modal(commands: &mut Commands, rows: Vec<(ast::node::Id, String
             .with_children(|panel| {
                 panel.spawn((
                     Text::new("Enter values for the variable declarations:"),
-                    TextFont {
-                        font_size: 16.0,
-                        ..default()
-                    },
+                    text_font(font, 16.0),
                     TextColor(Color::srgb(0.95, 0.95, 1.0)),
                     Node {
                         margin: UiRect::all(Val::Px(8.0)),
@@ -2189,10 +2205,7 @@ fn spawn_vardecl_modal(commands: &mut Commands, rows: Vec<(ast::node::Id, String
                         .with_children(|row| {
                             row.spawn((
                                 Text::new(format!("{}:", name)),
-                                TextFont {
-                                    font_size: 14.0,
-                                    ..default()
-                                },
+                                text_font(font, 14.0),
                                 TextColor(Color::srgb(0.85, 0.85, 0.9)),
                                 Node {
                                     width: Val::Px(120.0),
@@ -2223,10 +2236,7 @@ fn spawn_vardecl_modal(commands: &mut Commands, rows: Vec<(ast::node::Id, String
                             .with_children(|input| {
                                 input.spawn((
                                     Text::new(""),
-                                    TextFont {
-                                        font_size: 14.0,
-                                        ..default()
-                                    },
+                                    text_font(font, 14.0),
                                     TextColor(Color::srgb(0.91, 0.89, 0.87)),
                                     TextInputDisplay,
                                     ModalEntity,
@@ -2255,10 +2265,7 @@ fn spawn_vardecl_modal(commands: &mut Commands, rows: Vec<(ast::node::Id, String
                         .with_children(|b| {
                             b.spawn((
                                 Text::new("Cancel"),
-                                TextFont {
-                                    font_size: 14.0,
-                                    ..default()
-                                },
+                                text_font(font, 14.0),
                                 TextColor(Color::srgb(0.85, 0.85, 0.9)),
                             ));
                         });
@@ -2272,10 +2279,7 @@ fn spawn_vardecl_modal(commands: &mut Commands, rows: Vec<(ast::node::Id, String
                         .with_children(|b| {
                             b.spawn((
                                 Text::new("Evaluate"),
-                                TextFont {
-                                    font_size: 14.0,
-                                    ..default()
-                                },
+                                text_font(font, 14.0),
                                 TextColor(Color::srgb(0.85, 0.85, 0.9)),
                             ));
                         });
@@ -2318,11 +2322,11 @@ fn modal_button_node() -> Node {
     }
 }
 
-fn spawn_start_menu(mut commands: Commands, start_menu: Res<StartMenu>) {
-    spawn_start_menu_ui(&mut commands, start_menu.has_cancel);
+fn spawn_start_menu(mut commands: Commands, start_menu: Res<StartMenu>, ui_font: Res<UiFont>) {
+    spawn_start_menu_ui(&mut commands, &ui_font.0, start_menu.has_cancel);
 }
 
-fn spawn_start_menu_ui(commands: &mut Commands, has_cancel: bool) {
+fn spawn_start_menu_ui(commands: &mut Commands, font: &Handle<Font>, has_cancel: bool) {
     commands
         .spawn((
             backdrop_node(),
@@ -2340,10 +2344,7 @@ fn spawn_start_menu_ui(commands: &mut Commands, has_cancel: bool) {
             .with_children(|panel| {
                 panel.spawn((
                     Text::new("Expression Visualizer"),
-                    TextFont {
-                        font_size: 24.0,
-                        ..default()
-                    },
+                    text_font(font, 24.0),
                     TextColor(Color::srgb(0.95, 0.95, 1.0)),
                     Node {
                         margin: UiRect::all(Val::Px(12.0)),
@@ -2373,10 +2374,7 @@ fn spawn_start_menu_ui(commands: &mut Commands, has_cancel: bool) {
                         .with_children(|b| {
                             b.spawn((
                                 Text::new("New"),
-                                TextFont {
-                                    font_size: 14.0,
-                                    ..default()
-                                },
+                                text_font(font, 14.0),
                                 TextColor(Color::srgb(0.85, 0.85, 0.9)),
                                 StartMenuEntity,
                             ));
@@ -2391,10 +2389,7 @@ fn spawn_start_menu_ui(commands: &mut Commands, has_cancel: bool) {
                         .with_children(|b| {
                             b.spawn((
                                 Text::new("Load Example"),
-                                TextFont {
-                                    font_size: 14.0,
-                                    ..default()
-                                },
+                                text_font(font, 14.0),
                                 TextColor(Color::srgb(0.85, 0.85, 0.9)),
                                 StartMenuEntity,
                             ));
@@ -2409,10 +2404,7 @@ fn spawn_start_menu_ui(commands: &mut Commands, has_cancel: bool) {
                         .with_children(|b| {
                             b.spawn((
                                 Text::new("Controls"),
-                                TextFont {
-                                    font_size: 14.0,
-                                    ..default()
-                                },
+                                text_font(font, 14.0),
                                 TextColor(Color::srgb(0.85, 0.85, 0.9)),
                                 StartMenuEntity,
                             ));
@@ -2428,10 +2420,7 @@ fn spawn_start_menu_ui(commands: &mut Commands, has_cancel: bool) {
                             .with_children(|b| {
                                 b.spawn((
                                     Text::new("Cancel"),
-                                    TextFont {
-                                        font_size: 14.0,
-                                        ..default()
-                                    },
+                                    text_font(font, 14.0),
                                     TextColor(Color::srgb(0.85, 0.85, 0.9)),
                                     StartMenuEntity,
                                 ));
@@ -2594,6 +2583,7 @@ fn sync_start_menu_ui(
     mut commands: Commands,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
+    ui_font: Res<UiFont>,
     menu_entities: Query<Entity, With<StartMenuEntity>>,
     mut hideable: Query<&mut Node, With<HideDuringStartMenu>>,
     mut last_showing: Local<Option<bool>>,
@@ -2612,7 +2602,7 @@ fn sync_start_menu_ui(
             for e in menu_entities.iter() {
                 commands.entity(e).despawn();
             }
-            spawn_start_menu_ui(&mut commands, start_menu.has_cancel);
+            spawn_start_menu_ui(&mut commands, &ui_font.0, start_menu.has_cancel);
         }
     }
 
@@ -2748,6 +2738,7 @@ fn handle_modal_evaluate_button(
 fn sync_eval_step_bar(
     mut commands: Commands,
     eval: Res<EvalState>,
+    ui_font: Res<UiFont>,
     bar_q: Query<Entity, With<EvalStepBarEntity>>,
     mut was_running: Local<bool>,
 ) {
@@ -2765,6 +2756,7 @@ fn sync_eval_step_bar(
     // Spawn Prev / Next / Exit, right-aligned bottom.
     spawn_corner_button(
         &mut commands,
+        &ui_font.0,
         "Exit Evaluation",
         (ExitEvaluationButton, EvalStepBarEntity),
         Val::Px(12.0),
@@ -2772,6 +2764,7 @@ fn sync_eval_step_bar(
     );
     spawn_corner_button(
         &mut commands,
+        &ui_font.0,
         "Next",
         (NextStepButton, EvalStepBarEntity),
         Val::Px(170.0),
@@ -2779,6 +2772,7 @@ fn sync_eval_step_bar(
     );
     spawn_corner_button(
         &mut commands,
+        &ui_font.0,
         "Prev",
         (PrevStepButton, EvalStepBarEntity),
         Val::Px(240.0),
@@ -2881,6 +2875,7 @@ fn sync_value_labels(
     mut commands: Commands,
     eval: Res<EvalState>,
     state: Res<AstState>,
+    ui_font: Res<UiFont>,
     mut existing_q: Query<(Entity, &ValueLabel, &mut Text)>,
 ) {
     let snapshot: Option<&std::collections::HashMap<ast::node::Id, String>> = match &eval.phase {
@@ -2916,10 +2911,7 @@ fn sync_value_labels(
         let world_pos = layout_node.pos * Vec3::new(3.0, 1.5, 3.0);
         commands.spawn((
             Text::new(value.clone()),
-            TextFont {
-                font_size: 28.0,
-                ..default()
-            },
+            text_font(&ui_font.0, 28.0),
             TextColor(Color::srgb(1.0, 0.95, 0.3)),
             Node {
                 position_type: PositionType::Absolute,
@@ -3061,11 +3053,12 @@ fn rebuild_scene(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut materials_grid: ResMut<Assets<grid::GridMaterial>>,
     state: Res<AstState>,
+    ui_font: Res<UiFont>,
     mut rebuild: ResMut<NeedsRebuild>,
     query_ast_entities: Query<Entity, With<AstSceneEntity>>,
 ) {
     if rebuild.0 {
-        spawn_ast_nodes(commands, meshes, materials, materials_grid, state);
+        spawn_ast_nodes(commands, meshes, materials, materials_grid, state, ui_font);
         rebuild.0 = false;
     }
 }
@@ -3079,16 +3072,14 @@ pub struct WorldLabel {
 /// Spawn a UI text label that tracks a world position.
 fn spawn_world_label(
     commands: &mut Commands,
+    font: &Handle<Font>,
     render_label: render::RenderLabel,
     marker: impl Bundle,
 ) -> Entity {
     commands
         .spawn((
             Text::new(render_label.text),
-            TextFont {
-                font_size: render_label.font_size,
-                ..default()
-            },
+            text_font(font, render_label.font_size),
             TextColor(render_label.color),
             Node {
                 position_type: PositionType::Absolute,
@@ -3126,13 +3117,10 @@ fn update_world_labels(
     }
 }
 
-fn spawn_selection_display(mut commands: Commands) {
+fn spawn_selection_display(mut commands: Commands, ui_font: Res<UiFont>) {
     commands.spawn((
         Text::new(""),
-        TextFont {
-            font_size: 16.0,
-            ..default()
-        },
+        text_font(&ui_font.0, 16.0),
         TextColor(Color::srgb(0.85, 0.85, 0.9)),
         Node {
             position_type: PositionType::Absolute,
@@ -3145,13 +3133,10 @@ fn spawn_selection_display(mut commands: Commands) {
     ));
 }
 
-fn spawn_fps_display(mut commands: Commands) {
+fn spawn_fps_display(mut commands: Commands, ui_font: Res<UiFont>) {
     commands.spawn((
         Text::new("--"),
-        TextFont {
-            font_size: 12.0,
-            ..default()
-        },
+        text_font(&ui_font.0, 12.0),
         TextColor(Color::srgba(0.5, 0.5, 0.6, 0.8)),
         Node {
             position_type: PositionType::Absolute,
@@ -4025,6 +4010,7 @@ fn main() {
         .add_systems(
             Startup,
             (
+                load_ui_font,
                 setup_scene,
                 spawn_walls,
                 spawn_ast_nodes,
