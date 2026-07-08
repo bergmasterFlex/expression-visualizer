@@ -61,6 +61,30 @@ impl ToString for EType {
     }
 }
 
+/// Convert the AST-level type descriptor into the evaluation-level type,
+/// discarding any user-typed value literal.
+pub fn ast_type_to_eval_type(t: &crate::ast::node::EType) -> EType {
+    match t {
+        crate::ast::node::EType::Bool { .. } => EType::Bool(None),
+        crate::ast::node::EType::Int { .. } => EType::Int(None),
+        crate::ast::node::EType::Float { .. } => EType::Float(None),
+        crate::ast::node::EType::Char { .. } => EType::Char(None),
+        crate::ast::node::EType::String { .. } => EType::String(None),
+        crate::ast::node::EType::Any => EType::Any,
+        crate::ast::node::EType::Undefined => EType::Undefined,
+        crate::ast::node::EType::Exception { .. } => EType::Exception,
+    }
+}
+
+/// Recursively flatten a type into its leaf variants. `SumType`s are expanded
+/// depth-first; every non-`SumType` variant is emitted as-is.
+pub fn flatten_type(t: &EType) -> Vec<EType> {
+    match t {
+        EType::SumType(sub_types) => sub_types.iter().flat_map(flatten_type).collect(),
+        other => vec![other.clone()],
+    }
+}
+
 fn has_duplicates<T: Eq + std::hash::Hash>(v: &[T]) -> bool {
     let mut seen = std::collections::HashSet::new();
     v.iter().any(|item| !seen.insert(item))

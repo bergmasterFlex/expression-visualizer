@@ -85,6 +85,38 @@ impl Default for AstState {
                         ]),
                     },
                 ),
+                (
+                    ast::FunctionDeclarationId(3),
+                    ast::FunctionDeclaration {
+                        name: "*(-1)".to_string(),
+                        inputs: vec![FunctionParameterDeclaration {
+                            name: "number".to_string(),
+                            r#type: eval::EType::Int(None),
+                        }],
+                        output_type: eval::EType::SumType(vec![eval::EType::Int(None)]),
+                    },
+                ),
+                (
+                    ast::FunctionDeclarationId(4),
+                    ast::FunctionDeclaration {
+                        name: "substr".to_string(),
+                        inputs: vec![
+                            FunctionParameterDeclaration {
+                                name: "str".to_string(),
+                                r#type: eval::EType::String(None),
+                            },
+                            FunctionParameterDeclaration {
+                                name: "begin".to_string(),
+                                r#type: eval::EType::Int(None),
+                            },
+                            FunctionParameterDeclaration {
+                                name: "length".to_string(),
+                                r#type: eval::EType::Int(None),
+                            },
+                        ],
+                        output_type: eval::EType::SumType(vec![eval::EType::String(None)]),
+                    },
+                ),
             ]),
         }
     }
@@ -690,6 +722,29 @@ fn spawn_ast_nodes(
             .anchors
             .into_iter()
             .for_each(|(anchor_id, render_anchor)| {
+                let render::RenderAnchor {
+                    normal,
+                    hovered,
+                    type_markers,
+                } = render_anchor;
+
+                for marker in type_markers {
+                    let render::RenderTypeMarker { rect, label } = marker;
+                    commands.spawn((
+                        Mesh3d(meshes.add(rect.mesh)),
+                        MeshMaterial3d(materials.add(rect.material)),
+                        rect.transform,
+                        AstSceneEntity,
+                    ));
+                    spawn_world_label(&mut commands, &ui_font.0, label, AstSceneEntity);
+                }
+
+                let render_anchor = render::RenderAnchor {
+                    normal,
+                    hovered,
+                    type_markers: vec![],
+                };
+
                 let layout_anchor = state.layout_ast.layout_anchor(anchor_id.clone());
                 anchor_entities.insert(
                     anchor_id.clone(),

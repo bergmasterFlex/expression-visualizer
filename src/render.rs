@@ -25,6 +25,12 @@ pub struct RenderNode {
 pub struct RenderAnchor {
     pub normal: RenderObject,
     pub hovered: RenderObject,
+    pub type_markers: Vec<RenderTypeMarker>,
+}
+
+pub struct RenderTypeMarker {
+    pub rect: RenderObject,
+    pub label: RenderLabel,
 }
 
 pub struct RenderLabel {
@@ -33,6 +39,113 @@ pub struct RenderLabel {
     pub font_size: f32,
     pub world_pos: Vec3,
     pub offset: Vec2,
+}
+
+const TYPE_MARKER_ALPHA: f32 = 0.6;
+const TYPE_MARKER_Y_STEP: f32 = 1.0;
+const TYPE_MARKER_HALF_DEPTH: f32 = 0.5;
+
+/// Sort key that fixes the vertical order of type-marker rectangles.
+/// Returns `None` for variants that should not render a rectangle.
+fn type_marker_order(t: &crate::eval::EType) -> Option<u8> {
+    match t {
+        crate::eval::EType::Bool(..) => Some(0),
+        crate::eval::EType::Char(..) => Some(1),
+        crate::eval::EType::Int(..) => Some(2),
+        crate::eval::EType::Float(..) => Some(3),
+        crate::eval::EType::String(..) => Some(4),
+        crate::eval::EType::Undefined => Some(5),
+        _ => None,
+    }
+}
+
+fn type_marker_letter(t: &crate::eval::EType) -> &'static str {
+    match t {
+        crate::eval::EType::Bool(..) => "b",
+        crate::eval::EType::Char(..) => "c",
+        crate::eval::EType::Int(..) => "i",
+        crate::eval::EType::Float(..) => "f",
+        crate::eval::EType::String(..) => "s",
+        crate::eval::EType::Undefined => "u",
+        _ => "?",
+    }
+}
+
+fn type_marker_color(t: &crate::eval::EType) -> Color {
+    match t {
+        crate::eval::EType::Bool(..) => Color::srgba(0.65, 0.30, 0.95, TYPE_MARKER_ALPHA),
+        crate::eval::EType::Char(..) => Color::srgba(0.30, 0.90, 0.40, TYPE_MARKER_ALPHA),
+        crate::eval::EType::Int(..) => Color::srgba(0.40, 0.70, 1.00, TYPE_MARKER_ALPHA),
+        crate::eval::EType::Float(..) => Color::srgba(0.10, 0.25, 0.75, TYPE_MARKER_ALPHA),
+        crate::eval::EType::String(..) => Color::srgba(1.00, 0.90, 0.30, TYPE_MARKER_ALPHA),
+        crate::eval::EType::Undefined => Color::srgba(0.95, 0.30, 0.30, TYPE_MARKER_ALPHA),
+        _ => Color::srgba(0.5, 0.5, 0.5, TYPE_MARKER_ALPHA),
+    }
+}
+
+/// Flatten `t` (expanding sum types), filter to the six supported leaves, and
+/// sort into the fixed bottom-to-top stack order (undefined at bottom → bool
+/// at top).
+fn ordered_supported_leaves(t: &crate::eval::EType) -> Vec<crate::eval::EType> {
+    let mut leaves: Vec<_> = crate::eval::flatten_type(t)
+        .into_iter()
+        .filter_map(|leaf| type_marker_order(&leaf).map(|k| (k, leaf)))
+        .collect();
+    leaves.sort_by_key(|(k, _)| std::cmp::Reverse(*k));
+    leaves.into_iter().map(|(_, leaf)| leaf).collect()
+}
+
+/// Build the stack of translucent type rectangles at an anchor.
+///
+/// `anchor_world_pos` is the world-space anchor position; `is_input` decides
+/// which face of each rectangle touches the anchor (input: lower-Z face at
+/// anchor, stack extends +Z; output: upper-Z face at anchor, stack extends −Z).
+fn build_type_markers(
+    t: &crate::eval::EType,
+    anchor_world_pos: Vec3,
+    is_input: bool,
+) -> Vec<RenderTypeMarker> {
+    let leaves = ordered_supported_leaves(t);
+    let n = leaves.len();
+    if n == 0 {
+        return vec![];
+    }
+    let z_center = if is_input {
+        anchor_world_pos.z + TYPE_MARKER_HALF_DEPTH
+    } else {
+        anchor_world_pos.z - TYPE_MARKER_HALF_DEPTH
+    };
+    leaves
+        .into_iter()
+        .enumerate()
+        .map(|(k, leaf)| {
+            let y_center =
+                anchor_world_pos.y + (k as f32 - (n as f32 - 1.0) / 2.0) * TYPE_MARKER_Y_STEP;
+            let center = Vec3::new(anchor_world_pos.x, y_center, z_center);
+            RenderTypeMarker {
+                rect: RenderObject {
+                    mesh: Cuboid::new(0.0, TYPE_MARKER_Y_STEP, 2.0 * TYPE_MARKER_HALF_DEPTH)
+                        .mesh()
+                        .build(),
+                    material: StandardMaterial {
+                        base_color: type_marker_color(&leaf),
+                        alpha_mode: AlphaMode::Blend,
+                        cull_mode: None,
+                        unlit: true,
+                        ..default()
+                    },
+                    transform: Transform::from_translation(center),
+                },
+                label: RenderLabel {
+                    text: type_marker_letter(&leaf).to_string(),
+                    color: Color::WHITE,
+                    font_size: 14.0,
+                    world_pos: center,
+                    offset: Vec2::ZERO,
+                },
+            }
+        })
+        .collect()
 }
 
 /// Spawn the AST node meshes.
@@ -53,6 +166,9 @@ pub fn layoutnode_to_rendernode(
             output_anchor,
         } => {
             let color = Color::srgb(0.0, 0.9, 0.0);
+            let output_local = Vec3::new(0.0, 0.0, -0.225);
+            let output_world = node_pos + output_local;
+            let output_eval_type = crate::eval::ast_type_to_eval_type(r#type);
             RenderNode {
                 node: RenderObject {
                     mesh: match r#type {
@@ -107,8 +223,7 @@ pub fn layoutnode_to_rendernode(
                                 unlit: true,
                                 ..default()
                             },
-                            transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, -0.225)),
+                            transform: node_pos_tf * Transform::from_translation(output_local),
                         },
                         hovered: RenderObject {
                             mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
@@ -119,9 +234,10 @@ pub fn layoutnode_to_rendernode(
                                 ..default()
                             },
                             transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, -0.225))
+                                * Transform::from_translation(output_local)
                                 * Transform::from_scale(Vec3::splat(1.8)),
                         },
+                        type_markers: build_type_markers(&output_eval_type, output_world, false),
                     },
                 )]),
                 labels: vec![RenderLabel {
@@ -139,6 +255,11 @@ pub fn layoutnode_to_rendernode(
             output_anchor,
         } => {
             let color = Color::srgb(0.9, 0.0, 0.0);
+            let input_local = Vec3::new(0.0, 0.0, 0.55);
+            let output_local = Vec3::new(0.0, 0.0, -0.55);
+            let input_world = node_pos + input_local;
+            let output_world = node_pos + output_local;
+            let eval_type = crate::eval::ast_type_to_eval_type(r#type);
             RenderNode {
                 node: RenderObject {
                     mesh: match r#type {
@@ -185,8 +306,7 @@ pub fn layoutnode_to_rendernode(
                                     unlit: true,
                                     ..default()
                                 },
-                                transform: node_pos_tf
-                                    * Transform::from_translation(Vec3::new(0.0, 0.0, 0.55)),
+                                transform: node_pos_tf * Transform::from_translation(input_local),
                             },
                             hovered: RenderObject {
                                 mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
@@ -197,9 +317,10 @@ pub fn layoutnode_to_rendernode(
                                     ..default()
                                 },
                                 transform: node_pos_tf
-                                    * Transform::from_translation(Vec3::new(0.0, 0.0, 0.55))
+                                    * Transform::from_translation(input_local)
                                     * Transform::from_scale(Vec3::splat(1.8)),
                             },
+                            type_markers: build_type_markers(&eval_type, input_world, true),
                         },
                     ),
                     (
@@ -213,8 +334,7 @@ pub fn layoutnode_to_rendernode(
                                     unlit: true,
                                     ..default()
                                 },
-                                transform: node_pos_tf
-                                    * Transform::from_translation(Vec3::new(0.0, 0.0, -0.55)),
+                                transform: node_pos_tf * Transform::from_translation(output_local),
                             },
                             hovered: RenderObject {
                                 mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
@@ -225,9 +345,10 @@ pub fn layoutnode_to_rendernode(
                                     ..default()
                                 },
                                 transform: node_pos_tf
-                                    * Transform::from_translation(Vec3::new(0.0, 0.0, -0.55))
+                                    * Transform::from_translation(output_local)
                                     * Transform::from_scale(Vec3::splat(1.8)),
                             },
+                            type_markers: build_type_markers(&eval_type, output_world, false),
                         },
                     ),
                 ]),
@@ -241,33 +362,76 @@ pub fn layoutnode_to_rendernode(
             }
         }
         crate::ast::node::ENode::FunctionCall {
+            function_declaration_id,
             input_anchors,
             output_anchor,
-            ..
-        } => RenderNode {
-            node: RenderObject {
-                mesh: crate::mesh::rect_pyramid_z_mesh(
-                    input_anchors.len() as f32 * 0.5,
-                    std::f32::consts::FRAC_1_SQRT_2,
-                    1.0,
-                ),
-                material: StandardMaterial {
-                    base_color: Color::srgb(0.5, 0.9, 1.0),
-                    emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                    unlit: true,
-                    ..default()
+        } => {
+            let function_declaration = function_declarations
+                .get(function_declaration_id)
+                .expect("function call refers to unknown function declaration");
+            let output_local = Vec3::new(0.0, 0.0, -1.0);
+            let output_world = node_pos + output_local;
+            RenderNode {
+                node: RenderObject {
+                    mesh: crate::mesh::rect_pyramid_z_mesh(
+                        input_anchors.len() as f32 * 0.5,
+                        std::f32::consts::FRAC_1_SQRT_2,
+                        1.0,
+                    ),
+                    material: StandardMaterial {
+                        base_color: Color::srgb(0.5, 0.9, 1.0),
+                        emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
+                        unlit: true,
+                        ..default()
+                    },
+                    transform: node_pos_tf,
                 },
-                transform: node_pos_tf,
-            },
-            anchors: input_anchors
-                .iter()
-                .enumerate()
-                .map(|(i_anchor, anchor_id)| {
-                    let spread = 0.5;
-                    let start_x = -(input_anchors.len() as f32 - 1.0) * spread / 2.0;
-                    let x = start_x + i_anchor as f32 * spread;
-                    (
-                        anchor_id.clone(),
+                anchors: input_anchors
+                    .iter()
+                    .enumerate()
+                    .map(|(i_anchor, anchor_id)| {
+                        let spread = 1.0;
+                        let start_x = -(input_anchors.len() as f32 - 1.0) * spread / 2.0;
+                        let x = start_x + i_anchor as f32 * spread;
+                        let input_local = Vec3::new(x, 0.0, 0.0);
+                        let input_world = node_pos + input_local;
+                        let input_type = function_declaration
+                            .inputs
+                            .get(i_anchor)
+                            .map(|param| param.r#type.clone())
+                            .unwrap_or(crate::eval::EType::Undefined);
+                        (
+                            anchor_id.clone(),
+                            RenderAnchor {
+                                normal: RenderObject {
+                                    mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
+                                    material: StandardMaterial {
+                                        base_color: Color::srgb(0.3, 0.6, 1.0),
+                                        emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
+                                        unlit: true,
+                                        ..default()
+                                    },
+                                    transform: node_pos_tf
+                                        * Transform::from_translation(input_local),
+                                },
+                                hovered: RenderObject {
+                                    mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
+                                    material: StandardMaterial {
+                                        base_color: Color::srgb(0.5, 0.9, 1.0),
+                                        emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
+                                        unlit: true,
+                                        ..default()
+                                    },
+                                    transform: node_pos_tf
+                                        * Transform::from_translation(input_local)
+                                        * Transform::from_scale(Vec3::splat(1.8)),
+                                },
+                                type_markers: build_type_markers(&input_type, input_world, true),
+                            },
+                        )
+                    })
+                    .chain([(
+                        output_anchor.clone(),
                         RenderAnchor {
                             normal: RenderObject {
                                 mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
@@ -277,8 +441,7 @@ pub fn layoutnode_to_rendernode(
                                     unlit: true,
                                     ..default()
                                 },
-                                transform: node_pos_tf
-                                    * Transform::from_translation(Vec3::new(x, 0.0, 0.0)),
+                                transform: node_pos_tf * Transform::from_translation(output_local),
                             },
                             hovered: RenderObject {
                                 mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
@@ -289,51 +452,35 @@ pub fn layoutnode_to_rendernode(
                                     ..default()
                                 },
                                 transform: node_pos_tf
-                                    * Transform::from_translation(Vec3::new(x, 0.0, 0.0))
+                                    * Transform::from_translation(output_local)
                                     * Transform::from_scale(Vec3::splat(1.8)),
                             },
+                            type_markers: build_type_markers(
+                                &function_declaration.output_type,
+                                output_world,
+                                false,
+                            ),
                         },
-                    )
-                })
-                .chain([(
-                    output_anchor.clone(),
-                    RenderAnchor {
-                        normal: RenderObject {
-                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                            material: StandardMaterial {
-                                base_color: Color::srgb(0.3, 0.6, 1.0),
-                                emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                                unlit: true,
-                                ..default()
-                            },
-                            transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, -1.0)),
-                        },
-                        hovered: RenderObject {
-                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                            material: StandardMaterial {
-                                base_color: Color::srgb(0.5, 0.9, 1.0),
-                                emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                                unlit: true,
-                                ..default()
-                            },
-                            transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, -1.0))
-                                * Transform::from_scale(Vec3::splat(1.8)),
-                        },
-                    },
-                )])
-                .collect(),
-            labels: vec![RenderLabel {
-                text: node.label(function_declarations),
-                color: Color::WHITE,
-                font_size: 18.0,
-                world_pos: node_pos,
-                offset: Vec2::ZERO,
-            }],
-        },
-        crate::ast::node::ENode::VarDecl { output_anchor, .. } => {
+                    )])
+                    .collect(),
+                labels: vec![RenderLabel {
+                    text: node.label(function_declarations),
+                    color: Color::WHITE,
+                    font_size: 18.0,
+                    world_pos: node_pos,
+                    offset: Vec2::ZERO,
+                }],
+            }
+        }
+        crate::ast::node::ENode::VarDecl {
+            r#type,
+            output_anchor,
+            ..
+        } => {
             let color = Color::srgb(0.0, 0.6, 0.9);
+            let output_local = Vec3::new(0.0, 0.0, -0.225);
+            let output_world = node_pos + output_local;
+            let output_eval_type = crate::eval::ast_type_to_eval_type(r#type);
             RenderNode {
                 node: RenderObject {
                     mesh: Cuboid::new(0.45, 0.45, 0.45).mesh().build(),
@@ -357,8 +504,7 @@ pub fn layoutnode_to_rendernode(
                                 unlit: true,
                                 ..default()
                             },
-                            transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, -0.225)),
+                            transform: node_pos_tf * Transform::from_translation(output_local),
                         },
                         hovered: RenderObject {
                             mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
@@ -369,9 +515,10 @@ pub fn layoutnode_to_rendernode(
                                 ..default()
                             },
                             transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, -0.225))
+                                * Transform::from_translation(output_local)
                                 * Transform::from_scale(Vec3::splat(1.8)),
                         },
+                        type_markers: build_type_markers(&output_eval_type, output_world, false),
                     },
                 )]),
                 labels: vec![RenderLabel {
@@ -417,6 +564,7 @@ pub fn layoutnode_to_rendernode(
                         },
                         transform: node_pos_tf * Transform::from_scale(Vec3::splat(1.8)),
                     },
+                    type_markers: vec![],
                 },
             )]),
             labels: vec![],
@@ -486,6 +634,7 @@ pub fn layoutnode_to_rendernode(
                                     * Transform::from_translation(Vec3::new(0.0, y, 0.0))
                                     * Transform::from_scale(Vec3::splat(1.8)),
                             },
+                            type_markers: vec![],
                         },
                     )
                 })
@@ -515,6 +664,7 @@ pub fn layoutnode_to_rendernode(
                                 * Transform::from_translation(Vec3::new(0.0, 0.0, -3.0))
                                 * Transform::from_scale(Vec3::splat(1.8)),
                         },
+                        type_markers: vec![],
                     },
                 )])
                 .collect();
