@@ -123,37 +123,127 @@ impl LayoutAst {
         })
     }
 
-    pub fn move_node_delta(&self, node_id: crate::ast::node::Id, delta_pos: Vec3) -> Self {
-        // If the moved node is a Pattern, the X/Z portion of the delta must
-        // propagate to every sibling in the parent MatchNew so the stack
-        // stays vertically aligned. Y stays with the target only (Y is the
-        // pattern's row within the stack).
-        let (sibling_ids, parent_match_id) = match self.ast.nodes.get(&node_id) {
-            Some(crate::ast::node::ENode::Pattern { parent_match, .. }) => {
-                let siblings = match self.ast.nodes.get(parent_match) {
-                    Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => patterns.clone(),
-                    _ => vec![],
-                };
-                (siblings, Some(parent_match.clone()))
-            }
-            _ => (vec![], None),
-        };
+    /// Build a `grid position -> node id` lookup over all selectable nodes.
+    /// Excludes `MatchNew` containers (same rule as `node_at`).
+    fn occupancy_map(&self) -> std::collections::HashMap<IVec3, crate::ast::node::Id> {
+        self.layout_nodes
+            .iter()
+            .filter_map(|(id, ln)| {
+                if matches!(
+                    self.ast.nodes.get(id),
+                    Some(crate::ast::node::ENode::MatchNew { .. })
+                ) {
+                    return None;
+                }
+                Some((ln.pos.round().as_ivec3(), id.clone()))
+            })
+            .collect()
+    }
 
-        let xz_delta = Vec3::new(delta_pos.x, 0.0, delta_pos.z);
+    fn is_pattern(&self, id: &crate::ast::node::Id) -> bool {
+        matches!(
+            self.ast.nodes.get(id),
+            Some(crate::ast::node::ENode::Pattern { .. })
+        )
+    }
+
+    fn parent_match_of(&self, id: &crate::ast::node::Id) -> Option<crate::ast::node::Id> {
+        match self.ast.nodes.get(id) {
+            Some(crate::ast::node::ENode::Pattern { parent_match, .. }) => {
+                Some(parent_match.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the sibling Pattern ids of a `MatchNew`.
+    fn match_pattern_ids(&self, match_id: &crate::ast::node::Id) -> Vec<crate::ast::node::Id> {
+        match self.ast.nodes.get(match_id) {
+            Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => patterns.clone(),
+            _ => vec![],
+        }
+    }
+
+    /// Move `node_id` by `delta_pos`, applying the swap constraint: no two
+    /// nodes may share a grid position. Existing nodes on the target are
+    /// displaced (mirror delta), cascading recursively through matches.
+    /// Returns the updated layout and the effective grid position of the
+    /// primary node (which differs from `origin + delta` when the move
+    /// jumped over a match).
+    pub fn move_node_delta(&self, node_id: crate::ast::node::Id, delta_pos: Vec3) -> (Self, IVec3) {
+        let Some(primary_ln) = self.layout_nodes.get(&node_id) else {
+            return (self.clone_shape(), IVec3::ZERO);
+        };
+        let primary_origin = primary_ln.pos;
+        let occupancy = self.occupancy_map();
+
+        let primary_delta = self.jump_delta(&occupancy, &node_id, primary_origin, delta_pos);
+
+        let mut plan: std::collections::HashMap<crate::ast::node::Id, Vec3> =
+            std::collections::HashMap::new();
+        let mut worklist: std::collections::VecDeque<crate::ast::node::Id> =
+            std::collections::VecDeque::new();
+        for (id, d) in self.move_group(&node_id, primary_delta) {
+            let origin = self
+                .layout_nodes
+                .get(&id)
+                .map(|ln| ln.pos)
+                .unwrap_or(Vec3::ZERO);
+            plan.insert(id.clone(), origin + d);
+            worklist.push_back(id);
+        }
+
+        let mut iterations = 0usize;
+        while let Some(cur) = worklist.pop_front() {
+            iterations += 1;
+            if iterations > 128 {
+                warn!("move_node_delta: aborted after 128 iterations");
+                return (self.clone_shape(), primary_origin.round().as_ivec3());
+            }
+            let Some(new_pos) = plan.get(&cur).copied() else {
+                continue;
+            };
+            let key = new_pos.round().as_ivec3();
+            let Some(occ) = occupancy.get(&key) else {
+                continue;
+            };
+            if *occ == cur || plan.contains_key(occ) {
+                continue;
+            }
+            let occ_origin = self
+                .layout_nodes
+                .get(occ)
+                .map(|ln| ln.pos)
+                .unwrap_or(Vec3::ZERO);
+            let cur_origin = self
+                .layout_nodes
+                .get(&cur)
+                .map(|ln| ln.pos)
+                .unwrap_or(Vec3::ZERO);
+            let cur_delta = new_pos - cur_origin;
+            let swap_delta = self.jump_delta(&occupancy, occ, occ_origin, -cur_delta);
+            for (id, d) in self.move_group(occ, swap_delta) {
+                if plan.contains_key(&id) {
+                    warn!("move_node_delta: plan conflict, aborted");
+                    return (self.clone_shape(), primary_origin.round().as_ivec3());
+                }
+                let origin = self
+                    .layout_nodes
+                    .get(&id)
+                    .map(|ln| ln.pos)
+                    .unwrap_or(Vec3::ZERO);
+                plan.insert(id.clone(), origin + d);
+                worklist.push_back(id);
+            }
+        }
 
         let moved = Self {
             ast: self.ast.clone(),
             layout_nodes: self
                 .layout_nodes
                 .iter()
-                .map(|(id, layout_node)| {
-                    let new_pos = if *id == node_id {
-                        layout_node.pos + delta_pos
-                    } else if sibling_ids.contains(id) {
-                        layout_node.pos + xz_delta
-                    } else {
-                        layout_node.pos
-                    };
+                .map(|(id, ln)| {
+                    let new_pos = plan.get(id).copied().unwrap_or(ln.pos);
                     (
                         id.clone(),
                         LayoutNode {
@@ -165,10 +255,115 @@ impl LayoutAst {
                 .collect(),
         };
 
-        match parent_match_id {
-            Some(pid) => moved.recompute_matchnew_pos(&pid),
-            None => moved,
+        let mut match_ids: std::collections::HashSet<crate::ast::node::Id> =
+            std::collections::HashSet::new();
+        for id in plan.keys() {
+            if self.is_pattern(id) {
+                if let Some(mid) = self.parent_match_of(id) {
+                    match_ids.insert(mid);
+                }
+            }
         }
+        let after_recompute = match_ids
+            .iter()
+            .fold(moved, |acc, mid| acc.recompute_matchnew_pos(mid));
+
+        let effective_primary = plan
+            .get(&node_id)
+            .copied()
+            .unwrap_or(primary_origin)
+            .round()
+            .as_ivec3();
+        (after_recompute, effective_primary)
+    }
+
+    fn clone_shape(&self) -> Self {
+        Self {
+            ast: self.ast.clone(),
+            layout_nodes: self.layout_nodes.clone(),
+        }
+    }
+
+    /// Adjust a Y-direction delta so the mover jumps over the entire Y range
+    /// of any match whose pattern it would land on. Cascades through nested
+    /// matches. For X/Z deltas or non-pattern collisions the nominal delta
+    /// is returned unchanged. Same-match sibling collisions also pass through
+    /// unchanged so an intra-stack Y-swap can happen.
+    fn jump_delta(
+        &self,
+        occupancy: &std::collections::HashMap<IVec3, crate::ast::node::Id>,
+        mover: &crate::ast::node::Id,
+        origin: Vec3,
+        nominal_delta: Vec3,
+    ) -> Vec3 {
+        if nominal_delta.y.abs() < 0.5 {
+            return nominal_delta;
+        }
+        let step = if nominal_delta.y > 0.0 { 1.0 } else { -1.0 };
+        let mut target = origin + nominal_delta;
+        for _ in 0..32 {
+            let key = target.round().as_ivec3();
+            let Some(occ) = occupancy.get(&key) else {
+                return target - origin;
+            };
+            if occ == mover || !self.is_pattern(occ) {
+                return target - origin;
+            }
+            if self.is_pattern(mover) && self.parent_match_of(mover) == self.parent_match_of(occ) {
+                return target - origin;
+            }
+            let Some(match_id) = self.parent_match_of(occ) else {
+                return target - origin;
+            };
+            let ys: Vec<f32> = self
+                .match_pattern_ids(&match_id)
+                .iter()
+                .filter_map(|pid| self.layout_nodes.get(pid).map(|ln| ln.pos.y))
+                .collect();
+            if ys.is_empty() {
+                return target - origin;
+            }
+            let extreme = if step > 0.0 {
+                ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+            } else {
+                ys.iter().cloned().fold(f32::INFINITY, f32::min)
+            };
+            target.y = extreme + step;
+        }
+        nominal_delta
+    }
+
+    /// Compute the co-moving group for a seed node.
+    /// Non-Pattern: just `{seed}`. Pattern with Y-only delta: `{seed}` (row
+    /// change is per-pattern). Pattern with XZ delta: seed plus all sibling
+    /// patterns of the same match, all with the XZ delta (siblings without
+    /// the Y component).
+    fn move_group(
+        &self,
+        seed: &crate::ast::node::Id,
+        seed_delta: Vec3,
+    ) -> Vec<(crate::ast::node::Id, Vec3)> {
+        if !self.is_pattern(seed) {
+            return vec![(seed.clone(), seed_delta)];
+        }
+        let xz_zero = seed_delta.x.abs() < 0.5 && seed_delta.z.abs() < 0.5;
+        if xz_zero {
+            return vec![(seed.clone(), seed_delta)];
+        }
+        let Some(match_id) = self.parent_match_of(seed) else {
+            return vec![(seed.clone(), seed_delta)];
+        };
+        self.match_pattern_ids(&match_id)
+            .into_iter()
+            .map(|sid| {
+                let d = if sid == *seed {
+                    seed_delta
+                } else {
+                    Vec3::new(seed_delta.x, 0.0, seed_delta.z)
+                };
+                (sid, d)
+            })
+            .collect()
     }
 
     pub fn plus_edge(&self, from: crate::ast::AnchorId, to: crate::ast::AnchorId) -> Self {
@@ -623,9 +818,12 @@ impl LayoutAst {
     }
 
     /// Insert a new Pattern below `selected_pattern_id` in its parent MatchNew.
-    /// The selected Pattern and every sibling at Y ≥ selected.Y are shifted up
-    /// by 1 grid unit; the new Pattern occupies the freed grid slot with a
-    /// default `Int { value: None }` type. The caller is expected to bump
+    /// Every node at the match's XZ column with Y ≥ selected.Y is shifted up
+    /// by 1 grid unit — that includes the selected Pattern, sibling Patterns
+    /// above it, AND any external nodes stacked directly above the match at
+    /// the same XZ (so no external node ever gets overlapped by the growing
+    /// match). The new Pattern occupies the freed slot with a default
+    /// `Int { value: None }` type. The caller is expected to bump
     /// `pick.selected_pos.y` by 1 so selection tracks the originally-selected
     /// Pattern (now one row higher).
     pub fn plus_pattern_above(&self, selected_pattern_id: &crate::ast::node::Id) -> Self {
@@ -642,17 +840,22 @@ impl LayoutAst {
             }
         };
         let selected_y = selected_pos.y;
-        let sibling_ids: Vec<crate::ast::node::Id> = match self.ast.nodes.get(&parent_id) {
-            Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => patterns.clone(),
-            _ => vec![],
-        };
+        let column_x = selected_pos.x;
+        let column_z = selected_pos.z;
         let shifted_layout_nodes = self
             .layout_nodes
             .iter()
             .map(|(id, ln)| {
-                let is_sibling_at_or_above =
-                    sibling_ids.contains(id) && ln.pos.y >= selected_y - 0.001;
-                if is_sibling_at_or_above {
+                if matches!(
+                    self.ast.nodes.get(id),
+                    Some(crate::ast::node::ENode::MatchNew { .. })
+                ) {
+                    return (id.clone(), ln.clone());
+                }
+                let same_xz =
+                    (ln.pos.x - column_x).abs() < 0.5 && (ln.pos.z - column_z).abs() < 0.5;
+                let above_or_at = ln.pos.y >= selected_y - 0.001;
+                if same_xz && above_or_at {
                     (
                         id.clone(),
                         LayoutNode {
@@ -668,6 +871,10 @@ impl LayoutAst {
         let shifted = Self {
             ast: self.ast.clone(),
             layout_nodes: shifted_layout_nodes,
+        };
+        let sibling_ids: Vec<crate::ast::node::Id> = match shifted.ast.nodes.get(&parent_id) {
+            Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => patterns.clone(),
+            _ => vec![],
         };
         let (ast, new_output_anchor_id) = shifted.ast.with_next_anchor_id();
         let (ast, new_pattern_id) = ast.plus(crate::ast::node::ENode::Pattern {
@@ -691,15 +898,26 @@ impl LayoutAst {
                 input_anchor: match_input_anchor,
             },
         );
-        Self {
+        let with_new = Self {
             ast,
             layout_nodes: shifted.layout_nodes,
         }
-        ._plus_layout_node(
-            &new_pattern_id,
-            Vec3::new(selected_pos.x, selected_y, selected_pos.z),
-        )
-        .recompute_matchnew_pos(&parent_id)
+        ._plus_layout_node(&new_pattern_id, Vec3::new(column_x, selected_y, column_z));
+        let match_ids: Vec<crate::ast::node::Id> = with_new
+            .ast
+            .nodes
+            .iter()
+            .filter_map(|(id, n)| {
+                if matches!(n, crate::ast::node::ENode::MatchNew { .. }) {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        match_ids
+            .iter()
+            .fold(with_new, |acc, mid| acc.recompute_matchnew_pos(mid))
     }
 
     /// Refresh a MatchNew's synthetic LayoutNode to sit at the lowest sibling

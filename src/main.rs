@@ -1097,6 +1097,43 @@ fn update_add_pattern_button_visuals(
     }
 }
 
+fn update_add_generic_button_visuals(
+    pick: Res<PickState>,
+    state: Res<AstState>,
+    mut button_q: Query<(
+        &Interaction,
+        &mut BackgroundColor,
+        &Children,
+        &EAstActionButton,
+    )>,
+    mut text_color_q: Query<&mut TextColor>,
+) {
+    let enabled = state.layout_ast.node_at(pick.selected_pos).is_none();
+    for (interaction, mut bg, children, action) in button_q.iter_mut() {
+        if *action == EAstActionButton::AddPatternButton {
+            continue;
+        }
+        let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
+            continue;
+        };
+        if !enabled {
+            bg.0 = Color::srgba(0.10, 0.10, 0.13, 0.9);
+            text_color.0 = Color::srgb(0.35, 0.35, 0.4);
+            continue;
+        }
+        match *interaction {
+            Interaction::Hovered | Interaction::Pressed => {
+                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
+                text_color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
+                text_color.0 = Color::srgb(0.6, 0.6, 0.7);
+            }
+        }
+    }
+}
+
 fn update_delete_button_visuals(
     pick: Res<PickState>,
     state: Res<AstState>,
@@ -1217,6 +1254,10 @@ fn handle_add_node_button(
         match *interaction {
             Interaction::Pressed => {
                 let new_pos = pick.selected_pos.as_vec3();
+                let target_occupied = state.layout_ast.node_at(pick.selected_pos).is_some();
+                if target_occupied && *action != EAstActionButton::AddPatternButton {
+                    continue;
+                }
                 state.layout_ast = match action {
                     EAstActionButton::AddConstDeclButton => state
                         .layout_ast
@@ -3759,10 +3800,13 @@ fn handle_arrow_keys(
 
     if ctrl {
         // Move the node under the current selection (if any) and keep
-        // the selection anchored to it.
+        // the selection anchored to it — the effective position may differ
+        // from `selected + delta` when the move jumped over a match.
         if let Some(node_id) = state.layout_ast.node_at(pick.selected_pos) {
-            state.layout_ast = state.layout_ast.move_node_delta(node_id, delta.as_vec3());
-            pick.selected_pos += delta;
+            let (new_layout, effective_pos) =
+                state.layout_ast.move_node_delta(node_id, delta.as_vec3());
+            state.layout_ast = new_layout;
+            pick.selected_pos = effective_pos;
             rebuild.0 = true;
         }
     } else {
@@ -4229,6 +4273,7 @@ fn main() {
                 update_step_button_visuals,
                 update_delete_button_visuals,
                 update_add_pattern_button_visuals,
+                update_add_generic_button_visuals,
                 sync_value_labels,
             )
                 .chain(),
