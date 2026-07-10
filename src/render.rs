@@ -151,12 +151,13 @@ fn build_type_markers(
 /// Spawn the AST node meshes.
 pub fn layoutnode_to_rendernode(
     layout_node: &crate::layout::LayoutNode,
-    ast: &crate::ast::Ast,
+    layout_ast: &crate::layout::LayoutAst,
     function_declarations: &std::collections::HashMap<
         crate::ast::FunctionDeclarationId,
         crate::ast::FunctionDeclaration,
     >,
 ) -> RenderNode {
+    let ast = &layout_ast.ast;
     let node_pos = layout_node.pos * Vec3::new(3.0, 1.5, 3.0);
     let node_pos_tf = Transform::from_translation(node_pos);
     let node = ast.nodes.get(&layout_node.node_id).unwrap();
@@ -692,6 +693,122 @@ pub fn layoutnode_to_rendernode(
             anchors: std::collections::HashMap::new(),
             labels: vec![],
         },
+        crate::ast::node::ENode::Pattern {
+            r#type,
+            output_anchor,
+            ..
+        } => {
+            let color = Color::srgb(0.9, 0.0, 0.0);
+            let output_local = Vec3::new(0.0, 0.0, -0.55);
+            let output_world = node_pos + output_local;
+            let eval_type = crate::eval::ast_type_to_eval_type(r#type);
+            RenderNode {
+                node: RenderObject {
+                    mesh: Cuboid::new(0.45, 0.45, 0.45).mesh().build(),
+                    material: StandardMaterial {
+                        base_color: color,
+                        emissive: emissive_color(color),
+                        metallic: 0.3,
+                        perceptual_roughness: 0.6,
+                        ..default()
+                    },
+                    transform: node_pos_tf,
+                },
+                anchors: std::collections::HashMap::from([(
+                    output_anchor.clone(),
+                    RenderAnchor {
+                        normal: RenderObject {
+                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
+                            material: StandardMaterial {
+                                base_color: Color::srgb(0.3, 0.6, 1.0),
+                                emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
+                                unlit: true,
+                                ..default()
+                            },
+                            transform: node_pos_tf * Transform::from_translation(output_local),
+                        },
+                        hovered: RenderObject {
+                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
+                            material: StandardMaterial {
+                                base_color: Color::srgb(0.5, 0.9, 1.0),
+                                emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
+                                unlit: true,
+                                ..default()
+                            },
+                            transform: node_pos_tf
+                                * Transform::from_translation(output_local)
+                                * Transform::from_scale(Vec3::splat(1.8)),
+                        },
+                        type_markers: build_type_markers(&eval_type, output_world, false),
+                    },
+                )]),
+                labels: vec![RenderLabel {
+                    text: node.label(function_declarations),
+                    color: Color::WHITE,
+                    font_size: 18.0,
+                    world_pos: node_pos,
+                    offset: Vec2::ZERO,
+                }],
+            }
+        }
+        crate::ast::node::ENode::MatchNew {
+            patterns,
+            input_anchor,
+        } => {
+            // The MatchNew's LayoutNode sits at the lowest Pattern's grid pos
+            // (see LayoutAst::recompute_matchnew_pos). Find the highest sibling
+            // to size the envelope.
+            let max_y_grid = patterns
+                .iter()
+                .filter_map(|pid| layout_ast.layout_nodes.get(pid).map(|ln| ln.pos.y))
+                .fold(layout_node.pos.y, f32::max);
+            let y_diff_grid = max_y_grid - layout_node.pos.y;
+            let y_diff_world = y_diff_grid * LAYOUT_SCALE.y;
+            let height = y_diff_world + 0.45;
+            let center_local = Vec3::new(0.0, y_diff_world / 2.0, 0.0);
+            let input_local = Vec3::new(0.0, 0.0, 0.55);
+            RenderNode {
+                node: RenderObject {
+                    mesh: Cuboid::new(0.55, height, 0.55).mesh().build(),
+                    material: StandardMaterial {
+                        base_color: Color::srgba(0.9, 0.0, 0.0, 0.35),
+                        alpha_mode: AlphaMode::Blend,
+                        cull_mode: None,
+                        ..default()
+                    },
+                    transform: node_pos_tf * Transform::from_translation(center_local),
+                },
+                anchors: std::collections::HashMap::from([(
+                    input_anchor.clone(),
+                    RenderAnchor {
+                        normal: RenderObject {
+                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
+                            material: StandardMaterial {
+                                base_color: Color::srgb(0.3, 0.6, 1.0),
+                                emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
+                                unlit: true,
+                                ..default()
+                            },
+                            transform: node_pos_tf * Transform::from_translation(input_local),
+                        },
+                        hovered: RenderObject {
+                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
+                            material: StandardMaterial {
+                                base_color: Color::srgb(0.5, 0.9, 1.0),
+                                emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
+                                unlit: true,
+                                ..default()
+                            },
+                            transform: node_pos_tf
+                                * Transform::from_translation(input_local)
+                                * Transform::from_scale(Vec3::splat(1.8)),
+                        },
+                        type_markers: vec![],
+                    },
+                )]),
+                labels: vec![],
+            }
+        }
     };
 
     /*

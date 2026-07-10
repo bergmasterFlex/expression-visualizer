@@ -35,25 +35,91 @@ impl LayoutAst {
     }
 
     pub fn minus_node(&self, node_id: &crate::ast::node::Id) -> Self {
-        Self {
-            ast: self.ast.minus(node_id),
-            layout_nodes: self
-                .layout_nodes
-                .clone()
-                .into_iter()
-                .filter(|(id, _)| id != node_id)
-                .collect(),
+        match self.ast.nodes.get(node_id) {
+            Some(crate::ast::node::ENode::Pattern { parent_match, .. }) => {
+                let parent_id = parent_match.clone();
+                let remaining: Vec<crate::ast::node::Id> = match self.ast.nodes.get(&parent_id) {
+                    Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => {
+                        patterns.iter().filter(|p| *p != node_id).cloned().collect()
+                    }
+                    _ => vec![],
+                };
+                let after_pattern = Self {
+                    ast: self.ast.minus(node_id),
+                    layout_nodes: self
+                        .layout_nodes
+                        .clone()
+                        .into_iter()
+                        .filter(|(id, _)| id != node_id)
+                        .collect(),
+                };
+                if remaining.is_empty() {
+                    Self {
+                        ast: after_pattern.ast.minus(&parent_id),
+                        layout_nodes: after_pattern
+                            .layout_nodes
+                            .into_iter()
+                            .filter(|(id, _)| id != &parent_id)
+                            .collect(),
+                    }
+                } else {
+                    after_pattern
+                        ._with_matchnew_patterns(&parent_id, remaining)
+                        .recompute_matchnew_pos(&parent_id)
+                }
+            }
+            Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => {
+                let child_ids: Vec<_> = patterns.clone();
+                let after_children = child_ids.iter().fold(
+                    Self {
+                        ast: self.ast.clone(),
+                        layout_nodes: self.layout_nodes.clone(),
+                    },
+                    |acc, pid| Self {
+                        ast: acc.ast.minus(pid),
+                        layout_nodes: acc
+                            .layout_nodes
+                            .into_iter()
+                            .filter(|(id, _)| id != pid)
+                            .collect(),
+                    },
+                );
+                Self {
+                    ast: after_children.ast.minus(node_id),
+                    layout_nodes: after_children
+                        .layout_nodes
+                        .into_iter()
+                        .filter(|(id, _)| id != node_id)
+                        .collect(),
+                }
+            }
+            _ => Self {
+                ast: self.ast.minus(node_id),
+                layout_nodes: self
+                    .layout_nodes
+                    .clone()
+                    .into_iter()
+                    .filter(|(id, _)| id != node_id)
+                    .collect(),
+            },
         }
     }
 
     /// Returns the node whose layout position rounds to `pos`, if any.
+    /// `MatchNew` containers are excluded — only their `Pattern` children are
+    /// selectable, so a click on the envelope never picks the container.
     pub fn node_at(&self, pos: IVec3) -> Option<crate::ast::node::Id> {
         self.layout_nodes.iter().find_map(|(id, ln)| {
-            if ln.pos.round().as_ivec3() == pos {
-                Some(id.clone())
-            } else {
-                None
+            if ln.pos.round().as_ivec3() != pos {
+                return None;
             }
+            if matches!(
+                self.ast.nodes.get(id),
+                Some(crate::ast::node::ENode::MatchNew { .. })
+            ) {
+                return None;
+            }
+            Some(id.clone())
         })
     }
 
@@ -499,6 +565,187 @@ impl LayoutAst {
             layout_nodes: self.layout_nodes.clone(),
         }
         ._plus_layout_node(&node_id, pos)
+    }
+
+    /// Create a `MatchNew` container plus its initial `Pattern` child at `pos`.
+    /// The MatchNew's synthetic LayoutNode mirrors the lowest Pattern's pos so
+    /// rendering can iterate `layout_nodes` uniformly.
+    pub fn plus_match_new(&self, pos: Vec3) -> Self {
+        let (ast, match_input_anchor_id) = self.ast.with_next_anchor_id();
+        let (ast, pattern_output_anchor_id) = ast.with_next_anchor_id();
+        let (ast, match_node_id) = ast.plus(crate::ast::node::ENode::MatchNew {
+            patterns: vec![],
+            input_anchor: match_input_anchor_id.clone(),
+        });
+        let (ast, pattern_node_id) = ast.plus(crate::ast::node::ENode::Pattern {
+            parent_match: match_node_id.clone(),
+            r#type: crate::ast::node::EType::Int { value: None },
+            output_anchor: pattern_output_anchor_id,
+        });
+        let ast = ast.with_node_replaced(
+            &match_node_id,
+            crate::ast::node::ENode::MatchNew {
+                patterns: vec![pattern_node_id.clone()],
+                input_anchor: match_input_anchor_id,
+            },
+        );
+        Self {
+            ast,
+            layout_nodes: self.layout_nodes.clone(),
+        }
+        ._plus_layout_node(&pattern_node_id, pos)
+        ._plus_layout_node(&match_node_id, pos)
+    }
+
+    /// Insert a new Pattern below `selected_pattern_id` in its parent MatchNew.
+    /// The selected Pattern and every sibling at Y ≥ selected.Y are shifted up
+    /// by 1 grid unit; the new Pattern occupies the freed grid slot with a
+    /// default `Int { value: None }` type. The caller is expected to bump
+    /// `pick.selected_pos.y` by 1 so selection tracks the originally-selected
+    /// Pattern (now one row higher).
+    pub fn plus_pattern_above(&self, selected_pattern_id: &crate::ast::node::Id) -> Self {
+        let (parent_id, selected_pos) = match self.ast.nodes.get(selected_pattern_id) {
+            Some(crate::ast::node::ENode::Pattern { parent_match, .. }) => {
+                let ln = self.layout_nodes.get(selected_pattern_id).unwrap();
+                (parent_match.clone(), ln.pos)
+            }
+            _ => {
+                return Self {
+                    ast: self.ast.clone(),
+                    layout_nodes: self.layout_nodes.clone(),
+                }
+            }
+        };
+        let selected_y = selected_pos.y;
+        let sibling_ids: Vec<crate::ast::node::Id> = match self.ast.nodes.get(&parent_id) {
+            Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => patterns.clone(),
+            _ => vec![],
+        };
+        let shifted_layout_nodes = self
+            .layout_nodes
+            .iter()
+            .map(|(id, ln)| {
+                let is_sibling_at_or_above =
+                    sibling_ids.contains(id) && ln.pos.y >= selected_y - 0.001;
+                if is_sibling_at_or_above {
+                    (
+                        id.clone(),
+                        LayoutNode {
+                            node_id: id.clone(),
+                            pos: ln.pos + Vec3::new(0.0, 1.0, 0.0),
+                        },
+                    )
+                } else {
+                    (id.clone(), ln.clone())
+                }
+            })
+            .collect();
+        let shifted = Self {
+            ast: self.ast.clone(),
+            layout_nodes: shifted_layout_nodes,
+        };
+        let (ast, new_output_anchor_id) = shifted.ast.with_next_anchor_id();
+        let (ast, new_pattern_id) = ast.plus(crate::ast::node::ENode::Pattern {
+            parent_match: parent_id.clone(),
+            r#type: crate::ast::node::EType::Int { value: None },
+            output_anchor: new_output_anchor_id,
+        });
+        let new_patterns: Vec<crate::ast::node::Id> = sibling_ids
+            .iter()
+            .cloned()
+            .chain([new_pattern_id.clone()])
+            .collect();
+        let match_input_anchor = match ast.nodes.get(&parent_id) {
+            Some(crate::ast::node::ENode::MatchNew { input_anchor, .. }) => input_anchor.clone(),
+            _ => return shifted,
+        };
+        let ast = ast.with_node_replaced(
+            &parent_id,
+            crate::ast::node::ENode::MatchNew {
+                patterns: new_patterns,
+                input_anchor: match_input_anchor,
+            },
+        );
+        Self {
+            ast,
+            layout_nodes: shifted.layout_nodes,
+        }
+        ._plus_layout_node(
+            &new_pattern_id,
+            Vec3::new(selected_pos.x, selected_y, selected_pos.z),
+        )
+        .recompute_matchnew_pos(&parent_id)
+    }
+
+    /// Refresh a MatchNew's synthetic LayoutNode to sit at the lowest sibling
+    /// Pattern's grid position (needed after any add/remove/shift of Patterns
+    /// so the render pass finds the container at the correct origin).
+    pub fn recompute_matchnew_pos(&self, match_id: &crate::ast::node::Id) -> Self {
+        let pattern_ids: Vec<crate::ast::node::Id> = match self.ast.nodes.get(match_id) {
+            Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => patterns.clone(),
+            _ => {
+                return Self {
+                    ast: self.ast.clone(),
+                    layout_nodes: self.layout_nodes.clone(),
+                }
+            }
+        };
+        let lowest_pos = pattern_ids
+            .iter()
+            .filter_map(|pid| self.layout_nodes.get(pid).map(|ln| ln.pos))
+            .min_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
+        let Some(new_pos) = lowest_pos else {
+            return Self {
+                ast: self.ast.clone(),
+                layout_nodes: self.layout_nodes.clone(),
+            };
+        };
+        Self {
+            ast: self.ast.clone(),
+            layout_nodes: self
+                .layout_nodes
+                .iter()
+                .map(|(id, ln)| {
+                    if id == match_id {
+                        (
+                            id.clone(),
+                            LayoutNode {
+                                node_id: id.clone(),
+                                pos: new_pos,
+                            },
+                        )
+                    } else {
+                        (id.clone(), ln.clone())
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn _with_matchnew_patterns(
+        &self,
+        match_id: &crate::ast::node::Id,
+        new_patterns: Vec<crate::ast::node::Id>,
+    ) -> Self {
+        let input_anchor = match self.ast.nodes.get(match_id) {
+            Some(crate::ast::node::ENode::MatchNew { input_anchor, .. }) => input_anchor.clone(),
+            _ => {
+                return Self {
+                    ast: self.ast.clone(),
+                    layout_nodes: self.layout_nodes.clone(),
+                }
+            }
+        };
+        Self {
+            ast: self.ast.with_node_replaced(
+                match_id,
+                crate::ast::node::ENode::MatchNew {
+                    patterns: new_patterns,
+                    input_anchor,
+                },
+            ),
+            layout_nodes: self.layout_nodes.clone(),
+        }
     }
 
     pub fn plus_var_decl(&self, pos: Vec3) -> Self {

@@ -197,13 +197,14 @@ struct AstSceneEntity;
 struct DeleteNodeButton;
 #[derive(Component)]
 struct HamburgerButton;
-#[derive(Component, Clone)]
+#[derive(Component, Clone, PartialEq, Eq)]
 enum EAstActionButton {
     AddConstDeclButton,
     AddVarDeclButton,
     AddTypeCastButton,
     AddFunctionCallButton,
-    AddMatchFrontButton,
+    AddMatchButton,
+    AddPatternButton,
 }
 
 #[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
@@ -492,6 +493,7 @@ enum NodeVariantKind {
     TypeElimination,
     VarDecl,
     FunctionCall,
+    Pattern,
     Other,
 }
 
@@ -502,6 +504,7 @@ fn variant_kind(node: Option<&ast::node::ENode>) -> NodeVariantKind {
         Some(ast::node::ENode::TypeElimination { .. }) => NodeVariantKind::TypeElimination,
         Some(ast::node::ENode::VarDecl { .. }) => NodeVariantKind::VarDecl,
         Some(ast::node::ENode::FunctionCall { .. }) => NodeVariantKind::FunctionCall,
+        Some(ast::node::ENode::Pattern { .. }) => NodeVariantKind::Pattern,
         Some(_) => NodeVariantKind::Other,
     }
 }
@@ -704,7 +707,7 @@ fn spawn_ast_nodes(
         }
         let render_node = render::layoutnode_to_rendernode(
             &layout_node,
-            &state.layout_ast.ast,
+            &state.layout_ast,
             &state.function_declarations,
         );
         let node_entity = commands
@@ -842,7 +845,8 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
         ("Add ConstDecl", EAstActionButton::AddConstDeclButton),
         ("Add VarDecl", EAstActionButton::AddVarDeclButton),
         ("Add FunctionCall", EAstActionButton::AddFunctionCallButton),
-        ("Add Match", EAstActionButton::AddMatchFrontButton),
+        ("Add Match", EAstActionButton::AddMatchButton),
+        ("Add Pattern", EAstActionButton::AddPatternButton),
         ("Add TypeCast", EAstActionButton::AddTypeCastButton),
     ] {
         y_offset += 36.0;
@@ -1050,6 +1054,49 @@ fn handle_delete_node_button(
     }
 }
 
+fn update_add_pattern_button_visuals(
+    pick: Res<PickState>,
+    state: Res<AstState>,
+    mut button_q: Query<(
+        &Interaction,
+        &mut BackgroundColor,
+        &Children,
+        &EAstActionButton,
+    )>,
+    mut text_color_q: Query<&mut TextColor>,
+) {
+    let enabled = matches!(
+        state
+            .layout_ast
+            .node_at(pick.selected_pos)
+            .and_then(|id| state.layout_ast.ast.nodes.get(&id).cloned()),
+        Some(ast::node::ENode::Pattern { .. })
+    );
+    for (interaction, mut bg, children, action) in button_q.iter_mut() {
+        if *action != EAstActionButton::AddPatternButton {
+            continue;
+        }
+        let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
+            continue;
+        };
+        if !enabled {
+            bg.0 = Color::srgba(0.10, 0.10, 0.13, 0.9);
+            text_color.0 = Color::srgb(0.35, 0.35, 0.4);
+            continue;
+        }
+        match *interaction {
+            Interaction::Hovered | Interaction::Pressed => {
+                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
+                text_color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
+                text_color.0 = Color::srgb(0.6, 0.6, 0.7);
+            }
+        }
+    }
+}
+
 fn update_delete_button_visuals(
     pick: Res<PickState>,
     state: Res<AstState>,
@@ -1187,8 +1234,21 @@ fn handle_add_node_button(
                     EAstActionButton::AddTypeCastButton => state
                         .layout_ast
                         .plus_type_elimination(ast::node::EType::Int { value: None }, new_pos),
-                    EAstActionButton::AddMatchFrontButton => {
-                        state.layout_ast.plus_match_front(new_pos)
+                    EAstActionButton::AddMatchButton => state.layout_ast.plus_match_new(new_pos),
+                    EAstActionButton::AddPatternButton => {
+                        match state.layout_ast.node_at(pick.selected_pos) {
+                            Some(id)
+                                if matches!(
+                                    state.layout_ast.ast.nodes.get(&id),
+                                    Some(ast::node::ENode::Pattern { .. })
+                                ) =>
+                            {
+                                let updated = state.layout_ast.plus_pattern_above(&id);
+                                pick.selected_pos.y += 1;
+                                updated
+                            }
+                            _ => continue,
+                        }
                     }
                 };
                 rebuild.0 = true;
@@ -1258,11 +1318,13 @@ fn sync_node_editor_ui(
     let variant = variant_kind(node);
     let type_choice = node.and_then(|n| match n {
         ast::node::ENode::TypeIntroduction { r#type, .. }
-        | ast::node::ENode::TypeElimination { r#type, .. } => type_choice_of(r#type),
+        | ast::node::ENode::TypeElimination { r#type, .. }
+        | ast::node::ENode::Pattern { r#type, .. } => type_choice_of(r#type),
         _ => None,
     });
     let typeelim_has_value = match node {
-        Some(ast::node::ENode::TypeElimination { r#type, .. }) => value_of_etype(r#type).is_some(),
+        Some(ast::node::ENode::TypeElimination { r#type, .. })
+        | Some(ast::node::ENode::Pattern { r#type, .. }) => value_of_etype(r#type).is_some(),
         _ => false,
     };
     let func_id = match node {
@@ -1279,6 +1341,7 @@ fn sync_node_editor_ui(
             | NodeVariantKind::TypeElimination
             | NodeVariantKind::VarDecl
             | NodeVariantKind::FunctionCall
+            | NodeVariantKind::Pattern
     );
     let visible =
         editable && *ui_mode == UiMode::Playground && !start_menu.showing && !is_evaluating(&eval);
@@ -1349,6 +1412,23 @@ fn sync_node_editor_ui(
             }
             ast::node::ENode::TypeElimination { r#type, .. } => {
                 spawn_editor_label(panel, font, "TypeCast");
+                spawn_labeled_row(panel, font, "Type", |slot| {
+                    spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
+                });
+                if !matches!(r#type, ast::node::EType::Undefined) {
+                    spawn_labeled_row(panel, font, "Value", |slot| {
+                        spawn_typeelim_checkbox_and_value(
+                            slot,
+                            font,
+                            &node_id,
+                            r#type,
+                            &dropdown_state.open,
+                        );
+                    });
+                }
+            }
+            ast::node::ENode::Pattern { r#type, .. } => {
+                spawn_editor_label(panel, font, "Pattern");
                 spawn_labeled_row(panel, font, "Type", |slot| {
                     spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
@@ -1816,7 +1896,8 @@ fn handle_dropdown_option_click(
                 match node {
                     Some(ast::node::ENode::TypeIntroduction { r#type, .. })
                     | Some(ast::node::ENode::TypeElimination { r#type, .. })
-                    | Some(ast::node::ENode::VarDecl { r#type, .. }) => {
+                    | Some(ast::node::ENode::VarDecl { r#type, .. })
+                    | Some(ast::node::ENode::Pattern { r#type, .. }) => {
                         let value = value_of_etype(r#type);
                         *r#type = make_etype(*new_choice, value);
                         rebuild.0 = true;
@@ -1829,7 +1910,8 @@ fn handle_dropdown_option_click(
                 match node {
                     Some(ast::node::ENode::TypeIntroduction { r#type, .. })
                     | Some(ast::node::ENode::TypeElimination { r#type, .. })
-                    | Some(ast::node::ENode::VarDecl { r#type, .. }) => {
+                    | Some(ast::node::ENode::VarDecl { r#type, .. })
+                    | Some(ast::node::ENode::Pattern { r#type, .. }) => {
                         if let ast::node::EType::Bool { value } = r#type {
                             *value = Some(if *v { "true" } else { "false" }.to_string());
                             rebuild.0 = true;
@@ -1863,19 +1945,20 @@ fn handle_value_enable_checkbox(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        if let Some(ast::node::ENode::TypeElimination { r#type, .. }) =
-            state.layout_ast.ast.nodes.get_mut(&cb.node_id)
-        {
-            let current = value_of_etype(r#type);
-            let toggled: Option<String> = if current.is_some() {
-                None
-            } else {
-                Some(String::new())
-            };
-            if let Some(choice) = type_choice_of(r#type) {
-                *r#type = make_etype(choice, toggled);
-                rebuild.0 = true;
-            }
+        let r#type = match state.layout_ast.ast.nodes.get_mut(&cb.node_id) {
+            Some(ast::node::ENode::TypeElimination { r#type, .. })
+            | Some(ast::node::ENode::Pattern { r#type, .. }) => r#type,
+            _ => continue,
+        };
+        let current = value_of_etype(r#type);
+        let toggled: Option<String> = if current.is_some() {
+            None
+        } else {
+            Some(String::new())
+        };
+        if let Some(choice) = type_choice_of(r#type) {
+            *r#type = make_etype(choice, toggled);
+            rebuild.0 = true;
         }
     }
 }
@@ -1902,7 +1985,8 @@ fn handle_node_editor_text_input(
                 let r#type = match node {
                     ast::node::ENode::TypeIntroduction { r#type, .. }
                     | ast::node::ENode::TypeElimination { r#type, .. }
-                    | ast::node::ENode::VarDecl { r#type, .. } => r#type,
+                    | ast::node::ENode::VarDecl { r#type, .. }
+                    | ast::node::ENode::Pattern { r#type, .. } => r#type,
                     _ => continue,
                 };
                 let Some(choice) = type_choice_of(r#type) else {
@@ -4144,6 +4228,7 @@ fn main() {
                 sync_evaluate_button_visibility,
                 update_step_button_visuals,
                 update_delete_button_visuals,
+                update_add_pattern_button_visuals,
                 sync_value_labels,
             )
                 .chain(),

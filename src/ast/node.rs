@@ -38,6 +38,15 @@ pub enum ENode {
         width: usize,
         depth: usize,
     },
+    MatchNew {
+        patterns: Vec<super::node::Id>,
+        input_anchor: super::AnchorId,
+    },
+    Pattern {
+        parent_match: super::node::Id,
+        r#type: EType,
+        output_anchor: super::AnchorId,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +86,8 @@ impl ENode {
             ENode::MatchFront { .. } => "match front".to_string(),
             ENode::MatchBack { .. } => "match back".to_string(),
             ENode::MatchGrid { .. } => "match grid".to_string(),
+            ENode::MatchNew { .. } => "match".to_string(),
+            ENode::Pattern { r#type, .. } => r#type.to_string(),
         }
     }
 
@@ -148,6 +159,16 @@ impl ENode {
                 })
                 .chain(vec![(output_anchor.clone(), super::EAnchor::Output)])
                 .collect(),
+            ENode::MatchNew { input_anchor, .. } => vec![(
+                input_anchor.clone(),
+                super::EAnchor::Input {
+                    order_num: 0,
+                    name: None,
+                },
+            )],
+            ENode::Pattern { output_anchor, .. } => {
+                vec![(output_anchor.clone(), super::EAnchor::Output)]
+            }
         }
     }
 }

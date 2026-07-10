@@ -132,7 +132,8 @@ pub fn eval_type(
             .clone()),
         crate::ast::node::ENode::TypeIntroduction { r#type, .. }
         | crate::ast::node::ENode::TypeElimination { r#type, .. }
-        | crate::ast::node::ENode::VarDecl { r#type, .. } => Ok(match r#type {
+        | crate::ast::node::ENode::VarDecl { r#type, .. }
+        | crate::ast::node::ENode::Pattern { r#type, .. } => Ok(match r#type {
             crate::ast::node::EType::Bool { value } => EType::Bool(None),
             crate::ast::node::EType::Int { value } => EType::Int(None),
             crate::ast::node::EType::Float { value } => EType::Float(None),
@@ -145,6 +146,7 @@ pub fn eval_type(
         crate::ast::node::ENode::MatchFront { .. } => Err("match front has no type".to_string()),
         crate::ast::node::ENode::MatchBack { .. } => Err("match back has no type".to_string()),
         crate::ast::node::ENode::MatchGrid { .. } => Err("match grid has no type".to_string()),
+        crate::ast::node::ENode::MatchNew { .. } => Err("match has no type".to_string()),
     }
 }
 

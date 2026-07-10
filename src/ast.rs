@@ -104,6 +104,31 @@ impl Ast {
         )
     }
 
+    /// Replace `n_id`'s node with `new_node`. Anchor tables are untouched;
+    /// callers are responsible for ensuring the replacement has the same
+    /// anchors (used e.g. to update a `MatchNew`'s `patterns` list).
+    pub fn with_node_replaced(&self, n_id: &node::Id, new_node: node::ENode) -> Self {
+        Self {
+            next_node_id: self.next_node_id.clone(),
+            next_anchor_id: self.next_anchor_id.clone(),
+            nodes: self
+                .nodes
+                .clone()
+                .into_iter()
+                .map(|(id, n)| {
+                    if id == *n_id {
+                        (id, new_node.clone())
+                    } else {
+                        (id, n)
+                    }
+                })
+                .collect(),
+            anchors: self.anchors.clone(),
+            anchor_to_node: self.anchor_to_node.clone(),
+            edges: self.edges.clone(),
+        }
+    }
+
     pub fn minus(&self, n_id: &node::Id) -> Self {
         let anchor_ids = self
             .nodes
