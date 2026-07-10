@@ -3,7 +3,7 @@ use bevy::prelude::*;
 use crate::ast::FunctionDeclaration;
 
 /// Scale factor from layout coordinates to world coordinates.
-pub const LAYOUT_SCALE: Vec3 = Vec3::new(3.0, 1.5, 3.0);
+pub const LAYOUT_SCALE: Vec3 = Vec3::new(3.0, 3.0, 3.0);
 
 /// Convert a layout position to a world-space position.
 pub fn layout_to_world(pos: Vec3) -> Vec3 {
@@ -158,7 +158,7 @@ pub fn layoutnode_to_rendernode(
     >,
 ) -> RenderNode {
     let ast = &layout_ast.ast;
-    let node_pos = layout_node.pos * Vec3::new(3.0, 1.5, 3.0);
+    let node_pos = layout_to_world(layout_node.pos);
     let node_pos_tf = Transform::from_translation(node_pos);
     let node = ast.nodes.get(&layout_node.node_id).unwrap();
     return match node {

@@ -124,25 +124,50 @@ impl LayoutAst {
     }
 
     pub fn move_node_delta(&self, node_id: crate::ast::node::Id, delta_pos: Vec3) -> Self {
-        Self {
+        // If the moved node is a Pattern, the X/Z portion of the delta must
+        // propagate to every sibling in the parent MatchNew so the stack
+        // stays vertically aligned. Y stays with the target only (Y is the
+        // pattern's row within the stack).
+        let (sibling_ids, parent_match_id) = match self.ast.nodes.get(&node_id) {
+            Some(crate::ast::node::ENode::Pattern { parent_match, .. }) => {
+                let siblings = match self.ast.nodes.get(parent_match) {
+                    Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => patterns.clone(),
+                    _ => vec![],
+                };
+                (siblings, Some(parent_match.clone()))
+            }
+            _ => (vec![], None),
+        };
+
+        let xz_delta = Vec3::new(delta_pos.x, 0.0, delta_pos.z);
+
+        let moved = Self {
             ast: self.ast.clone(),
             layout_nodes: self
                 .layout_nodes
                 .iter()
                 .map(|(id, layout_node)| {
+                    let new_pos = if *id == node_id {
+                        layout_node.pos + delta_pos
+                    } else if sibling_ids.contains(id) {
+                        layout_node.pos + xz_delta
+                    } else {
+                        layout_node.pos
+                    };
                     (
                         id.clone(),
-                        if *id == node_id {
-                            LayoutNode {
-                                node_id: id.clone(),
-                                pos: layout_node.pos + delta_pos,
-                            }
-                        } else {
-                            layout_node.clone()
+                        LayoutNode {
+                            node_id: id.clone(),
+                            pos: new_pos,
                         },
                     )
                 })
                 .collect(),
+        };
+
+        match parent_match_id {
+            Some(pid) => moved.recompute_matchnew_pos(&pid),
+            None => moved,
         }
     }
 
