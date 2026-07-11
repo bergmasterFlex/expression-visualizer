@@ -2219,6 +2219,7 @@ fn spawn_controls_modal(commands: &mut Commands, font: &Handle<Font>) {
     ];
     let key_bindings: &[(&str, &str)] = &[
         ("Arrow keys", "Move selection along the grid"),
+        ("Shift + Up/Down", "Move selection vertically"),
         ("Ctrl + Arrow", "Move the selected node"),
         (
             "Ctrl + Shift + Up/Down",
@@ -3763,20 +3764,16 @@ fn handle_arrow_keys(
 
     // Direction of each arrow in layout coordinates.
     let delta = if keys.just_pressed(KeyCode::ArrowUp) {
-        if ctrl && shift {
+        if shift {
             Some(IVec3::new(0, 1, 0))
-        } else if !shift {
-            Some(IVec3::new(-1, 0, 0))
         } else {
-            None
+            Some(IVec3::new(-1, 0, 0))
         }
     } else if keys.just_pressed(KeyCode::ArrowDown) {
-        if ctrl && shift {
+        if shift {
             Some(IVec3::new(0, -1, 0))
-        } else if !shift {
-            Some(IVec3::new(1, 0, 0))
         } else {
-            None
+            Some(IVec3::new(1, 0, 0))
         }
     } else if keys.just_pressed(KeyCode::ArrowLeft) {
         if !shift {
