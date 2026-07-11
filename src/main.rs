@@ -1112,14 +1112,14 @@ fn handle_delete_node_button(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        if let Some(selected_node_id) = pick.current_ast(&state).node_at(pick.selected_pos) {
+        if let Some(selected_node_id) = pick.selected_ast(&state).node_at(pick.selected_pos) {
             let is_sink_wall = matches!(
-                pick.current_ast(&state).ast.nodes.get(&selected_node_id),
+                pick.selected_ast(&state).ast.nodes.get(&selected_node_id),
                 Some(ast::node::ENode::SinkWall { .. })
             );
             if !is_sink_wall {
-                let updated = pick.current_ast(&state).minus_node(&selected_node_id);
-                *pick.current_ast_mut(&mut state) = updated;
+                let updated = pick.selected_ast(&state).minus_node(&selected_node_id);
+                *pick.selected_ast_mut(&mut state) = updated;
                 rebuild.0 = true;
             }
         }
@@ -1262,9 +1262,9 @@ fn update_delete_button_visuals(
     mut button_q: Query<(&Interaction, &mut BackgroundColor, &Children), With<DeleteNodeButton>>,
     mut text_color_q: Query<&mut TextColor>,
 ) {
-    let enabled = match pick.current_ast(&state).node_at(pick.selected_pos) {
+    let enabled = match pick.selected_ast(&state).node_at(pick.selected_pos) {
         Some(id) => !matches!(
-            pick.current_ast(&state).ast.nodes.get(&id),
+            pick.selected_ast(&state).ast.nodes.get(&id),
             Some(ast::node::ENode::SinkWall { .. })
         ),
         None => false,
@@ -3566,6 +3566,8 @@ fn spawn_breadcrumb_display(mut commands: Commands, ui_font: Res<UiFont>) {
             position_type: PositionType::Absolute,
             top: Val::Px(58.0),
             right: Val::Px(14.0),
+            max_width: Val::Px(260.0),
+            overflow: Overflow::clip(),
             ..default()
         },
         BreadcrumbDisplay,
@@ -3987,20 +3989,20 @@ fn trigger_camera_focus_on_selection_change(
     state: Res<AstState>,
     orbit: Res<camera::OrbitCamera>,
     mut tween: ResMut<camera::CameraTween>,
-    mut last_pos: Local<Option<IVec3>>,
+    mut last_selection: Local<Option<(IVec3, Vec<ast::node::Id>)>>,
     start_menu: Res<StartMenu>,
 ) {
     if start_menu.showing {
         return;
     }
-    let current = pick.selected_pos;
-    if *last_pos != Some(current) {
-        if last_pos.is_some() {
+    let current = (pick.selected_pos, pick.selected_context.clone());
+    if last_selection.as_ref() != Some(&current) {
+        if last_selection.is_some() {
             let offset = state.program_ast().context_offset(&pick.selected_context);
-            let world = render::layout_to_world(current.as_vec3() + offset);
+            let world = render::layout_to_world(pick.selected_pos.as_vec3() + offset);
             tween.focus_on(&orbit, world);
         }
-        *last_pos = Some(current);
+        *last_selection = Some(current);
     }
 }
 
