@@ -862,14 +862,20 @@ impl LayoutAst {
             patterns: vec![],
             input_anchor: match_input_anchor_id.clone(),
         });
-        let (pattern_sub_ast, sub_sink_id) = crate::ast::Ast::initial_pattern_sub_ast();
-        let pattern_sub_layout = Self::initial_pattern_sub_layout(&pattern_sub_ast, &sub_sink_id);
+        // Sub-AST bootstrap MUST happen after the Pattern parent-id is
+        // reserved so the sub-AST's counter starts past it and every id
+        // in the tree stays globally unique.
         let (ast, pattern_node_id) = ast.plus(crate::ast::node::ENode::Pattern {
             parent_match: match_node_id.clone(),
             r#type: crate::ast::node::EType::Int { value: None },
             output_anchor: pattern_output_anchor_id,
-            ast: pattern_sub_ast,
+            // Pattern.ast is dead (Step-2 note); real sub-AST lives in
+            // sub_layouts. A dummy empty ast is fine here.
+            ast: crate::ast::Ast::empty(),
         });
+        let (ast, pattern_sub_ast, sub_sink_id) =
+            crate::ast::Ast::initial_pattern_sub_ast_from(ast);
+        let pattern_sub_layout = Self::initial_pattern_sub_layout(&pattern_sub_ast, &sub_sink_id);
         let ast = ast.with_node_replaced(
             &match_node_id,
             crate::ast::node::ENode::MatchNew {
@@ -972,15 +978,18 @@ impl LayoutAst {
             _ => vec![],
         };
         let (ast, new_output_anchor_id) = shifted.ast.with_next_anchor_id();
-        let (new_pattern_sub_ast, new_sub_sink_id) = crate::ast::Ast::initial_pattern_sub_ast();
-        let new_pattern_sub_layout =
-            Self::initial_pattern_sub_layout(&new_pattern_sub_ast, &new_sub_sink_id);
+        // Reserve Pattern id first, then bootstrap sub-AST off the bumped
+        // parent counter (see plus_match_new for the id-uniqueness rule).
         let (ast, new_pattern_id) = ast.plus(crate::ast::node::ENode::Pattern {
             parent_match: parent_id.clone(),
             r#type: crate::ast::node::EType::Int { value: None },
             output_anchor: new_output_anchor_id,
-            ast: new_pattern_sub_ast,
+            ast: crate::ast::Ast::empty(),
         });
+        let (ast, new_pattern_sub_ast, new_sub_sink_id) =
+            crate::ast::Ast::initial_pattern_sub_ast_from(ast);
+        let new_pattern_sub_layout =
+            Self::initial_pattern_sub_layout(&new_pattern_sub_ast, &new_sub_sink_id);
         let new_patterns: Vec<crate::ast::node::Id> = sibling_ids
             .iter()
             .cloned()
@@ -1200,5 +1209,71 @@ impl LayoutAst {
             node_id,
             pos: Vec3::splat(1.0),
         }
+    }
+
+    /// Owner path from this LayoutAst down to the LayoutAst whose
+    /// `layout_nodes` contains `target`. `Some(vec![])` = target lives in
+    /// `self`; `Some(vec![a, b])` = target lives in `self.sub_layouts[a]
+    /// .sub_layouts[b]`. `None` = not found.
+    pub fn context_of_node(
+        &self,
+        target: &crate::ast::node::Id,
+    ) -> Option<Vec<crate::ast::node::Id>> {
+        if self.layout_nodes.contains_key(target) {
+            return Some(vec![]);
+        }
+        for (owner_id, sub) in &self.sub_layouts {
+            if let Some(mut rest) = sub.context_of_node(target) {
+                let mut path = vec![owner_id.clone()];
+                path.append(&mut rest);
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// Return the LayoutAst that holds `target` in its `ast.nodes` map.
+    /// Used by editor handlers to mutate node fields without needing to
+    /// know which sub-layout the node lives in.
+    pub fn find_node_ast_mut(&mut self, target: &crate::ast::node::Id) -> Option<&mut LayoutAst> {
+        if self.ast.nodes.contains_key(target) {
+            return Some(self);
+        }
+        for sub in self.sub_layouts.values_mut() {
+            if let Some(found) = sub.find_node_ast_mut(target) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Resolve an owner path (as produced by `context_of_node`) to the
+    /// corresponding sub-LayoutAst reference. Panics if the path names a
+    /// key that no longer exists — callers are expected to have obtained
+    /// the path from a fresh lookup in the same frame.
+    pub fn resolve_context<'a>(&'a self, path: &[crate::ast::node::Id]) -> &'a LayoutAst {
+        let mut ast = self;
+        for id in path {
+            ast = ast.sub_layouts.get(id).unwrap();
+        }
+        ast
+    }
+
+    /// Sum of grid-space owner positions along `path`. Used by crosshair to
+    /// place its anchor for sub-AST-selected nodes when no rendered entity
+    /// is around to read from.
+    pub fn context_offset(&self, path: &[crate::ast::node::Id]) -> Vec3 {
+        let mut offset = Vec3::ZERO;
+        let mut ast = self;
+        for id in path {
+            if let Some(ln) = ast.layout_nodes.get(id) {
+                offset += ln.pos;
+            }
+            let Some(next) = ast.sub_layouts.get(id) else {
+                break;
+            };
+            ast = next;
+        }
+        offset
     }
 }

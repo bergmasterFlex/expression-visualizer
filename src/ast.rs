@@ -45,14 +45,42 @@ impl Ast {
     }
 
     /// Starting state for a Pattern's inner sub-AST: a single SinkWall.
-    /// Returns the fresh AST plus the sink node id (the caller uses the id to
-    /// register the sink's LayoutNode in the sibling LayoutAst).
-    pub fn initial_pattern_sub_ast() -> (Self, node::Id) {
-        let (ast, sink_input_anchor_id) = Self::empty().with_next_anchor_id();
-        let (ast, sink_node_id) = ast.plus(node::ENode::SinkWall {
+    /// The sub-AST inherits the parent's id counters so node and anchor
+    /// ids stay globally unique across the whole tree — required because
+    /// selection/hover/find_node_ast_mut all key on plain `node::Id`.
+    /// Returns the sub-AST, the sink node id, and the counter-bumped
+    /// parent-AST (which the caller uses instead of `parent` for any
+    /// further `plus` calls).
+    pub fn initial_pattern_sub_ast_from(parent: Self) -> (Self, Self, node::Id) {
+        let sub_ast = Self {
+            next_node_id: parent.next_node_id.clone(),
+            next_anchor_id: parent.next_anchor_id.clone(),
+            nodes: std::collections::HashMap::new(),
+            anchors: std::collections::HashMap::new(),
+            anchor_to_node: std::collections::HashMap::new(),
+            edges: std::collections::HashMap::new(),
+        };
+        let (sub_ast, sink_input_anchor_id) = sub_ast.with_next_anchor_id();
+        let (sub_ast, sink_node_id) = sub_ast.plus(node::ENode::SinkWall {
             input_anchor: sink_input_anchor_id,
         });
-        (ast, sink_node_id)
+        let parent_bumped = parent.with_counters_at_least(&sub_ast);
+        (parent_bumped, sub_ast, sink_node_id)
+    }
+
+    /// Bump `next_node_id` and `next_anchor_id` to at least the values in
+    /// `other`. Used to sync a parent AST's counters after a sub-AST was
+    /// bootstrapped off the parent's counters (keeps future `plus` calls
+    /// on the parent from re-using ids already consumed by the sub-AST).
+    pub fn with_counters_at_least(&self, other: &Self) -> Self {
+        Self {
+            next_node_id: node::Id(self.next_node_id.0.max(other.next_node_id.0)),
+            next_anchor_id: AnchorId(self.next_anchor_id.0.max(other.next_anchor_id.0)),
+            nodes: self.nodes.clone(),
+            anchors: self.anchors.clone(),
+            anchor_to_node: self.anchor_to_node.clone(),
+            edges: self.edges.clone(),
+        }
     }
 
     pub fn plus_edge(&self, from: AnchorId, to: AnchorId) -> Self {

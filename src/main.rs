@@ -310,6 +310,13 @@ struct PickState {
     /// change lands in the right sub-ast. Stays empty until Step 5 wires
     /// the "Select Ast" button.
     context_path: Vec<ast::node::Id>,
+    /// Owner path from the Program-Ast to the LayoutAst that holds the
+    /// currently selected node. Empty = selection lives in the Program-
+    /// Ast. Independent of `context_path`: selection may land in a sub-
+    /// AST while add/delete/move still target the Program (until Step 5
+    /// adds "Select Ast"). `selected_pos` is expressed in the coordinate
+    /// system of the LayoutAst identified by `selected_context`.
+    selected_context: Vec<ast::node::Id>,
 }
 
 impl Default for PickState {
@@ -321,6 +328,7 @@ impl Default for PickState {
             press_cursor: None,
             press_over_ui: false,
             context_path: Vec::new(),
+            selected_context: Vec::new(),
         }
     }
 }
@@ -340,6 +348,13 @@ impl PickState {
             ast = ast.sub_layouts.get_mut(id).unwrap();
         }
         ast
+    }
+
+    /// LayoutAst that owns the currently selected node. Follows
+    /// `selected_context` — distinct from `current_ast`, which follows
+    /// `context_path`.
+    fn selected_ast<'a>(&self, state: &'a AstState) -> &'a layout::LayoutAst {
+        state.program_ast().resolve_context(&self.selected_context)
     }
 }
 
@@ -1263,6 +1278,7 @@ fn handle_example_buttons(
                 pick.hovered_node = None;
                 pick.hovered_pos = None;
                 pick.context_path.clear();
+                pick.selected_context.clear();
                 rebuild.0 = true;
             }
             Interaction::Hovered => {
@@ -1420,10 +1436,11 @@ fn sync_node_editor_ui(
     editor_children_q: Query<Entity, With<NodeEditorEntity>>,
     mut cache: Local<NodeEditorFingerprint>,
 ) {
-    let node_id = state.program_ast().node_at(pick.selected_pos);
+    let selected_ast = pick.selected_ast(&state);
+    let node_id = selected_ast.node_at(pick.selected_pos);
     let node = node_id
         .as_ref()
-        .and_then(|id| state.program_ast().ast.nodes.get(id));
+        .and_then(|id| selected_ast.ast.nodes.get(id));
     let variant = variant_kind(node);
     let type_choice = node.and_then(|n| match n {
         ast::node::ENode::TypeIntroduction { r#type, .. }
@@ -2001,7 +2018,10 @@ fn handle_dropdown_option_click(
         }
         match &option.choice {
             DropdownChoice::Type(new_choice) => {
-                let node = state.program_ast_mut().ast.nodes.get_mut(&option.node_id);
+                let node = state
+                    .layout_ast
+                    .find_node_ast_mut(&option.node_id)
+                    .and_then(|a| a.ast.nodes.get_mut(&option.node_id));
                 match node {
                     Some(ast::node::ENode::TypeIntroduction { r#type, .. })
                     | Some(ast::node::ENode::TypeElimination { r#type, .. })
@@ -2015,7 +2035,10 @@ fn handle_dropdown_option_click(
                 }
             }
             DropdownChoice::BoolValue(v) => {
-                let node = state.program_ast_mut().ast.nodes.get_mut(&option.node_id);
+                let node = state
+                    .layout_ast
+                    .find_node_ast_mut(&option.node_id)
+                    .and_then(|a| a.ast.nodes.get_mut(&option.node_id));
                 match node {
                     Some(ast::node::ENode::TypeIntroduction { r#type, .. })
                     | Some(ast::node::ENode::TypeElimination { r#type, .. })
@@ -2032,12 +2055,14 @@ fn handle_dropdown_option_click(
             DropdownChoice::Function(new_fn_id) => {
                 let decl = state.function_declarations.get(new_fn_id).cloned();
                 if let Some(new_decl) = decl {
-                    let new_layout = state.program_ast().with_function_call_replaced(
-                        &option.node_id,
-                        (new_fn_id.clone(), &new_decl),
-                    );
-                    *state.program_ast_mut() = new_layout;
-                    rebuild.0 = true;
+                    if let Some(owning_ast) = state.layout_ast.find_node_ast_mut(&option.node_id) {
+                        let new_layout = owning_ast.with_function_call_replaced(
+                            &option.node_id,
+                            (new_fn_id.clone(), &new_decl),
+                        );
+                        *owning_ast = new_layout;
+                        rebuild.0 = true;
+                    }
                 }
             }
         }
@@ -2054,7 +2079,11 @@ fn handle_value_enable_checkbox(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        let r#type = match state.program_ast_mut().ast.nodes.get_mut(&cb.node_id) {
+        let r#type = match state
+            .layout_ast
+            .find_node_ast_mut(&cb.node_id)
+            .and_then(|a| a.ast.nodes.get_mut(&cb.node_id))
+        {
             Some(ast::node::ENode::TypeElimination { r#type, .. })
             | Some(ast::node::ENode::Pattern { r#type, .. }) => r#type,
             _ => continue,
@@ -2079,10 +2108,9 @@ fn handle_node_editor_text_input(
 ) {
     for (editor_input, input) in input_q.iter() {
         let Some(node) = state
-            .program_ast_mut()
-            .ast
-            .nodes
-            .get_mut(&editor_input.node_id)
+            .layout_ast
+            .find_node_ast_mut(&editor_input.node_id)
+            .and_then(|a| a.ast.nodes.get_mut(&editor_input.node_id))
         else {
             continue;
         };
@@ -2703,6 +2731,7 @@ fn handle_start_menu_new_button(
             Interaction::Pressed => {
                 *state.program_ast_mut() = layout::LayoutAst::empty().plus_sink_wall();
                 pick.context_path.clear();
+                pick.selected_context.clear();
                 *mode = UiMode::Playground;
                 rebuild.0 = true;
                 start_menu.showing = false;
@@ -2738,6 +2767,7 @@ fn handle_start_menu_load_example_button(
             Interaction::Pressed => {
                 *state.program_ast_mut() = layout::LayoutAst::empty().plus_sink_example();
                 pick.context_path.clear();
+                pick.selected_context.clear();
                 *mode = UiMode::Examples;
                 rebuild.0 = true;
                 start_menu.showing = false;
@@ -3527,11 +3557,22 @@ fn pick_nodes(
         pick.press_over_ui = false;
         if is_click && !press_over_ui && !over_ui {
             if let Some((node_id, _)) = closest {
-                if let Some(ln) = state.program_ast().layout_nodes.get(&node_id) {
-                    pick.selected_pos = ln.pos.round().as_ivec3();
+                // Walk the whole layout tree to find which sub-AST owns
+                // this node — hover already sees globally-spawned nodes,
+                // so a click may land on a sub-AST node.
+                if let Some(ctx) = state.program_ast().context_of_node(&node_id) {
+                    let owning_ast = state.program_ast().resolve_context(&ctx);
+                    if let Some(ln) = owning_ast.layout_nodes.get(&node_id) {
+                        pick.selected_pos = ln.pos.round().as_ivec3();
+                        pick.selected_context = ctx;
+                    }
                 }
             } else if let Some(pos) = grid_hit {
+                // The visible ground-plane is the Program's implicit
+                // visual — a grid click always returns selection to the
+                // Program-Ast.
                 pick.selected_pos = pos;
+                pick.selected_context.clear();
             }
             // Click into truly empty space (beyond visible grid) leaves
             // the selection unchanged.
@@ -3545,7 +3586,7 @@ fn highlight_hovered(
     node_q: Query<(&AstNodeEntity, &MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let selected_node = state.program_ast().node_at(pick.selected_pos);
+    let selected_node = pick.selected_ast(&state).node_at(pick.selected_pos);
     for (node_ent, mat_handle) in node_q.iter() {
         let Some(mat) = materials.get_mut(&mat_handle.0) else {
             continue;
@@ -3580,14 +3621,15 @@ fn update_selection_display(
     let Ok((mut text, mut color)) = display_q.single_mut() else {
         return;
     };
-    if let Some(id) = state.program_ast().node_at(pick.selected_pos) {
-        if let Some(node) = state.program_ast().ast.nodes.get(&id) {
+    let selected_ast = pick.selected_ast(&state);
+    if let Some(id) = selected_ast.node_at(pick.selected_pos) {
+        if let Some(node) = selected_ast.ast.nodes.get(&id) {
             text.0 = format!(
                 "{} : {}",
                 node.label(&state.function_declarations),
                 match eval::eval_type(
                     &node,
-                    &state.program_ast().ast,
+                    &selected_ast.ast,
                     &state.function_declarations,
                     vec![]
                 ) {
@@ -4127,9 +4169,10 @@ fn update_crosshair(
 
     // Anchor world position: use node transform if a node lives at the
     // selected position (accounts for any drift), otherwise derive from
-    // the layout-scaled selected_pos.
-    let anchor_world = state
-        .layout_ast
+    // the layout-scaled selected_pos. When selection lives in a sub-AST,
+    // add the accumulated owner offset — selected_pos is local.
+    let anchor_world = pick
+        .selected_ast(&state)
         .node_at(pick.selected_pos)
         .and_then(|id| {
             node_q
@@ -4137,7 +4180,10 @@ fn update_crosshair(
                 .find(|(e, _)| e.node_id == id)
                 .map(|(_, tf)| tf.translation())
         })
-        .unwrap_or_else(|| render::layout_to_world(pick.selected_pos.as_vec3()));
+        .unwrap_or_else(|| {
+            let offset = state.program_ast().context_offset(&pick.selected_context);
+            render::layout_to_world(pick.selected_pos.as_vec3() + offset)
+        });
 
     let Ok(screen) = camera.world_to_viewport(cam_tf, anchor_world) else {
         hide_all(&mut crosshair_q);
