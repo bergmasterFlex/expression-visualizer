@@ -224,6 +224,7 @@ enum EAstActionButton {
     AddFunctionCallButton,
     AddMatchButton,
     AddPatternButton,
+    SelectAstButton,
 }
 
 #[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
@@ -909,6 +910,7 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
         ("Add Match", EAstActionButton::AddMatchButton),
         ("Add Pattern", EAstActionButton::AddPatternButton),
         ("Add TypeCast", EAstActionButton::AddTypeCastButton),
+        ("Select Ast", EAstActionButton::SelectAstButton),
     ] {
         y_offset += 36.0;
         spawn_ui_button(
@@ -1169,12 +1171,57 @@ fn update_add_generic_button_visuals(
     )>,
     mut text_color_q: Query<&mut TextColor>,
 ) {
-    let enabled = pick
+    let pos_free = pick
         .current_ast(&state)
         .node_at(pick.selected_pos)
         .is_none();
     for (interaction, mut bg, children, action) in button_q.iter_mut() {
-        if *action == EAstActionButton::AddPatternButton {
+        if *action == EAstActionButton::AddPatternButton
+            || *action == EAstActionButton::SelectAstButton
+        {
+            continue;
+        }
+        let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
+            continue;
+        };
+        let vardecl_locked =
+            *action == EAstActionButton::AddVarDeclButton && !pick.context_path.is_empty();
+        let enabled = pos_free && !vardecl_locked;
+        if !enabled {
+            bg.0 = Color::srgba(0.10, 0.10, 0.13, 0.9);
+            text_color.0 = Color::srgb(0.35, 0.35, 0.4);
+            continue;
+        }
+        match *interaction {
+            Interaction::Hovered | Interaction::Pressed => {
+                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
+                text_color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
+                text_color.0 = Color::srgb(0.6, 0.6, 0.7);
+            }
+        }
+    }
+}
+
+fn update_select_ast_button_visuals(
+    pick: Res<PickState>,
+    state: Res<AstState>,
+    mut button_q: Query<(
+        &Interaction,
+        &mut BackgroundColor,
+        &Children,
+        &EAstActionButton,
+    )>,
+    mut text_color_q: Query<&mut TextColor>,
+) {
+    let enabled = pick
+        .selected_ast(&state)
+        .node_at(pick.selected_pos)
+        .is_some();
+    for (interaction, mut bg, children, action) in button_q.iter_mut() {
+        if *action != EAstActionButton::SelectAstButton {
             continue;
         }
         let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
@@ -1329,6 +1376,7 @@ fn handle_add_node_button(
                     continue;
                 }
                 let new_layout = match action {
+                    EAstActionButton::SelectAstButton => continue,
                     EAstActionButton::AddConstDeclButton => pick
                         .current_ast(&state)
                         .plus_type_introduction(ast::node::EType::Int { value: None }, new_pos),
@@ -1387,6 +1435,42 @@ fn handle_add_node_button(
                 color.0 = Color::srgb(0.6, 0.6, 0.7);
             }
         }
+    }
+}
+
+fn handle_select_ast_button(
+    interaction_q: Query<
+        (&Interaction, &EAstActionButton),
+        (Changed<Interaction>, With<EAstActionButton>),
+    >,
+    state: Res<AstState>,
+    mut pick: ResMut<PickState>,
+    mut rebuild: ResMut<NeedsRebuild>,
+    eval: Res<EvalState>,
+) {
+    if is_evaluating(&eval) {
+        return;
+    }
+    for (interaction, action) in interaction_q.iter() {
+        if *action != EAstActionButton::SelectAstButton {
+            continue;
+        }
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        let Some(selected_node_id) = pick.selected_ast(&state).node_at(pick.selected_pos) else {
+            continue;
+        };
+        let is_pattern = matches!(
+            pick.selected_ast(&state).ast.nodes.get(&selected_node_id),
+            Some(ast::node::ENode::Pattern { .. })
+        );
+        let mut new_context = pick.selected_context.clone();
+        if is_pattern {
+            new_context.push(selected_node_id);
+        }
+        pick.context_path = new_context;
+        rebuild.0 = true;
     }
 }
 
@@ -4346,6 +4430,7 @@ fn main() {
                     (
                         handle_delete_node_button,
                         handle_add_node_button,
+                        handle_select_ast_button,
                         handle_example_buttons,
                         handle_hamburger_button,
                         handle_start_menu_new_button,
@@ -4399,6 +4484,7 @@ fn main() {
                 update_delete_button_visuals,
                 update_add_pattern_button_visuals,
                 update_add_generic_button_visuals,
+                update_select_ast_button_visuals,
                 sync_value_labels,
             )
                 .chain(),
