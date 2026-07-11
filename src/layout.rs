@@ -57,9 +57,7 @@ impl LayoutAst {
     /// where user-visible nodes live in Step 1 (mirrors the previous behavior
     /// of a flat `LayoutAst::empty()` root).
     pub fn empty_with_program() -> (Self, crate::ast::node::Id) {
-        let (ast, program_id) = crate::ast::Ast::empty().plus(crate::ast::node::ENode::Program {
-            ast: crate::ast::Ast::empty(),
-        });
+        let (ast, program_id) = crate::ast::Ast::empty().plus(crate::ast::node::ENode::Program {});
         let outer = Self {
             ast,
             layout_nodes: std::collections::HashMap::new(),
@@ -869,9 +867,6 @@ impl LayoutAst {
             parent_match: match_node_id.clone(),
             r#type: crate::ast::node::EType::Int { value: None },
             output_anchor: pattern_output_anchor_id,
-            // Pattern.ast is dead (Step-2 note); real sub-AST lives in
-            // sub_layouts. A dummy empty ast is fine here.
-            ast: crate::ast::Ast::empty(),
         });
         let (ast, pattern_sub_ast, sub_sink_id) =
             crate::ast::Ast::initial_pattern_sub_ast_from(ast);
@@ -984,7 +979,6 @@ impl LayoutAst {
             parent_match: parent_id.clone(),
             r#type: crate::ast::node::EType::Int { value: None },
             output_anchor: new_output_anchor_id,
-            ast: crate::ast::Ast::empty(),
         });
         let (ast, new_pattern_sub_ast, new_sub_sink_id) =
             crate::ast::Ast::initial_pattern_sub_ast_from(ast);

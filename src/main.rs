@@ -367,6 +367,10 @@ struct SelectionDisplay;
 #[derive(Component)]
 struct FpsDisplay;
 
+/// UI text showing the current editing context (context_path) as breadcrumb.
+#[derive(Component)]
+struct BreadcrumbDisplay;
+
 #[derive(Component)]
 struct TextInput {
     value: String,
@@ -1129,12 +1133,14 @@ fn update_add_pattern_button_visuals(
     )>,
     mut text_color_q: Query<&mut TextColor>,
 ) {
-    let enabled = matches!(
-        pick.current_ast(&state)
-            .node_at(pick.selected_pos)
-            .and_then(|id| pick.current_ast(&state).ast.nodes.get(&id).cloned()),
-        Some(ast::node::ENode::Pattern { .. })
-    );
+    let context_mismatch = pick.selected_context != pick.context_path;
+    let enabled = !context_mismatch
+        && matches!(
+            pick.current_ast(&state)
+                .node_at(pick.selected_pos)
+                .and_then(|id| pick.current_ast(&state).ast.nodes.get(&id).cloned()),
+            Some(ast::node::ENode::Pattern { .. })
+        );
     for (interaction, mut bg, children, action) in button_q.iter_mut() {
         if *action != EAstActionButton::AddPatternButton {
             continue;
@@ -1186,7 +1192,8 @@ fn update_add_generic_button_visuals(
         };
         let vardecl_locked =
             *action == EAstActionButton::AddVarDeclButton && !pick.context_path.is_empty();
-        let enabled = pos_free && !vardecl_locked;
+        let context_mismatch = pick.selected_context != pick.context_path;
+        let enabled = pos_free && !vardecl_locked && !context_mismatch;
         if !enabled {
             bg.0 = Color::srgba(0.10, 0.10, 0.13, 0.9);
             text_color.0 = Color::srgb(0.35, 0.35, 0.4);
@@ -1367,6 +1374,9 @@ fn handle_add_node_button(
 
         match *interaction {
             Interaction::Pressed => {
+                if pick.selected_context != pick.context_path {
+                    continue;
+                }
                 let new_pos = pick.selected_pos.as_vec3();
                 let target_occupied = pick
                     .current_ast(&state)
@@ -3543,6 +3553,36 @@ fn update_fps_display(
     };
 }
 
+fn spawn_breadcrumb_display(mut commands: Commands, ui_font: Res<UiFont>) {
+    commands.spawn((
+        Text::new("Program"),
+        text_font(&ui_font.0, 12.0),
+        TextColor(Color::srgba(0.55, 0.55, 0.65, 0.9)),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(58.0),
+            right: Val::Px(14.0),
+            ..default()
+        },
+        BreadcrumbDisplay,
+        HideDuringStartMenu,
+    ));
+}
+
+fn update_breadcrumb_display(
+    pick: Res<PickState>,
+    mut text_q: Query<&mut Text, With<BreadcrumbDisplay>>,
+) {
+    let Ok(mut text) = text_q.single_mut() else {
+        return;
+    };
+    let mut parts = vec!["Program".to_string()];
+    for id in &pick.context_path {
+        parts.push(format!("Pattern({})", id.0));
+    }
+    text.0 = parts.join(" > ");
+}
+
 fn pick_nodes(
     camera_q: Query<(&Camera, &GlobalTransform), With<camera::OrbitCameraTag>>,
     windows: Query<&Window>,
@@ -3652,11 +3692,16 @@ fn pick_nodes(
                     }
                 }
             } else if let Some(pos) = grid_hit {
-                // The visible ground-plane is the Program's implicit
-                // visual — a grid click always returns selection to the
-                // Program-Ast.
-                pick.selected_pos = pos;
-                pick.selected_context.clear();
+                // Bleibe im aktiven Editier-Kontext; rechne Grid-World-Pos in
+                // Container-lokale Coords um (nur X/Z; Y=0 = Ground-Level des
+                // aktuellen Asts, unabhängig von Pattern-Höhe im Program-Ast).
+                let offset = state.program_ast().context_offset(&pick.context_path);
+                pick.selected_pos = IVec3::new(
+                    pos.x - offset.x.round() as i32,
+                    0,
+                    pos.z - offset.z.round() as i32,
+                );
+                pick.selected_context = pick.context_path.clone();
             }
             // Click into truly empty space (beyond visible grid) leaves
             // the selection unchanged.
@@ -3935,6 +3980,7 @@ fn text_input_keyboard(
 /// (fresh `Local`) does not trigger, so app startup doesn't jump.
 fn trigger_camera_focus_on_selection_change(
     pick: Res<PickState>,
+    state: Res<AstState>,
     orbit: Res<camera::OrbitCamera>,
     mut tween: ResMut<camera::CameraTween>,
     mut last_pos: Local<Option<IVec3>>,
@@ -3946,7 +3992,8 @@ fn trigger_camera_focus_on_selection_change(
     let current = pick.selected_pos;
     if *last_pos != Some(current) {
         if last_pos.is_some() {
-            let world = render::layout_to_world(current.as_vec3());
+            let offset = state.program_ast().context_offset(&pick.selected_context);
+            let world = render::layout_to_world(current.as_vec3() + offset);
             tween.focus_on(&orbit, world);
         }
         *last_pos = Some(current);
@@ -4410,6 +4457,7 @@ fn main() {
                 spawn_selection_display,
                 spawn_node_editor_panel,
                 spawn_fps_display,
+                spawn_breadcrumb_display,
                 spawn_crosshair,
                 spawn_start_menu,
             )
@@ -4466,7 +4514,12 @@ fn main() {
         )
         .add_systems(
             Update,
-            (update_world_labels, update_crosshair, update_fps_display),
+            (
+                update_world_labels,
+                update_crosshair,
+                update_fps_display,
+                update_breadcrumb_display,
+            ),
         )
         .add_systems(
             Update,
