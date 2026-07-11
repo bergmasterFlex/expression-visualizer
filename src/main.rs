@@ -227,13 +227,6 @@ enum EAstActionButton {
     SelectAstButton,
 }
 
-#[derive(Resource, Default, PartialEq, Eq, Clone, Copy)]
-enum UiMode {
-    #[default]
-    Playground,
-    Examples,
-}
-
 #[derive(Resource)]
 struct StartMenu {
     showing: bool,
@@ -254,8 +247,6 @@ struct StartMenuEntity;
 #[derive(Component)]
 struct StartMenuNewButton;
 #[derive(Component)]
-struct StartMenuLoadExampleButton;
-#[derive(Component)]
 struct StartMenuCancelButton;
 #[derive(Component)]
 struct StartMenuControlsButton;
@@ -263,23 +254,6 @@ struct StartMenuControlsButton;
 /// Marker for UI entities that should be hidden while the start menu is open.
 #[derive(Component)]
 struct HideDuringStartMenu;
-
-#[derive(Component)]
-struct PlaygroundOnly;
-#[derive(Component)]
-struct ExamplesOnly;
-
-#[derive(Component, Clone)]
-enum ExampleButton {
-    Sink,
-    FuncCall,
-    Match,
-    Pattern,
-    TypeCast,
-    VarDecl,
-    ConstDecl,
-    TypeClass,
-}
 
 /// Stores the currently selected grid position and hover state.
 ///
@@ -901,13 +875,12 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
     // Hamburger menu button (top-left) — opens the menu modal.
     spawn_hamburger_button(&mut commands, Vec2::new(12.0, 12.0));
 
-    // Playground-mode controls.
     let mut y_offset = 60.0;
     spawn_ui_button(
         &mut commands,
         &ui_font.0,
         "Delete Node",
-        (DeleteNodeButton, PlaygroundOnly),
+        DeleteNodeButton,
         Vec2::new(12.0, y_offset),
         Display::Flex,
     );
@@ -925,37 +898,12 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
             &mut commands,
             &ui_font.0,
             label,
-            (action, PlaygroundOnly),
+            action,
             Vec2::new(12.0, y_offset),
             Display::Flex,
         );
     }
 
-    // Examples-mode buttons (initially hidden; update_mode_visibility keeps them in sync).
-    let mut y_offset = 60.0;
-    for (label, kind) in [
-        ("Sink", ExampleButton::Sink),
-        ("FuncCall", ExampleButton::FuncCall),
-        ("Match", ExampleButton::Match),
-        ("Pattern", ExampleButton::Pattern),
-        ("TypeCast", ExampleButton::TypeCast),
-        ("VarDecl", ExampleButton::VarDecl),
-        ("ConstDecl", ExampleButton::ConstDecl),
-        ("TypeClass", ExampleButton::TypeClass),
-    ] {
-        spawn_ui_button(
-            &mut commands,
-            &ui_font.0,
-            label,
-            (kind, ExamplesOnly),
-            Vec2::new(12.0, y_offset),
-            Display::None,
-        );
-        y_offset += 36.0;
-    }
-
-    // "Evaluate" button at the bottom-right corner — visible in both
-    // Playground and Examples modes.
     spawn_corner_button(
         &mut commands,
         &ui_font.0,
@@ -1065,37 +1013,6 @@ fn spawn_hamburger_button(commands: &mut Commands, pos: Vec2) {
             parent.spawn((bar(), BackgroundColor(bar_color)));
             parent.spawn((bar(), BackgroundColor(bar_color)));
         });
-}
-
-fn update_mode_visibility(
-    mode: Res<UiMode>,
-    start_menu: Res<StartMenu>,
-    eval: Res<EvalState>,
-    mut playground_q: Query<&mut Node, (With<PlaygroundOnly>, Without<ExamplesOnly>)>,
-    mut examples_q: Query<&mut Node, (With<ExamplesOnly>, Without<PlaygroundOnly>)>,
-    mut text_inputs: Query<&mut TextInput>,
-) {
-    if start_menu.showing || modal_is_open(&eval) {
-        return;
-    }
-    if !mode.is_changed() && !start_menu.is_changed() && !eval.is_changed() {
-        return;
-    }
-    let (playground_display, examples_display) = match *mode {
-        UiMode::Playground => (Display::Flex, Display::None),
-        UiMode::Examples => (Display::None, Display::Flex),
-    };
-    for mut node in playground_q.iter_mut() {
-        node.display = playground_display;
-    }
-    for mut node in examples_q.iter_mut() {
-        node.display = examples_display;
-    }
-    if *mode != UiMode::Playground {
-        for mut input in text_inputs.iter_mut() {
-            input.focused = false;
-        }
-    }
 }
 
 fn handle_delete_node_button(
@@ -1291,66 +1208,6 @@ fn update_delete_button_visuals(
     }
 }
 
-fn handle_example_buttons(
-    mut interaction_q: Query<
-        (
-            &Interaction,
-            &mut BackgroundColor,
-            &Children,
-            &ExampleButton,
-        ),
-        (Changed<Interaction>, With<ExampleButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
-    mut state: ResMut<AstState>,
-    mut rebuild: ResMut<NeedsRebuild>,
-    mut pick: ResMut<PickState>,
-    eval: Res<EvalState>,
-) {
-    if is_evaluating(&eval) {
-        return;
-    }
-    for (interaction, mut bg, children, kind) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-
-        match *interaction {
-            Interaction::Pressed => {
-                let new_layout = match kind {
-                    ExampleButton::Sink => layout::LayoutAst::empty().plus_sink_example(),
-                    ExampleButton::VarDecl => layout::LayoutAst::empty().plus_vardecl_example(),
-                    ExampleButton::ConstDecl => layout::LayoutAst::empty().plus_constdecl_example(),
-                    ExampleButton::FuncCall => {
-                        let decl = state
-                            .function_declarations
-                            .iter()
-                            .find(|(_, d)| d.name == "charAt")
-                            .map(|(id, decl)| (id.clone(), decl))
-                            .unwrap();
-                        layout::LayoutAst::empty().plus_funccall_example(decl)
-                    }
-                    ExampleButton::Match => layout::LayoutAst::empty().plus_match_example(),
-                    _ => layout::LayoutAst::empty().plus_sink_wall(),
-                };
-                *state.program_ast_mut() = new_layout;
-                pick.selected_pos = IVec3::ZERO;
-                pick.hovered_node = None;
-                pick.hovered_pos = None;
-                pick.context_path.clear();
-                pick.selected_context.clear();
-                rebuild.0 = true;
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                color.0 = Color::srgb(0.6, 0.6, 0.7);
-            }
-        }
-    }
-}
-
 fn handle_add_node_button(
     mut interaction_q: Query<
         (
@@ -1526,7 +1383,6 @@ fn sync_node_editor_ui(
     state: Res<AstState>,
     pick: Res<PickState>,
     dropdown_state: Res<DropdownState>,
-    ui_mode: Res<UiMode>,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
     ui_font: Res<UiFont>,
@@ -1567,8 +1423,7 @@ fn sync_node_editor_ui(
             | NodeVariantKind::FunctionCall
             | NodeVariantKind::Pattern
     );
-    let visible =
-        editable && *ui_mode == UiMode::Playground && !start_menu.showing && !is_evaluating(&eval);
+    let visible = editable && !start_menu.showing && !is_evaluating(&eval);
 
     let fp = NodeEditorFingerprint {
         node_id: node_id.clone(),
@@ -2763,21 +2618,6 @@ fn spawn_start_menu_ui(commands: &mut Commands, font: &Handle<Font>, has_cancel:
                             Button,
                             modal_button_node(),
                             BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
-                            StartMenuLoadExampleButton,
-                            StartMenuEntity,
-                        ))
-                        .with_children(|b| {
-                            b.spawn((
-                                Text::new("Load Example"),
-                                text_font(font, 14.0),
-                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
-                                StartMenuEntity,
-                            ));
-                        });
-                        btns.spawn((
-                            Button,
-                            modal_button_node(),
-                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
                             StartMenuControlsButton,
                             StartMenuEntity,
                         ))
@@ -2818,7 +2658,6 @@ fn handle_start_menu_new_button(
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut state: ResMut<AstState>,
-    mut mode: ResMut<UiMode>,
     mut rebuild: ResMut<NeedsRebuild>,
     mut start_menu: ResMut<StartMenu>,
     mut pick: ResMut<PickState>,
@@ -2830,43 +2669,6 @@ fn handle_start_menu_new_button(
                 *state.program_ast_mut() = layout::LayoutAst::empty().plus_sink_wall();
                 pick.context_path.clear();
                 pick.selected_context.clear();
-                *mode = UiMode::Playground;
-                rebuild.0 = true;
-                start_menu.showing = false;
-                start_menu.has_cancel = false;
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
-                color.0 = Color::srgb(1.0, 1.0, 1.0);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-        }
-    }
-}
-
-fn handle_start_menu_load_example_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (Changed<Interaction>, With<StartMenuLoadExampleButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
-    mut state: ResMut<AstState>,
-    mut mode: ResMut<UiMode>,
-    mut rebuild: ResMut<NeedsRebuild>,
-    mut start_menu: ResMut<StartMenu>,
-    mut pick: ResMut<PickState>,
-) {
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-        match *interaction {
-            Interaction::Pressed => {
-                *state.program_ast_mut() = layout::LayoutAst::empty().plus_sink_example();
-                pick.context_path.clear();
-                pick.selected_context.clear();
-                *mode = UiMode::Examples;
                 rebuild.0 = true;
                 start_menu.showing = false;
                 start_menu.has_cancel = false;
@@ -4450,7 +4252,6 @@ fn main() {
         .init_resource::<NeedsRebuild>()
         .init_resource::<PickState>()
         .init_resource::<DragState>()
-        .init_resource::<UiMode>()
         .init_resource::<EvalState>()
         .init_resource::<StartMenu>()
         .init_resource::<DropdownState>()
@@ -4487,14 +4288,11 @@ fn main() {
                         handle_delete_node_button,
                         handle_add_node_button,
                         handle_select_ast_button,
-                        handle_example_buttons,
                         handle_hamburger_button,
                         handle_start_menu_new_button,
-                        handle_start_menu_load_example_button,
                         handle_start_menu_controls_button,
                         handle_start_menu_cancel_button,
                         sync_start_menu_ui,
-                        update_mode_visibility,
                         pick_nodes,
                     )
                         .chain(),
