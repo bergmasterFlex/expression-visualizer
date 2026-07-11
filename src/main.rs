@@ -1490,7 +1490,7 @@ fn spawn_node_editor_panel(mut commands: Commands) {
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
-            top: Val::Px(60.0),
+            top: Val::Px(82.0),
             right: Val::Px(14.0),
             width: Val::Px(280.0),
             flex_direction: FlexDirection::Column,
