@@ -21,9 +21,15 @@ pub struct LayoutAnchor {
     pub pos: Vec3,
 }
 
+#[derive(Clone)]
 pub struct LayoutAst {
     pub ast: crate::ast::Ast,
     pub layout_nodes: std::collections::HashMap<crate::ast::node::Id, LayoutNode>,
+    /// Per-owner nested layouts. Keyed by the container node id (Program in
+    /// Step 1; Pattern in later steps). The `sub_layouts[program_id]` LayoutAst
+    /// is the source of truth for the top-level context — the ENode::Program's
+    /// own `ast` field is unused in Step 1 and stays empty.
+    pub sub_layouts: std::collections::HashMap<crate::ast::node::Id, LayoutAst>,
 }
 
 impl LayoutAst {
@@ -31,7 +37,24 @@ impl LayoutAst {
         Self {
             ast: crate::ast::Ast::empty(),
             layout_nodes: std::collections::HashMap::new(),
+            sub_layouts: std::collections::HashMap::new(),
         }
+    }
+
+    /// Build a root LayoutAst that holds a single Program node plus an empty
+    /// `sub_layouts` entry keyed by the Program's id. The inner LayoutAst is
+    /// where user-visible nodes live in Step 1 (mirrors the previous behavior
+    /// of a flat `LayoutAst::empty()` root).
+    pub fn empty_with_program() -> (Self, crate::ast::node::Id) {
+        let (ast, program_id) = crate::ast::Ast::empty().plus(crate::ast::node::ENode::Program {
+            ast: crate::ast::Ast::empty(),
+        });
+        let outer = Self {
+            ast,
+            layout_nodes: std::collections::HashMap::new(),
+            sub_layouts: std::collections::HashMap::from([(program_id.clone(), Self::empty())]),
+        };
+        (outer, program_id)
     }
 
     pub fn minus_node(&self, node_id: &crate::ast::node::Id) -> Self {
@@ -52,6 +75,7 @@ impl LayoutAst {
                         .into_iter()
                         .filter(|(id, _)| id != node_id)
                         .collect(),
+                    sub_layouts: self.sub_layouts.clone(),
                 };
                 if remaining.is_empty() {
                     Self {
@@ -61,6 +85,7 @@ impl LayoutAst {
                             .into_iter()
                             .filter(|(id, _)| id != &parent_id)
                             .collect(),
+                        sub_layouts: after_pattern.sub_layouts,
                     }
                 } else {
                     after_pattern
@@ -74,6 +99,7 @@ impl LayoutAst {
                     Self {
                         ast: self.ast.clone(),
                         layout_nodes: self.layout_nodes.clone(),
+                        sub_layouts: self.sub_layouts.clone(),
                     },
                     |acc, pid| Self {
                         ast: acc.ast.minus(pid),
@@ -82,6 +108,7 @@ impl LayoutAst {
                             .into_iter()
                             .filter(|(id, _)| id != pid)
                             .collect(),
+                        sub_layouts: acc.sub_layouts,
                     },
                 );
                 Self {
@@ -91,6 +118,7 @@ impl LayoutAst {
                         .into_iter()
                         .filter(|(id, _)| id != node_id)
                         .collect(),
+                    sub_layouts: after_children.sub_layouts,
                 }
             }
             _ => Self {
@@ -101,6 +129,7 @@ impl LayoutAst {
                     .into_iter()
                     .filter(|(id, _)| id != node_id)
                     .collect(),
+                sub_layouts: self.sub_layouts.clone(),
             },
         }
     }
@@ -253,6 +282,7 @@ impl LayoutAst {
                     )
                 })
                 .collect(),
+            sub_layouts: self.sub_layouts.clone(),
         };
 
         let mut match_ids: std::collections::HashSet<crate::ast::node::Id> =
@@ -281,6 +311,7 @@ impl LayoutAst {
         Self {
             ast: self.ast.clone(),
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
     }
 
@@ -370,6 +401,7 @@ impl LayoutAst {
         Self {
             ast: self.ast.plus_edge(from, to),
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
     }
 
@@ -382,6 +414,7 @@ impl LayoutAst {
         Self {
             ast: self.ast.plus_edge_colored(from, to, color),
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
     }
 
@@ -393,6 +426,7 @@ impl LayoutAst {
         Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&node_id, Vec3::new(0.0, 0.0, -4.0))
     }
@@ -415,6 +449,7 @@ impl LayoutAst {
         Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&sink_node_id, Vec3::new(0.0, 0.0, -4.0))
         ._plus_layout_node(&ti_node_id, Vec3::new(0.0, 0.0, 0.0))
@@ -438,6 +473,7 @@ impl LayoutAst {
         Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&sink_node_id, Vec3::new(0.0, 0.0, -4.0))
         ._plus_layout_node(&ti_node_id, Vec3::new(0.0, 0.0, 0.0))
@@ -510,6 +546,7 @@ impl LayoutAst {
         let layout = Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&sink_node_id, Vec3::new(0.0, 0.0, -4.0))
         ._plus_layout_node(&fc_node_id, Vec3::new(0.0, 0.0, 0.0));
@@ -624,6 +661,7 @@ impl LayoutAst {
         Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&sink_node_id, Vec3::new(0.0, 0.0, -12.0))
         ._plus_layout_node(&mf_node_id, Vec3::new(0.0, 0.0, -2.0))
@@ -685,6 +723,7 @@ impl LayoutAst {
         let layout = Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&sink_node_id, Vec3::new(0.0, 0.0, -4.0));
 
@@ -705,6 +744,7 @@ impl LayoutAst {
         Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&node_id, pos)
     }
@@ -720,6 +760,7 @@ impl LayoutAst {
         Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&node_id, pos)
     }
@@ -759,6 +800,7 @@ impl LayoutAst {
         Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&node_id, pos)
     }
@@ -783,6 +825,7 @@ impl LayoutAst {
         Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&node_id, pos)
     }
@@ -812,6 +855,7 @@ impl LayoutAst {
         Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&pattern_node_id, pos)
         ._plus_layout_node(&match_node_id, pos)
@@ -836,6 +880,7 @@ impl LayoutAst {
                 return Self {
                     ast: self.ast.clone(),
                     layout_nodes: self.layout_nodes.clone(),
+                    sub_layouts: self.sub_layouts.clone(),
                 }
             }
         };
@@ -871,6 +916,7 @@ impl LayoutAst {
         let shifted = Self {
             ast: self.ast.clone(),
             layout_nodes: shifted_layout_nodes,
+            sub_layouts: self.sub_layouts.clone(),
         };
         let sibling_ids: Vec<crate::ast::node::Id> = match shifted.ast.nodes.get(&parent_id) {
             Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => patterns.clone(),
@@ -901,6 +947,7 @@ impl LayoutAst {
         let with_new = Self {
             ast,
             layout_nodes: shifted.layout_nodes,
+            sub_layouts: shifted.sub_layouts,
         }
         ._plus_layout_node(&new_pattern_id, Vec3::new(column_x, selected_y, column_z));
         let match_ids: Vec<crate::ast::node::Id> = with_new
@@ -930,6 +977,7 @@ impl LayoutAst {
                 return Self {
                     ast: self.ast.clone(),
                     layout_nodes: self.layout_nodes.clone(),
+                    sub_layouts: self.sub_layouts.clone(),
                 }
             }
         };
@@ -941,6 +989,7 @@ impl LayoutAst {
             return Self {
                 ast: self.ast.clone(),
                 layout_nodes: self.layout_nodes.clone(),
+                sub_layouts: self.sub_layouts.clone(),
             };
         };
         Self {
@@ -962,6 +1011,7 @@ impl LayoutAst {
                     }
                 })
                 .collect(),
+            sub_layouts: self.sub_layouts.clone(),
         }
     }
 
@@ -976,6 +1026,7 @@ impl LayoutAst {
                 return Self {
                     ast: self.ast.clone(),
                     layout_nodes: self.layout_nodes.clone(),
+                    sub_layouts: self.sub_layouts.clone(),
                 }
             }
         };
@@ -988,6 +1039,7 @@ impl LayoutAst {
                 },
             ),
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
     }
 
@@ -1001,6 +1053,7 @@ impl LayoutAst {
         Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&node_id, pos)
     }
@@ -1020,6 +1073,7 @@ impl LayoutAst {
                     },
                 )])
                 .collect(),
+            sub_layouts: self.sub_layouts.clone(),
         }
     }
 
@@ -1048,8 +1102,3 @@ impl LayoutAst {
         }
     }
 }
-
-/// Spacing constants for the 3D layout.
-const SPACING_X: f32 = 2.0;
-const SPACING_Y: f32 = 2.0;
-const SPACING_Z: f32 = 3.5;

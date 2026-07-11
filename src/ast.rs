@@ -8,7 +8,7 @@ pub struct Edge {
     pub color: Color,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Ast {
     next_node_id: node::Id,
     next_anchor_id: AnchorId,

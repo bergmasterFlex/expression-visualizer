@@ -47,6 +47,9 @@ pub enum ENode {
         r#type: EType,
         output_anchor: super::AnchorId,
     },
+    Program {
+        ast: super::Ast,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +91,7 @@ impl ENode {
             ENode::MatchGrid { .. } => "match grid".to_string(),
             ENode::MatchNew { .. } => "match".to_string(),
             ENode::Pattern { r#type, .. } => r#type.to_string(),
+            ENode::Program { .. } => "program".to_string(),
         }
     }
 
@@ -169,6 +173,7 @@ impl ENode {
             ENode::Pattern { output_anchor, .. } => {
                 vec![(output_anchor.clone(), super::EAnchor::Output)]
             }
+            ENode::Program { .. } => vec![],
         }
     }
 }

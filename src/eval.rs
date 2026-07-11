@@ -147,6 +147,7 @@ pub fn eval_type(
         crate::ast::node::ENode::MatchBack { .. } => Err("match back has no type".to_string()),
         crate::ast::node::ENode::MatchGrid { .. } => Err("match grid has no type".to_string()),
         crate::ast::node::ENode::MatchNew { .. } => Err("match has no type".to_string()),
+        crate::ast::node::ENode::Program { .. } => Err("program has no type".to_string()),
     }
 }
 

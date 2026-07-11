@@ -809,6 +809,9 @@ pub fn layoutnode_to_rendernode(
                 labels: vec![],
             }
         }
+        crate::ast::node::ENode::Program { .. } => {
+            unreachable!("Program node has no layout position and is never rendered directly")
+        }
     };
 
     /*
