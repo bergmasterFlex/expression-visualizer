@@ -21,6 +21,17 @@ pub struct LayoutAnchor {
     pub pos: Vec3,
 }
 
+/// A single entry produced by `LayoutAst::walk_all`. Groups a LayoutNode with
+/// enough context (its owning LayoutAst for anchor lookups, the accumulated
+/// grid-space offset, and a sink-scale hint) so the render layer can place
+/// pattern sub-AST nodes correctly without re-doing the traversal.
+pub struct WalkedNode<'a> {
+    pub layout_ast: &'a LayoutAst,
+    pub layout_node: &'a LayoutNode,
+    pub extra_offset: Vec3,
+    pub sink_scale: f32,
+}
+
 #[derive(Clone)]
 pub struct LayoutAst {
     pub ast: crate::ast::Ast,
@@ -75,7 +86,12 @@ impl LayoutAst {
                         .into_iter()
                         .filter(|(id, _)| id != node_id)
                         .collect(),
-                    sub_layouts: self.sub_layouts.clone(),
+                    sub_layouts: self
+                        .sub_layouts
+                        .clone()
+                        .into_iter()
+                        .filter(|(id, _)| id != node_id)
+                        .collect(),
                 };
                 if remaining.is_empty() {
                     Self {
@@ -108,7 +124,11 @@ impl LayoutAst {
                             .into_iter()
                             .filter(|(id, _)| id != pid)
                             .collect(),
-                        sub_layouts: acc.sub_layouts,
+                        sub_layouts: acc
+                            .sub_layouts
+                            .into_iter()
+                            .filter(|(id, _)| id != pid)
+                            .collect(),
                     },
                 );
                 Self {
@@ -832,7 +852,9 @@ impl LayoutAst {
 
     /// Create a `MatchNew` container plus its initial `Pattern` child at `pos`.
     /// The MatchNew's synthetic LayoutNode mirrors the lowest Pattern's pos so
-    /// rendering can iterate `layout_nodes` uniformly.
+    /// rendering can iterate `layout_nodes` uniformly. The Pattern is created
+    /// with a fresh sub-AST (single SinkWall) and a matching entry in
+    /// `sub_layouts[pattern_id]` positioning that sink at Pattern-local (0,0,-1).
     pub fn plus_match_new(&self, pos: Vec3) -> Self {
         let (ast, match_input_anchor_id) = self.ast.with_next_anchor_id();
         let (ast, pattern_output_anchor_id) = ast.with_next_anchor_id();
@@ -840,10 +862,13 @@ impl LayoutAst {
             patterns: vec![],
             input_anchor: match_input_anchor_id.clone(),
         });
+        let (pattern_sub_ast, sub_sink_id) = crate::ast::Ast::initial_pattern_sub_ast();
+        let pattern_sub_layout = Self::initial_pattern_sub_layout(&pattern_sub_ast, &sub_sink_id);
         let (ast, pattern_node_id) = ast.plus(crate::ast::node::ENode::Pattern {
             parent_match: match_node_id.clone(),
             r#type: crate::ast::node::EType::Int { value: None },
             output_anchor: pattern_output_anchor_id,
+            ast: pattern_sub_ast,
         });
         let ast = ast.with_node_replaced(
             &match_node_id,
@@ -855,10 +880,34 @@ impl LayoutAst {
         Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
-            sub_layouts: self.sub_layouts.clone(),
+            sub_layouts: self
+                .sub_layouts
+                .clone()
+                .into_iter()
+                .chain([(pattern_node_id.clone(), pattern_sub_layout)])
+                .collect(),
         }
         ._plus_layout_node(&pattern_node_id, pos)
         ._plus_layout_node(&match_node_id, pos)
+    }
+
+    /// LayoutAst for a fresh Pattern's sub-AST: registers the initial sink at
+    /// Pattern-local grid position (0, 0, -1).
+    fn initial_pattern_sub_layout(
+        sub_ast: &crate::ast::Ast,
+        sub_sink_id: &crate::ast::node::Id,
+    ) -> Self {
+        Self {
+            ast: sub_ast.clone(),
+            layout_nodes: std::collections::HashMap::from([(
+                sub_sink_id.clone(),
+                LayoutNode {
+                    node_id: sub_sink_id.clone(),
+                    pos: Vec3::new(0.0, 0.0, -1.0),
+                },
+            )]),
+            sub_layouts: std::collections::HashMap::new(),
+        }
     }
 
     /// Insert a new Pattern below `selected_pattern_id` in its parent MatchNew.
@@ -923,10 +972,14 @@ impl LayoutAst {
             _ => vec![],
         };
         let (ast, new_output_anchor_id) = shifted.ast.with_next_anchor_id();
+        let (new_pattern_sub_ast, new_sub_sink_id) = crate::ast::Ast::initial_pattern_sub_ast();
+        let new_pattern_sub_layout =
+            Self::initial_pattern_sub_layout(&new_pattern_sub_ast, &new_sub_sink_id);
         let (ast, new_pattern_id) = ast.plus(crate::ast::node::ENode::Pattern {
             parent_match: parent_id.clone(),
             r#type: crate::ast::node::EType::Int { value: None },
             output_anchor: new_output_anchor_id,
+            ast: new_pattern_sub_ast,
         });
         let new_patterns: Vec<crate::ast::node::Id> = sibling_ids
             .iter()
@@ -947,7 +1000,11 @@ impl LayoutAst {
         let with_new = Self {
             ast,
             layout_nodes: shifted.layout_nodes,
-            sub_layouts: shifted.sub_layouts,
+            sub_layouts: shifted
+                .sub_layouts
+                .into_iter()
+                .chain([(new_pattern_id.clone(), new_pattern_sub_layout)])
+                .collect(),
         }
         ._plus_layout_node(&new_pattern_id, Vec3::new(column_x, selected_y, column_z));
         let match_ids: Vec<crate::ast::node::Id> = with_new
@@ -1074,6 +1131,49 @@ impl LayoutAst {
                 )])
                 .collect(),
             sub_layouts: self.sub_layouts.clone(),
+        }
+    }
+
+    /// Recursively walk every node in this LayoutAst and its `sub_layouts`.
+    /// Each entry carries the containing LayoutAst (for anchor lookups), the
+    /// LayoutNode, the accumulated grid-space offset from the outer root, and
+    /// a sink-scale hint (1.0 outside patterns, 1/3 inside).
+    ///
+    /// Descent into a sub-layout uses the owner node's grid position as the
+    /// additional offset. The outer root's `layout_nodes` is expected to be
+    /// empty (Program has no LayoutNode) so `sub_layouts[program_id]` is
+    /// entered with offset (0,0,0) and scale 1.
+    pub fn walk_all(&self) -> Vec<WalkedNode> {
+        let mut out = Vec::new();
+        self.walk_all_into(Vec3::ZERO, 1.0, &mut out);
+        out
+    }
+
+    fn walk_all_into<'a>(&'a self, offset: Vec3, sink_scale: f32, out: &mut Vec<WalkedNode<'a>>) {
+        for layout_node in self.layout_nodes.values() {
+            out.push(WalkedNode {
+                layout_ast: self,
+                layout_node,
+                extra_offset: offset,
+                sink_scale,
+            });
+        }
+        for (owner_id, sub_layout) in &self.sub_layouts {
+            let owner_grid_pos = self
+                .layout_nodes
+                .get(owner_id)
+                .map(|ln| ln.pos)
+                .unwrap_or(Vec3::ZERO);
+            let sub_offset = offset + owner_grid_pos;
+            let sub_scale = if matches!(
+                self.ast.nodes.get(owner_id),
+                Some(crate::ast::node::ENode::Pattern { .. })
+            ) {
+                1.0 / 3.0
+            } else {
+                sink_scale
+            };
+            sub_layout.walk_all_into(sub_offset, sub_scale, out);
         }
     }
 

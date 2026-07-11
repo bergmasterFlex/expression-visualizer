@@ -46,6 +46,11 @@ pub enum ENode {
         parent_match: super::node::Id,
         r#type: EType,
         output_anchor: super::AnchorId,
+        /// Sub-AST inside this Pattern. In Step 2 this is initialised with a
+        /// single SinkWall; the source of truth for the visible layout of that
+        /// sub-AST lives in the enclosing `LayoutAst.sub_layouts[pattern_id]`.
+        /// Kept in sync via `with_ast_at_path`-style helpers in later steps.
+        ast: super::Ast,
     },
     Program {
         ast: super::Ast,

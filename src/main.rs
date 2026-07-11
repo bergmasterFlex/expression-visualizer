@@ -686,15 +686,14 @@ fn spawn_ast_nodes(
 ) {
     let mut node_entites = std::collections::HashMap::<ast::node::Id, Entity>::new();
     let mut anchor_entities = std::collections::HashMap::<ast::AnchorId, Entity>::new();
-    for (node_id, layout_node) in &state.program_ast().layout_nodes {
-        let node = state
-            .program_ast()
-            .ast
-            .nodes
-            .get(&layout_node.node_id)
-            .unwrap();
+    let program_ast_ptr: *const layout::LayoutAst = state.program_ast();
+    for walked in state.layout_ast.walk_all() {
+        let layout_node = walked.layout_node;
+        let node_id = &layout_node.node_id;
+        let node = walked.layout_ast.ast.nodes.get(node_id).unwrap();
+        let is_program_ast = std::ptr::eq(walked.layout_ast, program_ast_ptr);
         if let ast::node::ENode::MatchGrid { width, depth } = node {
-            let world_pos = layout_node.pos * Vec3::new(3.0, 3.0, 3.0);
+            let world_pos = (layout_node.pos + walked.extra_offset) * Vec3::new(3.0, 3.0, 3.0);
             let size_x = *width as f32 * 3.0;
             let size_z = *depth as f32 * 3.0;
             let tf = Transform::from_translation(
@@ -725,9 +724,11 @@ fn spawn_ast_nodes(
             continue;
         }
         let render_node = render::layoutnode_to_rendernode(
-            &layout_node,
-            state.program_ast(),
+            layout_node,
+            walked.layout_ast,
             &state.function_declarations,
+            walked.extra_offset,
+            walked.sink_scale,
         );
         let node_entity = commands
             .spawn((
@@ -767,28 +768,28 @@ fn spawn_ast_nodes(
                     type_markers: vec![],
                 };
 
-                let layout_anchor = state.program_ast().layout_anchor(anchor_id.clone());
-                anchor_entities.insert(
-                    anchor_id.clone(),
-                    commands
-                        .spawn((
-                            Mesh3d(meshes.add(render_anchor.normal.mesh.clone())),
-                            MeshMaterial3d(materials.add(render_anchor.normal.material.clone())),
-                            render_anchor.normal.transform,
-                            match layout_anchor.anchor {
-                                ast::EAnchor::Input { .. } => EAnchor::Input {
-                                    id: anchor_id,
-                                    render_objects: render_anchor,
-                                },
-                                ast::EAnchor::Output => EAnchor::Output {
-                                    id: anchor_id,
-                                    render_objects: render_anchor,
-                                },
+                let layout_anchor = walked.layout_ast.layout_anchor(anchor_id.clone());
+                let spawned = commands
+                    .spawn((
+                        Mesh3d(meshes.add(render_anchor.normal.mesh.clone())),
+                        MeshMaterial3d(materials.add(render_anchor.normal.material.clone())),
+                        render_anchor.normal.transform,
+                        match layout_anchor.anchor {
+                            ast::EAnchor::Input { .. } => EAnchor::Input {
+                                id: anchor_id.clone(),
+                                render_objects: render_anchor,
                             },
-                            AstSceneEntity,
-                        ))
-                        .id(),
-                );
+                            ast::EAnchor::Output => EAnchor::Output {
+                                id: anchor_id.clone(),
+                                render_objects: render_anchor,
+                            },
+                        },
+                        AstSceneEntity,
+                    ))
+                    .id();
+                if is_program_ast {
+                    anchor_entities.insert(anchor_id, spawned);
+                }
             });
 
         node_entites.insert(node_id.clone(), node_entity.clone());

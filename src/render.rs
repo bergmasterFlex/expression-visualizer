@@ -149,6 +149,12 @@ fn build_type_markers(
 }
 
 /// Spawn the AST node meshes.
+///
+/// `extra_offset` (grid units) is added to `layout_node.pos` before the
+/// grid→world conversion; used for pattern sub-AST nodes whose positions are
+/// relative to the containing pattern. `sink_scale` shrinks a SinkWall's mesh
+/// (anchor sphere and its transform stay unchanged so it remains clickable);
+/// non-Sink node kinds ignore it.
 pub fn layoutnode_to_rendernode(
     layout_node: &crate::layout::LayoutNode,
     layout_ast: &crate::layout::LayoutAst,
@@ -156,9 +162,11 @@ pub fn layoutnode_to_rendernode(
         crate::ast::FunctionDeclarationId,
         crate::ast::FunctionDeclaration,
     >,
+    extra_offset: Vec3,
+    sink_scale: f32,
 ) -> RenderNode {
     let ast = &layout_ast.ast;
-    let node_pos = layout_to_world(layout_node.pos);
+    let node_pos = layout_to_world(layout_node.pos + extra_offset);
     let node_pos_tf = Transform::from_translation(node_pos);
     let node = ast.nodes.get(&layout_node.node_id).unwrap();
     return match node {
@@ -533,7 +541,7 @@ pub fn layoutnode_to_rendernode(
         }
         crate::ast::node::ENode::SinkWall { input_anchor } => RenderNode {
             node: RenderObject {
-                mesh: crate::mesh::square_pyramid_z_mesh(6.0, 9.0),
+                mesh: crate::mesh::square_pyramid_z_mesh(6.0 * sink_scale, 9.0 * sink_scale),
                 material: StandardMaterial {
                     base_color: Color::srgba(0.5, 0.5, 0.5, 0.5),
                     alpha_mode: AlphaMode::Blend,

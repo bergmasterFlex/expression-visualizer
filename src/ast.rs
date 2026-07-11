@@ -44,6 +44,17 @@ impl Ast {
         }
     }
 
+    /// Starting state for a Pattern's inner sub-AST: a single SinkWall.
+    /// Returns the fresh AST plus the sink node id (the caller uses the id to
+    /// register the sink's LayoutNode in the sibling LayoutAst).
+    pub fn initial_pattern_sub_ast() -> (Self, node::Id) {
+        let (ast, sink_input_anchor_id) = Self::empty().with_next_anchor_id();
+        let (ast, sink_node_id) = ast.plus(node::ENode::SinkWall {
+            input_anchor: sink_input_anchor_id,
+        });
+        (ast, sink_node_id)
+    }
+
     pub fn plus_edge(&self, from: AnchorId, to: AnchorId) -> Self {
         self.plus_edge_colored(from, to, crate::colors::WHITE)
     }
