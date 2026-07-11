@@ -303,6 +303,13 @@ struct PickState {
     /// clicking a dropdown/text-input/checkbox doesn't move the selection
     /// to whatever grid cell the ray passes through behind the panel.
     press_over_ui: bool,
+    /// Path of container ids from the Program-Ast down to the currently
+    /// active editing context. Empty = Program-Ast (top-level user code);
+    /// a non-empty path names Pattern ids in outer-to-inner order. Add/
+    /// delete/move handlers route through `current_ast(_mut)` so the
+    /// change lands in the right sub-ast. Stays empty until Step 5 wires
+    /// the "Select Ast" button.
+    context_path: Vec<ast::node::Id>,
 }
 
 impl Default for PickState {
@@ -313,7 +320,26 @@ impl Default for PickState {
             hovered_pos: None,
             press_cursor: None,
             press_over_ui: false,
+            context_path: Vec::new(),
         }
+    }
+}
+
+impl PickState {
+    fn current_ast<'a>(&self, state: &'a AstState) -> &'a layout::LayoutAst {
+        let mut ast = state.program_ast();
+        for id in &self.context_path {
+            ast = ast.sub_layouts.get(id).unwrap();
+        }
+        ast
+    }
+
+    fn current_ast_mut<'a>(&self, state: &'a mut AstState) -> &'a mut layout::LayoutAst {
+        let mut ast = state.program_ast_mut();
+        for id in &self.context_path {
+            ast = ast.sub_layouts.get_mut(id).unwrap();
+        }
+        ast
     }
 }
 
@@ -1061,14 +1087,14 @@ fn handle_delete_node_button(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        if let Some(selected_node_id) = state.program_ast().node_at(pick.selected_pos) {
+        if let Some(selected_node_id) = pick.current_ast(&state).node_at(pick.selected_pos) {
             let is_sink_wall = matches!(
-                state.program_ast().ast.nodes.get(&selected_node_id),
+                pick.current_ast(&state).ast.nodes.get(&selected_node_id),
                 Some(ast::node::ENode::SinkWall { .. })
             );
             if !is_sink_wall {
-                let updated = state.program_ast().minus_node(&selected_node_id);
-                *state.program_ast_mut() = updated;
+                let updated = pick.current_ast(&state).minus_node(&selected_node_id);
+                *pick.current_ast_mut(&mut state) = updated;
                 rebuild.0 = true;
             }
         }
@@ -1087,10 +1113,9 @@ fn update_add_pattern_button_visuals(
     mut text_color_q: Query<&mut TextColor>,
 ) {
     let enabled = matches!(
-        state
-            .program_ast()
+        pick.current_ast(&state)
             .node_at(pick.selected_pos)
-            .and_then(|id| state.program_ast().ast.nodes.get(&id).cloned()),
+            .and_then(|id| pick.current_ast(&state).ast.nodes.get(&id).cloned()),
         Some(ast::node::ENode::Pattern { .. })
     );
     for (interaction, mut bg, children, action) in button_q.iter_mut() {
@@ -1129,7 +1154,10 @@ fn update_add_generic_button_visuals(
     )>,
     mut text_color_q: Query<&mut TextColor>,
 ) {
-    let enabled = state.program_ast().node_at(pick.selected_pos).is_none();
+    let enabled = pick
+        .current_ast(&state)
+        .node_at(pick.selected_pos)
+        .is_none();
     for (interaction, mut bg, children, action) in button_q.iter_mut() {
         if *action == EAstActionButton::AddPatternButton {
             continue;
@@ -1161,9 +1189,9 @@ fn update_delete_button_visuals(
     mut button_q: Query<(&Interaction, &mut BackgroundColor, &Children), With<DeleteNodeButton>>,
     mut text_color_q: Query<&mut TextColor>,
 ) {
-    let enabled = match state.program_ast().node_at(pick.selected_pos) {
+    let enabled = match pick.current_ast(&state).node_at(pick.selected_pos) {
         Some(id) => !matches!(
-            state.program_ast().ast.nodes.get(&id),
+            pick.current_ast(&state).ast.nodes.get(&id),
             Some(ast::node::ENode::SinkWall { .. })
         ),
         None => false,
@@ -1234,6 +1262,7 @@ fn handle_example_buttons(
                 pick.selected_pos = IVec3::ZERO;
                 pick.hovered_node = None;
                 pick.hovered_pos = None;
+                pick.context_path.clear();
                 rebuild.0 = true;
             }
             Interaction::Hovered => {
@@ -1276,19 +1305,29 @@ fn handle_add_node_button(
         match *interaction {
             Interaction::Pressed => {
                 let new_pos = pick.selected_pos.as_vec3();
-                let target_occupied = state.program_ast().node_at(pick.selected_pos).is_some();
+                let target_occupied = pick
+                    .current_ast(&state)
+                    .node_at(pick.selected_pos)
+                    .is_some();
                 if target_occupied && *action != EAstActionButton::AddPatternButton {
                     continue;
                 }
                 let new_layout = match action {
-                    EAstActionButton::AddConstDeclButton => state
-                        .program_ast()
+                    EAstActionButton::AddConstDeclButton => pick
+                        .current_ast(&state)
                         .plus_type_introduction(ast::node::EType::Int { value: None }, new_pos),
                     EAstActionButton::AddVarDeclButton => {
-                        state.program_ast().plus_var_decl(new_pos)
+                        // Only the Program-Ast may hold VarDecls. Guard here so
+                        // a stray click on a "should be disabled" button in a
+                        // Pattern context is a no-op; Step 5 will additionally
+                        // grey out the button.
+                        if !pick.context_path.is_empty() {
+                            continue;
+                        }
+                        pick.current_ast(&state).plus_var_decl(new_pos)
                     }
                     EAstActionButton::AddFunctionCallButton => {
-                        state.program_ast().plus_function_call(
+                        pick.current_ast(&state).plus_function_call(
                             state
                                 .function_declarations
                                 .iter()
@@ -1298,19 +1337,21 @@ fn handle_add_node_button(
                             new_pos,
                         )
                     }
-                    EAstActionButton::AddTypeCastButton => state
-                        .program_ast()
+                    EAstActionButton::AddTypeCastButton => pick
+                        .current_ast(&state)
                         .plus_type_elimination(ast::node::EType::Int { value: None }, new_pos),
-                    EAstActionButton::AddMatchButton => state.program_ast().plus_match_new(new_pos),
+                    EAstActionButton::AddMatchButton => {
+                        pick.current_ast(&state).plus_match_new(new_pos)
+                    }
                     EAstActionButton::AddPatternButton => {
-                        match state.program_ast().node_at(pick.selected_pos) {
+                        match pick.current_ast(&state).node_at(pick.selected_pos) {
                             Some(id)
                                 if matches!(
-                                    state.program_ast().ast.nodes.get(&id),
+                                    pick.current_ast(&state).ast.nodes.get(&id),
                                     Some(ast::node::ENode::Pattern { .. })
                                 ) =>
                             {
-                                let updated = state.program_ast().plus_pattern_above(&id);
+                                let updated = pick.current_ast(&state).plus_pattern_above(&id);
                                 pick.selected_pos.y += 1;
                                 updated
                             }
@@ -1318,7 +1359,7 @@ fn handle_add_node_button(
                         }
                     }
                 };
-                *state.program_ast_mut() = new_layout;
+                *pick.current_ast_mut(&mut state) = new_layout;
                 rebuild.0 = true;
             }
             Interaction::Hovered => {
@@ -2654,12 +2695,14 @@ fn handle_start_menu_new_button(
     mut mode: ResMut<UiMode>,
     mut rebuild: ResMut<NeedsRebuild>,
     mut start_menu: ResMut<StartMenu>,
+    mut pick: ResMut<PickState>,
 ) {
     for (interaction, mut bg, children) in interaction_q.iter_mut() {
         let mut color = text_color_q.get_mut(children[0]).unwrap();
         match *interaction {
             Interaction::Pressed => {
                 *state.program_ast_mut() = layout::LayoutAst::empty().plus_sink_wall();
+                pick.context_path.clear();
                 *mode = UiMode::Playground;
                 rebuild.0 = true;
                 start_menu.showing = false;
@@ -2687,12 +2730,14 @@ fn handle_start_menu_load_example_button(
     mut mode: ResMut<UiMode>,
     mut rebuild: ResMut<NeedsRebuild>,
     mut start_menu: ResMut<StartMenu>,
+    mut pick: ResMut<PickState>,
 ) {
     for (interaction, mut bg, children) in interaction_q.iter_mut() {
         let mut color = text_color_q.get_mut(children[0]).unwrap();
         match *interaction {
             Interaction::Pressed => {
                 *state.program_ast_mut() = layout::LayoutAst::empty().plus_sink_example();
+                pick.context_path.clear();
                 *mode = UiMode::Examples;
                 rebuild.0 = true;
                 start_menu.showing = false;
@@ -3832,11 +3877,11 @@ fn handle_arrow_keys(
         // Move the node under the current selection (if any) and keep
         // the selection anchored to it — the effective position may differ
         // from `selected + delta` when the move jumped over a match.
-        if let Some(node_id) = state.program_ast().node_at(pick.selected_pos) {
-            let (new_layout, effective_pos) = state
-                .program_ast()
+        if let Some(node_id) = pick.current_ast(&state).node_at(pick.selected_pos) {
+            let (new_layout, effective_pos) = pick
+                .current_ast(&state)
                 .move_node_delta(node_id, delta.as_vec3());
-            *state.program_ast_mut() = new_layout;
+            *pick.current_ast_mut(&mut state) = new_layout;
             pick.selected_pos = effective_pos;
             rebuild.0 = true;
         }
