@@ -1195,14 +1195,30 @@ impl LayoutAst {
     }
 
     pub fn layout_anchor(&self, anchor_id: crate::ast::AnchorId) -> LayoutAnchor {
-        let anchor = self.ast.anchors.get(&anchor_id).unwrap();
-        let node_id = self.ast.anchor_to_node.get(&anchor_id).unwrap().clone();
-        LayoutAnchor {
-            anchor_id: anchor_id,
-            anchor: anchor.clone(),
-            node_id,
-            pos: Vec3::splat(1.0),
+        self.try_layout_anchor(&anchor_id).unwrap_or_else(|| {
+            panic!(
+                "layout_anchor: anchor {:?} not found in any (sub-)ast",
+                anchor_id
+            )
+        })
+    }
+
+    fn try_layout_anchor(&self, anchor_id: &crate::ast::AnchorId) -> Option<LayoutAnchor> {
+        if let Some(anchor) = self.ast.anchors.get(anchor_id) {
+            let node_id = self.ast.anchor_to_node.get(anchor_id).unwrap().clone();
+            return Some(LayoutAnchor {
+                anchor_id: anchor_id.clone(),
+                anchor: anchor.clone(),
+                node_id,
+                pos: Vec3::splat(1.0),
+            });
         }
+        for sub in self.sub_layouts.values() {
+            if let Some(la) = sub.try_layout_anchor(anchor_id) {
+                return Some(la);
+            }
+        }
+        None
     }
 
     /// Owner path from this LayoutAst down to the LayoutAst whose

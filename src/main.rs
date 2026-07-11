@@ -357,6 +357,14 @@ impl PickState {
     fn selected_ast<'a>(&self, state: &'a AstState) -> &'a layout::LayoutAst {
         state.program_ast().resolve_context(&self.selected_context)
     }
+
+    fn selected_ast_mut<'a>(&self, state: &'a mut AstState) -> &'a mut layout::LayoutAst {
+        let mut ast = state.program_ast_mut();
+        for id in &self.selected_context {
+            ast = ast.sub_layouts.get_mut(id).unwrap();
+        }
+        ast
+    }
 }
 
 /// UI text showing the selected node's info.
@@ -732,12 +740,10 @@ fn spawn_ast_nodes(
 ) {
     let mut node_entites = std::collections::HashMap::<ast::node::Id, Entity>::new();
     let mut anchor_entities = std::collections::HashMap::<ast::AnchorId, Entity>::new();
-    let program_ast_ptr: *const layout::LayoutAst = state.program_ast();
     for walked in state.layout_ast.walk_all() {
         let layout_node = walked.layout_node;
         let node_id = &layout_node.node_id;
         let node = walked.layout_ast.ast.nodes.get(node_id).unwrap();
-        let is_program_ast = std::ptr::eq(walked.layout_ast, program_ast_ptr);
         if let ast::node::ENode::MatchGrid { width, depth } = node {
             let world_pos = (layout_node.pos + walked.extra_offset) * Vec3::new(3.0, 3.0, 3.0);
             let size_x = *width as f32 * 3.0;
@@ -833,9 +839,7 @@ fn spawn_ast_nodes(
                         AstSceneEntity,
                     ))
                     .id();
-                if is_program_ast {
-                    anchor_entities.insert(anchor_id, spawned);
-                }
+                anchor_entities.insert(anchor_id, spawned);
             });
 
         node_entites.insert(node_id.clone(), node_entity.clone());
@@ -4050,11 +4054,13 @@ fn handle_arrow_keys(
         // Move the node under the current selection (if any) and keep
         // the selection anchored to it — the effective position may differ
         // from `selected + delta` when the move jumped over a match.
-        if let Some(node_id) = pick.current_ast(&state).node_at(pick.selected_pos) {
+        // Route through selected_ast (not current_ast) so a Sub-Ast node
+        // can be moved without first switching context_path via SelectAst.
+        if let Some(node_id) = pick.selected_ast(&state).node_at(pick.selected_pos) {
             let (new_layout, effective_pos) = pick
-                .current_ast(&state)
+                .selected_ast(&state)
                 .move_node_delta(node_id, delta.as_vec3());
-            *pick.current_ast_mut(&mut state) = new_layout;
+            *pick.selected_ast_mut(&mut state) = new_layout;
             pick.selected_pos = effective_pos;
             rebuild.0 = true;
         }
