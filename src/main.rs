@@ -3464,7 +3464,7 @@ fn pick_nodes(
         let t = -ray.origin.y / ray.direction.y;
         if t > 0.0 {
             let hit = ray.origin + *ray.direction * t;
-            if Vec2::new(hit.x, hit.z).length() <= grid_config.fade_start {
+            if Vec2::new(hit.x, hit.z).length() <= grid_config.fade_end {
                 let spacing = grid_config.spacing;
                 let gx = (hit.x / spacing).round() as i32;
                 let gz = (hit.z / spacing).round() as i32;
@@ -4088,6 +4088,7 @@ fn spawn_crosshair(mut commands: Commands) {
 fn update_crosshair(
     pick: Res<PickState>,
     state: Res<AstState>,
+    grid_config: Res<grid::GridConfig>,
     camera_q: Query<(&Camera, &GlobalTransform), With<camera::OrbitCameraTag>>,
     node_q: Query<(&AstNodeEntity, &GlobalTransform)>,
     windows: Query<&Window>,
@@ -4131,10 +4132,10 @@ fn update_crosshair(
         return;
     };
 
-    // Project a world-space sphere with constant radius onto the screen
-    // to get a perspective-correct, distance-aware box size.
-    const CROSSHAIR_RADIUS: f32 = 0.5;
-    let edge_world = anchor_world + *cam_tf.right() * CROSSHAIR_RADIUS;
+    // Project a world-space offset of half a cell onto the screen so the
+    // crosshair frames the selected cell (perspective-correct, distance-aware).
+    let crosshair_radius = grid_config.spacing * 0.5;
+    let edge_world = anchor_world + *cam_tf.right() * crosshair_radius;
     let Ok(edge_screen) = camera.world_to_viewport(cam_tf, edge_world) else {
         hide_all(&mut crosshair_q);
         return;

@@ -12,9 +12,10 @@ use bevy::shader::ShaderRef;
 pub struct GridConfig {
     pub spacing: f32,
     pub half_extent: f32,
-    /// Distance (in world units) from origin where the grid starts fading
-    /// out. Also the radius within which grid crossings can be hovered.
+    /// Distance (in world units) from origin where the grid starts fading out.
     pub fade_start: f32,
+    /// Distance where the grid becomes fully transparent. Also the radius
+    /// within which grid cells can be hovered/clicked.
     pub fade_end: f32,
 }
 
@@ -47,10 +48,10 @@ pub struct GridMaterial {
     pub fade_end: f32,
     #[uniform(0)]
     pub line_thickness: f32,
-    /// World-space (x, z) of the grid crossing under the cursor.
+    /// World-space (x, z) of the hovered cell's center.
     #[uniform(0)]
     pub hover_pos: Vec2,
-    /// 1.0 when a grid crossing is hovered, 0.0 otherwise.
+    /// 1.0 when a grid cell is hovered, 0.0 otherwise.
     #[uniform(0)]
     pub hover_active: f32,
     /// Padding to keep the uniform block 16-byte aligned.

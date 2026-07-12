@@ -11,6 +11,7 @@ struct GridParams {
     fade_start: f32,
     fade_end: f32,
     line_thickness: f32,
+    // World-space (x, z) of the hovered cell's center.
     hover_pos: vec2<f32>,
     hover_active: f32,
     _pad: f32,
@@ -23,7 +24,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let world_pos = in.world_position.xz;
 
     let coord = world_pos / params.spacing;
-    let grid = abs(fract(coord - 0.5) - 0.5);
+    // Lines drawn at half-integer coord so integer grid positions
+    // (world = int * spacing) sit at cell centers, not crossings.
+    let grid = abs(fract(coord) - 0.5);
     let line_width = fwidth(coord);
 
     let line_x = 1.0 - saturate(grid.x / (line_width.x * params.line_thickness));
@@ -37,19 +40,19 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let avg_color = mix(params.plane_color, params.line_color, 0.3);
     var color = mix(grid_color, avg_color, density_blend);
 
-    // Hover feedback: locally brighten grid lines around the hovered
-    // crossing and add a faint disc on the plane.
+    // Hover feedback: fill the hovered cell (side = spacing) with a soft
+    // wash, anti-aliased against fwidth so it stays crisp at oblique angles.
     if params.hover_active > 0.5 {
-        let hover_d = length(world_pos - params.hover_pos);
-        // Line brightening — falls off over ~1.5 world units.
-        let line_boost = (1.0 - smoothstep(0.0, 1.5, hover_d)) * lines * 0.9;
-        color = vec4<f32>(color.rgb + params.line_color.rgb * line_boost, color.a);
-        // Faint disc — visible within ~0.6 world units.
-        let disc = 1.0 - smoothstep(0.0, 0.6, hover_d);
-        let disc_alpha = disc * 0.25;
+        let d = abs(world_pos - params.hover_pos);
+        let half_cell = params.spacing * 0.5;
+        let aa = max(fwidth(world_pos.x), fwidth(world_pos.y));
+        let mask_x = 1.0 - smoothstep(half_cell - aa, half_cell + aa, d.x);
+        let mask_y = 1.0 - smoothstep(half_cell - aa, half_cell + aa, d.y);
+        let cell = mask_x * mask_y;
+        let fill_alpha = cell * 0.28;
         color = vec4<f32>(
-            mix(color.rgb, params.line_color.rgb, disc_alpha),
-            color.a + disc_alpha,
+            mix(color.rgb, params.line_color.rgb, fill_alpha),
+            color.a + fill_alpha,
         );
     }
 
