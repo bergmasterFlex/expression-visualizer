@@ -112,8 +112,8 @@ fn spawn_grid(
     commands.spawn((
         Mesh3d(meshes.add(Plane3d::default().mesh().size(size, size).build())),
         MeshMaterial3d(materials.add(GridMaterial {
-            plane_color: LinearRgba::new(0.2, 0.2, 0.3, 0.03),
-            line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.05),
+            plane_color: LinearRgba::new(0.2, 0.2, 0.3, 0.08),
+            line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.15),
             spacing: config.spacing,
             fade_start: config.fade_start,
             fade_end: config.fade_end,

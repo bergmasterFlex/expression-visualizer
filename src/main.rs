@@ -715,13 +715,16 @@ fn setup_scene(mut commands: Commands) {
 
 /// Spawn the transparent grey front wall at z = +12,
 /// spanning x ∈ [-30, 30] and y ∈ [-3, 3].
-fn spawn_walls(
+/// Front boundary of the top-level workspace, representing the `ENode::Program`
+/// root. Sits at grid z=0, symmetric to the SinkWall at grid z=-4, so the two
+/// tightly encapsulate the grid corridor (z ∈ [-3, -1]).
+fn spawn_program_wall(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let wall_mesh = meshes.add(Cuboid::new(40.0, 6.0, 0.05));
-    let wall_material = materials.add(StandardMaterial {
+    let program_wall_mesh = meshes.add(Cuboid::new(40.0, 6.0, 0.05));
+    let program_wall_material = materials.add(StandardMaterial {
         base_color: Color::srgba(0.5, 0.5, 0.5, 0.5),
         alpha_mode: AlphaMode::Blend,
         cull_mode: None,
@@ -729,9 +732,9 @@ fn spawn_walls(
     });
 
     commands.spawn((
-        Mesh3d(wall_mesh),
-        MeshMaterial3d(wall_material),
-        Transform::from_xyz(0.0, 0.0, 12.0),
+        Mesh3d(program_wall_mesh),
+        MeshMaterial3d(program_wall_material),
+        Transform::from_xyz(0.0, 0.0, 0.0),
     ));
 }
 
@@ -4371,7 +4374,7 @@ fn main() {
             (
                 load_ui_font,
                 setup_scene,
-                spawn_walls,
+                spawn_program_wall,
                 spawn_ast_nodes,
                 spawn_ui,
                 spawn_selection_display,
