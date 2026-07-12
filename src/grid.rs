@@ -97,6 +97,11 @@ impl Plugin for GridPlugin {
     }
 }
 
+/// Marker for the base (Y=0) grid so hover/click systems can skip it — the
+/// base grid is a passive visual hint, not an interactive surface.
+#[derive(Component)]
+pub struct BaseGridEntity;
+
 fn spawn_grid(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -107,8 +112,8 @@ fn spawn_grid(
     commands.spawn((
         Mesh3d(meshes.add(Plane3d::default().mesh().size(size, size).build())),
         MeshMaterial3d(materials.add(GridMaterial {
-            plane_color: LinearRgba::new(0.2, 0.2, 0.3, 0.18),
-            line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.4),
+            plane_color: LinearRgba::new(0.2, 0.2, 0.3, 0.03),
+            line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.05),
             spacing: config.spacing,
             fade_start: config.fade_start,
             fade_end: config.fade_end,
@@ -117,5 +122,6 @@ fn spawn_grid(
             hover_active: 0.0,
             _pad: 0.0,
         })),
+        BaseGridEntity,
     ));
 }

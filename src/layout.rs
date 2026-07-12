@@ -32,6 +32,25 @@ pub struct WalkedNode<'a> {
     pub sink_scale: f32,
 }
 
+/// One entry per LayoutAst reached from a root. Used by the per-AST grid
+/// renderer to place a dedicated grid mesh per Program/Pattern sub-AST.
+pub struct WalkedAst<'a> {
+    pub layout_ast: &'a LayoutAst,
+    /// Owner path from the walk root to this AST. Empty at the outermost
+    /// LayoutAst (the one `walk_all_asts` was called on).
+    pub context: Vec<crate::ast::node::Id>,
+    /// Accumulated grid-space offset from the root to this AST's origin.
+    pub extra_offset: Vec3,
+}
+
+/// Bounds of an AST grid in that AST's local grid coordinates. Both corners
+/// are inclusive; `y = 0` for both.
+#[derive(Debug, Clone, Copy)]
+pub struct AstGridBounds {
+    pub min: IVec3,
+    pub max: IVec3,
+}
+
 #[derive(Clone)]
 pub struct LayoutAst {
     pub ast: crate::ast::Ast,
@@ -875,6 +894,95 @@ impl LayoutAst {
             };
             sub_layout.walk_all_into(sub_offset, sub_scale, out);
         }
+    }
+
+    /// Yield every LayoutAst reachable from `self`, including `self` itself.
+    /// Each entry carries the owner path from `self` down to the yielded AST
+    /// (empty at `self`) and the accumulated grid-space offset.
+    pub fn walk_all_asts(&self) -> Vec<WalkedAst> {
+        let mut out = Vec::new();
+        self.walk_all_asts_into(Vec::new(), Vec3::ZERO, &mut out);
+        out
+    }
+
+    fn walk_all_asts_into<'a>(
+        &'a self,
+        context: Vec<crate::ast::node::Id>,
+        offset: Vec3,
+        out: &mut Vec<WalkedAst<'a>>,
+    ) {
+        out.push(WalkedAst {
+            layout_ast: self,
+            context: context.clone(),
+            extra_offset: offset,
+        });
+        for (owner_id, sub_layout) in &self.sub_layouts {
+            let owner_grid_pos = self
+                .layout_nodes
+                .get(owner_id)
+                .map(|ln| ln.pos)
+                .unwrap_or(Vec3::ZERO);
+            let mut sub_context = context.clone();
+            sub_context.push(owner_id.clone());
+            sub_layout.walk_all_asts_into(sub_context, offset + owner_grid_pos, out);
+        }
+    }
+
+    /// Compute the grid bounds for this AST in its own local coordinates.
+    ///
+    /// - Z range: `[sink.z + 1, -1]` where `sink.z` is the single SinkWall's
+    ///   layout-Z. The front wall is treated as Z=0 for both the Program-Ast
+    ///   (which has no explicit front node) and Pattern sub-ASTs (where the
+    ///   Pattern itself is the implicit front). If the corridor collapses
+    ///   (`sink.z >= -1`) or no SinkWall exists, returns `None`.
+    /// - X range: min/max over all layout nodes' rounded X, unioned with
+    ///   `active_selection.x` when provided. If the AST has no nodes at all
+    ///   the sink is the only node — X min/max = 0 (sink is at X=0).
+    ///
+    /// `active_selection` is the currently-selected cell in this AST's local
+    /// coords, passed only when this AST is the active editing context.
+    pub fn ast_grid_bounds(&self, active_selection: Option<IVec3>) -> Option<AstGridBounds> {
+        let sink_z =
+            self.layout_nodes
+                .iter()
+                .find_map(|(id, ln)| match self.ast.nodes.get(id) {
+                    Some(crate::ast::node::ENode::SinkWall { .. }) => {
+                        Some(ln.pos.round().as_ivec3().z)
+                    }
+                    _ => None,
+                })?;
+        let z_min = sink_z + 1;
+        let z_max = -1;
+        if z_min > z_max {
+            return None;
+        }
+        let mut x_min = i32::MAX;
+        let mut x_max = i32::MIN;
+        for ln in self.layout_nodes.values() {
+            let x = ln.pos.round().as_ivec3().x;
+            if x < x_min {
+                x_min = x;
+            }
+            if x > x_max {
+                x_max = x;
+            }
+        }
+        if let Some(sel) = active_selection {
+            if sel.x < x_min {
+                x_min = sel.x;
+            }
+            if sel.x > x_max {
+                x_max = sel.x;
+            }
+        }
+        if x_min == i32::MAX {
+            x_min = 0;
+            x_max = 0;
+        }
+        Some(AstGridBounds {
+            min: IVec3::new(x_min, 0, z_min),
+            max: IVec3::new(x_max, 0, z_max),
+        })
     }
 
     pub fn edges(&self) -> Vec<LayoutEdge> {

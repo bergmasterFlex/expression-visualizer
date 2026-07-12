@@ -203,6 +203,22 @@ struct AstNodeEntity {
     node_id: ast::node::Id,
 }
 
+/// Marker for a per-AST grid mesh (one per Program-Ast / Pattern sub-AST).
+/// Carries just enough info to map a raycast hit back to a local grid cell
+/// in the owning LayoutAst.
+#[derive(Component, Clone)]
+struct AstGridEntity {
+    /// Owner path from the root LayoutAst down to this AST's LayoutAst.
+    /// Empty = root (the outer container that owns the Program node).
+    /// Length 1 with the Program's id = the Program-Ast itself.
+    context: Vec<ast::node::Id>,
+    /// Accumulated grid-space offset of this AST's origin from the root.
+    origin_offset: Vec3,
+    /// Local grid-space bounds this grid currently spans (inclusive).
+    min: IVec3,
+    max: IVec3,
+}
+
 /// Flag resource that signals the scene needs rebuilding.
 #[derive(Resource, Default)]
 struct NeedsRebuild(bool);
@@ -265,9 +281,10 @@ struct PickState {
     selected_pos: IVec3,
     /// Node under the cursor (ray-sphere hit), if any.
     hovered_node: Option<ast::node::Id>,
-    /// Grid crossing under the cursor (ray hit on y=0 plane), if within
-    /// the visible grid extent and no node was hit.
-    hovered_pos: Option<IVec3>,
+    /// AST grid cell under the cursor (ray hit on an `AstGridEntity`), if
+    /// any. Includes both the local cell coords and the owning AST's
+    /// context path so click routing knows where to write.
+    hovered_grid: Option<HoveredGrid>,
     /// Cursor position at the last left-mouse press. Used to distinguish
     /// click vs drag — a release within `CLICK_MOVE_THRESHOLD` of this
     /// counts as a click and updates the selection; further movement is
@@ -294,12 +311,27 @@ struct PickState {
     selected_context: Vec<ast::node::Id>,
 }
 
+/// Populated when the cursor is over a per-AST grid mesh.
+#[derive(Clone)]
+struct HoveredGrid {
+    /// Local grid coords inside the hovered AST.
+    local_pos: IVec3,
+    /// Owner path (from Program-Ast) to the hovered AST.
+    context: Vec<ast::node::Id>,
+    /// Entity of the `AstGridEntity` mesh that was hit — used so the hover
+    /// shader wash flips only on the AST grid actually under the cursor.
+    entity: Entity,
+    /// World XZ of the hovered cell's center. Fed to the grid shader's
+    /// `hover_pos` uniform.
+    world_center: Vec2,
+}
+
 impl Default for PickState {
     fn default() -> Self {
         Self {
             selected_pos: IVec3::ZERO,
             hovered_node: None,
-            hovered_pos: None,
+            hovered_grid: None,
             press_cursor: None,
             press_over_ui: false,
             context_path: Vec::new(),
@@ -711,6 +743,7 @@ fn spawn_ast_nodes(
     mut materials_grid: ResMut<Assets<grid::GridMaterial>>,
     state: Res<AstState>,
     ui_font: Res<UiFont>,
+    pick: Res<PickState>,
 ) {
     let mut node_entites = std::collections::HashMap::<ast::node::Id, Entity>::new();
     let mut anchor_entities = std::collections::HashMap::<ast::AnchorId, Entity>::new();
@@ -829,6 +862,49 @@ fn spawn_ast_nodes(
                 from_anchor: *anchor_entities.get(&e.from_anchor.anchor_id).unwrap(),
                 to_anchor: *anchor_entities.get(&e.to_anchor.anchor_id).unwrap(),
                 color: e.color,
+            },
+            AstSceneEntity,
+        ));
+    }
+
+    for walked_ast in state.program_ast().walk_all_asts() {
+        let active_selection = if walked_ast.context == pick.selected_context {
+            Some(pick.selected_pos)
+        } else {
+            None
+        };
+        let Some(bounds) = walked_ast.layout_ast.ast_grid_bounds(active_selection) else {
+            continue;
+        };
+        let width_cells = (bounds.max.x - bounds.min.x + 1) as f32;
+        let depth_cells = (bounds.max.z - bounds.min.z + 1) as f32;
+        let size_x = width_cells * 3.0;
+        let size_z = depth_cells * 3.0;
+        let center_local = Vec3::new(
+            (bounds.min.x + bounds.max.x) as f32 * 0.5,
+            0.0,
+            (bounds.min.z + bounds.max.z) as f32 * 0.5,
+        );
+        let world_center = (center_local + walked_ast.extra_offset) * Vec3::new(3.0, 3.0, 3.0);
+        commands.spawn((
+            Mesh3d(meshes.add(Plane3d::default().mesh().size(size_x, size_z).build())),
+            MeshMaterial3d(materials_grid.add(grid::GridMaterial {
+                plane_color: LinearRgba::new(0.07, 0.07, 0.1, 0.55),
+                line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.4),
+                spacing: 3.0,
+                fade_start: 15.0,
+                fade_end: 100.0,
+                line_thickness: 1.5,
+                hover_pos: Vec2::ZERO,
+                hover_active: 0.0,
+                _pad: 0.0,
+            })),
+            Transform::from_translation(world_center),
+            AstGridEntity {
+                context: walked_ast.context,
+                origin_offset: walked_ast.extra_offset,
+                min: bounds.min,
+                max: bounds.max,
             },
             AstSceneEntity,
         ));
@@ -3243,11 +3319,20 @@ fn rebuild_scene(
     mut materials_grid: ResMut<Assets<grid::GridMaterial>>,
     state: Res<AstState>,
     ui_font: Res<UiFont>,
+    pick: Res<PickState>,
     mut rebuild: ResMut<NeedsRebuild>,
     query_ast_entities: Query<Entity, With<AstSceneEntity>>,
 ) {
     if rebuild.0 {
-        spawn_ast_nodes(commands, meshes, materials, materials_grid, state, ui_font);
+        spawn_ast_nodes(
+            commands,
+            meshes,
+            materials,
+            materials_grid,
+            state,
+            ui_font,
+            pick,
+        );
         rebuild.0 = false;
     }
 }
@@ -3397,15 +3482,16 @@ fn pick_nodes(
     mouse: Res<ButtonInput<MouseButton>>,
     mut pick: ResMut<PickState>,
     node_q: Query<(&AstNodeEntity, &Transform)>,
+    grid_q: Query<(Entity, &AstGridEntity)>,
     state: Res<AstState>,
-    grid_config: Res<grid::GridConfig>,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
     ui_interactions: Query<&Interaction, With<Button>>,
+    mut rebuild: ResMut<NeedsRebuild>,
 ) {
     if start_menu.showing {
         pick.hovered_node = None;
-        pick.hovered_pos = None;
+        pick.hovered_grid = None;
         pick.press_cursor = None;
         pick.press_over_ui = false;
         return;
@@ -3421,13 +3507,13 @@ fn pick_nodes(
     };
     let Some(cursor) = window.cursor_position() else {
         pick.hovered_node = None;
-        pick.hovered_pos = None;
+        pick.hovered_grid = None;
         return;
     };
 
     let Ok(ray) = camera.viewport_to_world(cam_gt, cursor) else {
         pick.hovered_node = None;
-        pick.hovered_pos = None;
+        pick.hovered_grid = None;
         return;
     };
 
@@ -3457,22 +3543,46 @@ fn pick_nodes(
     }
     pick.hovered_node = closest.as_ref().map(|(id, _)| id.clone());
 
-    // Ray-plane test against y=0 for grid hover. Skip if a node is hovered
-    // or the cursor is over a UI element.
-    let mut grid_hit: Option<IVec3> = None;
-    if !over_ui && closest.is_none() && ray.direction.y.abs() > 1e-4 {
-        let t = -ray.origin.y / ray.direction.y;
-        if t > 0.0 {
-            let hit = ray.origin + *ray.direction * t;
-            if Vec2::new(hit.x, hit.z).length() <= grid_config.fade_end {
-                let spacing = grid_config.spacing;
-                let gx = (hit.x / spacing).round() as i32;
-                let gz = (hit.z / spacing).round() as i32;
-                grid_hit = Some(IVec3::new(gx, 0, gz));
+    // Ray-plane test against each spawned AST grid. Each AST grid sits at
+    // its own Y (Program-Ast Y=0; Pattern sub-AST at Pattern's world Y) and
+    // spans a rectangle in local grid coords. Pick the closest rect hit.
+    const LAYOUT_SCALE_F: f32 = 3.0;
+    let mut grid_hit: Option<HoveredGrid> = None;
+    let mut best_t = f32::INFINITY;
+    if !over_ui && closest.is_none() {
+        for (entity, ag) in grid_q.iter() {
+            let plane_y = ag.origin_offset.y * LAYOUT_SCALE_F;
+            let denom = ray.direction.y;
+            if denom.abs() < 1e-4 {
+                continue;
             }
+            let t = (plane_y - ray.origin.y) / denom;
+            if t <= 0.0 || t >= best_t {
+                continue;
+            }
+            let hit = ray.origin + *ray.direction * t;
+            let world_offset_x = ag.origin_offset.x * LAYOUT_SCALE_F;
+            let world_offset_z = ag.origin_offset.z * LAYOUT_SCALE_F;
+            let local_x = ((hit.x - world_offset_x) / LAYOUT_SCALE_F).round() as i32;
+            let local_z = ((hit.z - world_offset_z) / LAYOUT_SCALE_F).round() as i32;
+            if local_x < ag.min.x || local_x > ag.max.x {
+                continue;
+            }
+            if local_z < ag.min.z || local_z > ag.max.z {
+                continue;
+            }
+            let world_cx = (local_x as f32 + ag.origin_offset.x) * LAYOUT_SCALE_F;
+            let world_cz = (local_z as f32 + ag.origin_offset.z) * LAYOUT_SCALE_F;
+            best_t = t;
+            grid_hit = Some(HoveredGrid {
+                local_pos: IVec3::new(local_x, 0, local_z),
+                context: ag.context.clone(),
+                entity,
+                world_center: Vec2::new(world_cx, world_cz),
+            });
         }
     }
-    pick.hovered_pos = grid_hit;
+    pick.hovered_grid = grid_hit.clone();
 
     const CLICK_MOVE_THRESHOLD: f32 = 5.0;
     if mouse.just_pressed(MouseButton::Left) {
@@ -3489,30 +3599,26 @@ fn pick_nodes(
         pick.press_over_ui = false;
         if is_click && !press_over_ui && !over_ui {
             if let Some((node_id, _)) = closest {
-                // Walk the whole layout tree to find which sub-AST owns
-                // this node — hover already sees globally-spawned nodes,
-                // so a click may land on a sub-AST node.
                 if let Some(ctx) = state.program_ast().context_of_node(&node_id) {
                     let owning_ast = state.program_ast().resolve_context(&ctx);
                     if let Some(ln) = owning_ast.layout_nodes.get(&node_id) {
-                        pick.selected_pos = ln.pos.round().as_ivec3();
-                        pick.selected_context = ctx;
+                        let new_pos = ln.pos.round().as_ivec3();
+                        if pick.selected_pos != new_pos || pick.selected_context != ctx {
+                            pick.selected_pos = new_pos;
+                            pick.selected_context = ctx;
+                            rebuild.0 = true;
+                        }
                     }
                 }
-            } else if let Some(pos) = grid_hit {
-                // Bleibe im aktiven Editier-Kontext; rechne Grid-World-Pos in
-                // Container-lokale Coords um (nur X/Z; Y=0 = Ground-Level des
-                // aktuellen Asts, unabhängig von Pattern-Höhe im Program-Ast).
-                let offset = state.program_ast().context_offset(&pick.context_path);
-                pick.selected_pos = IVec3::new(
-                    pos.x - offset.x.round() as i32,
-                    0,
-                    pos.z - offset.z.round() as i32,
-                );
-                pick.selected_context = pick.context_path.clone();
+            } else if let Some(hit) = grid_hit {
+                if pick.selected_pos != hit.local_pos || pick.selected_context != hit.context {
+                    pick.selected_pos = hit.local_pos;
+                    pick.selected_context = hit.context;
+                    rebuild.0 = true;
+                }
             }
-            // Click into truly empty space (beyond visible grid) leaves
-            // the selection unchanged.
+            // Click into truly empty space (no AST grid hit) leaves the
+            // selection unchanged.
         }
     }
 }
@@ -3587,22 +3693,25 @@ fn update_selection_display(
 
 fn update_grid_hover_material(
     pick: Res<PickState>,
-    grid_config: Res<grid::GridConfig>,
+    grid_q: Query<(Entity, &MeshMaterial3d<grid::GridMaterial>), With<AstGridEntity>>,
     mut materials: ResMut<Assets<grid::GridMaterial>>,
 ) {
-    let (pos, active) = match pick.hovered_pos {
-        Some(p) => (
-            Vec2::new(
-                p.x as f32 * grid_config.spacing,
-                p.z as f32 * grid_config.spacing,
-            ),
-            1.0,
-        ),
-        None => (Vec2::ZERO, 0.0),
-    };
-    for (_, mat) in materials.iter_mut() {
-        mat.hover_pos = pos;
-        mat.hover_active = active;
+    let hit_entity = pick.hovered_grid.as_ref().map(|h| h.entity);
+    let hit_center = pick
+        .hovered_grid
+        .as_ref()
+        .map(|h| h.world_center)
+        .unwrap_or(Vec2::ZERO);
+    for (entity, mat_handle) in grid_q.iter() {
+        let Some(mat) = materials.get_mut(&mat_handle.0) else {
+            continue;
+        };
+        if Some(entity) == hit_entity {
+            mat.hover_pos = hit_center;
+            mat.hover_active = 1.0;
+        } else {
+            mat.hover_active = 0.0;
+        }
     }
 }
 
@@ -3871,6 +3980,7 @@ fn handle_arrow_keys(
     } else {
         // Plain arrow: navigate the selection between grid crossings.
         pick.selected_pos += delta;
+        rebuild.0 = true;
     }
 }
 
