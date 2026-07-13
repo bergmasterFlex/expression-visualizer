@@ -219,6 +219,16 @@ struct AstGridEntity {
     max: IVec3,
 }
 
+/// Marker for the Program-Ast's front wall at Z=0. VarDecls attach to this
+/// wall; the wall itself is a pickable vertical plane. Bounds are in the
+/// Program-Ast's local grid X coordinates (inclusive), with half-a-cell of
+/// padding on each side baked into the mesh but *not* into the pick region.
+#[derive(Component, Clone)]
+struct ProgramWallEntity {
+    min_x: i32,
+    max_x: i32,
+}
+
 /// Flag resource that signals the scene needs rebuilding.
 #[derive(Resource, Default)]
 struct NeedsRebuild(bool);
@@ -713,31 +723,6 @@ fn setup_scene(mut commands: Commands) {
     ));
 }
 
-/// Spawn the transparent grey front wall at z = +12,
-/// spanning x ∈ [-30, 30] and y ∈ [-3, 3].
-/// Front boundary of the top-level workspace, representing the `ENode::Program`
-/// root. Sits at grid z=0, symmetric to the SinkWall at grid z=-4, so the two
-/// tightly encapsulate the grid corridor (z ∈ [-3, -1]).
-fn spawn_program_wall(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-) {
-    let program_wall_mesh = meshes.add(Cuboid::new(40.0, 6.0, 0.05));
-    let program_wall_material = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.5, 0.5, 0.5, 0.5),
-        alpha_mode: AlphaMode::Blend,
-        cull_mode: None,
-        ..default()
-    });
-
-    commands.spawn((
-        Mesh3d(program_wall_mesh),
-        MeshMaterial3d(program_wall_material),
-        Transform::from_xyz(0.0, 0.0, 0.0),
-    ));
-}
-
 /// Spawn the AST node meshes.
 fn spawn_ast_nodes(
     mut commands: Commands,
@@ -904,13 +889,38 @@ fn spawn_ast_nodes(
             })),
             Transform::from_translation(world_center),
             AstGridEntity {
-                context: walked_ast.context,
+                context: walked_ast.context.clone(),
                 origin_offset: walked_ast.extra_offset,
                 min: bounds.min,
                 max: bounds.max,
             },
             AstSceneEntity,
         ));
+
+        // Program-Ast: front wall at Z=0. Grid-wide plus half a cell of
+        // padding on each side, so VarDecls at the outermost grid X still
+        // have wall to attach to.
+        if walked_ast.context.is_empty() {
+            let wall_width_cells = width_cells + 1.0;
+            let wall_size_x = wall_width_cells * 3.0;
+            let wall_center_x =
+                (bounds.min.x + bounds.max.x) as f32 * 0.5 * 3.0 + walked_ast.extra_offset.x * 3.0;
+            commands.spawn((
+                Mesh3d(meshes.add(Cuboid::new(wall_size_x, 6.0, 0.05))),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: Color::srgba(0.5, 0.5, 0.5, 0.5),
+                    alpha_mode: AlphaMode::Blend,
+                    cull_mode: None,
+                    ..default()
+                })),
+                Transform::from_xyz(wall_center_x, 0.0, 0.0),
+                ProgramWallEntity {
+                    min_x: bounds.min.x,
+                    max_x: bounds.max.x,
+                },
+                AstSceneEntity,
+            ));
+        }
     }
 
     /*
@@ -1190,10 +1200,19 @@ fn update_add_generic_button_visuals(
         let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
             continue;
         };
-        let vardecl_locked =
-            *action == EAstActionButton::AddVarDeclButton && !pick.context_path.is_empty();
+        let wall_slot =
+            pick.context_path.is_empty() && pick.selected_pos.y == 0 && pick.selected_pos.z == 0;
+        let vardecl_locked = *action == EAstActionButton::AddVarDeclButton && !wall_slot;
+        let wall_slot_locked = wall_slot
+            && matches!(
+                *action,
+                EAstActionButton::AddConstDeclButton
+                    | EAstActionButton::AddFunctionCallButton
+                    | EAstActionButton::AddTypeCastButton
+                    | EAstActionButton::AddMatchButton
+            );
         let context_mismatch = pick.selected_context != pick.context_path;
-        let enabled = pos_free && !vardecl_locked && !context_mismatch;
+        let enabled = pos_free && !vardecl_locked && !wall_slot_locked && !context_mismatch;
         if !enabled {
             bg.0 = Color::srgba(0.10, 0.10, 0.13, 0.9);
             text_color.0 = Color::srgb(0.35, 0.35, 0.4);
@@ -1325,17 +1344,34 @@ fn handle_add_node_button(
                 if target_occupied && *action != EAstActionButton::AddPatternButton {
                     continue;
                 }
+                // Wall row (Program-Ast, Y=0, Z=0) is VarDecl-only. Refuse
+                // every other creation action defensively.
+                let is_wall_slot = pick.context_path.is_empty()
+                    && pick.selected_pos.y == 0
+                    && pick.selected_pos.z == 0;
+                if is_wall_slot
+                    && !matches!(
+                        *action,
+                        EAstActionButton::AddVarDeclButton
+                            | EAstActionButton::SelectAstButton
+                            | EAstActionButton::AddPatternButton
+                    )
+                {
+                    continue;
+                }
                 let new_layout = match action {
                     EAstActionButton::SelectAstButton => continue,
                     EAstActionButton::AddConstDeclButton => pick
                         .current_ast(&state)
                         .plus_type_introduction(ast::node::EType::Int { value: None }, new_pos),
                     EAstActionButton::AddVarDeclButton => {
-                        // Only the Program-Ast may hold VarDecls. Guard here so
-                        // a stray click on a "should be disabled" button in a
-                        // Pattern context is a no-op; Step 5 will additionally
-                        // grey out the button.
-                        if !pick.context_path.is_empty() {
+                        // VarDecls live on the Program-Ast's front wall at
+                        // (x, 0, 0) — refuse anything else defensively; the
+                        // enable-check normally greys the button out first.
+                        if !pick.context_path.is_empty()
+                            || pick.selected_pos.y != 0
+                            || pick.selected_pos.z != 0
+                        {
                             continue;
                         }
                         pick.current_ast(&state).plus_var_decl(new_pos)
@@ -3486,6 +3522,7 @@ fn pick_nodes(
     mut pick: ResMut<PickState>,
     node_q: Query<(&AstNodeEntity, &Transform)>,
     grid_q: Query<(Entity, &AstGridEntity)>,
+    wall_q: Query<(Entity, &ProgramWallEntity)>,
     state: Res<AstState>,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
@@ -3582,6 +3619,36 @@ fn pick_nodes(
                 context: ag.context.clone(),
                 entity,
                 world_center: Vec2::new(world_cx, world_cz),
+            });
+        }
+        // Program-Ast front wall: vertical plane at Z=0. Half-a-cell of
+        // pick padding on each side matches the wall mesh's own padding.
+        for (entity, wall) in wall_q.iter() {
+            let denom = ray.direction.z;
+            if denom.abs() < 1e-4 {
+                continue;
+            }
+            let t = -ray.origin.z / denom;
+            if t <= 0.0 || t >= best_t {
+                continue;
+            }
+            let hit = ray.origin + *ray.direction * t;
+            let min_wx = (wall.min_x as f32 - 0.5) * LAYOUT_SCALE_F;
+            let max_wx = (wall.max_x as f32 + 0.5) * LAYOUT_SCALE_F;
+            if hit.x < min_wx || hit.x > max_wx {
+                continue;
+            }
+            if hit.y < -3.0 || hit.y > 3.0 {
+                continue;
+            }
+            let local_x = (hit.x / LAYOUT_SCALE_F).round() as i32;
+            let world_cx = local_x as f32 * LAYOUT_SCALE_F;
+            best_t = t;
+            grid_hit = Some(HoveredGrid {
+                local_pos: IVec3::new(local_x, 0, 0),
+                context: Vec::new(),
+                entity,
+                world_center: Vec2::new(world_cx, 0.0),
             });
         }
     }
@@ -4374,7 +4441,6 @@ fn main() {
             (
                 load_ui_font,
                 setup_scene,
-                spawn_program_wall,
                 spawn_ast_nodes,
                 spawn_ui,
                 spawn_selection_display,

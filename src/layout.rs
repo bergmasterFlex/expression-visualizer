@@ -241,6 +241,19 @@ impl LayoutAst {
             return (self.clone_shape(), IVec3::ZERO);
         };
         let primary_origin = primary_ln.pos;
+        // VarDecls are pinned to the Program wall row (Y=0, Z=0);
+        // every other node type must stay south of it (Z < 0).
+        let delta_pos = match self.ast.nodes.get(&node_id) {
+            Some(crate::ast::node::ENode::VarDecl { .. }) => Vec3::new(delta_pos.x, 0.0, 0.0),
+            _ => {
+                let target_z = (primary_origin.z + delta_pos.z).round() as i32;
+                if target_z >= 0 {
+                    Vec3::new(delta_pos.x, delta_pos.y, 0.0)
+                } else {
+                    delta_pos
+                }
+            }
+        };
         let occupancy = self.occupancy_map();
 
         let primary_delta = self.jump_delta(&occupancy, &node_id, primary_origin, delta_pos);
@@ -820,6 +833,8 @@ impl LayoutAst {
     }
 
     pub fn plus_var_decl(&self, pos: Vec3) -> Self {
+        // VarDecls live only on the Program wall (Y=0, Z=0). Snap defensively.
+        let pos = Vec3::new(pos.x, 0.0, 0.0);
         let (ast, output_anchor_id) = self.ast.with_next_anchor_id();
         let (ast, node_id) = ast.plus(crate::ast::node::ENode::VarDecl {
             name: "v".to_string(),
