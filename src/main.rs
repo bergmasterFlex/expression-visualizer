@@ -1410,6 +1410,7 @@ fn handle_add_node_button(
                     }
                 };
                 *pick.current_ast_mut(&mut state) = new_layout;
+                state.layout_ast = state.layout_ast.settle_matches();
                 rebuild.0 = true;
             }
             Interaction::Hovered => {
@@ -4044,6 +4045,7 @@ fn handle_arrow_keys(
                 .selected_ast(&state)
                 .move_node_delta(node_id, delta.as_vec3());
             *pick.selected_ast_mut(&mut state) = new_layout;
+            state.layout_ast = state.layout_ast.settle_matches();
             pick.selected_pos = effective_pos;
             rebuild.0 = true;
         }

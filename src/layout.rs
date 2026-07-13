@@ -51,6 +51,65 @@ pub struct AstGridBounds {
     pub max: IVec3,
 }
 
+/// Inclusive 3D bounding box in grid cells. Used for match footprint math.
+#[derive(Debug, Clone, Copy)]
+pub struct AABB {
+    pub min: IVec3,
+    pub max: IVec3,
+}
+
+impl AABB {
+    pub fn point(p: IVec3) -> Self {
+        Self { min: p, max: p }
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            min: IVec3::new(
+                self.min.x.min(other.min.x),
+                self.min.y.min(other.min.y),
+                self.min.z.min(other.min.z),
+            ),
+            max: IVec3::new(
+                self.max.x.max(other.max.x),
+                self.max.y.max(other.max.y),
+                self.max.z.max(other.max.z),
+            ),
+        }
+    }
+
+    pub fn union_opt(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(a.union(b)),
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
+        }
+    }
+
+    pub fn translated(self, delta: IVec3) -> Self {
+        Self {
+            min: self.min + delta,
+            max: self.max + delta,
+        }
+    }
+
+    pub fn contains(&self, p: IVec3) -> bool {
+        p.x >= self.min.x
+            && p.x <= self.max.x
+            && p.y >= self.min.y
+            && p.y <= self.max.y
+            && p.z >= self.min.z
+            && p.z <= self.max.z
+    }
+
+    pub fn cells(&self) -> impl Iterator<Item = IVec3> + '_ {
+        let (min, max) = (self.min, self.max);
+        (min.z..=max.z).flat_map(move |z| {
+            (min.y..=max.y).flat_map(move |y| (min.x..=max.x).map(move |x| IVec3::new(x, y, z)))
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct LayoutAst {
     pub ast: crate::ast::Ast,
@@ -190,20 +249,31 @@ impl LayoutAst {
     }
 
     /// Build a `grid position -> node id` lookup over all selectable nodes.
-    /// Excludes `MatchNew` containers (same rule as `node_at`).
+    /// MatchNews claim every cell of their `matchnew_footprint`; other nodes
+    /// claim a single cell. When both a Pattern and its owning Match cover the
+    /// same cell (Pattern rows of the match column) the Pattern id wins, so
+    /// intra-stack Y-swap still resolves the Pattern as target.
     fn occupancy_map(&self) -> std::collections::HashMap<IVec3, crate::ast::node::Id> {
-        self.layout_nodes
-            .iter()
-            .filter_map(|(id, ln)| {
-                if matches!(
-                    self.ast.nodes.get(id),
-                    Some(crate::ast::node::ENode::MatchNew { .. })
-                ) {
-                    return None;
-                }
-                Some((ln.pos.round().as_ivec3(), id.clone()))
-            })
-            .collect()
+        let mut map: std::collections::HashMap<IVec3, crate::ast::node::Id> =
+            std::collections::HashMap::new();
+        for (id, _ln) in &self.layout_nodes {
+            if !self.is_matchnew(id) {
+                continue;
+            }
+            let Some(bbox) = self.matchnew_footprint(id) else {
+                continue;
+            };
+            for cell in bbox.cells() {
+                map.insert(cell, id.clone());
+            }
+        }
+        for (id, ln) in &self.layout_nodes {
+            if self.is_matchnew(id) {
+                continue;
+            }
+            map.insert(ln.pos.round().as_ivec3(), id.clone());
+        }
+        map
     }
 
     fn is_pattern(&self, id: &crate::ast::node::Id) -> bool {
@@ -228,6 +298,81 @@ impl LayoutAst {
             Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => patterns.clone(),
             _ => vec![],
         }
+    }
+
+    fn is_matchnew(&self, id: &crate::ast::node::Id) -> bool {
+        matches!(
+            self.ast.nodes.get(id),
+            Some(crate::ast::node::ENode::MatchNew { .. })
+        )
+    }
+
+    /// Union of all visible grid cells in this LayoutAst's local coords.
+    /// MatchNew nodes contribute their `matchnew_footprint` (recursive over
+    /// nested sub-ASTs); every other node contributes its rounded cell.
+    /// Sub-layouts contribute their own inner_footprint offset by the owner
+    /// node's grid position.
+    pub fn inner_footprint(&self) -> Option<AABB> {
+        let mut bbox: Option<AABB> = None;
+        for (id, ln) in &self.layout_nodes {
+            let node_bbox = if self.is_matchnew(id) {
+                self.matchnew_footprint(id)
+            } else {
+                Some(AABB::point(ln.pos.round().as_ivec3()))
+            };
+            bbox = AABB::union_opt(bbox, node_bbox);
+        }
+        for (owner_id, sub) in &self.sub_layouts {
+            let owner_pos = self
+                .layout_nodes
+                .get(owner_id)
+                .map(|ln| ln.pos.round().as_ivec3())
+                .unwrap_or(IVec3::ZERO);
+            let sub_bbox = sub.inner_footprint().map(|b| b.translated(owner_pos));
+            bbox = AABB::union_opt(bbox, sub_bbox);
+        }
+        bbox
+    }
+
+    /// Grid-space AABB (in this LayoutAst's local coords) that a MatchNew
+    /// container claims. Aggregates all Pattern arms:
+    ///   - Y: `sum over patterns of max(1, subast_y_extent)` stacked at the
+    ///     Pattern's own y (patterns are assumed to occupy consecutive rows).
+    ///   - X: union of every Pattern's sub-AST X extent, translated by the
+    ///     Pattern's outer position.
+    ///   - Z: each Pattern's sub-AST Z range padded by 2 additional cells in
+    ///     the −Z direction (to contain the sub-sink), upper-bounded by the
+    ///     Pattern's own Z (i.e. the parent-facing side).
+    /// Recursion via `inner_footprint` — inner matches inflate their host
+    /// Pattern's sub-AST bbox and thus the outer footprint too.
+    pub fn matchnew_footprint(&self, match_id: &crate::ast::node::Id) -> Option<AABB> {
+        if !self.is_matchnew(match_id) {
+            return None;
+        }
+        let pattern_ids = self.match_pattern_ids(match_id);
+        let mut bbox: Option<AABB> = None;
+        for pid in &pattern_ids {
+            let Some(p_ln) = self.layout_nodes.get(pid) else {
+                continue;
+            };
+            let p_pos = p_ln.pos.round().as_ivec3();
+            let sub = self.sub_layouts.get(pid);
+            let sub_bbox = sub.and_then(|s| s.inner_footprint());
+            let (arm_y, x_min, x_max, z_min) = match sub_bbox {
+                Some(b) => {
+                    let sub_y_extent = b.max.y - b.min.y + 1;
+                    let arm_y = sub_y_extent.max(1);
+                    (arm_y, b.min.x, b.max.x, b.min.z)
+                }
+                None => (1, 0, 0, 0),
+            };
+            let arm = AABB {
+                min: IVec3::new(p_pos.x + x_min, p_pos.y, p_pos.z + z_min - 2),
+                max: IVec3::new(p_pos.x + x_max, p_pos.y + arm_y - 1, p_pos.z),
+            };
+            bbox = AABB::union_opt(bbox, Some(arm));
+        }
+        bbox
     }
 
     /// Move `node_id` by `delta_pos`, applying the swap constraint: no two
@@ -300,7 +445,16 @@ impl LayoutAst {
                 .map(|ln| ln.pos)
                 .unwrap_or(Vec3::ZERO);
             let cur_delta = new_pos - cur_origin;
-            let swap_delta = self.jump_delta(&occupancy, occ, occ_origin, -cur_delta);
+            // Section-swap for MatchNew: match rides in the same direction as
+            // the intruder so its multi-cell footprint fully vacates the
+            // target cell (mirror delta would leave residual overlap when
+            // the match is wider than the mover's step).
+            let raw_swap = if self.is_matchnew(occ) {
+                cur_delta
+            } else {
+                -cur_delta
+            };
+            let swap_delta = self.jump_delta(&occupancy, occ, occ_origin, raw_swap);
             for (id, d) in self.move_group(occ, swap_delta) {
                 if plan.contains_key(&id) {
                     warn!("move_node_delta: plan conflict, aborted");
@@ -343,6 +497,9 @@ impl LayoutAst {
                     match_ids.insert(mid);
                 }
             }
+            if self.is_matchnew(id) {
+                match_ids.insert(id.clone());
+            }
         }
         let after_recompute = match_ids
             .iter()
@@ -365,9 +522,98 @@ impl LayoutAst {
         }
     }
 
+    /// Push external nodes out of every MatchNew's footprint, bottom-up.
+    /// Recurses into `sub_layouts` first so inner matches settle before their
+    /// container measures its own footprint. At each level, for every match:
+    /// scan `layout_nodes` for non-child nodes whose rounded position falls
+    /// inside the footprint and bump them along the axis with the smallest
+    /// exit distance — +Y for Y-overlap, ±X toward the near footprint edge,
+    /// −Z toward the sub-sink side (never +Z; that side faces the parent
+    /// wall). Uses `move_node_delta` for each bump so cascading collisions
+    /// resolve automatically. Iterates until stable (128-step cap).
+    pub fn settle_matches(&self) -> Self {
+        let settled_subs: std::collections::HashMap<crate::ast::node::Id, LayoutAst> = self
+            .sub_layouts
+            .iter()
+            .map(|(k, v)| (k.clone(), v.settle_matches()))
+            .collect();
+        let mut layout = Self {
+            ast: self.ast.clone(),
+            layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: settled_subs,
+        };
+        let match_ids: Vec<crate::ast::node::Id> = layout
+            .layout_nodes
+            .keys()
+            .filter(|id| layout.is_matchnew(id))
+            .cloned()
+            .collect();
+        for match_id in &match_ids {
+            for _ in 0..128 {
+                let Some(bbox) = layout.matchnew_footprint(match_id) else {
+                    break;
+                };
+                let pattern_ids = layout.match_pattern_ids(match_id);
+                let intruder = layout.layout_nodes.iter().find_map(|(id, ln)| {
+                    if id == match_id || pattern_ids.contains(id) {
+                        return None;
+                    }
+                    let p = ln.pos.round().as_ivec3();
+                    if bbox.contains(p) {
+                        Some((id.clone(), p))
+                    } else {
+                        None
+                    }
+                });
+                let Some((intruder_id, ipos)) = intruder else {
+                    break;
+                };
+                let center_x = (bbox.min.x + bbox.max.x) / 2;
+                let push_x = if ipos.x <= center_x {
+                    bbox.min.x - 1 - ipos.x
+                } else {
+                    bbox.max.x + 1 - ipos.x
+                };
+                let push_y = bbox.max.y + 1 - ipos.y;
+                let push_z = bbox.min.z - 1 - ipos.z;
+                // VarDecls are pinned to Y=0, Z=0 → only X-push can succeed.
+                let is_var_decl = matches!(
+                    layout.ast.nodes.get(&intruder_id),
+                    Some(crate::ast::node::ENode::VarDecl { .. })
+                );
+                let (best_axis, best_dist) = if is_var_decl {
+                    (0u8, push_x)
+                } else {
+                    let mut best_axis = 1u8; // 0=x, 1=y, 2=z
+                    let mut best_dist = push_y;
+                    if push_x.abs() < best_dist.abs() {
+                        best_axis = 0;
+                        best_dist = push_x;
+                    }
+                    if push_z.abs() < best_dist.abs() {
+                        best_axis = 2;
+                        best_dist = push_z;
+                    }
+                    (best_axis, best_dist)
+                };
+                let delta = match best_axis {
+                    0 => Vec3::new(best_dist as f32, 0.0, 0.0),
+                    2 => Vec3::new(0.0, 0.0, best_dist as f32),
+                    _ => Vec3::new(0.0, best_dist as f32, 0.0),
+                };
+                if delta.length_squared() < 0.25 {
+                    break;
+                }
+                let (new_layout, _) = layout.move_node_delta(intruder_id, delta);
+                layout = new_layout;
+            }
+        }
+        layout
+    }
+
     /// Adjust a Y-direction delta so the mover jumps over the entire Y range
-    /// of any match whose pattern it would land on. Cascades through nested
-    /// matches. For X/Z deltas or non-pattern collisions the nominal delta
+    /// of any Match footprint it would land on. Cascades through nested
+    /// matches. For X/Z deltas or non-Match collisions the nominal delta
     /// is returned unchanged. Same-match sibling collisions also pass through
     /// unchanged so an intra-stack Y-swap can happen.
     fn jump_delta(
@@ -387,43 +633,56 @@ impl LayoutAst {
             let Some(occ) = occupancy.get(&key) else {
                 return target - origin;
             };
-            if occ == mover || !self.is_pattern(occ) {
+            if occ == mover {
                 return target - origin;
             }
-            if self.is_pattern(mover) && self.parent_match_of(mover) == self.parent_match_of(occ) {
-                return target - origin;
-            }
-            let Some(match_id) = self.parent_match_of(occ) else {
-                return target - origin;
-            };
-            let ys: Vec<f32> = self
-                .match_pattern_ids(&match_id)
-                .iter()
-                .filter_map(|pid| self.layout_nodes.get(pid).map(|ln| ln.pos.y))
-                .collect();
-            if ys.is_empty() {
-                return target - origin;
-            }
-            let extreme = if step > 0.0 {
-                ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+            // Resolve which match's footprint we've hit (occ is either the
+            // match itself or a Pattern child of one).
+            let match_id = if self.is_matchnew(occ) {
+                Some(occ.clone())
+            } else if self.is_pattern(occ) {
+                self.parent_match_of(occ)
             } else {
-                ys.iter().cloned().fold(f32::INFINITY, f32::min)
+                None
             };
-            target.y = extreme + step;
+            let Some(match_id) = match_id else {
+                return target - origin;
+            };
+            // Same-match intra-stack Y-swap: let it through.
+            if self.is_pattern(mover) && self.parent_match_of(mover) == Some(match_id.clone()) {
+                return target - origin;
+            }
+            let Some(bbox) = self.matchnew_footprint(&match_id) else {
+                return target - origin;
+            };
+            target.y = if step > 0.0 {
+                bbox.max.y as f32 + step
+            } else {
+                bbox.min.y as f32 + step
+            };
         }
         nominal_delta
     }
 
     /// Compute the co-moving group for a seed node.
-    /// Non-Pattern: just `{seed}`. Pattern with Y-only delta: `{seed}` (row
-    /// change is per-pattern). Pattern with XZ delta: seed plus all sibling
-    /// patterns of the same match, all with the XZ delta (siblings without
-    /// the Y component).
+    /// - MatchNew seed: seed plus all its Pattern children with the same
+    ///   delta (rigid block; sub-layouts follow via Pattern-local coords).
+    /// - Non-Pattern seed: `{seed}`.
+    /// - Pattern with Y-only delta: `{seed}` (row change is per-pattern).
+    /// - Pattern with XZ delta: seed plus all sibling Patterns of the same
+    ///   match, all with the XZ delta (siblings without the Y component).
     fn move_group(
         &self,
         seed: &crate::ast::node::Id,
         seed_delta: Vec3,
     ) -> Vec<(crate::ast::node::Id, Vec3)> {
+        if self.is_matchnew(seed) {
+            let mut group: Vec<(crate::ast::node::Id, Vec3)> = vec![(seed.clone(), seed_delta)];
+            for pid in self.match_pattern_ids(seed) {
+                group.push((pid, seed_delta));
+            }
+            return group;
+        }
         if !self.is_pattern(seed) {
             return vec![(seed.clone(), seed_delta)];
         }
@@ -434,17 +693,19 @@ impl LayoutAst {
         let Some(match_id) = self.parent_match_of(seed) else {
             return vec![(seed.clone(), seed_delta)];
         };
-        self.match_pattern_ids(&match_id)
+        // Sibling patterns co-move on XZ, and the parent Match must follow
+        // so its footprint stays aligned during the swap-cascade phase.
+        let xz_delta = Vec3::new(seed_delta.x, 0.0, seed_delta.z);
+        let mut group: Vec<(crate::ast::node::Id, Vec3)> = self
+            .match_pattern_ids(&match_id)
             .into_iter()
             .map(|sid| {
-                let d = if sid == *seed {
-                    seed_delta
-                } else {
-                    Vec3::new(seed_delta.x, 0.0, seed_delta.z)
-                };
+                let d = if sid == *seed { seed_delta } else { xz_delta };
                 (sid, d)
             })
-            .collect()
+            .collect();
+        group.push((match_id, xz_delta));
+        group
     }
 
     pub fn plus_edge(&self, from: crate::ast::AnchorId, to: crate::ast::AnchorId) -> Self {
@@ -640,15 +901,12 @@ impl LayoutAst {
         }
     }
 
-    /// Insert a new Pattern below `selected_pattern_id` in its parent MatchNew.
-    /// Every node at the match's XZ column with Y ≥ selected.Y is shifted up
-    /// by 1 grid unit — that includes the selected Pattern, sibling Patterns
-    /// above it, AND any external nodes stacked directly above the match at
-    /// the same XZ (so no external node ever gets overlapped by the growing
-    /// match). The new Pattern occupies the freed slot with a default
-    /// `Int { value: None }` type. The caller is expected to bump
-    /// `pick.selected_pos.y` by 1 so selection tracks the originally-selected
-    /// Pattern (now one row higher).
+    /// Insert a new Pattern into `selected_pattern_id`'s parent MatchNew,
+    /// occupying the selected slot. Sibling Patterns of the same match at
+    /// Y ≥ selected.Y shift up by 1 to make room; the growing match footprint
+    /// then displaces any external neighbors via `settle_matches`. The caller
+    /// bumps `pick.selected_pos.y` by 1 so selection tracks the originally-
+    /// selected Pattern (now one row higher).
     pub fn plus_pattern_above(&self, selected_pattern_id: &crate::ast::node::Id) -> Self {
         let (parent_id, selected_pos) = match self.ast.nodes.get(selected_pattern_id) {
             Some(crate::ast::node::ENode::Pattern { parent_match, .. }) => {
@@ -666,20 +924,19 @@ impl LayoutAst {
         let selected_y = selected_pos.y;
         let column_x = selected_pos.x;
         let column_z = selected_pos.z;
+        // Shift only sibling Patterns of the same match at Y ≥ selected.Y.
+        // External neighbours are handled by settle_matches once the new
+        // Pattern has grown the footprint.
+        let match_pattern_ids: std::collections::HashSet<crate::ast::node::Id> =
+            self.match_pattern_ids(&parent_id).into_iter().collect();
         let shifted_layout_nodes = self
             .layout_nodes
             .iter()
             .map(|(id, ln)| {
-                if matches!(
-                    self.ast.nodes.get(id),
-                    Some(crate::ast::node::ENode::MatchNew { .. })
-                ) {
+                if !match_pattern_ids.contains(id) {
                     return (id.clone(), ln.clone());
                 }
-                let same_xz =
-                    (ln.pos.x - column_x).abs() < 0.5 && (ln.pos.z - column_z).abs() < 0.5;
-                let above_or_at = ln.pos.y >= selected_y - 0.001;
-                if same_xz && above_or_at {
+                if ln.pos.y >= selected_y - 0.001 {
                     (
                         id.clone(),
                         LayoutNode {
