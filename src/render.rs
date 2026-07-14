@@ -42,7 +42,7 @@ pub struct RenderLabel {
 }
 
 const TYPE_MARKER_ALPHA: f32 = 0.6;
-const TYPE_MARKER_Y_STEP: f32 = 1.0;
+pub const TYPE_MARKER_Y_STEP: f32 = 1.0;
 const TYPE_MARKER_HALF_DEPTH: f32 = 0.5;
 
 /// Sort key that fixes the vertical order of type-marker rectangles.
@@ -71,7 +71,7 @@ fn type_marker_letter(t: &crate::eval::EType) -> &'static str {
     }
 }
 
-fn type_marker_color(t: &crate::eval::EType) -> Color {
+pub fn type_marker_color(t: &crate::eval::EType) -> Color {
     match t {
         crate::eval::EType::Bool(..) => Color::srgba(0.65, 0.30, 0.95, TYPE_MARKER_ALPHA),
         crate::eval::EType::Char(..) => Color::srgba(0.30, 0.90, 0.40, TYPE_MARKER_ALPHA),
@@ -86,7 +86,7 @@ fn type_marker_color(t: &crate::eval::EType) -> Color {
 /// Flatten `t` (expanding sum types), filter to the six supported leaves, and
 /// sort into the fixed bottom-to-top stack order (undefined at bottom → bool
 /// at top).
-fn ordered_supported_leaves(t: &crate::eval::EType) -> Vec<crate::eval::EType> {
+pub fn ordered_supported_leaves(t: &crate::eval::EType) -> Vec<crate::eval::EType> {
     let mut leaves: Vec<_> = crate::eval::flatten_type(t)
         .into_iter()
         .filter_map(|leaf| type_marker_order(&leaf).map(|k| (k, leaf)))

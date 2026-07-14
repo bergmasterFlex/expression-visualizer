@@ -1,11 +1,8 @@
 pub mod node;
 
-use bevy::prelude::Color;
-
 #[derive(Clone, Debug)]
 pub struct Edge {
     pub to: AnchorId,
-    pub color: Color,
 }
 
 #[derive(Clone, Debug)]
@@ -84,11 +81,7 @@ impl Ast {
     }
 
     pub fn plus_edge(&self, from: AnchorId, to: AnchorId) -> Self {
-        self.plus_edge_colored(from, to, crate::colors::WHITE)
-    }
-
-    pub fn plus_edge_colored(&self, from: AnchorId, to: AnchorId, color: Color) -> Self {
-        let edge = Edge { to, color };
+        let edge = Edge { to };
         Self {
             next_node_id: self.next_node_id.clone(),
             next_anchor_id: self.next_anchor_id.clone(),

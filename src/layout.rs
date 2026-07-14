@@ -10,7 +10,6 @@ pub struct LayoutNode {
 pub struct LayoutEdge {
     pub from_anchor: LayoutAnchor,
     pub to_anchor: LayoutAnchor,
-    pub color: Color,
 }
 
 #[derive(Debug, Clone)]
@@ -713,19 +712,6 @@ impl LayoutAst {
         }
     }
 
-    pub fn plus_edge_colored(
-        &self,
-        from: crate::ast::AnchorId,
-        to: crate::ast::AnchorId,
-        color: Color,
-    ) -> Self {
-        Self {
-            ast: self.ast.plus_edge_colored(from, to, color),
-            layout_nodes: self.layout_nodes.clone(),
-            sub_layouts: self.sub_layouts.clone(),
-        }
-    }
-
     pub fn plus_sink_wall(&self) -> Self {
         let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
         let (ast, node_id) = ast.plus(crate::ast::node::ENode::SinkWall {
@@ -1262,7 +1248,6 @@ impl LayoutAst {
                 edges.clone().into_iter().map(|edge| LayoutEdge {
                     from_anchor: self.layout_anchor(from_anchor_id.clone()),
                     to_anchor: self.layout_anchor(edge.to.clone()),
-                    color: edge.color,
                 })
             })
             .collect()
@@ -1290,6 +1275,29 @@ impl LayoutAst {
         for sub in self.sub_layouts.values() {
             if let Some(la) = sub.try_layout_anchor(anchor_id) {
                 return Some(la);
+            }
+        }
+        None
+    }
+
+    /// Return the `EType` an output anchor produces, or an input anchor
+    /// expects — whichever the anchor happens to be. Walks sub-layouts.
+    /// `None` for anchors that carry no type (SinkWall input, MatchBack, …).
+    pub fn anchor_type(
+        &self,
+        anchor_id: &crate::ast::AnchorId,
+        function_declarations: &std::collections::HashMap<
+            crate::ast::FunctionDeclarationId,
+            crate::ast::FunctionDeclaration,
+        >,
+    ) -> Option<crate::eval::EType> {
+        if let Some(node_id) = self.ast.anchor_to_node.get(anchor_id) {
+            let node = self.ast.nodes.get(node_id)?;
+            return anchor_type_from_node(node, anchor_id, function_declarations);
+        }
+        for sub in self.sub_layouts.values() {
+            if let Some(t) = sub.anchor_type(anchor_id, function_declarations) {
+                return Some(t);
             }
         }
         None
@@ -1359,5 +1367,42 @@ impl LayoutAst {
             ast = next;
         }
         offset
+    }
+}
+
+fn anchor_type_from_node(
+    node: &crate::ast::node::ENode,
+    anchor_id: &crate::ast::AnchorId,
+    function_declarations: &std::collections::HashMap<
+        crate::ast::FunctionDeclarationId,
+        crate::ast::FunctionDeclaration,
+    >,
+) -> Option<crate::eval::EType> {
+    match node {
+        crate::ast::node::ENode::TypeIntroduction { r#type, .. }
+        | crate::ast::node::ENode::VarDecl { r#type, .. }
+        | crate::ast::node::ENode::Pattern { r#type, .. }
+        | crate::ast::node::ENode::TypeElimination { r#type, .. } => {
+            Some(crate::eval::ast_type_to_eval_type(r#type))
+        }
+        crate::ast::node::ENode::FunctionCall {
+            function_declaration_id,
+            input_anchors,
+            output_anchor,
+        } => {
+            let decl = function_declarations.get(function_declaration_id)?;
+            if anchor_id == output_anchor {
+                return Some(decl.output_type.clone());
+            }
+            let idx = input_anchors.iter().position(|a| a == anchor_id)?;
+            decl.inputs.get(idx).map(|p| p.r#type.clone())
+        }
+        // Anchors that don't currently carry a rendered type.
+        crate::ast::node::ENode::SinkWall { .. }
+        | crate::ast::node::ENode::MatchBack { .. }
+        | crate::ast::node::ENode::MatchNew { .. }
+        | crate::ast::node::ENode::MatchFront { .. }
+        | crate::ast::node::ENode::MatchGrid { .. }
+        | crate::ast::node::ENode::Program {} => None,
     }
 }

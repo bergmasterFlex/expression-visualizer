@@ -1,6 +1,7 @@
 mod ast;
 mod camera;
 mod colors;
+mod edge;
 mod eval;
 mod grid;
 mod layout;
@@ -168,7 +169,7 @@ impl EAnchor {
 pub struct Edge {
     pub from_anchor: Entity,
     pub to_anchor: Entity,
-    pub color: Color,
+    pub source_anchor_id: ast::AnchorId,
 }
 
 pub struct DragInfo {
@@ -729,12 +730,15 @@ fn spawn_ast_nodes(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut materials_grid: ResMut<Assets<grid::GridMaterial>>,
+    mut materials_edge: ResMut<Assets<edge::EdgeMaterial>>,
+    edge_labels: Option<Res<edge::EdgeLabelTextures>>,
     state: Res<AstState>,
     ui_font: Res<UiFont>,
     pick: Res<PickState>,
 ) {
     let mut node_entites = std::collections::HashMap::<ast::node::Id, Entity>::new();
     let mut anchor_entities = std::collections::HashMap::<ast::AnchorId, Entity>::new();
+    let mut anchor_world_positions = std::collections::HashMap::<ast::AnchorId, Vec3>::new();
     for walked in state.layout_ast.walk_all() {
         let layout_node = walked.layout_node;
         let node_id = &layout_node.node_id;
@@ -816,6 +820,7 @@ fn spawn_ast_nodes(
                 };
 
                 let layout_anchor = walked.layout_ast.layout_anchor(anchor_id.clone());
+                let anchor_world = render_anchor.normal.transform.translation;
                 let spawned = commands
                     .spawn((
                         Mesh3d(meshes.add(render_anchor.normal.mesh.clone())),
@@ -834,7 +839,8 @@ fn spawn_ast_nodes(
                         AstSceneEntity,
                     ))
                     .id();
-                anchor_entities.insert(anchor_id, spawned);
+                anchor_entities.insert(anchor_id.clone(), spawned);
+                anchor_world_positions.insert(anchor_id, anchor_world);
             });
 
         node_entites.insert(node_id.clone(), node_entity.clone());
@@ -844,15 +850,85 @@ fn spawn_ast_nodes(
         });
     }
 
-    for e in state.program_ast().edges() {
-        commands.spawn((
-            Edge {
-                from_anchor: *anchor_entities.get(&e.from_anchor.anchor_id).unwrap(),
-                to_anchor: *anchor_entities.get(&e.to_anchor.anchor_id).unwrap(),
-                color: e.color,
-            },
-            AstSceneEntity,
-        ));
+    if let Some(edge_labels) = edge_labels.as_ref() {
+        for e in state.program_ast().edges() {
+            let src_id = &e.from_anchor.anchor_id;
+            let tgt_id = &e.to_anchor.anchor_id;
+
+            let Some(&from_world) = anchor_world_positions.get(src_id) else {
+                continue;
+            };
+            let Some(&to_world) = anchor_world_positions.get(tgt_id) else {
+                continue;
+            };
+
+            let src_type = state
+                .program_ast()
+                .anchor_type(src_id, &state.function_declarations)
+                .unwrap_or(eval::EType::Undefined);
+            let source_leaves = render::ordered_supported_leaves(&src_type);
+            let n_src = source_leaves.len();
+            if n_src == 0 {
+                continue;
+            }
+
+            let tgt_type = state
+                .program_ast()
+                .anchor_type(tgt_id, &state.function_declarations);
+            let target_leaves = tgt_type
+                .as_ref()
+                .map(|t| render::ordered_supported_leaves(t))
+                .unwrap_or_default();
+            let n_tgt = target_leaves.len();
+
+            let curve = edge::EdgeCurve::from_endpoints(from_world, to_world);
+
+            let edge_root = commands
+                .spawn((
+                    Edge {
+                        from_anchor: *anchor_entities.get(src_id).unwrap(),
+                        to_anchor: *anchor_entities.get(tgt_id).unwrap(),
+                        source_anchor_id: src_id.clone(),
+                    },
+                    Transform::IDENTITY,
+                    Visibility::Inherited,
+                    AstSceneEntity,
+                ))
+                .id();
+
+            for (k, leaf) in source_leaves.iter().enumerate() {
+                let y_src = (k as f32 - (n_src as f32 - 1.0) / 2.0) * render::TYPE_MARKER_Y_STEP;
+                let leaf_kind = edge::leaf_kind_of(leaf);
+                let y_tgt = if let Some(idx) = target_leaves
+                    .iter()
+                    .position(|l| edge::leaf_kind_of(l) == leaf_kind)
+                {
+                    (idx as f32 - (n_tgt as f32 - 1.0) / 2.0) * render::TYPE_MARKER_Y_STEP
+                } else {
+                    0.0
+                };
+                let mesh =
+                    edge::build_ribbon_mesh(&curve, from_world.y + y_src, to_world.y + y_tgt);
+                let Some(kind) = edge::leaf_kind_of(leaf) else {
+                    continue;
+                };
+                let label = edge_labels.by_kind.get(&kind).cloned().unwrap();
+                commands.spawn((
+                    Mesh3d(meshes.add(mesh)),
+                    MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
+                        band_color: render::type_marker_color(leaf).to_linear(),
+                        letter_color: LinearRgba::WHITE,
+                        scroll_speed: 1.5,
+                        tile_length: 3.0,
+                        time: 0.0,
+                        _pad: 0.0,
+                        label,
+                    })),
+                    ChildOf(edge_root),
+                    AstSceneEntity,
+                ));
+            }
+        }
     }
 
     for walked_ast in state.program_ast().walk_all_asts() {
@@ -3234,89 +3310,6 @@ fn sync_value_labels(
     }
 }
 
-/* curved edges
-/// Draw edges using Gizmos (called every frame).
-fn draw_edges(mut gizmos: Gizmos, state: Res<AstState>) {
-    let edges = &state.program_ast().edges();
-    /*
-    let edges = edges
-        .into_iter()
-        .chain(
-            vec![
-                layout::LayoutEdge {
-                    from_id: 0,
-                    to_id: 0,
-                    from_pos: Vec3::new(0.0, 0.0, 0.0),
-                    to_pos: Vec3::new(10.0, 0.0, 0.0),
-                    label: "X",
-                    dir: layout::EdgeDir::Up,
-                },
-                layout::LayoutEdge {
-                    from_id: 0,
-                    to_id: 0,
-                    from_pos: Vec3::new(0.0, 0.0, 0.0),
-                    to_pos: Vec3::new(0.0, 10.0, 0.0),
-                    label: "Y",
-                    dir: layout::EdgeDir::Up,
-                },
-                layout::LayoutEdge {
-                    from_id: 0,
-                    to_id: 0,
-                    from_pos: Vec3::new(0.0, 0.0, 0.0),
-                    to_pos: Vec3::new(0.0, 0.0, 10.0),
-                    label: "Z",
-                    dir: layout::EdgeDir::Up,
-                },
-            ]
-            .into_iter(),
-        )
-        .collect::<Vec<layout::LayoutEdge>>();
-    */
-    for edge in edges {
-        let from = Vec3::from(edge.from_pos);
-        let to = edge.to_pos;
-
-        // Determine start/end offsets along Y
-        let node_radius = 0.4;
-        let start = from;
-        let end = to;
-
-        // Determine color
-        //let from_node = state.nodes.iter().find(|n| n.id == edge.from_id);
-        let color = Color::srgba(0.29, 0.87, 0.50, 0.55);
-
-        // Sample a cubic bezier for a smooth curve
-        let mid_y = (start.y + end.y) / 2.0;
-        let mid_z = (start.z + end.z) / 2.0;
-        let cp1 = Vec3::new(start.x, mid_y, mid_z);
-        let cp2 = Vec3::new(end.x, mid_y, mid_z);
-
-        let segments = 20;
-        let mut prev = start;
-        for i in 1..=segments {
-            let t = i as f32 / segments as f32;
-            let it = 1.0 - t;
-            let p = start * it * it * it
-                + cp1 * 3.0 * it * it * t
-                + cp2 * 3.0 * it * t * t
-                + end * t * t * t;
-            gizmos.line(prev, p, color);
-            prev = p;
-        }
-
-        // Small arrow cone at the end (approximate with short lines)
-        let dir = (end - cp2).normalize();
-        let perp1 = dir.cross(Vec3::Z).normalize_or_zero() * 0.08;
-        let perp2 = dir.cross(Vec3::X).normalize_or_zero() * 0.08;
-        let arrow_base = end - dir * 0.2;
-        gizmos.line(end, arrow_base + perp1, color);
-        gizmos.line(end, arrow_base - perp1, color);
-        gizmos.line(end, arrow_base + perp2, color);
-        gizmos.line(end, arrow_base - perp2, color);
-    }
-}
-*/
-
 /// Gentle pulsing animation for nodes.
 fn animate_nodes(time: Res<Time>, mut query: Query<(&AstNodeEntity, &mut Transform)>) {
     /*
@@ -3353,15 +3346,17 @@ fn clear_scene(
     }
 }
 fn rebuild_scene(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut materials_grid: ResMut<Assets<grid::GridMaterial>>,
+    commands: Commands,
+    meshes: ResMut<Assets<Mesh>>,
+    materials: ResMut<Assets<StandardMaterial>>,
+    materials_grid: ResMut<Assets<grid::GridMaterial>>,
+    materials_edge: ResMut<Assets<edge::EdgeMaterial>>,
+    edge_labels: Option<Res<edge::EdgeLabelTextures>>,
     state: Res<AstState>,
     ui_font: Res<UiFont>,
     pick: Res<PickState>,
     mut rebuild: ResMut<NeedsRebuild>,
-    query_ast_entities: Query<Entity, With<AstSceneEntity>>,
+    _query_ast_entities: Query<Entity, With<AstSceneEntity>>,
 ) {
     if rebuild.0 {
         spawn_ast_nodes(
@@ -3369,6 +3364,8 @@ fn rebuild_scene(
             meshes,
             materials,
             materials_grid,
+            materials_edge,
+            edge_labels,
             state,
             ui_font,
             pick,
@@ -4134,18 +4131,6 @@ fn anchor_hover_visual_system(
     }
 }
 
-fn draw_edges_gizmos(edges: Query<&Edge>, transforms: Query<&GlobalTransform>, mut gizmos: Gizmos) {
-    for edge in &edges {
-        let (Ok(from), Ok(to)) = (
-            transforms.get(edge.from_anchor),
-            transforms.get(edge.to_anchor),
-        ) else {
-            continue;
-        };
-        gizmos.line(from.translation(), to.translation(), edge.color);
-    }
-}
-
 fn draw_drag_preview(drag: Res<DragState>, mut gizmos: Gizmos) {
     let Some(ref info) = drag.active else { return };
     let color = if info.target_anchor.is_some() {
@@ -4431,6 +4416,7 @@ fn main() {
             FrameTimeDiagnosticsPlugin::default(),
         ))
         .add_plugins(grid::GridPlugin)
+        .add_plugins(edge::EdgePlugin)
         .init_resource::<AstState>()
         .init_resource::<NeedsRebuild>()
         .init_resource::<PickState>()
@@ -4458,13 +4444,7 @@ fn main() {
             Update,
             (
                 (
-                    (
-                        anchor_hover_visual_system,
-                        draw_edges_gizmos,
-                        draw_drag_preview,
-                    )
-                        .chain(),
-                    //draw_edges,
+                    (anchor_hover_visual_system, draw_drag_preview).chain(),
                     animate_nodes,
                     (
                         handle_delete_node_button,
