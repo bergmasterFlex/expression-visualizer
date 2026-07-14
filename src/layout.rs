@@ -581,20 +581,17 @@ impl LayoutAst {
                     layout.ast.nodes.get(&intruder_id),
                     Some(crate::ast::node::ENode::VarDecl { .. })
                 );
+                // Priority: Z (deeper) → X (sideways) → Y (upward). Y is a
+                // last resort because it crosses row boundaries; XZ keeps
+                // the intruder on the same floor.
                 let (best_axis, best_dist) = if is_var_decl {
                     (0u8, push_x)
+                } else if push_z != 0 {
+                    (2u8, push_z)
+                } else if push_x != 0 {
+                    (0u8, push_x)
                 } else {
-                    let mut best_axis = 1u8; // 0=x, 1=y, 2=z
-                    let mut best_dist = push_y;
-                    if push_x.abs() < best_dist.abs() {
-                        best_axis = 0;
-                        best_dist = push_x;
-                    }
-                    if push_z.abs() < best_dist.abs() {
-                        best_axis = 2;
-                        best_dist = push_z;
-                    }
-                    (best_axis, best_dist)
+                    (1u8, push_y)
                 };
                 let delta = match best_axis {
                     0 => Vec3::new(best_dist as f32, 0.0, 0.0),
