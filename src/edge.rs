@@ -11,9 +11,18 @@ use bevy::shader::ShaderRef;
 use crate::eval::EType;
 
 pub const RIBBON_HEIGHT: f32 = 1.0;
+/// Thin-band variant used when a source anchor carries an AST literal. Kept
+/// large enough that the marquee text is still readable on the resulting
+/// strip; too small and the rasterised glyphs collapse to a single pixel row.
+pub const RIBBON_LINE_HEIGHT: f32 = 0.25;
 pub const RIBBON_SEGMENTS: usize = 40;
 const LABEL_TEX_WIDTH: u32 = 256;
 const LABEL_TEX_HEIGHT: u32 = 32;
+
+/// Bytes of the bundled JetBrainsMono TTF. Exposed so callers that need to
+/// rasterise marquee text at spawn time (see `rasterize_marquee_text`) don't
+/// have to `include_bytes!` the same path themselves.
+pub const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
 
 /// Straight cubic Bézier between two anchor world positions. Both tangents
 /// leave along the Z flow axis: `p1` sits in −Z from the source (outputs
@@ -73,6 +82,19 @@ impl LeafKind {
         }
     }
 
+    /// Bare type name, without the marquee padding — used to compose the
+    /// alternating "value + type" marquee on value-carrying edges.
+    pub fn type_name(self) -> &'static str {
+        match self {
+            LeafKind::Bool => "bool",
+            LeafKind::Char => "char",
+            LeafKind::Int => "int",
+            LeafKind::Float => "float",
+            LeafKind::String => "string",
+            LeafKind::Undefined => "undefined",
+        }
+    }
+
     pub const ALL: [LeafKind; 6] = [
         LeafKind::Bool,
         LeafKind::Char,
@@ -97,13 +119,13 @@ pub fn leaf_kind_of(t: &EType) -> Option<LeafKind> {
     }
 }
 
-/// Build a vertical ribbon that follows `curve`, extruded ±0.5 in Y around
-/// `y_center(t) = mix(y_start, y_end, t)`. UV.x is arc length in world units
-/// (so the shader can tile the label texture with `uv.x / tile_length`),
+/// Build a vertical ribbon that follows `curve`, extruded ±height/2 in Y
+/// around `y_center(t) = mix(y_start, y_end, t)`. UV.x is arc length in world
+/// units (so the shader can tile the label texture with `uv.x / tile_length`),
 /// UV.y is 0 at the bottom edge and 1 at the top.
-pub fn build_ribbon_mesh(curve: &EdgeCurve, y_start: f32, y_end: f32) -> Mesh {
+pub fn build_ribbon_mesh(curve: &EdgeCurve, y_start: f32, y_end: f32, height: f32) -> Mesh {
     let n = RIBBON_SEGMENTS;
-    let half = RIBBON_HEIGHT * 0.5;
+    let half = height * 0.5;
 
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity((n + 1) * 2);
     let mut normals: Vec<[f32; 3]> = Vec::with_capacity((n + 1) * 2);
@@ -231,18 +253,26 @@ fn update_edge_material_time(time: Res<Time>, mut materials: ResMut<Assets<EdgeM
 /// to sidestep WASM async-load races — the startup system must have a font
 /// ready synchronously.
 fn rasterize_label_textures(mut images: ResMut<Assets<Image>>, mut commands: Commands) {
-    const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
     let font = FontRef::try_from_slice(FONT_BYTES).expect("bundled font is valid");
 
     let mut by_kind = std::collections::HashMap::new();
     for kind in LeafKind::ALL {
-        let handle = rasterize_one(&font, kind.marquee_text(), &mut images);
+        let handle = rasterize_marquee_text(&font, kind.marquee_text(), &mut images);
         by_kind.insert(kind, handle);
     }
     commands.insert_resource(EdgeLabelTextures { by_kind });
 }
 
-fn rasterize_one(font: &FontRef<'_>, text: &str, images: &mut Assets<Image>) -> Handle<Image> {
+/// Rasterise `text` fitted horizontally across a `LABEL_TEX_WIDTH`-wide
+/// R8Unorm texture with wrap-repeat sampling, matching what the marquee
+/// shader expects. Callers that only need the six per-leaf textures should
+/// use the `EdgeLabelTextures` resource; this is for on-demand text
+/// (e.g. value+type marquee strings on value-carrying edges).
+pub fn rasterize_marquee_text(
+    font: &FontRef<'_>,
+    text: &str,
+    images: &mut Assets<Image>,
+) -> Handle<Image> {
     let w = LABEL_TEX_WIDTH as usize;
     let h = LABEL_TEX_HEIGHT as usize;
     let mut buf = vec![0u8; w * h];

@@ -31,6 +31,13 @@ pub struct RenderAnchor {
 pub struct RenderTypeMarker {
     pub rect: RenderObject,
     pub label: RenderLabel,
+    /// Present iff this leaf's anchor carries an AST-level literal. Rendered
+    /// as a thin coloured segment along Z in the far 2/3 of the original
+    /// rect footprint, at the rect's Y-middle.
+    pub value_line: Option<RenderObject>,
+    /// Present alongside `value_line`. Text is the literal itself, projected
+    /// into screen space past the line's tip.
+    pub value_label: Option<RenderLabel>,
 }
 
 pub struct RenderLabel {
@@ -44,6 +51,13 @@ pub struct RenderLabel {
 const TYPE_MARKER_ALPHA: f32 = 0.6;
 pub const TYPE_MARKER_Y_STEP: f32 = 1.0;
 const TYPE_MARKER_HALF_DEPTH: f32 = 0.5;
+/// Y-thickness of the gizmo line drawn in the far 2/3 of a value-carrying
+/// type marker. Matches the anchor-sphere radius so lines and spheres read as
+/// one visual family.
+const VALUE_LINE_THICKNESS: f32 = 0.06;
+/// World-space padding between the tip of the gizmo line and the value
+/// label's projection point.
+const VALUE_LABEL_Z_PADDING: f32 = 0.1;
 
 /// Sort key that fixes the vertical order of type-marker rectangles.
 /// Returns `None` for variants that should not render a rectangle.
@@ -100,8 +114,15 @@ pub fn ordered_supported_leaves(t: &crate::eval::EType) -> Vec<crate::eval::ETyp
 /// `anchor_world_pos` is the world-space anchor position; `is_input` decides
 /// which face of each rectangle touches the anchor (input: lower-Z face at
 /// anchor, stack extends +Z; output: upper-Z face at anchor, stack extends −Z).
+///
+/// `ast_value` is the AST-level literal on the anchor's type, if any. When
+/// present, every rendered leaf collapses its rect to the third nearest the
+/// anchor and grows a horizontal gizmo line + value label in the far 2/3.
+/// In practice value-carrying nodes have a single leaf, so this only fires
+/// on one marker per anchor.
 fn build_type_markers(
     t: &crate::eval::EType,
+    ast_value: Option<&str>,
     anchor_world_pos: Vec3,
     is_input: bool,
 ) -> Vec<RenderTypeMarker> {
@@ -110,39 +131,104 @@ fn build_type_markers(
     if n == 0 {
         return vec![];
     }
-    let z_center = if is_input {
-        anchor_world_pos.z + TYPE_MARKER_HALF_DEPTH
-    } else {
-        anchor_world_pos.z - TYPE_MARKER_HALF_DEPTH
-    };
+    // Sign: +1 for inputs (stack extends +Z from the anchor), -1 for outputs.
+    let sign = if is_input { 1.0 } else { -1.0 };
+    let full_depth = 2.0 * TYPE_MARKER_HALF_DEPTH;
+    let stub_depth = full_depth / 3.0;
+    let line_depth = full_depth - stub_depth;
+    // Rect (full-value case) is centred at ±HALF_DEPTH from the anchor;
+    // the stub rect is centred at ±stub_depth/2 so its near face still
+    // touches the anchor at anchor.z.
+    let full_rect_z_center = anchor_world_pos.z + sign * TYPE_MARKER_HALF_DEPTH;
+    let stub_rect_z_center = anchor_world_pos.z + sign * (stub_depth * 0.5);
+    let line_z_center = anchor_world_pos.z + sign * (stub_depth + line_depth * 0.5);
+    let line_tip_z = anchor_world_pos.z + sign * full_depth;
+
     leaves
         .into_iter()
         .enumerate()
         .map(|(k, leaf)| {
             let y_center =
                 anchor_world_pos.y + (k as f32 - (n as f32 - 1.0) / 2.0) * TYPE_MARKER_Y_STEP;
-            let center = Vec3::new(anchor_world_pos.x, y_center, z_center);
-            RenderTypeMarker {
-                rect: RenderObject {
-                    mesh: Cuboid::new(0.0, TYPE_MARKER_Y_STEP, 2.0 * TYPE_MARKER_HALF_DEPTH)
-                        .mesh()
-                        .build(),
-                    material: StandardMaterial {
-                        base_color: type_marker_color(&leaf),
-                        alpha_mode: AlphaMode::Blend,
-                        cull_mode: None,
-                        unlit: true,
-                        ..default()
+            let color = type_marker_color(&leaf);
+            let letter = type_marker_letter(&leaf).to_string();
+
+            if let Some(value) = ast_value {
+                let stub_center = Vec3::new(anchor_world_pos.x, y_center, stub_rect_z_center);
+                let line_center = Vec3::new(anchor_world_pos.x, y_center, line_z_center);
+                let label_world = Vec3::new(
+                    anchor_world_pos.x,
+                    y_center,
+                    line_tip_z + sign * VALUE_LABEL_Z_PADDING,
+                );
+                RenderTypeMarker {
+                    rect: RenderObject {
+                        mesh: Cuboid::new(0.0, TYPE_MARKER_Y_STEP, stub_depth)
+                            .mesh()
+                            .build(),
+                        material: StandardMaterial {
+                            base_color: color,
+                            alpha_mode: AlphaMode::Blend,
+                            cull_mode: None,
+                            unlit: true,
+                            ..default()
+                        },
+                        transform: Transform::from_translation(stub_center),
                     },
-                    transform: Transform::from_translation(center),
-                },
-                label: RenderLabel {
-                    text: type_marker_letter(&leaf).to_string(),
-                    color: Color::WHITE,
-                    font_size: 14.0,
-                    world_pos: center,
-                    offset: Vec2::ZERO,
-                },
+                    label: RenderLabel {
+                        text: letter,
+                        color: Color::WHITE,
+                        font_size: 14.0,
+                        world_pos: stub_center,
+                        offset: Vec2::ZERO,
+                    },
+                    value_line: Some(RenderObject {
+                        mesh: Cuboid::new(0.0, VALUE_LINE_THICKNESS, line_depth)
+                            .mesh()
+                            .build(),
+                        material: StandardMaterial {
+                            base_color: color,
+                            alpha_mode: AlphaMode::Blend,
+                            cull_mode: None,
+                            unlit: true,
+                            ..default()
+                        },
+                        transform: Transform::from_translation(line_center),
+                    }),
+                    value_label: Some(RenderLabel {
+                        text: value.to_string(),
+                        color: Color::WHITE,
+                        font_size: 14.0,
+                        world_pos: label_world,
+                        offset: Vec2::ZERO,
+                    }),
+                }
+            } else {
+                let center = Vec3::new(anchor_world_pos.x, y_center, full_rect_z_center);
+                RenderTypeMarker {
+                    rect: RenderObject {
+                        mesh: Cuboid::new(0.0, TYPE_MARKER_Y_STEP, full_depth)
+                            .mesh()
+                            .build(),
+                        material: StandardMaterial {
+                            base_color: color,
+                            alpha_mode: AlphaMode::Blend,
+                            cull_mode: None,
+                            unlit: true,
+                            ..default()
+                        },
+                        transform: Transform::from_translation(center),
+                    },
+                    label: RenderLabel {
+                        text: letter,
+                        color: Color::WHITE,
+                        font_size: 14.0,
+                        world_pos: center,
+                        offset: Vec2::ZERO,
+                    },
+                    value_line: None,
+                    value_label: None,
+                }
             }
         })
         .collect()
@@ -178,6 +264,7 @@ pub fn layoutnode_to_rendernode(
             let output_local = Vec3::new(0.0, 0.0, -0.225);
             let output_world = node_pos + output_local;
             let output_eval_type = crate::eval::ast_type_to_eval_type(r#type);
+            let output_value = crate::layout::value_of_etype(r#type);
             RenderNode {
                 node: RenderObject {
                     mesh: match r#type {
@@ -246,7 +333,12 @@ pub fn layoutnode_to_rendernode(
                                 * Transform::from_translation(output_local)
                                 * Transform::from_scale(Vec3::splat(1.8)),
                         },
-                        type_markers: build_type_markers(&output_eval_type, output_world, false),
+                        type_markers: build_type_markers(
+                            &output_eval_type,
+                            output_value.as_deref(),
+                            output_world,
+                            false,
+                        ),
                     },
                 )]),
                 labels: vec![RenderLabel {
@@ -269,6 +361,7 @@ pub fn layoutnode_to_rendernode(
             let input_world = node_pos + input_local;
             let output_world = node_pos + output_local;
             let eval_type = crate::eval::ast_type_to_eval_type(r#type);
+            let elim_value = crate::layout::value_of_etype(r#type);
             RenderNode {
                 node: RenderObject {
                     mesh: match r#type {
@@ -329,7 +422,12 @@ pub fn layoutnode_to_rendernode(
                                     * Transform::from_translation(input_local)
                                     * Transform::from_scale(Vec3::splat(1.8)),
                             },
-                            type_markers: build_type_markers(&eval_type, input_world, true),
+                            type_markers: build_type_markers(
+                                &eval_type,
+                                elim_value.as_deref(),
+                                input_world,
+                                true,
+                            ),
                         },
                     ),
                     (
@@ -357,7 +455,12 @@ pub fn layoutnode_to_rendernode(
                                     * Transform::from_translation(output_local)
                                     * Transform::from_scale(Vec3::splat(1.8)),
                             },
-                            type_markers: build_type_markers(&eval_type, output_world, false),
+                            type_markers: build_type_markers(
+                                &eval_type,
+                                elim_value.as_deref(),
+                                output_world,
+                                false,
+                            ),
                         },
                     ),
                 ]),
@@ -435,7 +538,12 @@ pub fn layoutnode_to_rendernode(
                                         * Transform::from_translation(input_local)
                                         * Transform::from_scale(Vec3::splat(1.8)),
                                 },
-                                type_markers: build_type_markers(&input_type, input_world, true),
+                                type_markers: build_type_markers(
+                                    &input_type,
+                                    None,
+                                    input_world,
+                                    true,
+                                ),
                             },
                         )
                     })
@@ -466,6 +574,7 @@ pub fn layoutnode_to_rendernode(
                             },
                             type_markers: build_type_markers(
                                 &function_declaration.output_type,
+                                None,
                                 output_world,
                                 false,
                             ),
@@ -490,6 +599,7 @@ pub fn layoutnode_to_rendernode(
             let output_local = Vec3::new(0.0, 0.0, -0.225);
             let output_world = node_pos + output_local;
             let output_eval_type = crate::eval::ast_type_to_eval_type(r#type);
+            let output_value = crate::layout::value_of_etype(r#type);
             RenderNode {
                 node: RenderObject {
                     mesh: Cuboid::new(0.45, 0.45, 0.45).mesh().build(),
@@ -527,7 +637,12 @@ pub fn layoutnode_to_rendernode(
                                 * Transform::from_translation(output_local)
                                 * Transform::from_scale(Vec3::splat(1.8)),
                         },
-                        type_markers: build_type_markers(&output_eval_type, output_world, false),
+                        type_markers: build_type_markers(
+                            &output_eval_type,
+                            output_value.as_deref(),
+                            output_world,
+                            false,
+                        ),
                     },
                 )]),
                 labels: vec![RenderLabel {
@@ -710,6 +825,7 @@ pub fn layoutnode_to_rendernode(
             let output_local = Vec3::new(0.0, 0.0, -0.55);
             let output_world = node_pos + output_local;
             let eval_type = crate::eval::ast_type_to_eval_type(r#type);
+            let pattern_value = crate::layout::value_of_etype(r#type);
             RenderNode {
                 node: RenderObject {
                     mesh: Cuboid::new(0.45, 0.45, 0.45).mesh().build(),
@@ -747,7 +863,12 @@ pub fn layoutnode_to_rendernode(
                                 * Transform::from_translation(output_local)
                                 * Transform::from_scale(Vec3::splat(1.8)),
                         },
-                        type_markers: build_type_markers(&eval_type, output_world, false),
+                        type_markers: build_type_markers(
+                            &eval_type,
+                            pattern_value.as_deref(),
+                            output_world,
+                            false,
+                        ),
                     },
                 )]),
                 labels: vec![RenderLabel {

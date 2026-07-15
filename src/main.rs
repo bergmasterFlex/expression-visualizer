@@ -622,16 +622,7 @@ fn type_choice_label(t: TypeChoice) -> &'static str {
     }
 }
 
-fn value_of_etype(t: &ast::node::EType) -> Option<String> {
-    match t {
-        ast::node::EType::Bool { value }
-        | ast::node::EType::Int { value }
-        | ast::node::EType::Float { value }
-        | ast::node::EType::String { value }
-        | ast::node::EType::Char { value } => value.clone(),
-        _ => None,
-    }
-}
+use layout::value_of_etype;
 
 fn make_etype(choice: TypeChoice, value: Option<String>) -> ast::node::EType {
     match choice {
@@ -731,6 +722,7 @@ fn spawn_ast_nodes(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut materials_grid: ResMut<Assets<grid::GridMaterial>>,
     mut materials_edge: ResMut<Assets<edge::EdgeMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     edge_labels: Option<Res<edge::EdgeLabelTextures>>,
     state: Res<AstState>,
     ui_font: Res<UiFont>,
@@ -803,7 +795,12 @@ fn spawn_ast_nodes(
                 } = render_anchor;
 
                 for marker in type_markers {
-                    let render::RenderTypeMarker { rect, label } = marker;
+                    let render::RenderTypeMarker {
+                        rect,
+                        label,
+                        value_line,
+                        value_label,
+                    } = marker;
                     commands.spawn((
                         Mesh3d(meshes.add(rect.mesh)),
                         MeshMaterial3d(materials.add(rect.material)),
@@ -811,6 +808,17 @@ fn spawn_ast_nodes(
                         AstSceneEntity,
                     ));
                     spawn_world_label(&mut commands, &ui_font.0, label, AstSceneEntity);
+                    if let Some(line) = value_line {
+                        commands.spawn((
+                            Mesh3d(meshes.add(line.mesh)),
+                            MeshMaterial3d(materials.add(line.material)),
+                            line.transform,
+                            AstSceneEntity,
+                        ));
+                    }
+                    if let Some(vlabel) = value_label {
+                        spawn_world_label(&mut commands, &ui_font.0, vlabel, AstSceneEntity);
+                    }
                 }
 
                 let render_anchor = render::RenderAnchor {
@@ -851,6 +859,16 @@ fn spawn_ast_nodes(
     }
 
     if let Some(edge_labels) = edge_labels.as_ref() {
+        // Cache value+type marquee textures per (kind, value) within this
+        // spawn pass. Rebuilds are rare (only on scene rebuild) and edge
+        // counts are ~O(30), so a local map is cheaper than a resource.
+        let mut value_marquee_cache: std::collections::HashMap<
+            (edge::LeafKind, String),
+            Handle<Image>,
+        > = std::collections::HashMap::new();
+        let value_font =
+            ab_glyph::FontRef::try_from_slice(edge::FONT_BYTES).expect("bundled font is valid");
+
         for e in state.program_ast().edges() {
             let src_id = &e.from_anchor.anchor_id;
             let tgt_id = &e.to_anchor.anchor_id;
@@ -881,6 +899,12 @@ fn spawn_ast_nodes(
                 .unwrap_or_default();
             let n_tgt = target_leaves.len();
 
+            // AST-level literal on the source anchor (VarDecl / TypeIntroduction
+            // / Pattern / TypeElimination). `None` for FunctionCall outputs and
+            // structural nodes. When present, the sole rendered leaf swaps to
+            // the thin "value line" style.
+            let src_ast_value = state.program_ast().anchor_ast_value(src_id);
+
             let curve = edge::EdgeCurve::from_endpoints(from_world, to_world);
 
             let edge_root = commands
@@ -907,12 +931,30 @@ fn spawn_ast_nodes(
                 } else {
                     0.0
                 };
-                let mesh =
-                    edge::build_ribbon_mesh(&curve, from_world.y + y_src, to_world.y + y_tgt);
                 let Some(kind) = edge::leaf_kind_of(leaf) else {
                     continue;
                 };
-                let label = edge_labels.by_kind.get(&kind).cloned().unwrap();
+                let (height, label) = if let Some(value) = src_ast_value.as_deref() {
+                    let text = format!("  {}  {}  ", value, kind.type_name());
+                    let handle = value_marquee_cache
+                        .entry((kind, text.clone()))
+                        .or_insert_with(|| {
+                            edge::rasterize_marquee_text(&value_font, &text, &mut images)
+                        })
+                        .clone();
+                    (edge::RIBBON_LINE_HEIGHT, handle)
+                } else {
+                    (
+                        edge::RIBBON_HEIGHT,
+                        edge_labels.by_kind.get(&kind).cloned().unwrap(),
+                    )
+                };
+                let mesh = edge::build_ribbon_mesh(
+                    &curve,
+                    from_world.y + y_src,
+                    to_world.y + y_tgt,
+                    height,
+                );
                 commands.spawn((
                     Mesh3d(meshes.add(mesh)),
                     MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
@@ -3351,6 +3393,7 @@ fn rebuild_scene(
     materials: ResMut<Assets<StandardMaterial>>,
     materials_grid: ResMut<Assets<grid::GridMaterial>>,
     materials_edge: ResMut<Assets<edge::EdgeMaterial>>,
+    images: ResMut<Assets<Image>>,
     edge_labels: Option<Res<edge::EdgeLabelTextures>>,
     state: Res<AstState>,
     ui_font: Res<UiFont>,
@@ -3365,6 +3408,7 @@ fn rebuild_scene(
             materials,
             materials_grid,
             materials_edge,
+            images,
             edge_labels,
             state,
             ui_font,

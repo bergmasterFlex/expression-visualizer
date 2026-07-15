@@ -1303,6 +1303,22 @@ impl LayoutAst {
         None
     }
 
+    /// AST-level literal string attached to this anchor's type, if any.
+    /// Walks sub-layouts. Returns `None` when the anchor's node kind doesn't
+    /// carry an `ast::node::EType` field, or the field's value is `None`.
+    pub fn anchor_ast_value(&self, anchor_id: &crate::ast::AnchorId) -> Option<String> {
+        if let Some(node_id) = self.ast.anchor_to_node.get(anchor_id) {
+            let node = self.ast.nodes.get(node_id)?;
+            return anchor_ast_value_from_node(node, anchor_id);
+        }
+        for sub in self.sub_layouts.values() {
+            if let Some(v) = sub.anchor_ast_value(anchor_id) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
     /// Owner path from this LayoutAst down to the LayoutAst whose
     /// `layout_nodes` contains `target`. `Some(vec![])` = target lives in
     /// `self`; `Some(vec![a, b])` = target lives in `self.sub_layouts[a]
@@ -1404,5 +1420,66 @@ fn anchor_type_from_node(
         | crate::ast::node::ENode::MatchFront { .. }
         | crate::ast::node::ENode::MatchGrid { .. }
         | crate::ast::node::ENode::Program {} => None,
+    }
+}
+
+/// Concrete literal string on an `ast::node::EType`, if any. Only the
+/// value-carrying variants have an `Option<String>`; `Any`, `Undefined`,
+/// `Exception` return `None`.
+pub fn value_of_etype(t: &crate::ast::node::EType) -> Option<String> {
+    match t {
+        crate::ast::node::EType::Bool { value }
+        | crate::ast::node::EType::Int { value }
+        | crate::ast::node::EType::Float { value }
+        | crate::ast::node::EType::String { value }
+        | crate::ast::node::EType::Char { value } => value.clone(),
+        _ => None,
+    }
+}
+
+/// Return the AST-level literal attached to `anchor_id`'s type, if any.
+///
+/// Only anchors on nodes whose type is a first-class `ast::node::EType` field
+/// (TypeIntroduction, VarDecl, Pattern, TypeElimination) can carry a literal.
+/// FunctionCall inputs/outputs bind to `eval::EType` on the declaration, which
+/// has no AST-level literal — treated as `None`. Match / SinkWall / Program
+/// don't carry types at all.
+pub fn anchor_ast_value_from_node(
+    node: &crate::ast::node::ENode,
+    anchor_id: &crate::ast::AnchorId,
+) -> Option<String> {
+    match node {
+        crate::ast::node::ENode::TypeIntroduction {
+            r#type,
+            output_anchor,
+        }
+        | crate::ast::node::ENode::VarDecl {
+            r#type,
+            output_anchor,
+            ..
+        }
+        | crate::ast::node::ENode::Pattern {
+            r#type,
+            output_anchor,
+            ..
+        } => {
+            if anchor_id == output_anchor {
+                value_of_etype(r#type)
+            } else {
+                None
+            }
+        }
+        crate::ast::node::ENode::TypeElimination {
+            r#type,
+            input_anchor,
+            output_anchor,
+        } => {
+            if anchor_id == input_anchor || anchor_id == output_anchor {
+                value_of_etype(r#type)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
