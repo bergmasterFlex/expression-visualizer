@@ -11,10 +11,14 @@ use bevy::shader::ShaderRef;
 use crate::eval::EType;
 
 pub const RIBBON_HEIGHT: f32 = 1.0;
-/// Thin-band variant used when a source anchor carries an AST literal. Kept
-/// large enough that the marquee text is still readable on the resulting
-/// strip; too small and the rasterised glyphs collapse to a single pixel row.
+/// Ribbon height used when a source anchor carries an AST literal. The band
+/// itself is invisible in that mode (see `edge_band.wgsl`); the height is
+/// kept as-is so the rasterised marquee glyphs stay readable.
 pub const RIBBON_LINE_HEIGHT: f32 = 0.25;
+/// Half-thickness of the value-edge hairline in `uv.y` space (i.e. as a
+/// fraction of `RIBBON_LINE_HEIGHT`). 0.1 * 0.25 = 0.025 world units — thin
+/// like a grid line.
+pub const RIBBON_LINE_HALF_THICKNESS_UV: f32 = 0.1;
 pub const RIBBON_SEGMENTS: usize = 40;
 const LABEL_TEX_WIDTH: u32 = 256;
 const LABEL_TEX_HEIGHT: u32 = 32;
@@ -189,8 +193,20 @@ pub struct EdgeMaterial {
     /// Seconds since app start, updated each frame.
     #[uniform(0)]
     pub time: f32,
+    /// 0.0 = solid band (full ribbon coverage); 1.0 = hairline coverage that
+    /// is only visible in a thin band around `uv.y = 0.5` and cut out where
+    /// the marquee glyph texture has ink.
     #[uniform(0)]
-    pub _pad: f32,
+    pub line_mode: f32,
+    /// Half-thickness of the hairline in `uv.y` space when `line_mode == 1.0`.
+    #[uniform(0)]
+    pub line_half_thickness: f32,
+    #[uniform(0)]
+    pub _pad0: f32,
+    #[uniform(0)]
+    pub _pad1: f32,
+    #[uniform(0)]
+    pub _pad2: f32,
     #[texture(1)]
     #[sampler(2)]
     pub label: Handle<Image>,

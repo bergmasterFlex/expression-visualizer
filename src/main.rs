@@ -934,7 +934,7 @@ fn spawn_ast_nodes(
                 let Some(kind) = edge::leaf_kind_of(leaf) else {
                     continue;
                 };
-                let (height, label) = if let Some(value) = src_ast_value.as_deref() {
+                let (height, label, line_mode) = if let Some(value) = src_ast_value.as_deref() {
                     let text = format!("  {}  {}  ", value, kind.type_name());
                     let handle = value_marquee_cache
                         .entry((kind, text.clone()))
@@ -942,11 +942,12 @@ fn spawn_ast_nodes(
                             edge::rasterize_marquee_text(&value_font, &text, &mut images)
                         })
                         .clone();
-                    (edge::RIBBON_LINE_HEIGHT, handle)
+                    (edge::RIBBON_LINE_HEIGHT, handle, 1.0)
                 } else {
                     (
                         edge::RIBBON_HEIGHT,
                         edge_labels.by_kind.get(&kind).cloned().unwrap(),
+                        0.0,
                     )
                 };
                 let mesh = edge::build_ribbon_mesh(
@@ -963,7 +964,11 @@ fn spawn_ast_nodes(
                         scroll_speed: 1.5,
                         tile_length: 3.0,
                         time: 0.0,
-                        _pad: 0.0,
+                        line_mode,
+                        line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
+                        _pad0: 0.0,
+                        _pad1: 0.0,
+                        _pad2: 0.0,
                         label,
                     })),
                     ChildOf(edge_root),
