@@ -57,6 +57,25 @@ pub struct GridMaterial {
     /// Padding to keep the uniform block 16-byte aligned.
     #[uniform(0)]
     pub _pad: f32,
+    /// World-space (x, z) of the outer boundary min corner.
+    #[uniform(0)]
+    pub border_min: Vec2,
+    /// World-space (x, z) of the outer boundary max corner.
+    #[uniform(0)]
+    pub border_max: Vec2,
+    /// Color used when a fragment lies on the outer boundary.
+    #[uniform(0)]
+    pub border_color: LinearRgba,
+    /// 1.0 = draw outer border, 0.0 = off.
+    #[uniform(0)]
+    pub border_active: f32,
+    /// Multiplier over the normal line width for the border.
+    #[uniform(0)]
+    pub border_thickness: f32,
+    #[uniform(0)]
+    pub _pad2: f32,
+    #[uniform(0)]
+    pub _pad3: f32,
 }
 
 impl Material for GridMaterial {
@@ -121,6 +140,13 @@ fn spawn_grid(
             hover_pos: Vec2::ZERO,
             hover_active: 0.0,
             _pad: 0.0,
+            border_min: Vec2::ZERO,
+            border_max: Vec2::ZERO,
+            border_color: LinearRgba::WHITE,
+            border_active: 0.0,
+            border_thickness: 1.8,
+            _pad2: 0.0,
+            _pad3: 0.0,
         })),
         BaseGridEntity,
     ));

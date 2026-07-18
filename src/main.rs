@@ -755,6 +755,13 @@ fn spawn_ast_nodes(
                         hover_pos: Vec2::ZERO,
                         hover_active: 0.0,
                         _pad: 0.0,
+                        border_min: Vec2::ZERO,
+                        border_max: Vec2::ZERO,
+                        border_color: LinearRgba::WHITE,
+                        border_active: 0.0,
+                        border_thickness: 1.8,
+                        _pad2: 0.0,
+                        _pad3: 0.0,
                     })),
                     tf,
                     AstNodeEntity {
@@ -997,6 +1004,16 @@ fn spawn_ast_nodes(
             (bounds.min.z + bounds.max.z) as f32 * 0.5,
         );
         let world_center = (center_local + walked_ast.extra_offset) * Vec3::new(3.0, 3.0, 3.0);
+        let ox = walked_ast.extra_offset.x;
+        let oz = walked_ast.extra_offset.z;
+        let border_min = Vec2::new(
+            (bounds.min.x as f32 + ox - 0.5) * 3.0,
+            (bounds.min.z as f32 + oz - 0.5) * 3.0,
+        );
+        let border_max = Vec2::new(
+            (bounds.max.x as f32 + ox + 0.5) * 3.0,
+            (bounds.max.z as f32 + oz + 0.5) * 3.0,
+        );
         commands.spawn((
             Mesh3d(meshes.add(Plane3d::default().mesh().size(size_x, size_z).build())),
             MeshMaterial3d(materials_grid.add(grid::GridMaterial {
@@ -1009,6 +1026,13 @@ fn spawn_ast_nodes(
                 hover_pos: Vec2::ZERO,
                 hover_active: 0.0,
                 _pad: 0.0,
+                border_min,
+                border_max,
+                border_color: LinearRgba::WHITE,
+                border_active: 0.0,
+                border_thickness: 1.8,
+                _pad2: 0.0,
+                _pad3: 0.0,
             })),
             Transform::from_translation(world_center),
             AstGridEntity {
@@ -3808,9 +3832,9 @@ fn update_selection_display(
     }
 }
 
-fn update_grid_hover_material(
+fn update_grid_material(
     pick: Res<PickState>,
-    grid_q: Query<(Entity, &MeshMaterial3d<grid::GridMaterial>), With<AstGridEntity>>,
+    grid_q: Query<(Entity, &AstGridEntity, &MeshMaterial3d<grid::GridMaterial>)>,
     mut materials: ResMut<Assets<grid::GridMaterial>>,
 ) {
     let hit_entity = pick.hovered_grid.as_ref().map(|h| h.entity);
@@ -3819,7 +3843,7 @@ fn update_grid_hover_material(
         .as_ref()
         .map(|h| h.world_center)
         .unwrap_or(Vec2::ZERO);
-    for (entity, mat_handle) in grid_q.iter() {
+    for (entity, ast_grid, mat_handle) in grid_q.iter() {
         let Some(mat) = materials.get_mut(&mat_handle.0) else {
             continue;
         };
@@ -3829,6 +3853,11 @@ fn update_grid_hover_material(
         } else {
             mat.hover_active = 0.0;
         }
+        mat.border_active = if ast_grid.context == pick.context_path {
+            1.0
+        } else {
+            0.0
+        };
     }
 }
 
@@ -4509,7 +4538,7 @@ fn main() {
                         .chain(),
                     highlight_hovered,
                     update_selection_display,
-                    update_grid_hover_material,
+                    update_grid_material,
                     update_cursor,
                     text_input_focus,
                     text_input_keyboard,

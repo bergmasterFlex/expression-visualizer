@@ -15,6 +15,14 @@ struct GridParams {
     hover_pos: vec2<f32>,
     hover_active: f32,
     _pad: f32,
+    // World-space (x, z) of the outer boundary.
+    border_min: vec2<f32>,
+    border_max: vec2<f32>,
+    border_color: vec4<f32>,
+    border_active: f32,
+    border_thickness: f32,
+    _pad2: f32,
+    _pad3: f32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: GridParams;
@@ -39,6 +47,28 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let grid_color = mix(params.plane_color, params.line_color, lines);
     let avg_color = mix(params.plane_color, params.line_color, 0.3);
     var color = mix(grid_color, avg_color, density_blend);
+
+    // Outer boundary highlight for the current-context AST grid: paint the
+    // four mesh-edge grid lines in border_color instead of line_color.
+    if params.border_active > 0.5 {
+        let d_x = min(
+            abs(world_pos.x - params.border_min.x),
+            abs(world_pos.x - params.border_max.x),
+        );
+        let d_y = min(
+            abs(world_pos.y - params.border_min.y),
+            abs(world_pos.y - params.border_max.y),
+        );
+        let bw = fwidth(world_pos) * params.line_thickness * params.border_thickness;
+        let on_border = max(
+            1.0 - saturate(d_x / bw.x),
+            1.0 - saturate(d_y / bw.y),
+        );
+        color = vec4<f32>(
+            mix(color.rgb, params.border_color.rgb, on_border),
+            max(color.a, on_border * params.border_color.a),
+        );
+    }
 
     // Hover feedback: fill the hovered cell (side = spacing) with a soft
     // wash, anti-aliased against fwidth so it stays crisp at oblique angles.
