@@ -760,8 +760,9 @@ fn spawn_ast_nodes(
                         border_color: LinearRgba::WHITE,
                         border_active: 0.0,
                         border_thickness: 1.8,
+                        footprint_count: 0,
                         _pad2: 0.0,
-                        _pad3: 0.0,
+                        footprints: [Vec4::ZERO; grid::MAX_FOOTPRINTS],
                     })),
                     tf,
                     AstNodeEntity {
@@ -1014,6 +1015,36 @@ fn spawn_ast_nodes(
             (bounds.max.x as f32 + ox + 0.5) * 3.0,
             (bounds.max.z as f32 + oz + 0.5) * 3.0,
         );
+        // Collect multi-cell node footprints in this LayoutAst and convert
+        // to world-space XZ rects. Fed to the grid shader to suppress
+        // interior grid lines inside merged fields.
+        let mut footprints = [Vec4::ZERO; grid::MAX_FOOTPRINTS];
+        let mut footprint_count: u32 = 0;
+        for id in walked_ast.layout_ast.layout_nodes.keys() {
+            let Some(fp) = walked_ast.layout_ast.node_footprint(id) else {
+                continue;
+            };
+            if (fp.max.x - fp.min.x) == 0 && (fp.max.z - fp.min.z) == 0 {
+                continue;
+            }
+            if (footprint_count as usize) >= grid::MAX_FOOTPRINTS {
+                warn!(
+                    "grid: more than {} footprints in one AST; truncating",
+                    grid::MAX_FOOTPRINTS
+                );
+                break;
+            }
+            let min_w = Vec2::new(
+                (fp.min.x as f32 + ox - 0.5) * 3.0,
+                (fp.min.z as f32 + oz - 0.5) * 3.0,
+            );
+            let max_w = Vec2::new(
+                (fp.max.x as f32 + ox + 0.5) * 3.0,
+                (fp.max.z as f32 + oz + 0.5) * 3.0,
+            );
+            footprints[footprint_count as usize] = Vec4::new(min_w.x, min_w.y, max_w.x, max_w.y);
+            footprint_count += 1;
+        }
         commands.spawn((
             Mesh3d(meshes.add(Plane3d::default().mesh().size(size_x, size_z).build())),
             MeshMaterial3d(materials_grid.add(grid::GridMaterial {
@@ -1031,8 +1062,9 @@ fn spawn_ast_nodes(
                 border_color: LinearRgba::WHITE,
                 border_active: 0.0,
                 border_thickness: 1.8,
+                footprint_count,
                 _pad2: 0.0,
-                _pad3: 0.0,
+                footprints,
             })),
             Transform::from_translation(world_center),
             AstGridEntity {
@@ -1557,7 +1589,7 @@ fn handle_add_node_button(
                     }
                 };
                 *pick.current_ast_mut(&mut state) = new_layout;
-                state.layout_ast = state.layout_ast.settle_matches();
+                state.layout_ast = state.layout_ast.settle_footprints();
                 rebuild.0 = true;
             }
             Interaction::Hovered => {
@@ -2277,6 +2309,7 @@ fn handle_dropdown_option_click(
                             (new_fn_id.clone(), &new_decl),
                         );
                         *owning_ast = new_layout;
+                        state.layout_ast = state.layout_ast.settle_footprints();
                         rebuild.0 = true;
                     }
                 }
@@ -4120,7 +4153,7 @@ fn handle_arrow_keys(
                 .selected_ast(&state)
                 .move_node_delta(node_id, delta.as_vec3());
             *pick.selected_ast_mut(&mut state) = new_layout;
-            state.layout_ast = state.layout_ast.settle_matches();
+            state.layout_ast = state.layout_ast.settle_footprints();
             pick.selected_pos = effective_pos;
             rebuild.0 = true;
         }

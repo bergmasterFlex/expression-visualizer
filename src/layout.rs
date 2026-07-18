@@ -229,48 +229,85 @@ impl LayoutAst {
         }
     }
 
-    /// Returns the node whose layout position rounds to `pos`, if any.
+    /// Returns the node whose footprint contains `pos`, if any.
     /// `MatchNew` containers are excluded — only their `Pattern` children are
     /// selectable, so a click on the envelope never picks the container.
+    /// Multi-cell nodes (matches implicitly, function calls with the
+    /// minimum-extent rule) are selectable from any cell inside their
+    /// `node_footprint`.
     pub fn node_at(&self, pos: IVec3) -> Option<crate::ast::node::Id> {
-        self.layout_nodes.iter().find_map(|(id, ln)| {
-            if ln.pos.round().as_ivec3() != pos {
-                return None;
-            }
+        self.layout_nodes.keys().find_map(|id| {
             if matches!(
                 self.ast.nodes.get(id),
                 Some(crate::ast::node::ENode::MatchNew { .. })
             ) {
                 return None;
             }
-            Some(id.clone())
+            let bbox = self.node_footprint(id)?;
+            if bbox.contains(pos) {
+                Some(id.clone())
+            } else {
+                None
+            }
         })
     }
 
+    /// AABB (in this LayoutAst's local grid coords) that a node claims.
+    /// Delegates to `matchnew_footprint` for matches; for FunctionCall applies
+    /// the minimum-extent rule (1–2 inputs → 1X×2Z toward −Z; ≥3 inputs →
+    /// 2X×2Z extending +X and −Z). Every other node claims a single cell at
+    /// its rounded position.
+    pub fn node_footprint(&self, id: &crate::ast::node::Id) -> Option<AABB> {
+        let ln = self.layout_nodes.get(id)?;
+        let node = self.ast.nodes.get(id)?;
+        let pos = ln.pos.round().as_ivec3();
+        match node {
+            crate::ast::node::ENode::MatchNew { .. } => self.matchnew_footprint(id),
+            crate::ast::node::ENode::FunctionCall { input_anchors, .. } => {
+                let (width_extra, depth_extra) = if input_anchors.len() >= 3 {
+                    (1, 1)
+                } else {
+                    (0, 1)
+                };
+                Some(AABB {
+                    min: IVec3::new(pos.x, pos.y, pos.z - depth_extra),
+                    max: IVec3::new(pos.x + width_extra, pos.y, pos.z),
+                })
+            }
+            _ => Some(AABB::point(pos)),
+        }
+    }
+
     /// Build a `grid position -> node id` lookup over all selectable nodes.
-    /// MatchNews claim every cell of their `matchnew_footprint`; other nodes
-    /// claim a single cell. When both a Pattern and its owning Match cover the
-    /// same cell (Pattern rows of the match column) the Pattern id wins, so
-    /// intra-stack Y-swap still resolves the Pattern as target.
+    /// Every node claims every cell of its `node_footprint`. When both a
+    /// Pattern and its owning Match cover the same cell (Pattern rows of the
+    /// match column) the Pattern id wins, so intra-stack Y-swap still
+    /// resolves the Pattern as target — matches are inserted first and
+    /// non-matches overwrite them.
     fn occupancy_map(&self) -> std::collections::HashMap<IVec3, crate::ast::node::Id> {
         let mut map: std::collections::HashMap<IVec3, crate::ast::node::Id> =
             std::collections::HashMap::new();
-        for (id, _ln) in &self.layout_nodes {
+        for id in self.layout_nodes.keys() {
             if !self.is_matchnew(id) {
                 continue;
             }
-            let Some(bbox) = self.matchnew_footprint(id) else {
+            let Some(bbox) = self.node_footprint(id) else {
                 continue;
             };
             for cell in bbox.cells() {
                 map.insert(cell, id.clone());
             }
         }
-        for (id, ln) in &self.layout_nodes {
+        for id in self.layout_nodes.keys() {
             if self.is_matchnew(id) {
                 continue;
             }
-            map.insert(ln.pos.round().as_ivec3(), id.clone());
+            let Some(bbox) = self.node_footprint(id) else {
+                continue;
+            };
+            for cell in bbox.cells() {
+                map.insert(cell, id.clone());
+            }
         }
         map
     }
@@ -444,15 +481,15 @@ impl LayoutAst {
                 .map(|ln| ln.pos)
                 .unwrap_or(Vec3::ZERO);
             let cur_delta = new_pos - cur_origin;
-            // Section-swap for MatchNew: match rides in the same direction as
-            // the intruder so its multi-cell footprint fully vacates the
+            // Section-swap for multi-cell owners: the owner rides in the same
+            // direction as the intruder so its footprint fully vacates the
             // target cell (mirror delta would leave residual overlap when
-            // the match is wider than the mover's step).
-            let raw_swap = if self.is_matchnew(occ) {
-                cur_delta
-            } else {
-                -cur_delta
-            };
+            // the owner is wider than the mover's step).
+            let occ_is_multi = self
+                .node_footprint(occ)
+                .map(|b| b.cells().count() > 1)
+                .unwrap_or(false);
+            let raw_swap = if occ_is_multi { cur_delta } else { -cur_delta };
             let swap_delta = self.jump_delta(&occupancy, occ, occ_origin, raw_swap);
             for (id, d) in self.move_group(occ, swap_delta) {
                 if plan.contains_key(&id) {
@@ -521,40 +558,53 @@ impl LayoutAst {
         }
     }
 
-    /// Push external nodes out of every MatchNew's footprint, bottom-up.
-    /// Recurses into `sub_layouts` first so inner matches settle before their
-    /// container measures its own footprint. At each level, for every match:
-    /// scan `layout_nodes` for non-child nodes whose rounded position falls
-    /// inside the footprint and bump them along the axis with the smallest
-    /// exit distance — +Y for Y-overlap, ±X toward the near footprint edge,
-    /// −Z toward the sub-sink side (never +Z; that side faces the parent
-    /// wall). Uses `move_node_delta` for each bump so cascading collisions
-    /// resolve automatically. Iterates until stable (128-step cap).
-    pub fn settle_matches(&self) -> Self {
+    /// Push external nodes out of every multi-cell node footprint, bottom-up.
+    /// Applies to any node whose `node_footprint` has volume > 1 — matches
+    /// and multi-input function calls. Recurses into `sub_layouts` first so
+    /// inner owners settle before their container measures its own footprint.
+    /// At each level, for every such owner: scan `layout_nodes` for
+    /// non-related nodes whose rounded position falls inside the footprint
+    /// and bump them along the axis with the smallest exit distance — +Y for
+    /// Y-overlap, ±X toward the near footprint edge, −Z toward the sub-sink
+    /// side (never +Z; that side faces the parent wall). Uses
+    /// `move_node_delta` for each bump so cascading collisions resolve
+    /// automatically. Iterates until stable (128-step cap).
+    pub fn settle_footprints(&self) -> Self {
         let settled_subs: std::collections::HashMap<crate::ast::node::Id, LayoutAst> = self
             .sub_layouts
             .iter()
-            .map(|(k, v)| (k.clone(), v.settle_matches()))
+            .map(|(k, v)| (k.clone(), v.settle_footprints()))
             .collect();
         let mut layout = Self {
             ast: self.ast.clone(),
             layout_nodes: self.layout_nodes.clone(),
             sub_layouts: settled_subs,
         };
-        let match_ids: Vec<crate::ast::node::Id> = layout
+        let owner_ids: Vec<crate::ast::node::Id> = layout
             .layout_nodes
             .keys()
-            .filter(|id| layout.is_matchnew(id))
+            .filter(|id| {
+                layout
+                    .node_footprint(id)
+                    .map(|b| b.cells().count() > 1)
+                    .unwrap_or(false)
+            })
             .cloned()
             .collect();
-        for match_id in &match_ids {
+        for owner_id in &owner_ids {
+            // Patterns of a MatchNew ride along with their parent; skip them
+            // as intruders. For non-match owners there are no related ids.
+            let related: Vec<crate::ast::node::Id> = if layout.is_matchnew(owner_id) {
+                layout.match_pattern_ids(owner_id)
+            } else {
+                vec![]
+            };
             for _ in 0..128 {
-                let Some(bbox) = layout.matchnew_footprint(match_id) else {
+                let Some(bbox) = layout.node_footprint(owner_id) else {
                     break;
                 };
-                let pattern_ids = layout.match_pattern_ids(match_id);
                 let intruder = layout.layout_nodes.iter().find_map(|(id, ln)| {
-                    if id == match_id || pattern_ids.contains(id) {
+                    if id == owner_id || related.contains(id) {
                         return None;
                     }
                     let p = ln.pos.round().as_ivec3();
@@ -887,7 +937,7 @@ impl LayoutAst {
     /// Insert a new Pattern into `selected_pattern_id`'s parent MatchNew,
     /// occupying the selected slot. Sibling Patterns of the same match at
     /// Y ≥ selected.Y shift up by 1 to make room; the growing match footprint
-    /// then displaces any external neighbors via `settle_matches`. The caller
+    /// then displaces any external neighbors via `settle_footprints`. The caller
     /// bumps `pick.selected_pos.y` by 1 so selection tracks the originally-
     /// selected Pattern (now one row higher).
     pub fn plus_pattern_above(&self, selected_pattern_id: &crate::ast::node::Id) -> Self {
@@ -908,7 +958,7 @@ impl LayoutAst {
         let column_x = selected_pos.x;
         let column_z = selected_pos.z;
         // Shift only sibling Patterns of the same match at Y ≥ selected.Y.
-        // External neighbours are handled by settle_matches once the new
+        // External neighbours are handled by settle_footprints once the new
         // Pattern has grown the footprint.
         let match_pattern_ids: std::collections::HashSet<crate::ast::node::Id> =
             self.match_pattern_ids(&parent_id).into_iter().collect();
@@ -1190,9 +1240,11 @@ impl LayoutAst {
     ///   (which has no explicit front node) and Pattern sub-ASTs (where the
     ///   Pattern itself is the implicit front). If the corridor collapses
     ///   (`sink.z >= -1`) or no SinkWall exists, returns `None`.
-    /// - X range: min/max over all layout nodes' rounded X, unioned with
-    ///   `active_selection.x` when provided. If the AST has no nodes at all
-    ///   the sink is the only node — X min/max = 0 (sink is at X=0).
+    /// - X range: min/max over every node's footprint X-span, unioned with
+    ///   `active_selection.x` when provided. Multi-cell footprints (matches,
+    ///   ≥3-input function calls) grow the grid so the extra cell is
+    ///   drawable. If the AST has no nodes at all the sink is the only
+    ///   node — X min/max = 0 (sink is at X=0).
     ///
     /// `active_selection` is the currently-selected cell in this AST's local
     /// coords, passed only when this AST is the active editing context.
@@ -1213,13 +1265,15 @@ impl LayoutAst {
         }
         let mut x_min = i32::MAX;
         let mut x_max = i32::MIN;
-        for ln in self.layout_nodes.values() {
-            let x = ln.pos.round().as_ivec3().x;
-            if x < x_min {
-                x_min = x;
+        for id in self.layout_nodes.keys() {
+            let Some(fp) = self.node_footprint(id) else {
+                continue;
+            };
+            if fp.min.x < x_min {
+                x_min = fp.min.x;
             }
-            if x > x_max {
-                x_max = x;
+            if fp.max.x > x_max {
+                x_max = fp.max.x;
             }
         }
         if let Some(sel) = active_selection {

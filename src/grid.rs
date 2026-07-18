@@ -34,6 +34,11 @@ impl Default for GridConfig {
 
 pub const GRID_SHADER_HANDLE: Handle<Shader> = uuid_handle!("47524944-4d41-4000-8000-000000000001");
 
+/// Maximum number of multi-cell node footprints that can suppress interior
+/// grid lines in a single grid mesh. Must match `MAX_FOOTPRINTS` in
+/// `assets/shaders/grid.wgsl`.
+pub const MAX_FOOTPRINTS: usize = 16;
+
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
 pub struct GridMaterial {
     #[uniform(0)]
@@ -72,10 +77,16 @@ pub struct GridMaterial {
     /// Multiplier over the normal line width for the border.
     #[uniform(0)]
     pub border_thickness: f32,
+    /// Number of active entries in `footprints` (0..=MAX_FOOTPRINTS).
+    #[uniform(0)]
+    pub footprint_count: u32,
     #[uniform(0)]
     pub _pad2: f32,
+    /// World-space footprints of multi-cell nodes: `xy = min.xz`, `zw =
+    /// max.xz`. Fragments whose neighbours across the nearest grid line all
+    /// lie inside the same footprint suppress that line.
     #[uniform(0)]
-    pub _pad3: f32,
+    pub footprints: [Vec4; MAX_FOOTPRINTS],
 }
 
 impl Material for GridMaterial {
@@ -145,8 +156,9 @@ fn spawn_grid(
             border_color: LinearRgba::WHITE,
             border_active: 0.0,
             border_thickness: 1.8,
+            footprint_count: 0,
             _pad2: 0.0,
-            _pad3: 0.0,
+            footprints: [Vec4::ZERO; MAX_FOOTPRINTS],
         })),
         BaseGridEntity,
     ));

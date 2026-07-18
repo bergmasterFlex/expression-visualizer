@@ -481,14 +481,39 @@ pub fn layoutnode_to_rendernode(
             let function_declaration = function_declarations
                 .get(function_declaration_id)
                 .expect("function call refers to unknown function declaration");
-            let output_local = Vec3::new(0.0, 0.0, -1.0);
-            let output_world = node_pos + output_local;
+            // Footprint-driven placement: the mesh centres on the AABB of the
+            // node's footprint (min-extent rule in layout::node_footprint), so
+            // 1–2-input calls sit between two cells along Z and 3+-input calls
+            // sit between four cells (X+0.5, Z−0.5 from the anchor cell).
+            // The pyramid itself keeps its original small dimensions — only
+            // the footprint (grid-line suppression + displacement) grows.
+            let footprint = layout_ast
+                .node_footprint(&layout_node.node_id)
+                .expect("function call must have a footprint");
+            let fp_center_x_grid = (footprint.min.x + footprint.max.x) as f32 * 0.5;
+            let fp_center_z_grid = (footprint.min.z + footprint.max.z) as f32 * 0.5;
+            let n = input_anchors.len() as f32;
+            let mesh_base_x_world = n * 0.5;
+            let mesh_depth_world = 1.0;
+            let mesh_height_world = std::f32::consts::FRAC_1_SQRT_2;
+            // The rect_pyramid_z_mesh has its origin at the base centre (base
+            // at local Z=0, tip at local Z=−depth). Shift the transform by
+            // +depth/2 so the mesh's Z-bbox centres on the footprint centre.
+            let fp_center_world = layout_to_world(
+                Vec3::new(fp_center_x_grid, layout_node.pos.y, fp_center_z_grid) + extra_offset,
+            );
+            let mesh_center_world = fp_center_world + Vec3::new(0.0, 0.0, mesh_depth_world * 0.5);
+            let mesh_tf = Transform::from_translation(mesh_center_world);
+            let node_center_world = fp_center_world;
+            let spread = 1.0_f32;
+            let output_local = Vec3::new(0.0, 0.0, -mesh_depth_world);
+            let output_world = mesh_center_world + output_local;
             RenderNode {
                 node: RenderObject {
                     mesh: crate::mesh::rect_pyramid_z_mesh(
-                        input_anchors.len() as f32 * 0.5,
-                        std::f32::consts::FRAC_1_SQRT_2,
-                        1.0,
+                        mesh_base_x_world,
+                        mesh_height_world,
+                        mesh_depth_world,
                     ),
                     material: StandardMaterial {
                         base_color: Color::srgb(0.5, 0.9, 1.0),
@@ -496,17 +521,16 @@ pub fn layoutnode_to_rendernode(
                         unlit: true,
                         ..default()
                     },
-                    transform: node_pos_tf,
+                    transform: mesh_tf,
                 },
                 anchors: input_anchors
                     .iter()
                     .enumerate()
                     .map(|(i_anchor, anchor_id)| {
-                        let spread = 1.0;
-                        let start_x = -(input_anchors.len() as f32 - 1.0) * spread / 2.0;
+                        let start_x = -(n - 1.0) * spread / 2.0;
                         let x = start_x + i_anchor as f32 * spread;
                         let input_local = Vec3::new(x, 0.0, 0.0);
-                        let input_world = node_pos + input_local;
+                        let input_world = mesh_center_world + input_local;
                         let input_type = function_declaration
                             .inputs
                             .get(i_anchor)
@@ -523,8 +547,7 @@ pub fn layoutnode_to_rendernode(
                                         unlit: true,
                                         ..default()
                                     },
-                                    transform: node_pos_tf
-                                        * Transform::from_translation(input_local),
+                                    transform: mesh_tf * Transform::from_translation(input_local),
                                 },
                                 hovered: RenderObject {
                                     mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
@@ -534,7 +557,7 @@ pub fn layoutnode_to_rendernode(
                                         unlit: true,
                                         ..default()
                                     },
-                                    transform: node_pos_tf
+                                    transform: mesh_tf
                                         * Transform::from_translation(input_local)
                                         * Transform::from_scale(Vec3::splat(1.8)),
                                 },
@@ -558,7 +581,7 @@ pub fn layoutnode_to_rendernode(
                                     unlit: true,
                                     ..default()
                                 },
-                                transform: node_pos_tf * Transform::from_translation(output_local),
+                                transform: mesh_tf * Transform::from_translation(output_local),
                             },
                             hovered: RenderObject {
                                 mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
@@ -568,7 +591,7 @@ pub fn layoutnode_to_rendernode(
                                     unlit: true,
                                     ..default()
                                 },
-                                transform: node_pos_tf
+                                transform: mesh_tf
                                     * Transform::from_translation(output_local)
                                     * Transform::from_scale(Vec3::splat(1.8)),
                             },
@@ -585,7 +608,7 @@ pub fn layoutnode_to_rendernode(
                     text: node.label(function_declarations),
                     color: Color::WHITE,
                     font_size: 18.0,
-                    world_pos: node_pos,
+                    world_pos: node_center_world,
                     offset: Vec2::ZERO,
                 }],
             }
