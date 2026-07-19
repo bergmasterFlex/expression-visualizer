@@ -1,0 +1,8 @@
+[watch]
+# Explicit watch roots instead of the default (the build target's parent
+# folder, i.e. the repo root). Trunk registers a *recursive* watch before its
+# `ignore` list is applied to events, so an unreadable directory anywhere under
+# the root — e.g. `.claude/.cc-writes`, mode 0700 and owned by the Claude Code
+# agent user — aborts startup with "Permission denied". Naming the roots keeps
+# the walker out of those directories entirely; `--ignore` does not.
+watch = ["src", "assets", "index.html", "Cargo.toml"]

@@ -4302,6 +4302,7 @@ fn drag_update_system(
     hovered: Query<(&GlobalTransform, &EAnchor), With<AnchorHovered>>,
     mut drag: ResMut<DragState>,
     eval: Res<EvalState>,
+    state: Res<AstState>,
 ) {
     if is_evaluating(&eval) {
         return;
@@ -4340,15 +4341,21 @@ fn drag_update_system(
     // ins Leere trotzdem eine Edge an.
     info.target_anchor_id = None;
     if let Ok((tf, anchor)) = hovered.single() {
+        let target_id = anchor.id();
         // Vergleich über AnchorId, nicht Entity: Entities werden bei jedem
         // Rebuild neu gespawnt, ein Entity-Vergleich würde den Quell-Anchor
         // nach einem Rebuild mitten im Drag als gültiges Ziel durchlassen und
         // eine Self-Edge erzeugen.
-        let is_self = anchor.id() == info.source_anchor_id;
+        let is_self = target_id == info.source_anchor_id;
         // Nur output → input (oder umgekehrt) verbinden.
         let is_opposite_kind = matches!(anchor, EAnchor::Output { .. }) != info.source_is_output;
-        if !is_self && is_opposite_kind {
-            info.target_anchor_id = Some(anchor.id());
+        // Schon verbundene Paare snappen nicht ein, damit die Preview-Linie
+        // gelb bleibt statt eine Verbindung zu versprechen, die drag_end
+        // ohnehin als Duplikat verwirft.
+        let is_duplicate =
+            anchors_already_connected(state.program_ast(), &info.source_anchor_id, &target_id);
+        if !is_self && is_opposite_kind && !is_duplicate {
+            info.target_anchor_id = Some(target_id);
             info.current_end = tf.translation();
         }
     }
@@ -4509,6 +4516,30 @@ fn update_crosshair(
     }
 }
 
+/// True if `a` and `b` are already joined by an edge, in either stored
+/// direction.
+///
+/// `Ast::plus_edge` appends unconditionally, so without this guard reconnecting
+/// the same pair stacks a second, perfectly coincident ribbon on the first —
+/// invisible until one of them is deleted. The reverse direction is checked too
+/// because edges recorded before drag-end started normalising to output → input
+/// may still sit the other way around, and `eval::neighbours_of_anchor` treats
+/// both orientations as connected.
+fn anchors_already_connected(
+    layout_ast: &layout::LayoutAst,
+    a: &ast::AnchorId,
+    b: &ast::AnchorId,
+) -> bool {
+    let joined = |from: &ast::AnchorId, to: &ast::AnchorId| {
+        layout_ast
+            .ast
+            .edges
+            .get(from)
+            .is_some_and(|edges| edges.iter().any(|e| e.to == *to))
+    };
+    joined(a, b) || joined(b, a)
+}
+
 fn drag_end_system(
     mouse: Res<ButtonInput<MouseButton>>,
     mut drag: ResMut<DragState>,
@@ -4535,7 +4566,7 @@ fn drag_end_system(
                 // Defensiv: eine Self-Edge kollabiert die Kurve zu einer
                 // Schlaufe am Anchor. drag_update lässt das nicht zu, aber die
                 // Invariante hier nochmal festnageln.
-                if from != to {
+                if from != to && !anchors_already_connected(state.program_ast(), &from, &to) {
                     let updated = state.program_ast().plus_edge(from, to);
                     *state.program_ast_mut() = updated;
                     rebuild.0 = true;
