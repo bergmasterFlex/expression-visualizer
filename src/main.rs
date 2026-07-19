@@ -172,12 +172,20 @@ pub struct Edge {
     pub source_anchor_id: ast::AnchorId,
 }
 
+/// In-flight drag-to-connect state.
+///
+/// Deliberately holds no `Entity`: `clear_scene` despawns and respawns every
+/// `AstSceneEntity` on each rebuild, so an entity captured at drag start is
+/// stale the moment anything sets `NeedsRebuild` mid-drag. Anchor identity is
+/// tracked by `AnchorId`, which survives rebuilds.
 pub struct DragInfo {
-    pub source_anchor: Entity,
     pub source_anchor_id: ast::AnchorId,
+    /// `true` if the drag started on an `EAnchor::Output`. Lets the target
+    /// check reject same-kind pairs and lets drag-end store the edge in the
+    /// canonical output → input direction without an AST lookup.
+    pub source_is_output: bool,
     pub source_pos: Vec3,
     pub current_end: Vec3,
-    pub target_anchor: Option<Entity>,
     pub target_anchor_id: Option<ast::AnchorId>,
 }
 
@@ -4170,10 +4178,23 @@ fn anchor_hover_system(
     camera_q: Query<(&Camera, &GlobalTransform)>,
     anchors: Query<(Entity, &GlobalTransform), With<EAnchor>>,
     existing_hovers: Query<Entity, With<AnchorHovered>>,
+    ui_interactions: Query<&Interaction, With<Button>>,
 ) {
     // Alle vorherigen Hovers entfernen
     for e in &existing_hovers {
         commands.entity(e).remove::<AnchorHovered>();
+    }
+
+    // Anchor-Hover ist rein screen-space (Distanz zum projizierten Anchor) und
+    // weiß nichts von davorliegenden UI-Panels. Ohne diesen Guard startet ein
+    // Klick auf einen Button/eine Dropdown-Option einen Drag, sobald zufällig
+    // ein Anchor in Cursor-Nähe projiziert wird. Gleiches Muster wie in
+    // `pick_nodes`.
+    let over_ui = ui_interactions
+        .iter()
+        .any(|i| matches!(*i, Interaction::Hovered | Interaction::Pressed));
+    if over_ui {
+        return;
     }
 
     let Ok(window) = windows.single() else {
@@ -4244,7 +4265,7 @@ fn anchor_hover_visual_system(
 
 fn draw_drag_preview(drag: Res<DragState>, mut gizmos: Gizmos) {
     let Some(ref info) = drag.active else { return };
-    let color = if info.target_anchor.is_some() {
+    let color = if info.target_anchor_id.is_some() {
         Color::srgb(0.3, 1.0, 0.4) // grün = eingeschnappt
     } else {
         Color::srgb(1.0, 0.9, 0.3) // gelb = dragging
@@ -4254,7 +4275,7 @@ fn draw_drag_preview(drag: Res<DragState>, mut gizmos: Gizmos) {
 
 fn drag_start_system(
     mouse: Res<ButtonInput<MouseButton>>,
-    hovered: Query<(Entity, &GlobalTransform, &EAnchor), (With<AnchorHovered>)>,
+    hovered: Query<(&GlobalTransform, &EAnchor), With<AnchorHovered>>,
     mut drag: ResMut<DragState>,
     eval: Res<EvalState>,
 ) {
@@ -4262,14 +4283,13 @@ fn drag_start_system(
         return;
     }
     if mouse.just_pressed(MouseButton::Left) {
-        if let Ok((entity, tf, anchor)) = hovered.single() {
+        if let Ok((tf, anchor)) = hovered.single() {
             let pos = tf.translation();
             drag.active = Some(DragInfo {
-                source_anchor: entity,
                 source_anchor_id: anchor.id(),
+                source_is_output: matches!(anchor, EAnchor::Output { .. }),
                 source_pos: pos,
                 current_end: pos,
-                target_anchor: None,
                 target_anchor_id: None,
             });
         }
@@ -4279,7 +4299,7 @@ fn drag_start_system(
 fn drag_update_system(
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform)>,
-    hovered: Query<(Entity, &GlobalTransform, &EAnchor), (With<AnchorHovered>)>,
+    hovered: Query<(&GlobalTransform, &EAnchor), With<AnchorHovered>>,
     mut drag: ResMut<DragState>,
     eval: Res<EvalState>,
 ) {
@@ -4315,11 +4335,19 @@ fn drag_update_system(
         }
     }
 
-    // Snap zu hovering target
-    info.target_anchor = None;
-    if let Ok((entity, tf, anchor)) = hovered.single() {
-        if entity != info.source_anchor {
-            info.target_anchor = Some(entity);
+    // Snap zu hovering target. Muss jeden Frame zurückgesetzt werden — sonst
+    // hält drag_end an einem längst verlassenen Ziel fest und legt beim Drop
+    // ins Leere trotzdem eine Edge an.
+    info.target_anchor_id = None;
+    if let Ok((tf, anchor)) = hovered.single() {
+        // Vergleich über AnchorId, nicht Entity: Entities werden bei jedem
+        // Rebuild neu gespawnt, ein Entity-Vergleich würde den Quell-Anchor
+        // nach einem Rebuild mitten im Drag als gültiges Ziel durchlassen und
+        // eine Self-Edge erzeugen.
+        let is_self = anchor.id() == info.source_anchor_id;
+        // Nur output → input (oder umgekehrt) verbinden.
+        let is_opposite_kind = matches!(anchor, EAnchor::Output { .. }) != info.source_is_output;
+        if !is_self && is_opposite_kind {
             info.target_anchor_id = Some(anchor.id());
             info.current_end = tf.translation();
         }
@@ -4496,11 +4524,22 @@ fn drag_end_system(
     if mouse.just_released(MouseButton::Left) {
         if let Some(info) = drag.active.take() {
             if let Some(target_id) = info.target_anchor_id {
-                let updated = state
-                    .program_ast()
-                    .plus_edge(info.source_anchor_id, target_id);
-                *state.program_ast_mut() = updated;
-                rebuild.0 = true;
+                // Edges immer output → input speichern: EdgeCurve::from_endpoints
+                // leitet die Tangenten aus dieser Richtung ab, und der Renderer
+                // stapelt die Leaves nach Quelle/Ziel.
+                let (from, to) = if info.source_is_output {
+                    (info.source_anchor_id, target_id)
+                } else {
+                    (target_id, info.source_anchor_id)
+                };
+                // Defensiv: eine Self-Edge kollabiert die Kurve zu einer
+                // Schlaufe am Anchor. drag_update lässt das nicht zu, aber die
+                // Invariante hier nochmal festnageln.
+                if from != to {
+                    let updated = state.program_ast().plus_edge(from, to);
+                    *state.program_ast_mut() = updated;
+                    rebuild.0 = true;
+                }
             }
             // Kein target → Drag wird einfach verworfen
         }
