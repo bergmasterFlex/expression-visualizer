@@ -23,9 +23,13 @@ pub struct RenderNode {
 }
 
 pub struct RenderAnchor {
-    pub normal: RenderObject,
-    pub hovered: RenderObject,
+    /// World point used for screen-space hover picking and as the edge
+    /// endpoint. Sits at the centre of the anchor cuboid (or cuboid stack).
+    pub pick_center: Vec3,
     pub type_markers: Vec<RenderTypeMarker>,
+    /// Neutral cuboid for anchors that carry no type markers (SinkWall,
+    /// MatchBack, MatchNew), so they stay visible and pickable.
+    pub plain_body: Option<RenderObject>,
 }
 
 pub struct RenderTypeMarker {
@@ -50,7 +54,15 @@ pub struct RenderLabel {
 
 const TYPE_MARKER_ALPHA: f32 = 0.6;
 pub const TYPE_MARKER_Y_STEP: f32 = 1.0;
-const TYPE_MARKER_HALF_DEPTH: f32 = 0.5;
+const TYPE_MARKER_HALF_DEPTH: f32 = 0.25;
+/// Full Z-depth of an anchor cuboid (half the old 1.0 type-marker depth).
+const ANCHOR_DEPTH: f32 = 2.0 * TYPE_MARKER_HALF_DEPTH;
+/// X-width of an anchor cuboid (half the old 0.45 node width). Shared with the
+/// three slab nodes so anchor and node line up exactly in X.
+pub const ANCHOR_X: f32 = 0.225;
+/// Half Z-depth (and half X-width) of the three slab nodes — the anchor cuboid
+/// sits flush against this face.
+const NODE_HALF_DEPTH: f32 = ANCHOR_X / 2.0;
 /// Y-thickness of the gizmo line drawn in the far 2/3 of a value-carrying
 /// type marker. Matches the anchor-sphere radius so lines and spheres read as
 /// one visual family.
@@ -163,7 +175,7 @@ fn build_type_markers(
                 );
                 RenderTypeMarker {
                     rect: RenderObject {
-                        mesh: Cuboid::new(0.0, TYPE_MARKER_Y_STEP, stub_depth)
+                        mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, stub_depth)
                             .mesh()
                             .build(),
                         material: StandardMaterial {
@@ -207,7 +219,7 @@ fn build_type_markers(
                 let center = Vec3::new(anchor_world_pos.x, y_center, full_rect_z_center);
                 RenderTypeMarker {
                     rect: RenderObject {
-                        mesh: Cuboid::new(0.0, TYPE_MARKER_Y_STEP, full_depth)
+                        mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, full_depth)
                             .mesh()
                             .build(),
                         material: StandardMaterial {
@@ -232,6 +244,32 @@ fn build_type_markers(
             }
         })
         .collect()
+}
+
+/// Centre of an anchor cuboid whose near face sits at `face` (world space).
+/// Inputs extend the cuboid +Z from the face, outputs extend −Z.
+fn anchor_pick_center(face: Vec3, is_input: bool) -> Vec3 {
+    let sign = if is_input { 1.0 } else { -1.0 };
+    face + Vec3::new(0.0, 0.0, sign * ANCHOR_DEPTH * 0.5)
+}
+
+/// A neutral grey anchor cuboid centred at `center`. Used for anchors that
+/// carry no type markers (SinkWall, MatchBack, MatchNew) so they stay visible
+/// and pickable once the spheres are gone.
+fn plain_anchor_body(center: Vec3) -> RenderObject {
+    RenderObject {
+        mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, ANCHOR_DEPTH)
+            .mesh()
+            .build(),
+        material: StandardMaterial {
+            base_color: Color::srgba(0.5, 0.5, 0.5, TYPE_MARKER_ALPHA),
+            alpha_mode: AlphaMode::Blend,
+            cull_mode: None,
+            unlit: true,
+            ..default()
+        },
+        transform: Transform::from_translation(center),
+    }
 }
 
 /// Spawn the AST node meshes.
@@ -261,44 +299,15 @@ pub fn layoutnode_to_rendernode(
             output_anchor,
         } => {
             let color = Color::srgb(0.0, 0.9, 0.0);
-            let output_local = Vec3::new(0.0, 0.0, -0.225);
+            let output_local = Vec3::new(0.0, 0.0, -NODE_HALF_DEPTH);
             let output_world = node_pos + output_local;
             let output_eval_type = crate::eval::ast_type_to_eval_type(r#type);
             let output_value = crate::layout::value_of_etype(r#type);
             RenderNode {
                 node: RenderObject {
-                    mesh: match r#type {
-                        /*
-                        let sphere_mesh = meshes.add(Sphere::new(0.32));
-                        let octa_mesh = meshes.add(mesh::octahedron_mesh(0.38));
-                        let ring_mesh = meshes.add(Torus::new(0.225, 0.38));
-                        let ring_big_mesh = meshes.add(Torus::new(0.025, 0.48));
-                        let cone_mesh = meshes.add(mesh::create_cone_mesh(0.5, 1.0, 16));
-                        let pyramide_mesh = meshes.add(mesh::create_cone_mesh(0.5, 1.0, 4));
-                        let bool_mesh = meshes.add(mesh::create_bool_mesh(0.5, 1.0, 16));
-                        */
-                        crate::ast::node::EType::Bool { .. } => {
-                            Cuboid::new(0.45, 0.45, 0.45).mesh()
-                        }
-                        crate::ast::node::EType::Int { .. } => Cuboid::new(0.45, 0.45, 0.45).mesh(),
-                        crate::ast::node::EType::Float { .. } => {
-                            Cuboid::new(0.45, 0.45, 0.45).mesh()
-                        }
-                        crate::ast::node::EType::String { .. } => {
-                            Cuboid::new(0.45, 0.45, 0.45).mesh()
-                        }
-                        crate::ast::node::EType::Char { .. } => {
-                            Cuboid::new(0.45, 0.45, 0.45).mesh()
-                        }
-                        crate::ast::node::EType::Any { .. } => Cuboid::new(0.45, 0.45, 0.45).mesh(),
-                        crate::ast::node::EType::Undefined { .. } => {
-                            Cuboid::new(0.45, 0.45, 0.45).mesh()
-                        }
-                        crate::ast::node::EType::Exception { .. } => {
-                            Cuboid::new(0.45, 0.45, 0.45).mesh()
-                        }
-                    }
-                    .build(),
+                    mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, ANCHOR_X)
+                        .mesh()
+                        .build(),
                     material: StandardMaterial {
                         base_color: color,
                         emissive: emissive_color(color),
@@ -311,34 +320,14 @@ pub fn layoutnode_to_rendernode(
                 anchors: std::collections::HashMap::from([(
                     output_anchor.clone(),
                     RenderAnchor {
-                        normal: RenderObject {
-                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                            material: StandardMaterial {
-                                base_color: Color::srgb(0.3, 0.6, 1.0),
-                                emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                                unlit: true,
-                                ..default()
-                            },
-                            transform: node_pos_tf * Transform::from_translation(output_local),
-                        },
-                        hovered: RenderObject {
-                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                            material: StandardMaterial {
-                                base_color: Color::srgb(0.5, 0.9, 1.0),
-                                emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                                unlit: true,
-                                ..default()
-                            },
-                            transform: node_pos_tf
-                                * Transform::from_translation(output_local)
-                                * Transform::from_scale(Vec3::splat(1.8)),
-                        },
+                        pick_center: anchor_pick_center(output_world, false),
                         type_markers: build_type_markers(
                             &output_eval_type,
                             output_value.as_deref(),
                             output_world,
                             false,
                         ),
+                        plain_body: None,
                     },
                 )]),
                 labels: vec![RenderLabel {
@@ -356,37 +345,17 @@ pub fn layoutnode_to_rendernode(
             output_anchor,
         } => {
             let color = Color::srgb(0.9, 0.0, 0.0);
-            let input_local = Vec3::new(0.0, 0.0, 0.55);
-            let output_local = Vec3::new(0.0, 0.0, -0.55);
+            let input_local = Vec3::new(0.0, 0.0, NODE_HALF_DEPTH);
+            let output_local = Vec3::new(0.0, 0.0, -NODE_HALF_DEPTH);
             let input_world = node_pos + input_local;
             let output_world = node_pos + output_local;
             let eval_type = crate::eval::ast_type_to_eval_type(r#type);
             let elim_value = crate::layout::value_of_etype(r#type);
             RenderNode {
                 node: RenderObject {
-                    mesh: match r#type {
-                        crate::ast::node::EType::Bool { .. } => {
-                            Cuboid::new(0.45, 0.45, 0.45).mesh()
-                        }
-                        crate::ast::node::EType::Int { .. } => Cuboid::new(0.45, 0.45, 0.45).mesh(),
-                        crate::ast::node::EType::Float { .. } => {
-                            Cuboid::new(0.45, 0.45, 0.45).mesh()
-                        }
-                        crate::ast::node::EType::String { .. } => {
-                            Cuboid::new(0.45, 0.45, 0.45).mesh()
-                        }
-                        crate::ast::node::EType::Char { .. } => {
-                            Cuboid::new(0.45, 0.45, 0.45).mesh()
-                        }
-                        crate::ast::node::EType::Any { .. } => Cuboid::new(0.45, 0.45, 0.45).mesh(),
-                        crate::ast::node::EType::Undefined { .. } => {
-                            Cuboid::new(0.45, 0.45, 0.45).mesh()
-                        }
-                        crate::ast::node::EType::Exception { .. } => {
-                            Cuboid::new(0.45, 0.45, 0.45).mesh()
-                        }
-                    }
-                    .build(),
+                    mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, ANCHOR_X)
+                        .mesh()
+                        .build(),
                     material: StandardMaterial {
                         base_color: color,
                         emissive: emissive_color(color),
@@ -400,67 +369,27 @@ pub fn layoutnode_to_rendernode(
                     (
                         input_anchor.clone(),
                         RenderAnchor {
-                            normal: RenderObject {
-                                mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                                material: StandardMaterial {
-                                    base_color: Color::srgb(0.3, 0.6, 1.0),
-                                    emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                                    unlit: true,
-                                    ..default()
-                                },
-                                transform: node_pos_tf * Transform::from_translation(input_local),
-                            },
-                            hovered: RenderObject {
-                                mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                                material: StandardMaterial {
-                                    base_color: Color::srgb(0.5, 0.9, 1.0),
-                                    emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                                    unlit: true,
-                                    ..default()
-                                },
-                                transform: node_pos_tf
-                                    * Transform::from_translation(input_local)
-                                    * Transform::from_scale(Vec3::splat(1.8)),
-                            },
+                            pick_center: anchor_pick_center(input_world, true),
                             type_markers: build_type_markers(
                                 &eval_type,
                                 elim_value.as_deref(),
                                 input_world,
                                 true,
                             ),
+                            plain_body: None,
                         },
                     ),
                     (
                         output_anchor.clone(),
                         RenderAnchor {
-                            normal: RenderObject {
-                                mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                                material: StandardMaterial {
-                                    base_color: Color::srgb(0.3, 0.6, 1.0),
-                                    emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                                    unlit: true,
-                                    ..default()
-                                },
-                                transform: node_pos_tf * Transform::from_translation(output_local),
-                            },
-                            hovered: RenderObject {
-                                mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                                material: StandardMaterial {
-                                    base_color: Color::srgb(0.5, 0.9, 1.0),
-                                    emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                                    unlit: true,
-                                    ..default()
-                                },
-                                transform: node_pos_tf
-                                    * Transform::from_translation(output_local)
-                                    * Transform::from_scale(Vec3::splat(1.8)),
-                            },
+                            pick_center: anchor_pick_center(output_world, false),
                             type_markers: build_type_markers(
                                 &eval_type,
                                 elim_value.as_deref(),
                                 output_world,
                                 false,
                             ),
+                            plain_body: None,
                         },
                     ),
                 ]),
@@ -539,68 +468,28 @@ pub fn layoutnode_to_rendernode(
                         (
                             anchor_id.clone(),
                             RenderAnchor {
-                                normal: RenderObject {
-                                    mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                                    material: StandardMaterial {
-                                        base_color: Color::srgb(0.3, 0.6, 1.0),
-                                        emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                                        unlit: true,
-                                        ..default()
-                                    },
-                                    transform: mesh_tf * Transform::from_translation(input_local),
-                                },
-                                hovered: RenderObject {
-                                    mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                                    material: StandardMaterial {
-                                        base_color: Color::srgb(0.5, 0.9, 1.0),
-                                        emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                                        unlit: true,
-                                        ..default()
-                                    },
-                                    transform: mesh_tf
-                                        * Transform::from_translation(input_local)
-                                        * Transform::from_scale(Vec3::splat(1.8)),
-                                },
+                                pick_center: anchor_pick_center(input_world, true),
                                 type_markers: build_type_markers(
                                     &input_type,
                                     None,
                                     input_world,
                                     true,
                                 ),
+                                plain_body: None,
                             },
                         )
                     })
                     .chain([(
                         output_anchor.clone(),
                         RenderAnchor {
-                            normal: RenderObject {
-                                mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                                material: StandardMaterial {
-                                    base_color: Color::srgb(0.3, 0.6, 1.0),
-                                    emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                                    unlit: true,
-                                    ..default()
-                                },
-                                transform: mesh_tf * Transform::from_translation(output_local),
-                            },
-                            hovered: RenderObject {
-                                mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                                material: StandardMaterial {
-                                    base_color: Color::srgb(0.5, 0.9, 1.0),
-                                    emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                                    unlit: true,
-                                    ..default()
-                                },
-                                transform: mesh_tf
-                                    * Transform::from_translation(output_local)
-                                    * Transform::from_scale(Vec3::splat(1.8)),
-                            },
+                            pick_center: anchor_pick_center(output_world, false),
                             type_markers: build_type_markers(
                                 &function_declaration.output_type,
                                 None,
                                 output_world,
                                 false,
                             ),
+                            plain_body: None,
                         },
                     )])
                     .collect(),
@@ -619,13 +508,15 @@ pub fn layoutnode_to_rendernode(
             ..
         } => {
             let color = Color::srgb(0.0, 0.6, 0.9);
-            let output_local = Vec3::new(0.0, 0.0, -0.225);
+            let output_local = Vec3::new(0.0, 0.0, -NODE_HALF_DEPTH);
             let output_world = node_pos + output_local;
             let output_eval_type = crate::eval::ast_type_to_eval_type(r#type);
             let output_value = crate::layout::value_of_etype(r#type);
             RenderNode {
                 node: RenderObject {
-                    mesh: Cuboid::new(0.45, 0.45, 0.45).mesh().build(),
+                    mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, ANCHOR_X)
+                        .mesh()
+                        .build(),
                     material: StandardMaterial {
                         base_color: color,
                         emissive: emissive_color(color),
@@ -638,34 +529,14 @@ pub fn layoutnode_to_rendernode(
                 anchors: std::collections::HashMap::from([(
                     output_anchor.clone(),
                     RenderAnchor {
-                        normal: RenderObject {
-                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                            material: StandardMaterial {
-                                base_color: Color::srgb(0.3, 0.6, 1.0),
-                                emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                                unlit: true,
-                                ..default()
-                            },
-                            transform: node_pos_tf * Transform::from_translation(output_local),
-                        },
-                        hovered: RenderObject {
-                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                            material: StandardMaterial {
-                                base_color: Color::srgb(0.5, 0.9, 1.0),
-                                emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                                unlit: true,
-                                ..default()
-                            },
-                            transform: node_pos_tf
-                                * Transform::from_translation(output_local)
-                                * Transform::from_scale(Vec3::splat(1.8)),
-                        },
+                        pick_center: anchor_pick_center(output_world, false),
                         type_markers: build_type_markers(
                             &output_eval_type,
                             output_value.as_deref(),
                             output_world,
                             false,
                         ),
+                        plain_body: None,
                     },
                 )]),
                 labels: vec![RenderLabel {
@@ -691,27 +562,9 @@ pub fn layoutnode_to_rendernode(
             anchors: std::collections::HashMap::from([(
                 input_anchor.clone(),
                 RenderAnchor {
-                    normal: RenderObject {
-                        mesh: Sphere::new(0.12).mesh().ico(2).unwrap(),
-                        material: StandardMaterial {
-                            base_color: Color::srgb(0.3, 0.6, 1.0),
-                            emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                            unlit: true,
-                            ..default()
-                        },
-                        transform: node_pos_tf,
-                    },
-                    hovered: RenderObject {
-                        mesh: Sphere::new(0.12).mesh().ico(2).unwrap(),
-                        material: StandardMaterial {
-                            base_color: Color::srgb(0.5, 0.9, 1.0),
-                            emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                            unlit: true,
-                            ..default()
-                        },
-                        transform: node_pos_tf * Transform::from_scale(Vec3::splat(1.8)),
-                    },
+                    pick_center: node_pos,
                     type_markers: vec![],
+                    plain_body: Some(plain_anchor_body(node_pos)),
                 },
             )]),
             labels: vec![],
@@ -755,65 +608,27 @@ pub fn layoutnode_to_rendernode(
                 .enumerate()
                 .map(|(i, anchor_id)| {
                     let y = i as f32 * input_spread;
+                    let center = node_pos + Vec3::new(0.0, y, 0.0);
                     (
                         anchor_id.clone(),
                         RenderAnchor {
-                            normal: RenderObject {
-                                mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                                material: StandardMaterial {
-                                    base_color: Color::srgb(0.3, 0.6, 1.0),
-                                    emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                                    unlit: true,
-                                    ..default()
-                                },
-                                transform: node_pos_tf
-                                    * Transform::from_translation(Vec3::new(0.0, y, 0.0)),
-                            },
-                            hovered: RenderObject {
-                                mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                                material: StandardMaterial {
-                                    base_color: Color::srgb(0.5, 0.9, 1.0),
-                                    emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                                    unlit: true,
-                                    ..default()
-                                },
-                                transform: node_pos_tf
-                                    * Transform::from_translation(Vec3::new(0.0, y, 0.0))
-                                    * Transform::from_scale(Vec3::splat(1.8)),
-                            },
+                            pick_center: center,
                             type_markers: vec![],
+                            plain_body: Some(plain_anchor_body(center)),
                         },
                     )
                 })
-                .chain([(
-                    output_anchor.clone(),
-                    RenderAnchor {
-                        normal: RenderObject {
-                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                            material: StandardMaterial {
-                                base_color: Color::srgb(0.3, 0.6, 1.0),
-                                emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                                unlit: true,
-                                ..default()
-                            },
-                            transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, -3.0)),
+                .chain([{
+                    let center = node_pos + Vec3::new(0.0, 0.0, -3.0);
+                    (
+                        output_anchor.clone(),
+                        RenderAnchor {
+                            pick_center: center,
+                            type_markers: vec![],
+                            plain_body: Some(plain_anchor_body(center)),
                         },
-                        hovered: RenderObject {
-                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                            material: StandardMaterial {
-                                base_color: Color::srgb(0.5, 0.9, 1.0),
-                                emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                                unlit: true,
-                                ..default()
-                            },
-                            transform: node_pos_tf
-                                * Transform::from_translation(Vec3::new(0.0, 0.0, -3.0))
-                                * Transform::from_scale(Vec3::splat(1.8)),
-                        },
-                        type_markers: vec![],
-                    },
-                )])
+                    )
+                }])
                 .collect();
             RenderNode {
                 node: RenderObject {
@@ -845,13 +660,15 @@ pub fn layoutnode_to_rendernode(
             ..
         } => {
             let color = Color::srgb(0.9, 0.0, 0.0);
-            let output_local = Vec3::new(0.0, 0.0, -0.55);
+            let output_local = Vec3::new(0.0, 0.0, -NODE_HALF_DEPTH);
             let output_world = node_pos + output_local;
             let eval_type = crate::eval::ast_type_to_eval_type(r#type);
             let pattern_value = crate::layout::value_of_etype(r#type);
             RenderNode {
                 node: RenderObject {
-                    mesh: Cuboid::new(0.45, 0.45, 0.45).mesh().build(),
+                    mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, ANCHOR_X)
+                        .mesh()
+                        .build(),
                     material: StandardMaterial {
                         base_color: color,
                         emissive: emissive_color(color),
@@ -864,34 +681,14 @@ pub fn layoutnode_to_rendernode(
                 anchors: std::collections::HashMap::from([(
                     output_anchor.clone(),
                     RenderAnchor {
-                        normal: RenderObject {
-                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                            material: StandardMaterial {
-                                base_color: Color::srgb(0.3, 0.6, 1.0),
-                                emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                                unlit: true,
-                                ..default()
-                            },
-                            transform: node_pos_tf * Transform::from_translation(output_local),
-                        },
-                        hovered: RenderObject {
-                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                            material: StandardMaterial {
-                                base_color: Color::srgb(0.5, 0.9, 1.0),
-                                emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                                unlit: true,
-                                ..default()
-                            },
-                            transform: node_pos_tf
-                                * Transform::from_translation(output_local)
-                                * Transform::from_scale(Vec3::splat(1.8)),
-                        },
+                        pick_center: anchor_pick_center(output_world, false),
                         type_markers: build_type_markers(
                             &eval_type,
                             pattern_value.as_deref(),
                             output_world,
                             false,
                         ),
+                        plain_body: None,
                     },
                 )]),
                 labels: vec![RenderLabel {
@@ -916,12 +713,19 @@ pub fn layoutnode_to_rendernode(
                 .fold(layout_node.pos.y, f32::max);
             let y_diff_grid = max_y_grid - layout_node.pos.y;
             let y_diff_world = y_diff_grid * LAYOUT_SCALE.y;
-            let height = y_diff_world + 0.45;
+            // Pad by a full anchor-rect height so the top/bottom patterns (now
+            // TYPE_MARKER_Y_STEP tall) stay enclosed by the envelope.
+            let height = y_diff_world + TYPE_MARKER_Y_STEP;
             let center_local = Vec3::new(0.0, y_diff_world / 2.0, 0.0);
-            let input_local = Vec3::new(0.0, 0.0, 0.55);
+            // Envelope hugs the slim patterns with the same 0.05 per-side margin
+            // it had around the old 0.45 cubes.
+            let envelope_xz = ANCHOR_X + 2.0 * 0.05;
+            // Input port sits flush against the envelope's +Z front face.
+            let front_face = node_pos + Vec3::new(0.0, 0.0, envelope_xz / 2.0);
+            let port_center = anchor_pick_center(front_face, true);
             RenderNode {
                 node: RenderObject {
-                    mesh: Cuboid::new(0.55, height, 0.55).mesh().build(),
+                    mesh: Cuboid::new(envelope_xz, height, envelope_xz).mesh().build(),
                     material: StandardMaterial {
                         base_color: Color::srgba(0.9, 0.0, 0.0, 0.35),
                         alpha_mode: AlphaMode::Blend,
@@ -933,29 +737,9 @@ pub fn layoutnode_to_rendernode(
                 anchors: std::collections::HashMap::from([(
                     input_anchor.clone(),
                     RenderAnchor {
-                        normal: RenderObject {
-                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                            material: StandardMaterial {
-                                base_color: Color::srgb(0.3, 0.6, 1.0),
-                                emissive: LinearRgba::new(0.05, 0.1, 0.2, 1.0),
-                                unlit: true,
-                                ..default()
-                            },
-                            transform: node_pos_tf * Transform::from_translation(input_local),
-                        },
-                        hovered: RenderObject {
-                            mesh: Sphere::new(0.06).mesh().ico(2).unwrap(),
-                            material: StandardMaterial {
-                                base_color: Color::srgb(0.5, 0.9, 1.0),
-                                emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
-                                unlit: true,
-                                ..default()
-                            },
-                            transform: node_pos_tf
-                                * Transform::from_translation(input_local)
-                                * Transform::from_scale(Vec3::splat(1.8)),
-                        },
+                        pick_center: port_center,
                         type_markers: vec![],
+                        plain_body: Some(plain_anchor_body(port_center)),
                     },
                 )]),
                 labels: vec![],

@@ -147,20 +147,14 @@ pub struct AnchorHovered;
 
 #[derive(Component)]
 pub enum EAnchor {
-    Input {
-        id: ast::AnchorId,
-        render_objects: render::RenderAnchor,
-    },
-    Output {
-        id: ast::AnchorId,
-        render_objects: render::RenderAnchor,
-    },
+    Input { id: ast::AnchorId },
+    Output { id: ast::AnchorId },
 }
 
 impl EAnchor {
     pub fn id(&self) -> ast::AnchorId {
         match self {
-            EAnchor::Input { id, .. } | EAnchor::Output { id, .. } => id.clone(),
+            EAnchor::Input { id } | EAnchor::Output { id } => id.clone(),
         }
     }
 }
@@ -192,18 +186,6 @@ pub struct DragInfo {
 #[derive(Resource, Default)]
 pub struct DragState {
     pub active: Option<DragInfo>,
-}
-
-/// Vorberechnete Materials für Anchors
-#[derive(Component, Clone)]
-pub struct AnchorAssets {
-    pub mesh: Handle<Mesh>,
-    pub tf_normal_pre: Transform,
-    pub tf_normal_post: Transform,
-    pub tf_hovered_pre: Transform,
-    pub tf_hovered_post: Transform,
-    pub mat_normal: Handle<StandardMaterial>,
-    pub mat_hovered: Handle<StandardMaterial>,
 }
 
 /// Marker for AST node mesh entities (so we can despawn them on rebuild).
@@ -805,9 +787,9 @@ fn spawn_ast_nodes(
             .into_iter()
             .for_each(|(anchor_id, render_anchor)| {
                 let render::RenderAnchor {
-                    normal,
-                    hovered,
+                    pick_center,
                     type_markers,
+                    plain_body,
                 } = render_anchor;
 
                 for marker in type_markers {
@@ -837,34 +819,35 @@ fn spawn_ast_nodes(
                     }
                 }
 
-                let render_anchor = render::RenderAnchor {
-                    normal,
-                    hovered,
-                    type_markers: vec![],
-                };
+                // Neutral cuboid for anchors without type markers.
+                if let Some(body) = plain_body {
+                    commands.spawn((
+                        Mesh3d(meshes.add(body.mesh)),
+                        MeshMaterial3d(materials.add(body.material)),
+                        body.transform,
+                        AstSceneEntity,
+                    ));
+                }
 
+                // The anchor itself is now mesh-less: screen-space hover picking
+                // only needs its GlobalTransform, positioned at the cuboid centre.
                 let layout_anchor = walked.layout_ast.layout_anchor(anchor_id.clone());
-                let anchor_world = render_anchor.normal.transform.translation;
                 let spawned = commands
                     .spawn((
-                        Mesh3d(meshes.add(render_anchor.normal.mesh.clone())),
-                        MeshMaterial3d(materials.add(render_anchor.normal.material.clone())),
-                        render_anchor.normal.transform,
+                        Transform::from_translation(pick_center),
                         match layout_anchor.anchor {
                             ast::EAnchor::Input { .. } => EAnchor::Input {
                                 id: anchor_id.clone(),
-                                render_objects: render_anchor,
                             },
                             ast::EAnchor::Output => EAnchor::Output {
                                 id: anchor_id.clone(),
-                                render_objects: render_anchor,
                             },
                         },
                         AstSceneEntity,
                     ))
                     .id();
                 anchor_entities.insert(anchor_id.clone(), spawned);
-                anchor_world_positions.insert(anchor_id, anchor_world);
+                anchor_world_positions.insert(anchor_id, pick_center);
             });
 
         node_entites.insert(node_id.clone(), node_entity.clone());
@@ -4227,42 +4210,6 @@ fn anchor_hover_system(
     }
 }
 
-fn anchor_hover_visual_system(
-    mut anchors: Query<(
-        &EAnchor,
-        &mut Transform,
-        &mut MeshMaterial3d<StandardMaterial>,
-        Option<&AnchorHovered>,
-        &AnchorAssets,
-    )>,
-) {
-    for (anchor, mut tf, mut mat, hovered, assets) in &mut anchors {
-        let (is_hovered, target_mat) = if hovered.is_some() {
-            (true, &assets.mat_hovered)
-        } else {
-            (false, &assets.mat_normal)
-        };
-
-        // Smooth scale
-        //let s = tf.scale.x + (target_scale - tf.scale.x) * 0.18;
-        //tf.scale = Vec3::splat(s);
-        *tf = match anchor {
-            EAnchor::Input { render_objects, .. } | EAnchor::Output { render_objects, .. } => {
-                if hovered.is_some() {
-                    render_objects.hovered.transform
-                } else {
-                    render_objects.normal.transform
-                }
-            }
-        };
-
-        // Material swap (Handle-Vergleich ist billig)
-        if mat.0 != *target_mat {
-            mat.0 = target_mat.clone();
-        }
-    }
-}
-
 fn draw_drag_preview(drag: Res<DragState>, mut gizmos: Gizmos) {
     let Some(ref info) = drag.active else { return };
     let color = if info.target_anchor_id.is_some() {
@@ -4625,7 +4572,7 @@ fn main() {
             Update,
             (
                 (
-                    (anchor_hover_visual_system, draw_drag_preview).chain(),
+                    draw_drag_preview,
                     animate_nodes,
                     (
                         handle_delete_node_button,
