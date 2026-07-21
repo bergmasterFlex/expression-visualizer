@@ -654,6 +654,57 @@ impl LayoutAst {
                 layout = new_layout;
             }
         }
+        layout.settle_sink()
+    }
+
+    /// Push the SinkWall back (−Z) so the grid encapsulates the deepest node,
+    /// regardless of where on X/Y it sits. `deepest_z` is the minimum over
+    /// every non-sink node's `node_footprint` min.z (so multi-cell owners —
+    /// function calls, MatchNew footprints extending into −Z — are contained
+    /// too). The sink lands one cell behind that (`deepest_z - 1`), matching
+    /// the convention the swap constraint already produces. Expand-only: the
+    /// sink never moves forward, preserving the initial roomy corridor.
+    fn settle_sink(&self) -> Self {
+        let sink_id = self.layout_nodes.keys().find(|id| {
+            matches!(
+                self.ast.nodes.get(*id),
+                Some(crate::ast::node::ENode::SinkWall { .. })
+            )
+        });
+        let Some(sink_id) = sink_id.cloned() else {
+            return self.clone_shape();
+        };
+        let Some(sink_ln) = self.layout_nodes.get(&sink_id) else {
+            return self.clone_shape();
+        };
+        let sink_pos = sink_ln.pos;
+        let current_sink_z = sink_pos.round().as_ivec3().z;
+
+        let mut deepest_z = i32::MAX;
+        for id in self.layout_nodes.keys() {
+            if *id == sink_id {
+                continue;
+            }
+            let Some(fp) = self.node_footprint(id) else {
+                continue;
+            };
+            if fp.min.z < deepest_z {
+                deepest_z = fp.min.z;
+            }
+        }
+        if deepest_z == i32::MAX {
+            return self.clone_shape();
+        }
+
+        let new_sink_z = current_sink_z.min(deepest_z - 1);
+        if new_sink_z == current_sink_z {
+            return self.clone_shape();
+        }
+
+        let mut layout = self.clone_shape();
+        if let Some(ln) = layout.layout_nodes.get_mut(&sink_id) {
+            ln.pos.z = new_sink_z as f32;
+        }
         layout
     }
 
