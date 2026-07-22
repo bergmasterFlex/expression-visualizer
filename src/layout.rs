@@ -654,7 +654,7 @@ impl LayoutAst {
                 layout = new_layout;
             }
         }
-        layout.settle_sink()
+        layout.settle_sink().harmonize_match_sinks()
     }
 
     /// Push the SinkWall back (−Z) so the grid encapsulates the deepest node,
@@ -665,13 +665,7 @@ impl LayoutAst {
     /// the convention the swap constraint already produces. Expand-only: the
     /// sink never moves forward, preserving the initial roomy corridor.
     fn settle_sink(&self) -> Self {
-        let sink_id = self.layout_nodes.keys().find(|id| {
-            matches!(
-                self.ast.nodes.get(*id),
-                Some(crate::ast::node::ENode::SinkWall { .. })
-            )
-        });
-        let Some(sink_id) = sink_id.cloned() else {
+        let Some(sink_id) = self.sink_id() else {
             return self.clone_shape();
         };
         let Some(sink_ln) = self.layout_nodes.get(&sink_id) else {
@@ -704,6 +698,70 @@ impl LayoutAst {
         let mut layout = self.clone_shape();
         if let Some(ln) = layout.layout_nodes.get_mut(&sink_id) {
             ln.pos.z = new_sink_z as f32;
+        }
+        layout
+    }
+
+    /// The single SinkWall node id of this LayoutAst, if present.
+    fn sink_id(&self) -> Option<crate::ast::node::Id> {
+        self.layout_nodes
+            .keys()
+            .find(|id| {
+                matches!(
+                    self.ast.nodes.get(*id),
+                    Some(crate::ast::node::ENode::SinkWall { .. })
+                )
+            })
+            .cloned()
+    }
+
+    /// Align the SinkWall of every Pattern under each MatchNew at this level to
+    /// a common position: the deepest sibling sink (minimum Z). Copies that
+    /// reference sink's (x, z) onto every sibling sink so the match's back wall
+    /// is a single flat plane and the sinks stack exactly above each other
+    /// (only Y differs). Nested matches are handled by `settle_footprints`'s
+    /// recursion, so this only needs to touch matches owned at this level.
+    fn harmonize_match_sinks(&self) -> Self {
+        let mut layout = self.clone_shape();
+        let match_ids: Vec<crate::ast::node::Id> = layout
+            .layout_nodes
+            .keys()
+            .filter(|id| layout.is_matchnew(id))
+            .cloned()
+            .collect();
+        for match_id in &match_ids {
+            let pattern_ids = layout.match_pattern_ids(match_id);
+            // Reference = the sibling sink furthest back (smallest Z).
+            let mut reference: Option<(f32, f32)> = None;
+            for pid in &pattern_ids {
+                let Some(sub) = layout.sub_layouts.get(pid) else {
+                    continue;
+                };
+                let Some(sink_id) = sub.sink_id() else {
+                    continue;
+                };
+                let Some(ln) = sub.layout_nodes.get(&sink_id) else {
+                    continue;
+                };
+                if reference.map(|(_, z)| ln.pos.z < z).unwrap_or(true) {
+                    reference = Some((ln.pos.x, ln.pos.z));
+                }
+            }
+            let Some((ref_x, ref_z)) = reference else {
+                continue;
+            };
+            for pid in &pattern_ids {
+                let Some(sub) = layout.sub_layouts.get_mut(pid) else {
+                    continue;
+                };
+                let Some(sink_id) = sub.sink_id() else {
+                    continue;
+                };
+                if let Some(ln) = sub.layout_nodes.get_mut(&sink_id) {
+                    ln.pos.x = ref_x;
+                    ln.pos.z = ref_z;
+                }
+            }
         }
         layout
     }
