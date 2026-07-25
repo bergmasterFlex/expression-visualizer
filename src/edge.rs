@@ -40,10 +40,17 @@ pub struct EdgeCurve {
 
 impl EdgeCurve {
     pub fn from_endpoints(from_world: Vec3, to_world: Vec3) -> Self {
+        let dz = to_world.z - from_world.z;
         // Clamp the handle length so same-Z-rank connections still bulge
         // visibly instead of degenerating into a straight line.
-        let l = 1.5_f32
-            .max(0.5 * (to_world.z - from_world.z).abs() + 0.25 * (to_world - from_world).length());
+        let mut l = 1.5_f32.max(0.5 * dz.abs() + 0.25 * (to_world - from_world).length());
+        // When the target sits behind the source in −Z (normal flow), cap the
+        // handle length at the Z-gap: the cubic's Z-derivative stays ≤ 0 iff
+        // l ≤ |dz|, so the curve runs strictly toward −Z and never swings back
+        // toward +Z mid-span.
+        if dz < 0.0 {
+            l = l.min(-dz);
+        }
         Self {
             p0: from_world,
             p1: from_world + Vec3::NEG_Z * l,
