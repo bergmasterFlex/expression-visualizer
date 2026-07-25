@@ -333,13 +333,7 @@ pub fn layoutnode_to_rendernode(
                         plain_body: None,
                     },
                 )]),
-                labels: vec![RenderLabel {
-                    text: label_for_node(node, function_declarations),
-                    color: Color::WHITE,
-                    font_size: 18.0,
-                    world_pos: node_pos,
-                    offset: Vec2::ZERO,
-                }],
+                labels: vec![],
                 decorations: vec![],
             }
         }
@@ -397,13 +391,7 @@ pub fn layoutnode_to_rendernode(
                         },
                     ),
                 ]),
-                labels: vec![RenderLabel {
-                    text: label_for_node(node, function_declarations),
-                    color: Color::WHITE,
-                    font_size: 18.0,
-                    world_pos: node_pos,
-                    offset: Vec2::ZERO,
-                }],
+                labels: vec![],
                 decorations: vec![],
             }
         }
@@ -614,13 +602,7 @@ pub fn layoutnode_to_rendernode(
                         plain_body: None,
                     },
                 )]),
-                labels: vec![RenderLabel {
-                    text: label_for_node(node, function_declarations),
-                    color: Color::WHITE,
-                    font_size: 18.0,
-                    world_pos: node_pos,
-                    offset: Vec2::ZERO,
-                }],
+                labels: vec![],
                 decorations: vec![],
             }
         }
