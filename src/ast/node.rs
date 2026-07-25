@@ -3,7 +3,8 @@ pub struct Id(pub usize);
 
 #[derive(Debug, Clone)]
 pub enum ENode {
-    SinkWall {
+    Program {},
+    Sink {
         input_anchor: super::AnchorId,
     },
     FunctionCall {
@@ -11,11 +12,11 @@ pub enum ENode {
         input_anchors: Vec<super::AnchorId>,
         output_anchor: super::AnchorId,
     },
-    TypeIntroduction {
+    ConstDecl {
         r#type: EType,
         output_anchor: super::AnchorId,
     },
-    TypeElimination {
+    TypeCast {
         r#type: EType,
         input_anchor: super::AnchorId,
         output_anchor: super::AnchorId,
@@ -25,20 +26,7 @@ pub enum ENode {
         r#type: EType,
         output_anchor: super::AnchorId,
     },
-    MatchFront {
-        levels: usize,
-        width: usize,
-    },
-    MatchBack {
-        levels: usize,
-        input_anchors: Vec<super::AnchorId>,
-        output_anchor: super::AnchorId,
-    },
-    MatchGrid {
-        width: usize,
-        depth: usize,
-    },
-    MatchNew {
+    Match {
         patterns: Vec<super::node::Id>,
         input_anchor: super::AnchorId,
         output_anchor: super::AnchorId,
@@ -48,7 +36,6 @@ pub enum ENode {
         r#type: EType,
         output_anchor: super::AnchorId,
     },
-    Program {},
 }
 
 #[derive(Debug, Clone)]
@@ -59,41 +46,10 @@ pub enum EType {
     String { value: Option<String> },
     Char { value: Option<String> },
     Any,
-    Undefined,
-    Exception { message: Option<String> },
+    Undefined { message: Option<String> },
 }
 
 impl ENode {
-    pub fn label(
-        &self,
-        function_declarations: &std::collections::HashMap<
-            super::FunctionDeclarationId,
-            super::FunctionDeclaration,
-        >,
-    ) -> String {
-        match self {
-            ENode::SinkWall { .. } => "sink wall".to_string(),
-            ENode::FunctionCall {
-                function_declaration_id,
-                ..
-            } => function_declarations
-                .get(&function_declaration_id)
-                .unwrap()
-                .name
-                .to_string(),
-            ENode::TypeIntroduction { r#type, .. } | ENode::TypeElimination { r#type, .. } => {
-                r#type.to_string()
-            }
-            ENode::VarDecl { name, r#type, .. } => format!("{}: {}", name, r#type.to_string()),
-            ENode::MatchFront { .. } => "match front".to_string(),
-            ENode::MatchBack { .. } => "match back".to_string(),
-            ENode::MatchGrid { .. } => "match grid".to_string(),
-            ENode::MatchNew { .. } => "match".to_string(),
-            ENode::Pattern { r#type, .. } => r#type.to_string(),
-            ENode::Program { .. } => "program".to_string(),
-        }
-    }
-
     pub fn anchors(&self) -> Vec<(super::AnchorId, super::EAnchor)> {
         match self {
             ENode::FunctionCall {
@@ -115,17 +71,17 @@ impl ENode {
                 })
                 .chain(vec![(output_anchor.clone(), super::EAnchor::Output)])
                 .collect(),
-            ENode::SinkWall { input_anchor } => vec![(
+            ENode::Sink { input_anchor } => vec![(
                 input_anchor.clone(),
                 super::EAnchor::Input {
                     order_num: 0,
                     name: None,
                 },
             )],
-            ENode::TypeIntroduction { output_anchor, .. } => {
+            ENode::ConstDecl { output_anchor, .. } => {
                 vec![(output_anchor.clone(), super::EAnchor::Output)]
             }
-            ENode::TypeElimination {
+            ENode::TypeCast {
                 input_anchor,
                 output_anchor,
                 ..
@@ -142,27 +98,7 @@ impl ENode {
             ENode::VarDecl { output_anchor, .. } => {
                 vec![(output_anchor.clone(), super::EAnchor::Output)]
             }
-            ENode::MatchFront { .. } | ENode::MatchGrid { .. } => vec![],
-            ENode::MatchBack {
-                input_anchors,
-                output_anchor,
-                ..
-            } => input_anchors
-                .clone()
-                .into_iter()
-                .enumerate()
-                .map(|(i, anchor_id)| {
-                    (
-                        anchor_id,
-                        super::EAnchor::Input {
-                            order_num: i,
-                            name: None,
-                        },
-                    )
-                })
-                .chain(vec![(output_anchor.clone(), super::EAnchor::Output)])
-                .collect(),
-            ENode::MatchNew {
+            ENode::Match {
                 input_anchor,
                 output_anchor,
                 ..
@@ -205,14 +141,7 @@ impl ToString for EType {
                 }
             }
             EType::Any => "any".to_string(),
-            EType::Undefined => "undefined".to_string(),
-            EType::Exception { message } => {
-                if let Some(message) = message {
-                    format!("exception({})", message)
-                } else {
-                    "exception".to_string()
-                }
-            }
+            EType::Undefined { message } => message.unwrap_or("undefined".to_string()),
         }
     }
 }

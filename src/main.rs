@@ -569,8 +569,8 @@ struct DropdownState {
 enum NodeVariantKind {
     #[default]
     None,
-    TypeIntroduction,
-    TypeElimination,
+    ConstDecl,
+    TypeCast,
     VarDecl,
     FunctionCall,
     Pattern,
@@ -580,8 +580,8 @@ enum NodeVariantKind {
 fn variant_kind(node: Option<&ast::node::ENode>) -> NodeVariantKind {
     match node {
         None => NodeVariantKind::None,
-        Some(ast::node::ENode::TypeIntroduction { .. }) => NodeVariantKind::TypeIntroduction,
-        Some(ast::node::ENode::TypeElimination { .. }) => NodeVariantKind::TypeElimination,
+        Some(ast::node::ENode::ConstDecl { .. }) => NodeVariantKind::ConstDecl,
+        Some(ast::node::ENode::TypeCast { .. }) => NodeVariantKind::TypeCast,
         Some(ast::node::ENode::VarDecl { .. }) => NodeVariantKind::VarDecl,
         Some(ast::node::ENode::FunctionCall { .. }) => NodeVariantKind::FunctionCall,
         Some(ast::node::ENode::Pattern { .. }) => NodeVariantKind::Pattern,
@@ -596,8 +596,8 @@ fn type_choice_of(t: &ast::node::EType) -> Option<TypeChoice> {
         ast::node::EType::Float { .. } => Some(TypeChoice::Float),
         ast::node::EType::String { .. } => Some(TypeChoice::String),
         ast::node::EType::Char { .. } => Some(TypeChoice::Char),
-        ast::node::EType::Undefined => Some(TypeChoice::Undefined),
-        ast::node::EType::Any | ast::node::EType::Exception { .. } => None,
+        ast::node::EType::Undefined { .. } => Some(TypeChoice::Undefined),
+        ast::node::EType::Any => None,
     }
 }
 
@@ -621,7 +621,7 @@ fn make_etype(choice: TypeChoice, value: Option<String>) -> ast::node::EType {
         TypeChoice::Float => ast::node::EType::Float { value },
         TypeChoice::String => ast::node::EType::String { value },
         TypeChoice::Char => ast::node::EType::Char { value },
-        TypeChoice::Undefined => ast::node::EType::Undefined,
+        TypeChoice::Undefined => ast::node::EType::Undefined { message: None },
     }
 }
 
@@ -725,45 +725,6 @@ fn spawn_ast_nodes(
         let layout_node = walked.layout_node;
         let node_id = &layout_node.node_id;
         let node = walked.layout_ast.ast.nodes.get(node_id).unwrap();
-        if let ast::node::ENode::MatchGrid { width, depth } = node {
-            let world_pos = (layout_node.pos + walked.extra_offset) * Vec3::new(3.0, 3.0, 3.0);
-            let size_x = *width as f32 * 3.0;
-            let size_z = *depth as f32 * 3.0;
-            let tf = Transform::from_translation(
-                world_pos + Vec3::new(size_x / 2.0 - 1.5, 0.0, -size_z / 2.0),
-            );
-            let entity = commands
-                .spawn((
-                    Mesh3d(meshes.add(Plane3d::default().mesh().size(size_x, size_z).build())),
-                    MeshMaterial3d(materials_grid.add(grid::GridMaterial {
-                        plane_color: LinearRgba::new(0.07, 0.07, 0.1, 0.55),
-                        line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.4),
-                        spacing: 3.0,
-                        fade_start: 15.0,
-                        fade_end: 100.0,
-                        line_thickness: 1.5,
-                        hover_pos: Vec2::ZERO,
-                        hover_active: 0.0,
-                        _pad: 0.0,
-                        border_min: Vec2::ZERO,
-                        border_max: Vec2::ZERO,
-                        border_color: LinearRgba::WHITE,
-                        border_active: 0.0,
-                        border_thickness: 1.8,
-                        footprint_count: 0,
-                        _pad2: 0.0,
-                        footprints: [Vec4::ZERO; grid::MAX_FOOTPRINTS],
-                    })),
-                    tf,
-                    AstNodeEntity {
-                        node_id: node_id.clone(),
-                    },
-                    AstSceneEntity,
-                ))
-                .id();
-            node_entites.insert(node_id.clone(), entity);
-            continue;
-        }
         let render_node = render::layoutnode_to_rendernode(
             layout_node,
             walked.layout_ast,
@@ -783,7 +744,7 @@ fn spawn_ast_nodes(
             ))
             .id();
 
-        // Decorative meshes with no associated anchor (e.g. a MatchNew's grey
+        // Decorative meshes with no associated anchor (e.g. a Match's grey
         // sink-tip hull).
         for deco in render_node.decorations {
             commands.spawn((
@@ -910,8 +871,8 @@ fn spawn_ast_nodes(
                 .unwrap_or_default();
             let n_tgt = target_leaves.len();
 
-            // AST-level literal on the source anchor (VarDecl / TypeIntroduction
-            // / Pattern / TypeElimination). `None` for FunctionCall outputs and
+            // AST-level literal on the source anchor (VarDecl / ConstDecl
+            // / Pattern / TypeCast). `None` for FunctionCall outputs and
             // structural nodes. When present, the sole rendered leaf swaps to
             // the thin "value line" style.
             let src_ast_value = state.program_ast().anchor_ast_value(src_id);
@@ -1301,11 +1262,11 @@ fn handle_delete_node_button(
             continue;
         }
         if let Some(selected_node_id) = pick.selected_ast(&state).node_at(pick.selected_pos) {
-            let is_sink_wall = matches!(
+            let is_sink = matches!(
                 pick.selected_ast(&state).ast.nodes.get(&selected_node_id),
-                Some(ast::node::ENode::SinkWall { .. })
+                Some(ast::node::ENode::Sink { .. })
             );
-            if !is_sink_wall {
+            if !is_sink {
                 let updated = pick.selected_ast(&state).minus_node(&selected_node_id);
                 *pick.selected_ast_mut(&mut state) = updated;
                 rebuild.0 = true;
@@ -1462,7 +1423,7 @@ fn update_delete_button_visuals(
     let enabled = match pick.selected_ast(&state).node_at(pick.selected_pos) {
         Some(id) => !matches!(
             pick.selected_ast(&state).ast.nodes.get(&id),
-            Some(ast::node::ENode::SinkWall { .. })
+            Some(ast::node::ENode::Sink { .. })
         ),
         None => false,
     };
@@ -1545,7 +1506,7 @@ fn handle_add_node_button(
                     EAstActionButton::SelectAstButton => continue,
                     EAstActionButton::AddConstDeclButton => pick
                         .current_ast(&state)
-                        .plus_type_introduction(ast::node::EType::Int { value: None }, new_pos),
+                        .plus_const_decl(ast::node::EType::Int { value: None }, new_pos),
                     EAstActionButton::AddVarDeclButton => {
                         // VarDecls live on the Program-Ast's front wall at
                         // (x, 0, 0) — refuse anything else defensively; the
@@ -1571,9 +1532,9 @@ fn handle_add_node_button(
                     }
                     EAstActionButton::AddTypeCastButton => pick
                         .current_ast(&state)
-                        .plus_type_elimination(ast::node::EType::Int { value: None }, new_pos),
+                        .plus_type_cast(ast::node::EType::Int { value: None }, new_pos),
                     EAstActionButton::AddMatchButton => {
-                        pick.current_ast(&state).plus_match_new(new_pos)
+                        pick.current_ast(&state).plus_match(new_pos)
                     }
                     EAstActionButton::AddPatternButton => {
                         match pick.current_ast(&state).node_at(pick.selected_pos) {
@@ -1670,7 +1631,7 @@ struct NodeEditorFingerprint {
     node_id: Option<ast::node::Id>,
     variant: NodeVariantKind,
     type_choice: Option<TypeChoice>,
-    typeelim_has_value: bool,
+    typecast_has_value: bool,
     func_id: Option<ast::FunctionDeclarationId>,
     dropdown_open: Option<(ast::node::Id, DropdownKind)>,
     visible: bool,
@@ -1695,13 +1656,13 @@ fn sync_node_editor_ui(
         .and_then(|id| selected_ast.ast.nodes.get(id));
     let variant = variant_kind(node);
     let type_choice = node.and_then(|n| match n {
-        ast::node::ENode::TypeIntroduction { r#type, .. }
-        | ast::node::ENode::TypeElimination { r#type, .. }
+        ast::node::ENode::ConstDecl { r#type, .. }
+        | ast::node::ENode::TypeCast { r#type, .. }
         | ast::node::ENode::Pattern { r#type, .. } => type_choice_of(r#type),
         _ => None,
     });
-    let typeelim_has_value = match node {
-        Some(ast::node::ENode::TypeElimination { r#type, .. })
+    let typecast_has_value = match node {
+        Some(ast::node::ENode::TypeCast { r#type, .. })
         | Some(ast::node::ENode::Pattern { r#type, .. }) => value_of_etype(r#type).is_some(),
         _ => false,
     };
@@ -1715,8 +1676,8 @@ fn sync_node_editor_ui(
 
     let editable = matches!(
         variant,
-        NodeVariantKind::TypeIntroduction
-            | NodeVariantKind::TypeElimination
+        NodeVariantKind::ConstDecl
+            | NodeVariantKind::TypeCast
             | NodeVariantKind::VarDecl
             | NodeVariantKind::FunctionCall
             | NodeVariantKind::Pattern
@@ -1727,7 +1688,7 @@ fn sync_node_editor_ui(
         node_id: node_id.clone(),
         variant,
         type_choice,
-        typeelim_has_value,
+        typecast_has_value,
         func_id: func_id.clone(),
         dropdown_open: dropdown_state.open.clone(),
         visible,
@@ -1761,12 +1722,12 @@ fn sync_node_editor_ui(
     commands
         .entity(panel_entity)
         .with_children(|panel| match node {
-            ast::node::ENode::TypeIntroduction { r#type, .. } => {
+            ast::node::ENode::ConstDecl { r#type, .. } => {
                 spawn_editor_label(panel, font, "ConstDecl");
                 spawn_labeled_row(panel, font, "Type", |slot| {
                     spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
-                if !matches!(r#type, ast::node::EType::Undefined) {
+                if !matches!(r#type, ast::node::EType::Undefined { .. }) {
                     spawn_labeled_row(panel, font, "Value", |slot| {
                         spawn_value_widget(
                             slot,
@@ -1787,14 +1748,14 @@ fn sync_node_editor_ui(
                     spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
             }
-            ast::node::ENode::TypeElimination { r#type, .. } => {
+            ast::node::ENode::TypeCast { r#type, .. } => {
                 spawn_editor_label(panel, font, "TypeCast");
                 spawn_labeled_row(panel, font, "Type", |slot| {
                     spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
-                if !matches!(r#type, ast::node::EType::Undefined) {
+                if !matches!(r#type, ast::node::EType::Undefined { .. }) {
                     spawn_labeled_row(panel, font, "Value", |slot| {
-                        spawn_typeelim_checkbox_and_value(
+                        spawn_typecast_checkbox_and_value(
                             slot,
                             font,
                             &node_id,
@@ -1809,9 +1770,9 @@ fn sync_node_editor_ui(
                 spawn_labeled_row(panel, font, "Type", |slot| {
                     spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
-                if !matches!(r#type, ast::node::EType::Undefined) {
+                if !matches!(r#type, ast::node::EType::Undefined { .. }) {
                     spawn_labeled_row(panel, font, "Value", |slot| {
-                        spawn_typeelim_checkbox_and_value(
+                        spawn_typecast_checkbox_and_value(
                             slot,
                             font,
                             &node_id,
@@ -2010,7 +1971,7 @@ fn spawn_value_widget(
     open: &Option<(ast::node::Id, DropdownKind)>,
 ) {
     match current {
-        ast::node::EType::Undefined => {}
+        ast::node::EType::Undefined { .. } => {}
         ast::node::EType::Bool { value } => {
             let current_bool = value.as_deref() == Some("true");
             let label = value.as_deref().unwrap_or("bool");
@@ -2083,7 +2044,7 @@ fn spawn_value_widget(
     }
 }
 
-fn spawn_typeelim_checkbox_and_value(
+fn spawn_typecast_checkbox_and_value(
     row: &mut ChildSpawnerCommands,
     font: &Handle<Font>,
     node_id: &ast::node::Id,
@@ -2274,8 +2235,8 @@ fn handle_dropdown_option_click(
                     .find_node_ast_mut(&option.node_id)
                     .and_then(|a| a.ast.nodes.get_mut(&option.node_id));
                 match node {
-                    Some(ast::node::ENode::TypeIntroduction { r#type, .. })
-                    | Some(ast::node::ENode::TypeElimination { r#type, .. })
+                    Some(ast::node::ENode::ConstDecl { r#type, .. })
+                    | Some(ast::node::ENode::TypeCast { r#type, .. })
                     | Some(ast::node::ENode::VarDecl { r#type, .. })
                     | Some(ast::node::ENode::Pattern { r#type, .. }) => {
                         let value = value_of_etype(r#type);
@@ -2291,8 +2252,8 @@ fn handle_dropdown_option_click(
                     .find_node_ast_mut(&option.node_id)
                     .and_then(|a| a.ast.nodes.get_mut(&option.node_id));
                 match node {
-                    Some(ast::node::ENode::TypeIntroduction { r#type, .. })
-                    | Some(ast::node::ENode::TypeElimination { r#type, .. })
+                    Some(ast::node::ENode::ConstDecl { r#type, .. })
+                    | Some(ast::node::ENode::TypeCast { r#type, .. })
                     | Some(ast::node::ENode::VarDecl { r#type, .. })
                     | Some(ast::node::ENode::Pattern { r#type, .. }) => {
                         if let ast::node::EType::Bool { value } = r#type {
@@ -2336,7 +2297,7 @@ fn handle_value_enable_checkbox(
             .find_node_ast_mut(&cb.node_id)
             .and_then(|a| a.ast.nodes.get_mut(&cb.node_id))
         {
-            Some(ast::node::ENode::TypeElimination { r#type, .. })
+            Some(ast::node::ENode::TypeCast { r#type, .. })
             | Some(ast::node::ENode::Pattern { r#type, .. }) => r#type,
             _ => continue,
         };
@@ -2377,8 +2338,8 @@ fn handle_node_editor_text_input(
             }
             NodeEditorField::Value => {
                 let r#type = match node {
-                    ast::node::ENode::TypeIntroduction { r#type, .. }
-                    | ast::node::ENode::TypeElimination { r#type, .. }
+                    ast::node::ENode::ConstDecl { r#type, .. }
+                    | ast::node::ENode::TypeCast { r#type, .. }
                     | ast::node::ENode::VarDecl { r#type, .. }
                     | ast::node::ENode::Pattern { r#type, .. } => r#type,
                     _ => continue,
@@ -2965,7 +2926,7 @@ fn handle_start_menu_new_button(
         let mut color = text_color_q.get_mut(children[0]).unwrap();
         match *interaction {
             Interaction::Pressed => {
-                *state.program_ast_mut() = layout::LayoutAst::empty().plus_sink_wall();
+                *state.program_ast_mut() = layout::LayoutAst::empty().plus_sink();
                 pick.context_path.clear();
                 pick.selected_context.clear();
                 rebuild.0 = true;
@@ -3846,7 +3807,7 @@ fn update_selection_display(
         if let Some(node) = selected_ast.ast.nodes.get(&id) {
             text.0 = format!(
                 "{} : {}",
-                node.label(&state.function_declarations),
+                render::label_for_node(node, &state.function_declarations),
                 match eval::eval_type(
                     &node,
                     &selected_ast.ast,

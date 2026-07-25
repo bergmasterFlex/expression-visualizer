@@ -148,7 +148,7 @@ impl LayoutAst {
             Some(crate::ast::node::ENode::Pattern { parent_match, .. }) => {
                 let parent_id = parent_match.clone();
                 let remaining: Vec<crate::ast::node::Id> = match self.ast.nodes.get(&parent_id) {
-                    Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => {
+                    Some(crate::ast::node::ENode::Match { patterns, .. }) => {
                         patterns.iter().filter(|p| *p != node_id).cloned().collect()
                     }
                     _ => vec![],
@@ -180,11 +180,11 @@ impl LayoutAst {
                     }
                 } else {
                     after_pattern
-                        ._with_matchnew_patterns(&parent_id, remaining)
-                        .recompute_matchnew_pos(&parent_id)
+                        ._with_match_patterns(&parent_id, remaining)
+                        .recompute_match_pos(&parent_id)
                 }
             }
-            Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => {
+            Some(crate::ast::node::ENode::Match { patterns, .. }) => {
                 let child_ids: Vec<_> = patterns.clone();
                 let after_children = child_ids.iter().fold(
                     Self {
@@ -230,7 +230,7 @@ impl LayoutAst {
     }
 
     /// Returns the node whose footprint contains `pos`, if any.
-    /// `MatchNew` containers are excluded — only their `Pattern` children are
+    /// `Match` containers are excluded — only their `Pattern` children are
     /// selectable, so a click on the envelope never picks the container.
     /// Multi-cell nodes (matches implicitly, function calls with the
     /// minimum-extent rule) are selectable from any cell inside their
@@ -239,7 +239,7 @@ impl LayoutAst {
         self.layout_nodes.keys().find_map(|id| {
             if matches!(
                 self.ast.nodes.get(id),
-                Some(crate::ast::node::ENode::MatchNew { .. })
+                Some(crate::ast::node::ENode::Match { .. })
             ) {
                 return None;
             }
@@ -253,7 +253,7 @@ impl LayoutAst {
     }
 
     /// AABB (in this LayoutAst's local grid coords) that a node claims.
-    /// Delegates to `matchnew_footprint` for matches; for FunctionCall applies
+    /// Delegates to `match_footprint` for matches; for FunctionCall applies
     /// the minimum-extent rule (1–2 inputs → 1X×2Z toward −Z; ≥3 inputs →
     /// 2X×2Z extending +X and −Z). Every other node claims a single cell at
     /// its rounded position.
@@ -262,7 +262,7 @@ impl LayoutAst {
         let node = self.ast.nodes.get(id)?;
         let pos = ln.pos.round().as_ivec3();
         match node {
-            crate::ast::node::ENode::MatchNew { .. } => self.matchnew_footprint(id),
+            crate::ast::node::ENode::Match { .. } => self.match_footprint(id),
             crate::ast::node::ENode::FunctionCall { input_anchors, .. } => {
                 let (width_extra, depth_extra) = if input_anchors.len() >= 3 {
                     (1, 1)
@@ -288,7 +288,7 @@ impl LayoutAst {
         let mut map: std::collections::HashMap<IVec3, crate::ast::node::Id> =
             std::collections::HashMap::new();
         for id in self.layout_nodes.keys() {
-            if !self.is_matchnew(id) {
+            if !self.is_match(id) {
                 continue;
             }
             let Some(bbox) = self.node_footprint(id) else {
@@ -299,7 +299,7 @@ impl LayoutAst {
             }
         }
         for id in self.layout_nodes.keys() {
-            if self.is_matchnew(id) {
+            if self.is_match(id) {
                 continue;
             }
             let Some(bbox) = self.node_footprint(id) else {
@@ -328,31 +328,31 @@ impl LayoutAst {
         }
     }
 
-    /// Return the sibling Pattern ids of a `MatchNew`.
+    /// Return the sibling Pattern ids of a `Match`.
     fn match_pattern_ids(&self, match_id: &crate::ast::node::Id) -> Vec<crate::ast::node::Id> {
         match self.ast.nodes.get(match_id) {
-            Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => patterns.clone(),
+            Some(crate::ast::node::ENode::Match { patterns, .. }) => patterns.clone(),
             _ => vec![],
         }
     }
 
-    fn is_matchnew(&self, id: &crate::ast::node::Id) -> bool {
+    fn is_match(&self, id: &crate::ast::node::Id) -> bool {
         matches!(
             self.ast.nodes.get(id),
-            Some(crate::ast::node::ENode::MatchNew { .. })
+            Some(crate::ast::node::ENode::Match { .. })
         )
     }
 
     /// Union of all visible grid cells in this LayoutAst's local coords.
-    /// MatchNew nodes contribute their `matchnew_footprint` (recursive over
+    /// Match nodes contribute their `match_footprint` (recursive over
     /// nested sub-ASTs); every other node contributes its rounded cell.
     /// Sub-layouts contribute their own inner_footprint offset by the owner
     /// node's grid position.
     pub fn inner_footprint(&self) -> Option<AABB> {
         let mut bbox: Option<AABB> = None;
         for (id, ln) in &self.layout_nodes {
-            let node_bbox = if self.is_matchnew(id) {
-                self.matchnew_footprint(id)
+            let node_bbox = if self.is_match(id) {
+                self.match_footprint(id)
             } else {
                 Some(AABB::point(ln.pos.round().as_ivec3()))
             };
@@ -370,7 +370,7 @@ impl LayoutAst {
         bbox
     }
 
-    /// Grid-space AABB (in this LayoutAst's local coords) that a MatchNew
+    /// Grid-space AABB (in this LayoutAst's local coords) that a Match
     /// container claims. Aggregates all Pattern arms:
     ///   - Y: `sum over patterns of max(1, subast_y_extent)` stacked at the
     ///     Pattern's own y (patterns are assumed to occupy consecutive rows).
@@ -381,8 +381,8 @@ impl LayoutAst {
     ///     Pattern's own Z (i.e. the parent-facing side).
     /// Recursion via `inner_footprint` — inner matches inflate their host
     /// Pattern's sub-AST bbox and thus the outer footprint too.
-    pub fn matchnew_footprint(&self, match_id: &crate::ast::node::Id) -> Option<AABB> {
-        if !self.is_matchnew(match_id) {
+    pub fn match_footprint(&self, match_id: &crate::ast::node::Id) -> Option<AABB> {
+        if !self.is_match(match_id) {
             return None;
         }
         let pattern_ids = self.match_pattern_ids(match_id);
@@ -533,13 +533,13 @@ impl LayoutAst {
                     match_ids.insert(mid);
                 }
             }
-            if self.is_matchnew(id) {
+            if self.is_match(id) {
                 match_ids.insert(id.clone());
             }
         }
         let after_recompute = match_ids
             .iter()
-            .fold(moved, |acc, mid| acc.recompute_matchnew_pos(mid));
+            .fold(moved, |acc, mid| acc.recompute_match_pos(mid));
 
         let effective_primary = plan
             .get(&node_id)
@@ -592,9 +592,9 @@ impl LayoutAst {
             .cloned()
             .collect();
         for owner_id in &owner_ids {
-            // Patterns of a MatchNew ride along with their parent; skip them
+            // Patterns of a Match ride along with their parent; skip them
             // as intruders. For non-match owners there are no related ids.
-            let related: Vec<crate::ast::node::Id> = if layout.is_matchnew(owner_id) {
+            let related: Vec<crate::ast::node::Id> = if layout.is_match(owner_id) {
                 layout.match_pattern_ids(owner_id)
             } else {
                 vec![]
@@ -657,10 +657,10 @@ impl LayoutAst {
         layout.settle_sink().harmonize_match_sinks()
     }
 
-    /// Push the SinkWall back (−Z) so the grid encapsulates the deepest node,
+    /// Push the Sink back (−Z) so the grid encapsulates the deepest node,
     /// regardless of where on X/Y it sits. `deepest_z` is the minimum over
     /// every non-sink node's `node_footprint` min.z (so multi-cell owners —
-    /// function calls, MatchNew footprints extending into −Z — are contained
+    /// function calls, Match footprints extending into −Z — are contained
     /// too). The sink lands one cell behind that (`deepest_z - 1`), matching
     /// the convention the swap constraint already produces. Expand-only: the
     /// sink never moves forward, preserving the initial roomy corridor.
@@ -702,20 +702,20 @@ impl LayoutAst {
         layout
     }
 
-    /// The single SinkWall node id of this LayoutAst, if present.
+    /// The single Sink node id of this LayoutAst, if present.
     pub fn sink_id(&self) -> Option<crate::ast::node::Id> {
         self.layout_nodes
             .keys()
             .find(|id| {
                 matches!(
                     self.ast.nodes.get(*id),
-                    Some(crate::ast::node::ENode::SinkWall { .. })
+                    Some(crate::ast::node::ENode::Sink { .. })
                 )
             })
             .cloned()
     }
 
-    /// Align the SinkWall of every Pattern under each MatchNew at this level to
+    /// Align the Sink of every Pattern under each Match at this level to
     /// a common position: the deepest sibling sink (minimum Z). Copies that
     /// reference sink's (x, z) onto every sibling sink so the match's back wall
     /// is a single flat plane and the sinks stack exactly above each other
@@ -726,7 +726,7 @@ impl LayoutAst {
         let match_ids: Vec<crate::ast::node::Id> = layout
             .layout_nodes
             .keys()
-            .filter(|id| layout.is_matchnew(id))
+            .filter(|id| layout.is_match(id))
             .cloned()
             .collect();
         for match_id in &match_ids {
@@ -793,7 +793,7 @@ impl LayoutAst {
             }
             // Resolve which match's footprint we've hit (occ is either the
             // match itself or a Pattern child of one).
-            let match_id = if self.is_matchnew(occ) {
+            let match_id = if self.is_match(occ) {
                 Some(occ.clone())
             } else if self.is_pattern(occ) {
                 self.parent_match_of(occ)
@@ -807,7 +807,7 @@ impl LayoutAst {
             if self.is_pattern(mover) && self.parent_match_of(mover) == Some(match_id.clone()) {
                 return target - origin;
             }
-            let Some(bbox) = self.matchnew_footprint(&match_id) else {
+            let Some(bbox) = self.match_footprint(&match_id) else {
                 return target - origin;
             };
             target.y = if step > 0.0 {
@@ -820,7 +820,7 @@ impl LayoutAst {
     }
 
     /// Compute the co-moving group for a seed node.
-    /// - MatchNew seed: seed plus all its Pattern children with the same
+    /// - Match seed: seed plus all its Pattern children with the same
     ///   delta (rigid block; sub-layouts follow via Pattern-local coords).
     /// - Non-Pattern seed: `{seed}`.
     /// - Pattern with Y-only delta: `{seed}` (row change is per-pattern).
@@ -831,7 +831,7 @@ impl LayoutAst {
         seed: &crate::ast::node::Id,
         seed_delta: Vec3,
     ) -> Vec<(crate::ast::node::Id, Vec3)> {
-        if self.is_matchnew(seed) {
+        if self.is_match(seed) {
             let mut group: Vec<(crate::ast::node::Id, Vec3)> = vec![(seed.clone(), seed_delta)];
             for pid in self.match_pattern_ids(seed) {
                 group.push((pid, seed_delta));
@@ -871,9 +871,9 @@ impl LayoutAst {
         }
     }
 
-    pub fn plus_sink_wall(&self) -> Self {
+    pub fn plus_sink(&self) -> Self {
         let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
-        let (ast, node_id) = ast.plus(crate::ast::node::ENode::SinkWall {
+        let (ast, node_id) = ast.plus(crate::ast::node::ENode::Sink {
             input_anchor: input_anchor_id,
         });
         Self {
@@ -884,10 +884,10 @@ impl LayoutAst {
         ._plus_layout_node(&node_id, Vec3::new(0.0, 0.0, -4.0))
     }
 
-    pub fn plus_type_introduction(&self, r#type: crate::ast::node::EType, pos: Vec3) -> Self {
+    pub fn plus_const_decl(&self, r#type: crate::ast::node::EType, pos: Vec3) -> Self {
         let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
         let (ast, output_anchor_id) = ast.with_next_anchor_id();
-        let (ast, node_id) = ast.plus(crate::ast::node::ENode::TypeIntroduction {
+        let (ast, node_id) = ast.plus(crate::ast::node::ENode::ConstDecl {
             r#type,
             output_anchor: output_anchor_id,
         });
@@ -899,10 +899,10 @@ impl LayoutAst {
         ._plus_layout_node(&node_id, pos)
     }
 
-    pub fn plus_type_elimination(&self, r#type: crate::ast::node::EType, pos: Vec3) -> Self {
+    pub fn plus_type_cast(&self, r#type: crate::ast::node::EType, pos: Vec3) -> Self {
         let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
         let (ast, output_anchor_id) = ast.with_next_anchor_id();
-        let (ast, node_id) = ast.plus(crate::ast::node::ENode::TypeElimination {
+        let (ast, node_id) = ast.plus(crate::ast::node::ENode::TypeCast {
             r#type,
             input_anchor: input_anchor_id,
             output_anchor: output_anchor_id,
@@ -967,29 +967,16 @@ impl LayoutAst {
         self.minus_node(node_id).plus_function_call(new_fn, pos)
     }
 
-    pub fn plus_match_front(&self, pos: Vec3) -> Self {
-        let (ast, node_id) = self.ast.plus(crate::ast::node::ENode::MatchFront {
-            levels: 3,
-            width: 2,
-        });
-        Self {
-            ast,
-            layout_nodes: self.layout_nodes.clone(),
-            sub_layouts: self.sub_layouts.clone(),
-        }
-        ._plus_layout_node(&node_id, pos)
-    }
-
-    /// Create a `MatchNew` container plus its initial `Pattern` child at `pos`.
-    /// The MatchNew's synthetic LayoutNode mirrors the lowest Pattern's pos so
+    /// Create a `Match` container plus its initial `Pattern` child at `pos`.
+    /// The Match's synthetic LayoutNode mirrors the lowest Pattern's pos so
     /// rendering can iterate `layout_nodes` uniformly. The Pattern is created
-    /// with a fresh sub-AST (single SinkWall) and a matching entry in
+    /// with a fresh sub-AST (single Sink) and a matching entry in
     /// `sub_layouts[pattern_id]` positioning that sink at Pattern-local (0,0,-1).
-    pub fn plus_match_new(&self, pos: Vec3) -> Self {
+    pub fn plus_match(&self, pos: Vec3) -> Self {
         let (ast, match_input_anchor_id) = self.ast.with_next_anchor_id();
         let (ast, match_output_anchor_id) = ast.with_next_anchor_id();
         let (ast, pattern_output_anchor_id) = ast.with_next_anchor_id();
-        let (ast, match_node_id) = ast.plus(crate::ast::node::ENode::MatchNew {
+        let (ast, match_node_id) = ast.plus(crate::ast::node::ENode::Match {
             patterns: vec![],
             input_anchor: match_input_anchor_id.clone(),
             output_anchor: match_output_anchor_id.clone(),
@@ -1007,7 +994,7 @@ impl LayoutAst {
         let pattern_sub_layout = Self::initial_pattern_sub_layout(&pattern_sub_ast, &sub_sink_id);
         let ast = ast.with_node_replaced(
             &match_node_id,
-            crate::ast::node::ENode::MatchNew {
+            crate::ast::node::ENode::Match {
                 patterns: vec![pattern_node_id.clone()],
                 input_anchor: match_input_anchor_id,
                 output_anchor: match_output_anchor_id,
@@ -1046,7 +1033,7 @@ impl LayoutAst {
         }
     }
 
-    /// Insert a new Pattern into `selected_pattern_id`'s parent MatchNew,
+    /// Insert a new Pattern into `selected_pattern_id`'s parent Match,
     /// occupying the selected slot. Sibling Patterns of the same match at
     /// Y ≥ selected.Y shift up by 1 to make room; the growing match footprint
     /// then displaces any external neighbors via `settle_footprints`. The caller
@@ -1100,12 +1087,12 @@ impl LayoutAst {
             sub_layouts: self.sub_layouts.clone(),
         };
         let sibling_ids: Vec<crate::ast::node::Id> = match shifted.ast.nodes.get(&parent_id) {
-            Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => patterns.clone(),
+            Some(crate::ast::node::ENode::Match { patterns, .. }) => patterns.clone(),
             _ => vec![],
         };
         let (ast, new_output_anchor_id) = shifted.ast.with_next_anchor_id();
         // Reserve Pattern id first, then bootstrap sub-AST off the bumped
-        // parent counter (see plus_match_new for the id-uniqueness rule).
+        // parent counter (see plus_match for the id-uniqueness rule).
         let (ast, new_pattern_id) = ast.plus(crate::ast::node::ENode::Pattern {
             parent_match: parent_id.clone(),
             r#type: crate::ast::node::EType::Int { value: None },
@@ -1121,7 +1108,7 @@ impl LayoutAst {
             .chain([new_pattern_id.clone()])
             .collect();
         let (match_input_anchor, match_output_anchor) = match ast.nodes.get(&parent_id) {
-            Some(crate::ast::node::ENode::MatchNew {
+            Some(crate::ast::node::ENode::Match {
                 input_anchor,
                 output_anchor,
                 ..
@@ -1130,7 +1117,7 @@ impl LayoutAst {
         };
         let ast = ast.with_node_replaced(
             &parent_id,
-            crate::ast::node::ENode::MatchNew {
+            crate::ast::node::ENode::Match {
                 patterns: new_patterns,
                 input_anchor: match_input_anchor,
                 output_anchor: match_output_anchor,
@@ -1151,7 +1138,7 @@ impl LayoutAst {
             .nodes
             .iter()
             .filter_map(|(id, n)| {
-                if matches!(n, crate::ast::node::ENode::MatchNew { .. }) {
+                if matches!(n, crate::ast::node::ENode::Match { .. }) {
                     Some(id.clone())
                 } else {
                     None
@@ -1160,15 +1147,15 @@ impl LayoutAst {
             .collect();
         match_ids
             .iter()
-            .fold(with_new, |acc, mid| acc.recompute_matchnew_pos(mid))
+            .fold(with_new, |acc, mid| acc.recompute_match_pos(mid))
     }
 
-    /// Refresh a MatchNew's synthetic LayoutNode to sit at the lowest sibling
+    /// Refresh a Match's synthetic LayoutNode to sit at the lowest sibling
     /// Pattern's grid position (needed after any add/remove/shift of Patterns
     /// so the render pass finds the container at the correct origin).
-    pub fn recompute_matchnew_pos(&self, match_id: &crate::ast::node::Id) -> Self {
+    pub fn recompute_match_pos(&self, match_id: &crate::ast::node::Id) -> Self {
         let pattern_ids: Vec<crate::ast::node::Id> = match self.ast.nodes.get(match_id) {
-            Some(crate::ast::node::ENode::MatchNew { patterns, .. }) => patterns.clone(),
+            Some(crate::ast::node::ENode::Match { patterns, .. }) => patterns.clone(),
             _ => {
                 return Self {
                     ast: self.ast.clone(),
@@ -1211,13 +1198,13 @@ impl LayoutAst {
         }
     }
 
-    fn _with_matchnew_patterns(
+    fn _with_match_patterns(
         &self,
         match_id: &crate::ast::node::Id,
         new_patterns: Vec<crate::ast::node::Id>,
     ) -> Self {
         let (input_anchor, output_anchor) = match self.ast.nodes.get(match_id) {
-            Some(crate::ast::node::ENode::MatchNew {
+            Some(crate::ast::node::ENode::Match {
                 input_anchor,
                 output_anchor,
                 ..
@@ -1233,7 +1220,7 @@ impl LayoutAst {
         Self {
             ast: self.ast.with_node_replaced(
                 match_id,
-                crate::ast::node::ENode::MatchNew {
+                crate::ast::node::ENode::Match {
                     patterns: new_patterns,
                     input_anchor,
                     output_anchor,
@@ -1357,11 +1344,11 @@ impl LayoutAst {
 
     /// Compute the grid bounds for this AST in its own local coordinates.
     ///
-    /// - Z range: `[sink.z + 1, -1]` where `sink.z` is the single SinkWall's
+    /// - Z range: `[sink.z + 1, -1]` where `sink.z` is the single Sink's
     ///   layout-Z. The front wall is treated as Z=0 for both the Program-Ast
     ///   (which has no explicit front node) and Pattern sub-ASTs (where the
     ///   Pattern itself is the implicit front). If the corridor collapses
-    ///   (`sink.z >= -1`) or no SinkWall exists, returns `None`.
+    ///   (`sink.z >= -1`) or no Sink exists, returns `None`.
     /// - X range: min/max over every node's footprint X-span, unioned with
     ///   `active_selection.x` when provided. Multi-cell footprints (matches,
     ///   ≥3-input function calls) grow the grid so the extra cell is
@@ -1375,9 +1362,7 @@ impl LayoutAst {
             self.layout_nodes
                 .iter()
                 .find_map(|(id, ln)| match self.ast.nodes.get(id) {
-                    Some(crate::ast::node::ENode::SinkWall { .. }) => {
-                        Some(ln.pos.round().as_ivec3().z)
-                    }
+                    Some(crate::ast::node::ENode::Sink { .. }) => Some(ln.pos.round().as_ivec3().z),
                     _ => None,
                 })?;
         let z_min = sink_z + 1;
@@ -1458,7 +1443,7 @@ impl LayoutAst {
 
     /// Return the `EType` an output anchor produces, or an input anchor
     /// expects — whichever the anchor happens to be. Walks sub-layouts.
-    /// `None` for anchors that carry no type (SinkWall input, MatchBack, …).
+    /// `None` for anchors that carry no type (Sink input, Match, …).
     pub fn anchor_type(
         &self,
         anchor_id: &crate::ast::AnchorId,
@@ -1571,10 +1556,10 @@ fn anchor_type_from_node(
     >,
 ) -> Option<crate::eval::EType> {
     match node {
-        crate::ast::node::ENode::TypeIntroduction { r#type, .. }
+        crate::ast::node::ENode::ConstDecl { r#type, .. }
         | crate::ast::node::ENode::VarDecl { r#type, .. }
         | crate::ast::node::ENode::Pattern { r#type, .. }
-        | crate::ast::node::ENode::TypeElimination { r#type, .. } => {
+        | crate::ast::node::ENode::TypeCast { r#type, .. } => {
             Some(crate::eval::ast_type_to_eval_type(r#type))
         }
         crate::ast::node::ENode::FunctionCall {
@@ -1590,11 +1575,8 @@ fn anchor_type_from_node(
             decl.inputs.get(idx).map(|p| p.r#type.clone())
         }
         // Anchors that don't currently carry a rendered type.
-        crate::ast::node::ENode::SinkWall { .. }
-        | crate::ast::node::ENode::MatchBack { .. }
-        | crate::ast::node::ENode::MatchNew { .. }
-        | crate::ast::node::ENode::MatchFront { .. }
-        | crate::ast::node::ENode::MatchGrid { .. }
+        crate::ast::node::ENode::Sink { .. }
+        | crate::ast::node::ENode::Match { .. }
         | crate::ast::node::ENode::Program {} => None,
     }
 }
@@ -1616,16 +1598,16 @@ pub fn value_of_etype(t: &crate::ast::node::EType) -> Option<String> {
 /// Return the AST-level literal attached to `anchor_id`'s type, if any.
 ///
 /// Only anchors on nodes whose type is a first-class `ast::node::EType` field
-/// (TypeIntroduction, VarDecl, Pattern, TypeElimination) can carry a literal.
+/// (ConstDecl, VarDecl, Pattern, TypeCast) can carry a literal.
 /// FunctionCall inputs/outputs bind to `eval::EType` on the declaration, which
-/// has no AST-level literal — treated as `None`. Match / SinkWall / Program
+/// has no AST-level literal — treated as `None`. Match / Sink / Program
 /// don't carry types at all.
 pub fn anchor_ast_value_from_node(
     node: &crate::ast::node::ENode,
     anchor_id: &crate::ast::AnchorId,
 ) -> Option<String> {
     match node {
-        crate::ast::node::ENode::TypeIntroduction {
+        crate::ast::node::ENode::ConstDecl {
             r#type,
             output_anchor,
         }
@@ -1645,7 +1627,7 @@ pub fn anchor_ast_value_from_node(
                 None
             }
         }
-        crate::ast::node::ENode::TypeElimination {
+        crate::ast::node::ENode::TypeCast {
             r#type,
             input_anchor,
             output_anchor,

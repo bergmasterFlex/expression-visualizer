@@ -71,8 +71,7 @@ pub fn ast_type_to_eval_type(t: &crate::ast::node::EType) -> EType {
         crate::ast::node::EType::Char { .. } => EType::Char(None),
         crate::ast::node::EType::String { .. } => EType::String(None),
         crate::ast::node::EType::Any => EType::Any,
-        crate::ast::node::EType::Undefined => EType::Undefined,
-        crate::ast::node::EType::Exception { .. } => EType::Exception,
+        crate::ast::node::EType::Undefined { .. } => EType::Undefined,
     }
 }
 
@@ -104,7 +103,7 @@ pub fn eval_type(
         return Err("infinite edge loop".to_string());
     }
     match node {
-        crate::ast::node::ENode::SinkWall { input_anchor } => {
+        crate::ast::node::ENode::Sink { input_anchor } => {
             match ast
                 .get_connected_nodes_to_anchor(input_anchor.clone())
                 .first()
@@ -130,8 +129,8 @@ pub fn eval_type(
             .unwrap()
             .output_type
             .clone()),
-        crate::ast::node::ENode::TypeIntroduction { r#type, .. }
-        | crate::ast::node::ENode::TypeElimination { r#type, .. }
+        crate::ast::node::ENode::ConstDecl { r#type, .. }
+        | crate::ast::node::ENode::TypeCast { r#type, .. }
         | crate::ast::node::ENode::VarDecl { r#type, .. }
         | crate::ast::node::ENode::Pattern { r#type, .. } => Ok(match r#type {
             crate::ast::node::EType::Bool { value } => EType::Bool(None),
@@ -140,13 +139,9 @@ pub fn eval_type(
             crate::ast::node::EType::Char { value } => EType::Char(None),
             crate::ast::node::EType::String { value } => EType::String(None),
             crate::ast::node::EType::Any => EType::Any,
-            crate::ast::node::EType::Undefined => EType::Undefined,
-            crate::ast::node::EType::Exception { message } => EType::Exception,
+            crate::ast::node::EType::Undefined { .. } => EType::Undefined,
         }),
-        crate::ast::node::ENode::MatchFront { .. } => Err("match front has no type".to_string()),
-        crate::ast::node::ENode::MatchBack { .. } => Err("match back has no type".to_string()),
-        crate::ast::node::ENode::MatchGrid { .. } => Err("match grid has no type".to_string()),
-        crate::ast::node::ENode::MatchNew { .. } => Err("match has no type".to_string()),
+        crate::ast::node::ENode::Match { .. } => Err("match has no type".to_string()),
         crate::ast::node::ENode::Program { .. } => Err("program has no type".to_string()),
     }
 }
@@ -194,10 +189,10 @@ fn neighbours_of_anchor(
     out
 }
 
-/// True if any SinkWall has at least one edge on its input anchor.
+/// True if any Sink has at least one edge on its input anchor.
 pub fn sink_has_input(ast: &crate::ast::Ast) -> bool {
     ast.nodes.values().any(|node| match node {
-        crate::ast::node::ENode::SinkWall { input_anchor } => {
+        crate::ast::node::ENode::Sink { input_anchor } => {
             !neighbours_of_anchor(ast, input_anchor).is_empty()
         }
         _ => false,
@@ -205,7 +200,7 @@ pub fn sink_has_input(ast: &crate::ast::Ast) -> bool {
 }
 
 /// Step 0 snapshot: seed every VarDecl with the user's typed value (or empty
-/// string if missing) and every TypeIntroduction with a random pool pick.
+/// string if missing) and every ConstDecl with a random pool pick.
 pub fn initial_values(
     ast: &crate::ast::Ast,
     user_vardecl_values: &HashMap<crate::ast::node::Id, String>,
@@ -218,7 +213,7 @@ pub fn initial_values(
                 let v = user_vardecl_values.get(id).cloned().unwrap_or_default();
                 out.insert(id.clone(), v);
             }
-            crate::ast::node::ENode::TypeIntroduction { .. } => {
+            crate::ast::node::ENode::ConstDecl { .. } => {
                 out.insert(id.clone(), pick_random(rng));
             }
             _ => {}

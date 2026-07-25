@@ -41,7 +41,7 @@ impl Ast {
         }
     }
 
-    /// Starting state for a Pattern's inner sub-AST: a single SinkWall.
+    /// Starting state for a Pattern's inner sub-AST: a single Sink.
     /// The sub-AST inherits the parent's id counters so node and anchor
     /// ids stay globally unique across the whole tree — required because
     /// selection/hover/find_node_ast_mut all key on plain `node::Id`.
@@ -58,7 +58,7 @@ impl Ast {
             edges: std::collections::HashMap::new(),
         };
         let (sub_ast, sink_input_anchor_id) = sub_ast.with_next_anchor_id();
-        let (sub_ast, sink_node_id) = sub_ast.plus(node::ENode::SinkWall {
+        let (sub_ast, sink_node_id) = sub_ast.plus(node::ENode::Sink {
             input_anchor: sink_input_anchor_id,
         });
         let parent_bumped = parent.with_counters_at_least(&sub_ast);
@@ -138,7 +138,7 @@ impl Ast {
 
     /// Replace `n_id`'s node with `new_node`. Anchor tables are untouched;
     /// callers are responsible for ensuring the replacement has the same
-    /// anchors (used e.g. to update a `MatchNew`'s `patterns` list).
+    /// anchors (used e.g. to update a `Match`'s `patterns` list).
     pub fn with_node_replaced(&self, n_id: &node::Id, new_node: node::ENode) -> Self {
         Self {
             next_node_id: self.next_node_id.clone(),
