@@ -20,6 +20,9 @@ pub struct RenderNode {
     pub node: RenderObject,
     pub anchors: std::collections::HashMap<crate::ast::AnchorId, RenderAnchor>,
     pub labels: Vec<RenderLabel>,
+    /// Extra decorative meshes with no associated anchor (e.g. the grey
+    /// sink-tip hull of a MatchNew). Spawned alongside `node` by the renderer.
+    pub decorations: Vec<RenderObject>,
 }
 
 pub struct RenderAnchor {
@@ -337,6 +340,7 @@ pub fn layoutnode_to_rendernode(
                     world_pos: node_pos,
                     offset: Vec2::ZERO,
                 }],
+                decorations: vec![],
             }
         }
         crate::ast::node::ENode::TypeElimination {
@@ -400,6 +404,7 @@ pub fn layoutnode_to_rendernode(
                     world_pos: node_pos,
                     offset: Vec2::ZERO,
                 }],
+                decorations: vec![],
             }
         }
         crate::ast::node::ENode::FunctionCall {
@@ -500,6 +505,7 @@ pub fn layoutnode_to_rendernode(
                     world_pos: node_center_world,
                     offset: Vec2::ZERO,
                 }],
+                decorations: vec![],
             }
         }
         crate::ast::node::ENode::VarDecl {
@@ -546,6 +552,7 @@ pub fn layoutnode_to_rendernode(
                     world_pos: node_pos,
                     offset: Vec2::ZERO,
                 }],
+                decorations: vec![],
             }
         }
         crate::ast::node::ENode::SinkWall { input_anchor } => RenderNode {
@@ -568,6 +575,7 @@ pub fn layoutnode_to_rendernode(
                 },
             )]),
             labels: vec![],
+            decorations: vec![],
         },
         crate::ast::node::ENode::MatchFront { levels, width } => {
             let w = *width as f32;
@@ -586,6 +594,7 @@ pub fn layoutnode_to_rendernode(
                 },
                 anchors: std::collections::HashMap::new(),
                 labels: vec![],
+                decorations: vec![],
             }
         }
         crate::ast::node::ENode::MatchBack {
@@ -643,6 +652,7 @@ pub fn layoutnode_to_rendernode(
                 },
                 anchors,
                 labels: vec![],
+                decorations: vec![],
             }
         }
         crate::ast::node::ENode::MatchGrid { .. } => RenderNode {
@@ -653,6 +663,7 @@ pub fn layoutnode_to_rendernode(
             },
             anchors: std::collections::HashMap::new(),
             labels: vec![],
+            decorations: vec![],
         },
         crate::ast::node::ENode::Pattern {
             r#type,
@@ -698,11 +709,13 @@ pub fn layoutnode_to_rendernode(
                     world_pos: node_pos,
                     offset: Vec2::ZERO,
                 }],
+                decorations: vec![],
             }
         }
         crate::ast::node::ENode::MatchNew {
             patterns,
             input_anchor,
+            output_anchor,
         } => {
             // The MatchNew's LayoutNode sits at the lowest Pattern's grid pos
             // (see LayoutAst::recompute_matchnew_pos). Find the highest sibling
@@ -723,6 +736,80 @@ pub fn layoutnode_to_rendernode(
             // Input port sits flush against the envelope's +Z front face.
             let front_face = node_pos + Vec3::new(0.0, 0.0, envelope_xz / 2.0);
             let port_center = anchor_pick_center(front_face, true);
+
+            let mut anchors = std::collections::HashMap::from([(
+                input_anchor.clone(),
+                RenderAnchor {
+                    pick_center: port_center,
+                    type_markers: vec![],
+                    plain_body: Some(plain_anchor_body(port_center)),
+                },
+            )]);
+            let mut decorations = Vec::new();
+
+            // Grey sink-tip hull: the mirror of the red pattern envelope, drawn
+            // along the −Z tips of every sibling Pattern's SinkWall. Each
+            // Pattern's sink lives in its sub-layout; `harmonize_match_sinks`
+            // aligns all sibling sinks to a common (x, z), so the tips form a
+            // vertical Y column. Tip world = layout_to_world(sink_local +
+            // pattern_grid + extra_offset) + (0, 0, −SINK_TIP_DEPTH). Pattern
+            // sub-content always renders at sink_scale 1/3 (see walk_all_into),
+            // so the pyramid depth is 9 · 1/3 = 3.0 world units.
+            const SINK_TIP_DEPTH: f32 = 3.0;
+            let mut tip_x = node_pos.x;
+            let mut tip_z = node_pos.z;
+            let mut min_tip_y = f32::MAX;
+            let mut max_tip_y = f32::MIN;
+            for pid in patterns {
+                let Some(pattern_ln) = layout_ast.layout_nodes.get(pid) else {
+                    continue;
+                };
+                let Some(sub) = layout_ast.sub_layouts.get(pid) else {
+                    continue;
+                };
+                let Some(sink_id) = sub.sink_id() else {
+                    continue;
+                };
+                let Some(sink_ln) = sub.layout_nodes.get(&sink_id) else {
+                    continue;
+                };
+                let tip = layout_to_world(sink_ln.pos + pattern_ln.pos + extra_offset)
+                    + Vec3::new(0.0, 0.0, -SINK_TIP_DEPTH);
+                tip_x = tip.x;
+                tip_z = tip.z;
+                min_tip_y = min_tip_y.min(tip.y);
+                max_tip_y = max_tip_y.max(tip.y);
+            }
+
+            if min_tip_y <= max_tip_y {
+                let hull_height = (max_tip_y - min_tip_y) + TYPE_MARKER_Y_STEP;
+                let hull_center = Vec3::new(tip_x, (min_tip_y + max_tip_y) * 0.5, tip_z);
+                decorations.push(RenderObject {
+                    mesh: Cuboid::new(envelope_xz, hull_height, envelope_xz)
+                        .mesh()
+                        .build(),
+                    material: StandardMaterial {
+                        base_color: Color::srgba(0.5, 0.5, 0.5, 0.35),
+                        alpha_mode: AlphaMode::Blend,
+                        cull_mode: None,
+                        ..default()
+                    },
+                    transform: Transform::from_translation(hull_center),
+                });
+                // Output port mirrors the input port: flush against the hull's
+                // −Z back face, at the base (lowest) Pattern's Y (node_pos.y).
+                let back_face = Vec3::new(tip_x, node_pos.y, tip_z - envelope_xz / 2.0);
+                let out_center = anchor_pick_center(back_face, false);
+                anchors.insert(
+                    output_anchor.clone(),
+                    RenderAnchor {
+                        pick_center: out_center,
+                        type_markers: vec![],
+                        plain_body: Some(plain_anchor_body(out_center)),
+                    },
+                );
+            }
+
             RenderNode {
                 node: RenderObject {
                     mesh: Cuboid::new(envelope_xz, height, envelope_xz).mesh().build(),
@@ -734,15 +821,9 @@ pub fn layoutnode_to_rendernode(
                     },
                     transform: node_pos_tf * Transform::from_translation(center_local),
                 },
-                anchors: std::collections::HashMap::from([(
-                    input_anchor.clone(),
-                    RenderAnchor {
-                        pick_center: port_center,
-                        type_markers: vec![],
-                        plain_body: Some(plain_anchor_body(port_center)),
-                    },
-                )]),
+                anchors,
                 labels: vec![],
+                decorations,
             }
         }
         crate::ast::node::ENode::Program { .. } => {

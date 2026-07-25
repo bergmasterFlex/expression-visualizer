@@ -41,6 +41,7 @@ pub enum ENode {
     MatchNew {
         patterns: Vec<super::node::Id>,
         input_anchor: super::AnchorId,
+        output_anchor: super::AnchorId,
     },
     Pattern {
         parent_match: super::node::Id,
@@ -161,13 +162,20 @@ impl ENode {
                 })
                 .chain(vec![(output_anchor.clone(), super::EAnchor::Output)])
                 .collect(),
-            ENode::MatchNew { input_anchor, .. } => vec![(
-                input_anchor.clone(),
-                super::EAnchor::Input {
-                    order_num: 0,
-                    name: None,
-                },
-            )],
+            ENode::MatchNew {
+                input_anchor,
+                output_anchor,
+                ..
+            } => vec![
+                (
+                    input_anchor.clone(),
+                    super::EAnchor::Input {
+                        order_num: 0,
+                        name: None,
+                    },
+                ),
+                (output_anchor.clone(), super::EAnchor::Output),
+            ],
             ENode::Pattern { output_anchor, .. } => {
                 vec![(output_anchor.clone(), super::EAnchor::Output)]
             }

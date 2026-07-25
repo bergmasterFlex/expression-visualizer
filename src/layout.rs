@@ -703,7 +703,7 @@ impl LayoutAst {
     }
 
     /// The single SinkWall node id of this LayoutAst, if present.
-    fn sink_id(&self) -> Option<crate::ast::node::Id> {
+    pub fn sink_id(&self) -> Option<crate::ast::node::Id> {
         self.layout_nodes
             .keys()
             .find(|id| {
@@ -987,10 +987,12 @@ impl LayoutAst {
     /// `sub_layouts[pattern_id]` positioning that sink at Pattern-local (0,0,-1).
     pub fn plus_match_new(&self, pos: Vec3) -> Self {
         let (ast, match_input_anchor_id) = self.ast.with_next_anchor_id();
+        let (ast, match_output_anchor_id) = ast.with_next_anchor_id();
         let (ast, pattern_output_anchor_id) = ast.with_next_anchor_id();
         let (ast, match_node_id) = ast.plus(crate::ast::node::ENode::MatchNew {
             patterns: vec![],
             input_anchor: match_input_anchor_id.clone(),
+            output_anchor: match_output_anchor_id.clone(),
         });
         // Sub-AST bootstrap MUST happen after the Pattern parent-id is
         // reserved so the sub-AST's counter starts past it and every id
@@ -1008,6 +1010,7 @@ impl LayoutAst {
             crate::ast::node::ENode::MatchNew {
                 patterns: vec![pattern_node_id.clone()],
                 input_anchor: match_input_anchor_id,
+                output_anchor: match_output_anchor_id,
             },
         );
         Self {
@@ -1117,8 +1120,12 @@ impl LayoutAst {
             .cloned()
             .chain([new_pattern_id.clone()])
             .collect();
-        let match_input_anchor = match ast.nodes.get(&parent_id) {
-            Some(crate::ast::node::ENode::MatchNew { input_anchor, .. }) => input_anchor.clone(),
+        let (match_input_anchor, match_output_anchor) = match ast.nodes.get(&parent_id) {
+            Some(crate::ast::node::ENode::MatchNew {
+                input_anchor,
+                output_anchor,
+                ..
+            }) => (input_anchor.clone(), output_anchor.clone()),
             _ => return shifted,
         };
         let ast = ast.with_node_replaced(
@@ -1126,6 +1133,7 @@ impl LayoutAst {
             crate::ast::node::ENode::MatchNew {
                 patterns: new_patterns,
                 input_anchor: match_input_anchor,
+                output_anchor: match_output_anchor,
             },
         );
         let with_new = Self {
@@ -1208,8 +1216,12 @@ impl LayoutAst {
         match_id: &crate::ast::node::Id,
         new_patterns: Vec<crate::ast::node::Id>,
     ) -> Self {
-        let input_anchor = match self.ast.nodes.get(match_id) {
-            Some(crate::ast::node::ENode::MatchNew { input_anchor, .. }) => input_anchor.clone(),
+        let (input_anchor, output_anchor) = match self.ast.nodes.get(match_id) {
+            Some(crate::ast::node::ENode::MatchNew {
+                input_anchor,
+                output_anchor,
+                ..
+            }) => (input_anchor.clone(), output_anchor.clone()),
             _ => {
                 return Self {
                     ast: self.ast.clone(),
@@ -1224,6 +1236,7 @@ impl LayoutAst {
                 crate::ast::node::ENode::MatchNew {
                     patterns: new_patterns,
                     input_anchor,
+                    output_anchor,
                 },
             ),
             layout_nodes: self.layout_nodes.clone(),

@@ -782,6 +782,18 @@ fn spawn_ast_nodes(
                 AstSceneEntity,
             ))
             .id();
+
+        // Decorative meshes with no associated anchor (e.g. a MatchNew's grey
+        // sink-tip hull).
+        for deco in render_node.decorations {
+            commands.spawn((
+                Mesh3d(meshes.add(deco.mesh)),
+                MeshMaterial3d(materials.add(deco.material)),
+                deco.transform,
+                AstSceneEntity,
+            ));
+        }
+
         render_node
             .anchors
             .into_iter()
