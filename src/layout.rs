@@ -1454,6 +1454,32 @@ impl LayoutAst {
     ) -> Option<crate::eval::EType> {
         if let Some(node_id) = self.ast.anchor_to_node.get(anchor_id) {
             let node = self.ast.nodes.get(node_id)?;
+            // A typecast whose incoming type differs from its target type may
+            // fail: model that by adding `undefined` to the output type, i.e.
+            // `Sum(target, undefined)`. `any` casts never fail, so skip them.
+            if let crate::ast::node::ENode::TypeCast {
+                r#type,
+                input_anchor,
+                output_anchor,
+            } = node
+            {
+                if anchor_id == output_anchor {
+                    let target = crate::eval::ast_type_to_eval_type(r#type);
+                    if !matches!(target, crate::eval::EType::Any) {
+                        if let Some(incoming) =
+                            self.incoming_type(input_anchor, function_declarations)
+                        {
+                            if !eval_types_match(&incoming, &target) {
+                                return Some(crate::eval::EType::SumType(vec![
+                                    target,
+                                    crate::eval::EType::Undefined,
+                                ]));
+                            }
+                        }
+                    }
+                    return Some(target);
+                }
+            }
             return anchor_type_from_node(node, anchor_id, function_declarations);
         }
         for sub in self.sub_layouts.values() {
@@ -1462,6 +1488,20 @@ impl LayoutAst {
             }
         }
         None
+    }
+
+    /// Eval type flowing into `input` from a connected source anchor, if any.
+    /// `None` when the input is unconnected or the source carries no type.
+    fn incoming_type(
+        &self,
+        input: &crate::ast::AnchorId,
+        function_declarations: &std::collections::HashMap<
+            crate::ast::FunctionDeclarationId,
+            crate::ast::FunctionDeclaration,
+        >,
+    ) -> Option<crate::eval::EType> {
+        let source = source_anchor_for_input(&self.ast, input)?;
+        self.anchor_type(&source, function_declarations)
     }
 
     /// AST-level literal string attached to this anchor's type, if any.
@@ -1547,6 +1587,43 @@ impl LayoutAst {
     }
 }
 
+/// Source anchor feeding into `input`, if connected. Drag-to-connect records
+/// an edge from either end, so both directions are checked.
+fn source_anchor_for_input(
+    ast: &crate::ast::Ast,
+    input: &crate::ast::AnchorId,
+) -> Option<crate::ast::AnchorId> {
+    for (from, edges) in &ast.edges {
+        if edges.iter().any(|e| &e.to == input) {
+            return Some(from.clone());
+        }
+    }
+    ast.edges
+        .get(input)
+        .and_then(|edges| edges.first())
+        .map(|e| e.to.clone())
+}
+
+/// Structural type equality, ignoring any carried value literal. Two `SumType`s
+/// match when their leaves match pairwise in order.
+fn eval_types_match(a: &crate::eval::EType, b: &crate::eval::EType) -> bool {
+    use crate::eval::EType::*;
+    match (a, b) {
+        (Int(_), Int(_))
+        | (Float(_), Float(_))
+        | (Bool(_), Bool(_))
+        | (String(_), String(_))
+        | (Char(_), Char(_))
+        | (Any, Any)
+        | (Undefined, Undefined)
+        | (Exception, Exception) => true,
+        (SumType(x), SumType(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| eval_types_match(p, q))
+        }
+        _ => false,
+    }
+}
+
 fn anchor_type_from_node(
     node: &crate::ast::node::ENode,
     anchor_id: &crate::ast::AnchorId,
@@ -1558,9 +1635,23 @@ fn anchor_type_from_node(
     match node {
         crate::ast::node::ENode::ConstDecl { r#type, .. }
         | crate::ast::node::ENode::VarDecl { r#type, .. }
-        | crate::ast::node::ENode::Pattern { r#type, .. }
-        | crate::ast::node::ENode::TypeCast { r#type, .. } => {
+        | crate::ast::node::ENode::Pattern { r#type, .. } => {
             Some(crate::eval::ast_type_to_eval_type(r#type))
+        }
+        crate::ast::node::ENode::TypeCast {
+            r#type,
+            input_anchor,
+            ..
+        } => {
+            if anchor_id == input_anchor {
+                // The input type is undefined — the cast accepts any value.
+                None
+            } else {
+                // Base output type. The `Sum(target, undefined)` override for
+                // a mismatched incoming type is applied in
+                // `LayoutAst::anchor_type`, which has edge access.
+                Some(crate::eval::ast_type_to_eval_type(r#type))
+            }
         }
         crate::ast::node::ENode::FunctionCall {
             function_declaration_id,

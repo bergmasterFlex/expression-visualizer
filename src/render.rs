@@ -347,8 +347,14 @@ pub fn layoutnode_to_rendernode(
             let output_local = Vec3::new(0.0, 0.0, -NODE_HALF_DEPTH);
             let input_world = node_pos + input_local;
             let output_world = node_pos + output_local;
-            let eval_type = crate::eval::ast_type_to_eval_type(r#type);
+            // The output type reflects a possibly failed cast as
+            // `Sum(target, undefined)` when a mismatched type flows in; that
+            // override lives in `anchor_type`, so read it back for the markers.
+            let output_eval_type = layout_ast
+                .anchor_type(output_anchor, function_declarations)
+                .unwrap_or_else(|| crate::eval::ast_type_to_eval_type(r#type));
             let elim_value = crate::layout::value_of_etype(r#type);
+            let input_center = anchor_pick_center(input_world, true);
             RenderNode {
                 node: RenderObject {
                     mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, ANCHOR_X)
@@ -367,14 +373,12 @@ pub fn layoutnode_to_rendernode(
                     (
                         input_anchor.clone(),
                         RenderAnchor {
-                            pick_center: anchor_pick_center(input_world, true),
-                            type_markers: build_type_markers(
-                                &eval_type,
-                                elim_value.as_deref(),
-                                input_world,
-                                true,
-                            ),
-                            plain_body: None,
+                            pick_center: input_center,
+                            // A typecast's input type is undefined: it accepts
+                            // any incoming value, so render a neutral grey body
+                            // like the Sink and Match inputs.
+                            type_markers: vec![],
+                            plain_body: Some(plain_anchor_body(input_center)),
                         },
                     ),
                     (
@@ -382,7 +386,7 @@ pub fn layoutnode_to_rendernode(
                         RenderAnchor {
                             pick_center: anchor_pick_center(output_world, false),
                             type_markers: build_type_markers(
-                                &eval_type,
+                                &output_eval_type,
                                 elim_value.as_deref(),
                                 output_world,
                                 false,
