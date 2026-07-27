@@ -1,6 +1,7 @@
 mod ast;
 mod camera;
 mod colors;
+mod common;
 mod edge;
 mod eval;
 mod grid;
@@ -24,6 +25,11 @@ struct AstState {
     /// through `program_ast()` / `program_ast_mut()`.
     layout_ast: layout::LayoutAst,
     program_id: ast::node::Id,
+    /// Shared id domains for the whole LayoutAst tree. Threaded through every
+    /// `plus_*` builder so node and anchor ids stay globally unique across the
+    /// root, the program sub-layout, and all pattern sub-layouts.
+    node_id_domain: common::IdDomain<ast::node::Id>,
+    anchor_id_domain: common::IdDomain<ast::anchor::Id>,
     function_declarations:
         std::collections::HashMap<ast::FunctionDeclarationId, ast::FunctionDeclaration>,
 }
@@ -43,10 +49,13 @@ impl AstState {
 
 impl Default for AstState {
     fn default() -> Self {
-        let (layout_ast, program_id) = layout::LayoutAst::empty_with_program();
+        let (layout_ast, program_id, node_id_domain, anchor_id_domain) =
+            layout::LayoutAst::empty_with_program();
         Self {
             layout_ast,
             program_id,
+            node_id_domain,
+            anchor_id_domain,
             function_declarations: std::collections::HashMap::from([
                 (
                     ast::FunctionDeclarationId(0),
@@ -147,12 +156,12 @@ pub struct AnchorHovered;
 
 #[derive(Component)]
 pub enum EAnchor {
-    Input { id: ast::AnchorId },
-    Output { id: ast::AnchorId },
+    Input { id: ast::anchor::Id },
+    Output { id: ast::anchor::Id },
 }
 
 impl EAnchor {
-    pub fn id(&self) -> ast::AnchorId {
+    pub fn id(&self) -> ast::anchor::Id {
         match self {
             EAnchor::Input { id } | EAnchor::Output { id } => id.clone(),
         }
@@ -163,7 +172,7 @@ impl EAnchor {
 pub struct Edge {
     pub from_anchor: Entity,
     pub to_anchor: Entity,
-    pub source_anchor_id: ast::AnchorId,
+    pub source_anchor_id: ast::anchor::Id,
 }
 
 /// In-flight drag-to-connect state.
@@ -173,14 +182,14 @@ pub struct Edge {
 /// stale the moment anything sets `NeedsRebuild` mid-drag. Anchor identity is
 /// tracked by `AnchorId`, which survives rebuilds.
 pub struct DragInfo {
-    pub source_anchor_id: ast::AnchorId,
+    pub source_anchor_id: ast::anchor::Id,
     /// `true` if the drag started on an `EAnchor::Output`. Lets the target
     /// check reject same-kind pairs and lets drag-end store the edge in the
     /// canonical output → input direction without an AST lookup.
     pub source_is_output: bool,
     pub source_pos: Vec3,
     pub current_end: Vec3,
-    pub target_anchor_id: Option<ast::AnchorId>,
+    pub target_anchor_id: Option<ast::anchor::Id>,
 }
 
 #[derive(Resource, Default)]
@@ -719,8 +728,8 @@ fn spawn_ast_nodes(
     pick: Res<PickState>,
 ) {
     let mut node_entites = std::collections::HashMap::<ast::node::Id, Entity>::new();
-    let mut anchor_entities = std::collections::HashMap::<ast::AnchorId, Entity>::new();
-    let mut anchor_world_positions = std::collections::HashMap::<ast::AnchorId, Vec3>::new();
+    let mut anchor_entities = std::collections::HashMap::<ast::anchor::Id, Entity>::new();
+    let mut anchor_world_positions = std::collections::HashMap::<ast::anchor::Id, Vec3>::new();
     for walked in state.layout_ast.walk_all() {
         let layout_node = walked.layout_node;
         let node_id = &layout_node.node_id;
@@ -809,10 +818,10 @@ fn spawn_ast_nodes(
                     .spawn((
                         Transform::from_translation(pick_center),
                         match layout_anchor.anchor {
-                            ast::EAnchor::Input { .. } => EAnchor::Input {
+                            ast::anchor::EAnchor::Input { .. } => EAnchor::Input {
                                 id: anchor_id.clone(),
                             },
-                            ast::EAnchor::Output => EAnchor::Output {
+                            ast::anchor::EAnchor::Output => EAnchor::Output {
                                 id: anchor_id.clone(),
                             },
                         },
@@ -1502,11 +1511,18 @@ fn handle_add_node_button(
                 {
                     continue;
                 }
-                let new_layout = match action {
+                let node_id_domain = state.node_id_domain.clone();
+                let anchor_id_domain = state.anchor_id_domain.clone();
+                let (new_layout, new_node_id_domain, new_anchor_id_domain) = match action {
                     EAstActionButton::SelectAstButton => continue,
-                    EAstActionButton::AddConstDeclButton => pick
-                        .current_ast(&state)
-                        .plus_const_decl(ast::node::EType::Int { value: None }, new_pos),
+                    EAstActionButton::AddConstDeclButton => {
+                        pick.current_ast(&state).plus_const_decl(
+                            ast::node::EType::Int { value: None },
+                            new_pos,
+                            node_id_domain,
+                            anchor_id_domain,
+                        )
+                    }
                     EAstActionButton::AddVarDeclButton => {
                         // VarDecls live on the Program-Ast's front wall at
                         // (x, 0, 0) — refuse anything else defensively; the
@@ -1517,7 +1533,11 @@ fn handle_add_node_button(
                         {
                             continue;
                         }
-                        pick.current_ast(&state).plus_var_decl(new_pos)
+                        pick.current_ast(&state).plus_var_decl(
+                            new_pos,
+                            node_id_domain,
+                            anchor_id_domain,
+                        )
                     }
                     EAstActionButton::AddFunctionCallButton => {
                         pick.current_ast(&state).plus_function_call(
@@ -1528,14 +1548,21 @@ fn handle_add_node_button(
                                 .map(|(id, decl)| (id.clone(), decl))
                                 .unwrap(),
                             new_pos,
+                            node_id_domain,
+                            anchor_id_domain,
                         )
                     }
-                    EAstActionButton::AddTypeCastButton => pick
-                        .current_ast(&state)
-                        .plus_type_cast(ast::node::EType::Int { value: None }, new_pos),
-                    EAstActionButton::AddMatchButton => {
-                        pick.current_ast(&state).plus_match(new_pos)
-                    }
+                    EAstActionButton::AddTypeCastButton => pick.current_ast(&state).plus_type_cast(
+                        ast::node::EType::Int { value: None },
+                        new_pos,
+                        node_id_domain,
+                        anchor_id_domain,
+                    ),
+                    EAstActionButton::AddMatchButton => pick.current_ast(&state).plus_match(
+                        new_pos,
+                        node_id_domain,
+                        anchor_id_domain,
+                    ),
                     EAstActionButton::AddPatternButton => {
                         match pick.current_ast(&state).node_at(pick.selected_pos) {
                             Some(id)
@@ -1544,7 +1571,11 @@ fn handle_add_node_button(
                                     Some(ast::node::ENode::Pattern { .. })
                                 ) =>
                             {
-                                let updated = pick.current_ast(&state).plus_pattern_above(&id);
+                                let updated = pick.current_ast(&state).plus_pattern_above(
+                                    &id,
+                                    node_id_domain,
+                                    anchor_id_domain,
+                                );
                                 pick.selected_pos.y += 1;
                                 updated
                             }
@@ -1553,6 +1584,8 @@ fn handle_add_node_button(
                     }
                 };
                 *pick.current_ast_mut(&mut state) = new_layout;
+                state.node_id_domain = new_node_id_domain;
+                state.anchor_id_domain = new_anchor_id_domain;
                 state.layout_ast = state.layout_ast.settle_footprints();
                 rebuild.0 = true;
             }
@@ -2267,12 +2300,19 @@ fn handle_dropdown_option_click(
             DropdownChoice::Function(new_fn_id) => {
                 let decl = state.function_declarations.get(new_fn_id).cloned();
                 if let Some(new_decl) = decl {
+                    let node_id_domain = state.node_id_domain.clone();
+                    let anchor_id_domain = state.anchor_id_domain.clone();
                     if let Some(owning_ast) = state.layout_ast.find_node_ast_mut(&option.node_id) {
-                        let new_layout = owning_ast.with_function_call_replaced(
-                            &option.node_id,
-                            (new_fn_id.clone(), &new_decl),
-                        );
+                        let (new_layout, new_node_id_domain, new_anchor_id_domain) = owning_ast
+                            .with_function_call_replaced(
+                                &option.node_id,
+                                (new_fn_id.clone(), &new_decl),
+                                node_id_domain,
+                                anchor_id_domain,
+                            );
                         *owning_ast = new_layout;
+                        state.node_id_domain = new_node_id_domain;
+                        state.anchor_id_domain = new_anchor_id_domain;
                         state.layout_ast = state.layout_ast.settle_footprints();
                         rebuild.0 = true;
                     }
@@ -2926,7 +2966,13 @@ fn handle_start_menu_new_button(
         let mut color = text_color_q.get_mut(children[0]).unwrap();
         match *interaction {
             Interaction::Pressed => {
-                *state.program_ast_mut() = layout::LayoutAst::empty().plus_sink();
+                let node_id_domain = state.node_id_domain.clone();
+                let anchor_id_domain = state.anchor_id_domain.clone();
+                let (fresh, new_node_id_domain, new_anchor_id_domain) =
+                    layout::LayoutAst::empty().plus_sink(node_id_domain, anchor_id_domain);
+                *state.program_ast_mut() = fresh;
+                state.node_id_domain = new_node_id_domain;
+                state.anchor_id_domain = new_anchor_id_domain;
                 pick.context_path.clear();
                 pick.selected_context.clear();
                 rebuild.0 = true;
@@ -3578,7 +3624,7 @@ fn update_breadcrumb_display(
     };
     let mut parts = vec!["Program".to_string()];
     for id in &pick.context_path {
-        parts.push(format!("Pattern({})", id.0));
+        parts.push(format!("Pattern({})", id));
     }
     text.0 = parts.join(" > ");
 }
@@ -4447,10 +4493,10 @@ fn update_crosshair(
 /// both orientations as connected.
 fn anchors_already_connected(
     layout_ast: &layout::LayoutAst,
-    a: &ast::AnchorId,
-    b: &ast::AnchorId,
+    a: &ast::anchor::Id,
+    b: &ast::anchor::Id,
 ) -> bool {
-    let joined = |from: &ast::AnchorId, to: &ast::AnchorId| {
+    let joined = |from: &ast::anchor::Id, to: &ast::anchor::Id| {
         layout_ast
             .ast
             .edges

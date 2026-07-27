@@ -167,7 +167,7 @@ pub fn collect_var_decls(ast: &crate::ast::Ast) -> Vec<(crate::ast::node::Id, St
             _ => None,
         })
         .collect();
-    out.sort_by_key(|(id, _)| id.0);
+    out.sort_by(|(a, _), (b, _)| a.cmp(b));
     out
 }
 
@@ -176,7 +176,7 @@ pub fn collect_var_decls(ast: &crate::ast::Ast) -> Vec<(crate::ast::node::Id, St
 /// Drag-to-connect lets the user start from either anchor, so we accept both.
 fn neighbours_of_anchor(
     ast: &crate::ast::Ast,
-    anchor: &crate::ast::AnchorId,
+    anchor: &crate::ast::anchor::Id,
 ) -> Vec<crate::ast::node::Id> {
     let mut out: Vec<crate::ast::node::Id> = ast.get_connected_nodes_to_anchor(anchor.clone());
     if let Some(edges) = ast.edges.get(anchor) {
@@ -222,11 +222,11 @@ pub fn initial_values(
     out
 }
 
-fn node_input_anchors(node: &crate::ast::node::ENode) -> Vec<crate::ast::AnchorId> {
+fn node_input_anchors(node: &crate::ast::node::ENode) -> Vec<crate::ast::anchor::Id> {
     node.anchors()
         .into_iter()
         .filter_map(|(aid, a)| match a {
-            crate::ast::EAnchor::Input { .. } => Some(aid),
+            crate::ast::anchor::EAnchor::Input { .. } => Some(aid),
             _ => None,
         })
         .collect()

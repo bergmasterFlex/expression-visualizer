@@ -18,7 +18,7 @@ pub struct RenderObject {
 
 pub struct RenderNode {
     pub node: RenderObject,
-    pub anchors: std::collections::HashMap<crate::ast::AnchorId, RenderAnchor>,
+    pub anchors: std::collections::HashMap<crate::ast::anchor::Id, RenderAnchor>,
     pub labels: Vec<RenderLabel>,
     /// Extra decorative meshes with no associated anchor (e.g. the grey
     /// sink-tip hull of a Match). Spawned alongside `node` by the renderer.

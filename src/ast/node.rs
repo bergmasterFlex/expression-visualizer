@@ -1,40 +1,56 @@
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub struct Id(pub usize);
+#[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Ord)]
+pub struct Id(usize);
+
+impl crate::common::TId for Id {
+    fn zero() -> Self {
+        Self(0)
+    }
+
+    fn next_id(&self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+impl std::fmt::Display for Id {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Id({})", self.0)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ENode {
     Program {},
     Sink {
-        input_anchor: super::AnchorId,
+        input_anchor: super::anchor::Id,
     },
     FunctionCall {
         function_declaration_id: super::FunctionDeclarationId,
-        input_anchors: Vec<super::AnchorId>,
-        output_anchor: super::AnchorId,
+        input_anchors: Vec<super::anchor::Id>,
+        output_anchor: super::anchor::Id,
     },
     ConstDecl {
         r#type: EType,
-        output_anchor: super::AnchorId,
+        output_anchor: super::anchor::Id,
     },
     TypeCast {
         r#type: EType,
-        input_anchor: super::AnchorId,
-        output_anchor: super::AnchorId,
+        input_anchor: super::anchor::Id,
+        output_anchor: super::anchor::Id,
     },
     VarDecl {
         name: String,
         r#type: EType,
-        output_anchor: super::AnchorId,
+        output_anchor: super::anchor::Id,
     },
     Match {
         patterns: Vec<super::node::Id>,
-        input_anchor: super::AnchorId,
-        output_anchor: super::AnchorId,
+        input_anchor: super::anchor::Id,
+        output_anchor: super::anchor::Id,
     },
     Pattern {
         parent_match: super::node::Id,
         r#type: EType,
-        output_anchor: super::AnchorId,
+        output_anchor: super::anchor::Id,
     },
 }
 
@@ -50,7 +66,7 @@ pub enum EType {
 }
 
 impl ENode {
-    pub fn anchors(&self) -> Vec<(super::AnchorId, super::EAnchor)> {
+    pub fn anchors(&self) -> Vec<(super::anchor::Id, super::anchor::EAnchor)> {
         match self {
             ENode::FunctionCall {
                 input_anchors,
@@ -63,23 +79,26 @@ impl ENode {
                 .map(|(i, anchor_id)| {
                     (
                         anchor_id,
-                        super::EAnchor::Input {
+                        super::anchor::EAnchor::Input {
                             order_num: i,
                             name: Some(format!("param{}", i)),
                         },
                     )
                 })
-                .chain(vec![(output_anchor.clone(), super::EAnchor::Output)])
+                .chain(vec![(
+                    output_anchor.clone(),
+                    super::anchor::EAnchor::Output,
+                )])
                 .collect(),
             ENode::Sink { input_anchor } => vec![(
                 input_anchor.clone(),
-                super::EAnchor::Input {
+                super::anchor::EAnchor::Input {
                     order_num: 0,
                     name: None,
                 },
             )],
             ENode::ConstDecl { output_anchor, .. } => {
-                vec![(output_anchor.clone(), super::EAnchor::Output)]
+                vec![(output_anchor.clone(), super::anchor::EAnchor::Output)]
             }
             ENode::TypeCast {
                 input_anchor,
@@ -88,15 +107,15 @@ impl ENode {
             } => vec![
                 (
                     input_anchor.clone(),
-                    super::EAnchor::Input {
+                    super::anchor::EAnchor::Input {
                         order_num: 0,
                         name: None,
                     },
                 ),
-                (output_anchor.clone(), super::EAnchor::Output),
+                (output_anchor.clone(), super::anchor::EAnchor::Output),
             ],
             ENode::VarDecl { output_anchor, .. } => {
-                vec![(output_anchor.clone(), super::EAnchor::Output)]
+                vec![(output_anchor.clone(), super::anchor::EAnchor::Output)]
             }
             ENode::Match {
                 input_anchor,
@@ -105,15 +124,15 @@ impl ENode {
             } => vec![
                 (
                     input_anchor.clone(),
-                    super::EAnchor::Input {
+                    super::anchor::EAnchor::Input {
                         order_num: 0,
                         name: None,
                     },
                 ),
-                (output_anchor.clone(), super::EAnchor::Output),
+                (output_anchor.clone(), super::anchor::EAnchor::Output),
             ],
             ENode::Pattern { output_anchor, .. } => {
-                vec![(output_anchor.clone(), super::EAnchor::Output)]
+                vec![(output_anchor.clone(), super::anchor::EAnchor::Output)]
             }
             ENode::Program { .. } => vec![],
         }

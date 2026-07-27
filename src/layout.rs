@@ -1,5 +1,8 @@
 use bevy::prelude::*;
 
+type NodeIdDomain = crate::common::IdDomain<crate::ast::node::Id>;
+type AnchorIdDomain = crate::common::IdDomain<crate::ast::anchor::Id>;
+
 #[derive(Debug, Clone)]
 pub struct LayoutNode {
     pub node_id: crate::ast::node::Id,
@@ -14,9 +17,9 @@ pub struct LayoutEdge {
 
 #[derive(Debug, Clone)]
 pub struct LayoutAnchor {
-    pub anchor_id: crate::ast::AnchorId,
+    pub anchor_id: crate::ast::anchor::Id,
     pub node_id: crate::ast::node::Id,
-    pub anchor: crate::ast::EAnchor,
+    pub anchor: crate::ast::anchor::EAnchor,
     pub pos: Vec3,
 }
 
@@ -133,14 +136,18 @@ impl LayoutAst {
     /// `sub_layouts` entry keyed by the Program's id. The inner LayoutAst is
     /// where user-visible nodes live in Step 1 (mirrors the previous behavior
     /// of a flat `LayoutAst::empty()` root).
-    pub fn empty_with_program() -> (Self, crate::ast::node::Id) {
-        let (ast, program_id) = crate::ast::Ast::empty().plus(crate::ast::node::ENode::Program {});
+    pub fn empty_with_program() -> (Self, crate::ast::node::Id, NodeIdDomain, AnchorIdDomain) {
+        let node_id_domain = NodeIdDomain::new();
+        let anchor_id_domain = AnchorIdDomain::new();
+        let (node_id_domain, program_id) = node_id_domain.next_id();
+        let ast =
+            crate::ast::Ast::empty().plus(program_id.clone(), crate::ast::node::ENode::Program {});
         let outer = Self {
             ast,
             layout_nodes: std::collections::HashMap::new(),
             sub_layouts: std::collections::HashMap::from([(program_id.clone(), Self::empty())]),
         };
-        (outer, program_id)
+        (outer, program_id, node_id_domain, anchor_id_domain)
     }
 
     pub fn minus_node(&self, node_id: &crate::ast::node::Id) -> Self {
@@ -863,7 +870,7 @@ impl LayoutAst {
         group
     }
 
-    pub fn plus_edge(&self, from: crate::ast::AnchorId, to: crate::ast::AnchorId) -> Self {
+    pub fn plus_edge(&self, from: crate::ast::anchor::Id, to: crate::ast::anchor::Id) -> Self {
         Self {
             ast: self.ast.plus_edge(from, to),
             layout_nodes: self.layout_nodes.clone(),
@@ -871,48 +878,78 @@ impl LayoutAst {
         }
     }
 
-    pub fn plus_sink(&self) -> Self {
-        let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
-        let (ast, node_id) = ast.plus(crate::ast::node::ENode::Sink {
-            input_anchor: input_anchor_id,
-        });
-        Self {
+    pub fn plus_sink(
+        &self,
+        node_id_domain: NodeIdDomain,
+        anchor_id_domain: AnchorIdDomain,
+    ) -> (Self, NodeIdDomain, AnchorIdDomain) {
+        let (anchor_id_domain, input_anchor_id) = anchor_id_domain.next_id();
+        let (node_id_domain, node_id) = node_id_domain.next_id();
+        let ast = self.ast.plus(
+            node_id.clone(),
+            crate::ast::node::ENode::Sink {
+                input_anchor: input_anchor_id,
+            },
+        );
+        let layout = Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
             sub_layouts: self.sub_layouts.clone(),
         }
-        ._plus_layout_node(&node_id, Vec3::new(0.0, 0.0, -4.0))
+        ._plus_layout_node(&node_id, Vec3::new(0.0, 0.0, -4.0));
+        (layout, node_id_domain, anchor_id_domain)
     }
 
-    pub fn plus_const_decl(&self, r#type: crate::ast::node::EType, pos: Vec3) -> Self {
-        let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
-        let (ast, output_anchor_id) = ast.with_next_anchor_id();
-        let (ast, node_id) = ast.plus(crate::ast::node::ENode::ConstDecl {
-            r#type,
-            output_anchor: output_anchor_id,
-        });
-        Self {
+    pub fn plus_const_decl(
+        &self,
+        r#type: crate::ast::node::EType,
+        pos: Vec3,
+        node_id_domain: NodeIdDomain,
+        anchor_id_domain: AnchorIdDomain,
+    ) -> (Self, NodeIdDomain, AnchorIdDomain) {
+        let (anchor_id_domain, output_anchor_id) = anchor_id_domain.next_id();
+        let (node_id_domain, node_id) = node_id_domain.next_id();
+        let ast = self.ast.plus(
+            node_id.clone(),
+            crate::ast::node::ENode::ConstDecl {
+                r#type,
+                output_anchor: output_anchor_id,
+            },
+        );
+        let layout = Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
             sub_layouts: self.sub_layouts.clone(),
         }
-        ._plus_layout_node(&node_id, pos)
+        ._plus_layout_node(&node_id, pos);
+        (layout, node_id_domain, anchor_id_domain)
     }
 
-    pub fn plus_type_cast(&self, r#type: crate::ast::node::EType, pos: Vec3) -> Self {
-        let (ast, input_anchor_id) = self.ast.with_next_anchor_id();
-        let (ast, output_anchor_id) = ast.with_next_anchor_id();
-        let (ast, node_id) = ast.plus(crate::ast::node::ENode::TypeCast {
-            r#type,
-            input_anchor: input_anchor_id,
-            output_anchor: output_anchor_id,
-        });
-        Self {
+    pub fn plus_type_cast(
+        &self,
+        r#type: crate::ast::node::EType,
+        pos: Vec3,
+        node_id_domain: NodeIdDomain,
+        anchor_id_domain: AnchorIdDomain,
+    ) -> (Self, NodeIdDomain, AnchorIdDomain) {
+        let (anchor_id_domain, input_anchor_id) = anchor_id_domain.next_id();
+        let (anchor_id_domain, output_anchor_id) = anchor_id_domain.next_id();
+        let (node_id_domain, node_id) = node_id_domain.next_id();
+        let ast = self.ast.plus(
+            node_id.clone(),
+            crate::ast::node::ENode::TypeCast {
+                r#type,
+                input_anchor: input_anchor_id,
+                output_anchor: output_anchor_id,
+            },
+        );
+        let layout = Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
             sub_layouts: self.sub_layouts.clone(),
         }
-        ._plus_layout_node(&node_id, pos)
+        ._plus_layout_node(&node_id, pos);
+        (layout, node_id_domain, anchor_id_domain)
     }
 
     pub fn plus_function_call(
@@ -922,18 +959,20 @@ impl LayoutAst {
             &crate::ast::FunctionDeclaration,
         ),
         pos: Vec3,
-    ) -> Self {
-        let (ast, input_anchor_ids) =
+        node_id_domain: NodeIdDomain,
+        anchor_id_domain: AnchorIdDomain,
+    ) -> (Self, NodeIdDomain, AnchorIdDomain) {
+        let (anchor_id_domain, input_anchor_ids) =
             function_declaration
                 .1
                 .inputs
                 .iter()
-                .fold::<(crate::ast::Ast, Vec<crate::ast::AnchorId>), _>(
-                    (self.ast.clone(), vec![]),
-                    |(ast, input_anchor_ids), _| {
-                        let (ast, new_anchor_id) = ast.with_next_anchor_id();
+                .fold::<(AnchorIdDomain, Vec<crate::ast::anchor::Id>), _>(
+                    (anchor_id_domain, vec![]),
+                    |(anchor_id_domain, input_anchor_ids), _| {
+                        let (anchor_id_domain, new_anchor_id) = anchor_id_domain.next_id();
                         (
-                            ast,
+                            anchor_id_domain,
                             input_anchor_ids
                                 .into_iter()
                                 .chain(vec![new_anchor_id])
@@ -941,18 +980,23 @@ impl LayoutAst {
                         )
                     },
                 );
-        let (ast, output_anchor_id) = ast.with_next_anchor_id();
-        let (ast, node_id) = ast.plus(crate::ast::node::ENode::FunctionCall {
-            function_declaration_id: function_declaration.0,
-            input_anchors: input_anchor_ids,
-            output_anchor: output_anchor_id,
-        });
-        Self {
+        let (anchor_id_domain, output_anchor_id) = anchor_id_domain.next_id();
+        let (node_id_domain, node_id) = node_id_domain.next_id();
+        let ast = self.ast.plus(
+            node_id.clone(),
+            crate::ast::node::ENode::FunctionCall {
+                function_declaration_id: function_declaration.0,
+                input_anchors: input_anchor_ids,
+                output_anchor: output_anchor_id,
+            },
+        );
+        let layout = Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
             sub_layouts: self.sub_layouts.clone(),
         }
-        ._plus_layout_node(&node_id, pos)
+        ._plus_layout_node(&node_id, pos);
+        (layout, node_id_domain, anchor_id_domain)
     }
 
     pub fn with_function_call_replaced(
@@ -962,9 +1006,12 @@ impl LayoutAst {
             crate::ast::FunctionDeclarationId,
             &crate::ast::FunctionDeclaration,
         ),
-    ) -> Self {
+        node_id_domain: NodeIdDomain,
+        anchor_id_domain: AnchorIdDomain,
+    ) -> (Self, NodeIdDomain, AnchorIdDomain) {
         let pos = self.layout_nodes.get(node_id).unwrap().pos;
-        self.minus_node(node_id).plus_function_call(new_fn, pos)
+        self.minus_node(node_id)
+            .plus_function_call(new_fn, pos, node_id_domain, anchor_id_domain)
     }
 
     /// Create a `Match` container plus its initial `Pattern` child at `pos`.
@@ -972,25 +1019,37 @@ impl LayoutAst {
     /// rendering can iterate `layout_nodes` uniformly. The Pattern is created
     /// with a fresh sub-AST (single Sink) and a matching entry in
     /// `sub_layouts[pattern_id]` positioning that sink at Pattern-local (0,0,-1).
-    pub fn plus_match(&self, pos: Vec3) -> Self {
-        let (ast, match_input_anchor_id) = self.ast.with_next_anchor_id();
-        let (ast, match_output_anchor_id) = ast.with_next_anchor_id();
-        let (ast, pattern_output_anchor_id) = ast.with_next_anchor_id();
-        let (ast, match_node_id) = ast.plus(crate::ast::node::ENode::Match {
-            patterns: vec![],
-            input_anchor: match_input_anchor_id.clone(),
-            output_anchor: match_output_anchor_id.clone(),
-        });
-        // Sub-AST bootstrap MUST happen after the Pattern parent-id is
-        // reserved so the sub-AST's counter starts past it and every id
-        // in the tree stays globally unique.
-        let (ast, pattern_node_id) = ast.plus(crate::ast::node::ENode::Pattern {
-            parent_match: match_node_id.clone(),
-            r#type: crate::ast::node::EType::Int { value: None },
-            output_anchor: pattern_output_anchor_id,
-        });
-        let (ast, pattern_sub_ast, sub_sink_id) =
-            crate::ast::Ast::initial_pattern_sub_ast_from(ast);
+    pub fn plus_match(
+        &self,
+        pos: Vec3,
+        node_id_domain: NodeIdDomain,
+        anchor_id_domain: AnchorIdDomain,
+    ) -> (Self, NodeIdDomain, AnchorIdDomain) {
+        let (anchor_id_domain, match_input_anchor_id) = anchor_id_domain.next_id();
+        let (anchor_id_domain, match_output_anchor_id) = anchor_id_domain.next_id();
+        let (anchor_id_domain, pattern_output_anchor_id) = anchor_id_domain.next_id();
+        let (node_id_domain, match_node_id) = node_id_domain.next_id();
+        let ast = self.ast.plus(
+            match_node_id.clone(),
+            crate::ast::node::ENode::Match {
+                patterns: vec![],
+                input_anchor: match_input_anchor_id.clone(),
+                output_anchor: match_output_anchor_id.clone(),
+            },
+        );
+        let (node_id_domain, pattern_node_id) = node_id_domain.next_id();
+        let ast = ast.plus(
+            pattern_node_id.clone(),
+            crate::ast::node::ENode::Pattern {
+                parent_match: match_node_id.clone(),
+                r#type: crate::ast::node::EType::Int { value: None },
+                output_anchor: pattern_output_anchor_id,
+            },
+        );
+        // The sub-AST draws its sink node and anchor ids from the same shared
+        // id domains, so every id in the tree stays globally unique.
+        let (node_id_domain, anchor_id_domain, pattern_sub_ast, sub_sink_id) =
+            crate::ast::Ast::new_pattern_sub_ast(node_id_domain, anchor_id_domain);
         let pattern_sub_layout = Self::initial_pattern_sub_layout(&pattern_sub_ast, &sub_sink_id);
         let ast = ast.with_node_replaced(
             &match_node_id,
@@ -1000,7 +1059,7 @@ impl LayoutAst {
                 output_anchor: match_output_anchor_id,
             },
         );
-        Self {
+        let layout = Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
             sub_layouts: self
@@ -1011,7 +1070,8 @@ impl LayoutAst {
                 .collect(),
         }
         ._plus_layout_node(&pattern_node_id, pos)
-        ._plus_layout_node(&match_node_id, pos)
+        ._plus_layout_node(&match_node_id, pos);
+        (layout, node_id_domain, anchor_id_domain)
     }
 
     /// LayoutAst for a fresh Pattern's sub-AST: registers the initial sink at
@@ -1039,18 +1099,27 @@ impl LayoutAst {
     /// then displaces any external neighbors via `settle_footprints`. The caller
     /// bumps `pick.selected_pos.y` by 1 so selection tracks the originally-
     /// selected Pattern (now one row higher).
-    pub fn plus_pattern_above(&self, selected_pattern_id: &crate::ast::node::Id) -> Self {
+    pub fn plus_pattern_above(
+        &self,
+        selected_pattern_id: &crate::ast::node::Id,
+        node_id_domain: NodeIdDomain,
+        anchor_id_domain: AnchorIdDomain,
+    ) -> (Self, NodeIdDomain, AnchorIdDomain) {
         let (parent_id, selected_pos) = match self.ast.nodes.get(selected_pattern_id) {
             Some(crate::ast::node::ENode::Pattern { parent_match, .. }) => {
                 let ln = self.layout_nodes.get(selected_pattern_id).unwrap();
                 (parent_match.clone(), ln.pos)
             }
             _ => {
-                return Self {
-                    ast: self.ast.clone(),
-                    layout_nodes: self.layout_nodes.clone(),
-                    sub_layouts: self.sub_layouts.clone(),
-                }
+                return (
+                    Self {
+                        ast: self.ast.clone(),
+                        layout_nodes: self.layout_nodes.clone(),
+                        sub_layouts: self.sub_layouts.clone(),
+                    },
+                    node_id_domain,
+                    anchor_id_domain,
+                )
             }
         };
         let selected_y = selected_pos.y;
@@ -1090,16 +1159,20 @@ impl LayoutAst {
             Some(crate::ast::node::ENode::Match { patterns, .. }) => patterns.clone(),
             _ => vec![],
         };
-        let (ast, new_output_anchor_id) = shifted.ast.with_next_anchor_id();
-        // Reserve Pattern id first, then bootstrap sub-AST off the bumped
-        // parent counter (see plus_match for the id-uniqueness rule).
-        let (ast, new_pattern_id) = ast.plus(crate::ast::node::ENode::Pattern {
-            parent_match: parent_id.clone(),
-            r#type: crate::ast::node::EType::Int { value: None },
-            output_anchor: new_output_anchor_id,
-        });
-        let (ast, new_pattern_sub_ast, new_sub_sink_id) =
-            crate::ast::Ast::initial_pattern_sub_ast_from(ast);
+        let (anchor_id_domain, new_output_anchor_id) = anchor_id_domain.next_id();
+        let (node_id_domain, new_pattern_id) = node_id_domain.next_id();
+        let ast = shifted.ast.plus(
+            new_pattern_id.clone(),
+            crate::ast::node::ENode::Pattern {
+                parent_match: parent_id.clone(),
+                r#type: crate::ast::node::EType::Int { value: None },
+                output_anchor: new_output_anchor_id,
+            },
+        );
+        // The sub-AST draws its ids from the same shared domains, keeping every
+        // id in the tree globally unique (see plus_match).
+        let (node_id_domain, anchor_id_domain, new_pattern_sub_ast, new_sub_sink_id) =
+            crate::ast::Ast::new_pattern_sub_ast(node_id_domain, anchor_id_domain);
         let new_pattern_sub_layout =
             Self::initial_pattern_sub_layout(&new_pattern_sub_ast, &new_sub_sink_id);
         let new_patterns: Vec<crate::ast::node::Id> = sibling_ids
@@ -1113,7 +1186,7 @@ impl LayoutAst {
                 output_anchor,
                 ..
             }) => (input_anchor.clone(), output_anchor.clone()),
-            _ => return shifted,
+            _ => return (shifted, node_id_domain, anchor_id_domain),
         };
         let ast = ast.with_node_replaced(
             &parent_id,
@@ -1145,9 +1218,10 @@ impl LayoutAst {
                 }
             })
             .collect();
-        match_ids
+        let layout = match_ids
             .iter()
-            .fold(with_new, |acc, mid| acc.recompute_match_pos(mid))
+            .fold(with_new, |acc, mid| acc.recompute_match_pos(mid));
+        (layout, node_id_domain, anchor_id_domain)
     }
 
     /// Refresh a Match's synthetic LayoutNode to sit at the lowest sibling
@@ -1231,21 +1305,31 @@ impl LayoutAst {
         }
     }
 
-    pub fn plus_var_decl(&self, pos: Vec3) -> Self {
+    pub fn plus_var_decl(
+        &self,
+        pos: Vec3,
+        node_id_domain: NodeIdDomain,
+        anchor_id_domain: AnchorIdDomain,
+    ) -> (Self, NodeIdDomain, AnchorIdDomain) {
         // VarDecls live only on the Program wall (Y=0, Z=0). Snap defensively.
         let pos = Vec3::new(pos.x, 0.0, 0.0);
-        let (ast, output_anchor_id) = self.ast.with_next_anchor_id();
-        let (ast, node_id) = ast.plus(crate::ast::node::ENode::VarDecl {
-            name: "v".to_string(),
-            r#type: crate::ast::node::EType::Any,
-            output_anchor: output_anchor_id,
-        });
-        Self {
+        let (anchor_id_domain, output_anchor_id) = anchor_id_domain.next_id();
+        let (node_id_domain, node_id) = node_id_domain.next_id();
+        let ast = self.ast.plus(
+            node_id.clone(),
+            crate::ast::node::ENode::VarDecl {
+                name: "v".to_string(),
+                r#type: crate::ast::node::EType::Any,
+                output_anchor: output_anchor_id,
+            },
+        );
+        let layout = Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
             sub_layouts: self.sub_layouts.clone(),
         }
-        ._plus_layout_node(&node_id, pos)
+        ._plus_layout_node(&node_id, pos);
+        (layout, node_id_domain, anchor_id_domain)
     }
 
     fn _plus_layout_node(&self, node_id: &crate::ast::node::Id, pos: Vec3) -> Self {
@@ -1414,7 +1498,7 @@ impl LayoutAst {
             .collect()
     }
 
-    pub fn layout_anchor(&self, anchor_id: crate::ast::AnchorId) -> LayoutAnchor {
+    pub fn layout_anchor(&self, anchor_id: crate::ast::anchor::Id) -> LayoutAnchor {
         self.try_layout_anchor(&anchor_id).unwrap_or_else(|| {
             panic!(
                 "layout_anchor: anchor {:?} not found in any (sub-)ast",
@@ -1423,7 +1507,7 @@ impl LayoutAst {
         })
     }
 
-    fn try_layout_anchor(&self, anchor_id: &crate::ast::AnchorId) -> Option<LayoutAnchor> {
+    fn try_layout_anchor(&self, anchor_id: &crate::ast::anchor::Id) -> Option<LayoutAnchor> {
         if let Some(anchor) = self.ast.anchors.get(anchor_id) {
             let node_id = self.ast.anchor_to_node.get(anchor_id).unwrap().clone();
             return Some(LayoutAnchor {
@@ -1446,7 +1530,7 @@ impl LayoutAst {
     /// `None` for anchors that carry no type (Sink input, Match, …).
     pub fn anchor_type(
         &self,
-        anchor_id: &crate::ast::AnchorId,
+        anchor_id: &crate::ast::anchor::Id,
         function_declarations: &std::collections::HashMap<
             crate::ast::FunctionDeclarationId,
             crate::ast::FunctionDeclaration,
@@ -1494,7 +1578,7 @@ impl LayoutAst {
     /// `None` when the input is unconnected or the source carries no type.
     fn incoming_type(
         &self,
-        input: &crate::ast::AnchorId,
+        input: &crate::ast::anchor::Id,
         function_declarations: &std::collections::HashMap<
             crate::ast::FunctionDeclarationId,
             crate::ast::FunctionDeclaration,
@@ -1507,7 +1591,7 @@ impl LayoutAst {
     /// AST-level literal string attached to this anchor's type, if any.
     /// Walks sub-layouts. Returns `None` when the anchor's node kind doesn't
     /// carry an `ast::node::EType` field, or the field's value is `None`.
-    pub fn anchor_ast_value(&self, anchor_id: &crate::ast::AnchorId) -> Option<String> {
+    pub fn anchor_ast_value(&self, anchor_id: &crate::ast::anchor::Id) -> Option<String> {
         if let Some(node_id) = self.ast.anchor_to_node.get(anchor_id) {
             let node = self.ast.nodes.get(node_id)?;
             return anchor_ast_value_from_node(node, anchor_id);
@@ -1591,8 +1675,8 @@ impl LayoutAst {
 /// an edge from either end, so both directions are checked.
 fn source_anchor_for_input(
     ast: &crate::ast::Ast,
-    input: &crate::ast::AnchorId,
-) -> Option<crate::ast::AnchorId> {
+    input: &crate::ast::anchor::Id,
+) -> Option<crate::ast::anchor::Id> {
     for (from, edges) in &ast.edges {
         if edges.iter().any(|e| &e.to == input) {
             return Some(from.clone());
@@ -1626,7 +1710,7 @@ fn eval_types_match(a: &crate::eval::EType, b: &crate::eval::EType) -> bool {
 
 fn anchor_type_from_node(
     node: &crate::ast::node::ENode,
-    anchor_id: &crate::ast::AnchorId,
+    anchor_id: &crate::ast::anchor::Id,
     function_declarations: &std::collections::HashMap<
         crate::ast::FunctionDeclarationId,
         crate::ast::FunctionDeclaration,
@@ -1695,7 +1779,7 @@ pub fn value_of_etype(t: &crate::ast::node::EType) -> Option<String> {
 /// don't carry types at all.
 pub fn anchor_ast_value_from_node(
     node: &crate::ast::node::ENode,
-    anchor_id: &crate::ast::AnchorId,
+    anchor_id: &crate::ast::anchor::Id,
 ) -> Option<String> {
     match node {
         crate::ast::node::ENode::ConstDecl {
