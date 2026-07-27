@@ -140,8 +140,8 @@ impl LayoutAst {
         let node_id_domain = NodeIdDomain::new();
         let anchor_id_domain = AnchorIdDomain::new();
         let (node_id_domain, program_id) = node_id_domain.next_id();
-        let ast =
-            crate::ast::Ast::empty().plus(program_id.clone(), crate::ast::node::ENode::Program {});
+        let ast = crate::ast::Ast::empty()
+            .plus_node(program_id.clone(), crate::ast::node::ENode::Program {});
         let outer = Self {
             ast,
             layout_nodes: std::collections::HashMap::new(),
@@ -161,7 +161,7 @@ impl LayoutAst {
                     _ => vec![],
                 };
                 let after_pattern = Self {
-                    ast: self.ast.minus(node_id),
+                    ast: self.ast.minus_node(node_id),
                     layout_nodes: self
                         .layout_nodes
                         .clone()
@@ -177,7 +177,7 @@ impl LayoutAst {
                 };
                 if remaining.is_empty() {
                     Self {
-                        ast: after_pattern.ast.minus(&parent_id),
+                        ast: after_pattern.ast.minus_node(&parent_id),
                         layout_nodes: after_pattern
                             .layout_nodes
                             .into_iter()
@@ -200,7 +200,7 @@ impl LayoutAst {
                         sub_layouts: self.sub_layouts.clone(),
                     },
                     |acc, pid| Self {
-                        ast: acc.ast.minus(pid),
+                        ast: acc.ast.minus_node(pid),
                         layout_nodes: acc
                             .layout_nodes
                             .into_iter()
@@ -214,7 +214,7 @@ impl LayoutAst {
                     },
                 );
                 Self {
-                    ast: after_children.ast.minus(node_id),
+                    ast: after_children.ast.minus_node(node_id),
                     layout_nodes: after_children
                         .layout_nodes
                         .into_iter()
@@ -224,7 +224,7 @@ impl LayoutAst {
                 }
             }
             _ => Self {
-                ast: self.ast.minus(node_id),
+                ast: self.ast.minus_node(node_id),
                 layout_nodes: self
                     .layout_nodes
                     .clone()
@@ -885,7 +885,7 @@ impl LayoutAst {
     ) -> (Self, NodeIdDomain, AnchorIdDomain) {
         let (anchor_id_domain, input_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, node_id) = node_id_domain.next_id();
-        let ast = self.ast.plus(
+        let ast = self.ast.plus_node(
             node_id.clone(),
             crate::ast::node::ENode::Sink {
                 input_anchor: input_anchor_id,
@@ -909,7 +909,7 @@ impl LayoutAst {
     ) -> (Self, NodeIdDomain, AnchorIdDomain) {
         let (anchor_id_domain, output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, node_id) = node_id_domain.next_id();
-        let ast = self.ast.plus(
+        let ast = self.ast.plus_node(
             node_id.clone(),
             crate::ast::node::ENode::ConstDecl {
                 r#type,
@@ -935,7 +935,7 @@ impl LayoutAst {
         let (anchor_id_domain, input_anchor_id) = anchor_id_domain.next_id();
         let (anchor_id_domain, output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, node_id) = node_id_domain.next_id();
-        let ast = self.ast.plus(
+        let ast = self.ast.plus_node(
             node_id.clone(),
             crate::ast::node::ENode::TypeCast {
                 r#type,
@@ -982,7 +982,7 @@ impl LayoutAst {
                 );
         let (anchor_id_domain, output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, node_id) = node_id_domain.next_id();
-        let ast = self.ast.plus(
+        let ast = self.ast.plus_node(
             node_id.clone(),
             crate::ast::node::ENode::FunctionCall {
                 function_declaration_id: function_declaration.0,
@@ -1029,7 +1029,7 @@ impl LayoutAst {
         let (anchor_id_domain, match_output_anchor_id) = anchor_id_domain.next_id();
         let (anchor_id_domain, pattern_output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, match_node_id) = node_id_domain.next_id();
-        let ast = self.ast.plus(
+        let ast = self.ast.plus_node(
             match_node_id.clone(),
             crate::ast::node::ENode::Match {
                 patterns: vec![],
@@ -1038,7 +1038,7 @@ impl LayoutAst {
             },
         );
         let (node_id_domain, pattern_node_id) = node_id_domain.next_id();
-        let ast = ast.plus(
+        let ast = ast.plus_node(
             pattern_node_id.clone(),
             crate::ast::node::ENode::Pattern {
                 parent_match: match_node_id.clone(),
@@ -1161,7 +1161,7 @@ impl LayoutAst {
         };
         let (anchor_id_domain, new_output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, new_pattern_id) = node_id_domain.next_id();
-        let ast = shifted.ast.plus(
+        let ast = shifted.ast.plus_node(
             new_pattern_id.clone(),
             crate::ast::node::ENode::Pattern {
                 parent_match: parent_id.clone(),
@@ -1315,7 +1315,7 @@ impl LayoutAst {
         let pos = Vec3::new(pos.x, 0.0, 0.0);
         let (anchor_id_domain, output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, node_id) = node_id_domain.next_id();
-        let ast = self.ast.plus(
+        let ast = self.ast.plus_node(
             node_id.clone(),
             crate::ast::node::ENode::VarDecl {
                 name: "v".to_string(),

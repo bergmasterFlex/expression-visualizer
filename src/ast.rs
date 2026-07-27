@@ -35,7 +35,7 @@ impl Ast {
     ) {
         let (node_id_domain, sink_node_id) = node_id_domain.next_id();
         let (anchor_id_domain, sink_input_anchor_id) = anchor_id_domain.next_id();
-        let sub_ast = Self::empty().plus(
+        let sub_ast = Self::empty().plus_node(
             sink_node_id.clone(),
             node::ENode::Sink {
                 input_anchor: sink_input_anchor_id,
@@ -64,7 +64,7 @@ impl Ast {
         }
     }
 
-    pub fn plus(&self, node_id: node::Id, n: node::ENode) -> Self {
+    pub fn plus_node(&self, node_id: node::Id, n: node::ENode) -> Self {
         let anchors = n.anchors();
         Self {
             anchors: self
@@ -112,7 +112,7 @@ impl Ast {
         }
     }
 
-    pub fn minus(&self, n_id: &node::Id) -> Self {
+    pub fn minus_node(&self, n_id: &node::Id) -> Self {
         let anchor_ids = self
             .nodes
             .get(n_id)
