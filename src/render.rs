@@ -490,13 +490,35 @@ pub fn layoutnode_to_rendernode(
                         },
                     )])
                     .collect(),
-                labels: vec![RenderLabel {
+                labels: std::iter::once(RenderLabel {
                     text: label_for_node(node, function_declarations),
                     color: Color::WHITE,
                     font_size: 18.0,
                     world_pos: node_center_world,
                     offset: Vec2::ZERO,
-                }],
+                })
+                .chain(
+                    input_anchors
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i_anchor, _)| {
+                            let name = function_declaration.inputs.get(i_anchor)?.name.clone();
+                            let start_x = -(n - 1.0) * spread / 2.0;
+                            let x = start_x + i_anchor as f32 * spread;
+                            let input_world = mesh_center_world + Vec3::new(x, 0.0, 0.0);
+                            Some(RenderLabel {
+                                text: name,
+                                // Neutral grey, subordinate to the node name and the
+                                // centred type-marker letter.
+                                color: Color::srgb(0.5, 0.5, 0.5),
+                                font_size: 12.0,
+                                world_pos: input_world,
+                                // Nudge down so the centred type-marker letter stays free.
+                                offset: Vec2::new(0.0, 14.0),
+                            })
+                        }),
+                )
+                .collect(),
                 decorations: vec![],
             }
         }
