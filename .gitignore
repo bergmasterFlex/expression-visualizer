@@ -2,8 +2,5 @@ dist
 target
 .direnv
 result
-
-# Claude Code scratch dir. Mode 0700 and owned by the agent user, which also
-# breaks trunk's recursive file watcher on the repo root — see Trunk.toml.
-.claude/.cc-writes/
+.claude
 
