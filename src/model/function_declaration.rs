@@ -5,11 +5,11 @@ pub struct FunctionDeclarationId(pub usize);
 pub struct FunctionDeclaration {
     pub name: String,
     pub inputs: Vec<FunctionParameterDeclaration>,
-    pub output_type: crate::eval::EType,
+    pub output_type: crate::infer::EType,
 }
 
 #[derive(Clone)]
 pub struct FunctionParameterDeclaration {
     pub name: String,
-    pub r#type: crate::eval::EType,
+    pub r#type: crate::infer::EType,
 }

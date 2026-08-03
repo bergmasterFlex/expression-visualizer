@@ -13,9 +13,12 @@ impl crate::common::TId for Id {
 
 #[derive(Clone, Debug)]
 pub enum EAnchor {
-    Input {
-        order_num: usize,
-        name: Option<String>,
-    },
+    Input(InputAnchor),
     Output,
+}
+
+#[derive(Clone, Debug)]
+pub struct InputAnchor {
+    pub order_num: usize,
+    pub name: Option<String>,
 }

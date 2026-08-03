@@ -6,7 +6,6 @@ description = "3D AST visualizer with evaluation-order layout, built with Bevy +
 
 [dependencies]
 bevy = { version = "0.18", features = ["webgpu"] }
-rand = { version = "0.9", default-features = false, features = ["small_rng", "std", "os_rng", "thread_rng"] }
 ab_glyph = "0.2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

@@ -4,6 +4,7 @@ mod common;
 mod edge;
 mod eval;
 mod grid;
+mod infer;
 mod layout;
 mod mesh;
 mod model;
@@ -63,14 +64,14 @@ impl Default for AstState {
                         inputs: vec![
                             model::function_declaration::FunctionParameterDeclaration {
                                 name: "summand1".to_string(),
-                                r#type: eval::EType::Int(None),
+                                r#type: infer::EType::Int(None),
                             },
                             model::function_declaration::FunctionParameterDeclaration {
                                 name: "summand2".to_string(),
-                                r#type: eval::EType::Int(None),
+                                r#type: infer::EType::Int(None),
                             },
                         ],
-                        output_type: eval::EType::Int(None),
+                        output_type: infer::EType::Int(None),
                     },
                 ),
                 (
@@ -80,16 +81,16 @@ impl Default for AstState {
                         inputs: vec![
                             model::function_declaration::FunctionParameterDeclaration {
                                 name: "dividend".to_string(),
-                                r#type: eval::EType::Int(None),
+                                r#type: infer::EType::Int(None),
                             },
                             model::function_declaration::FunctionParameterDeclaration {
                                 name: "divisor".to_string(),
-                                r#type: eval::EType::Int(None),
+                                r#type: infer::EType::Int(None),
                             },
                         ],
-                        output_type: eval::EType::SumType(vec![
-                            eval::EType::Float(None),
-                            eval::EType::Undefined,
+                        output_type: infer::EType::SumType(vec![
+                            infer::EType::Float(None),
+                            infer::EType::Undefined,
                         ]),
                     },
                 ),
@@ -100,16 +101,16 @@ impl Default for AstState {
                         inputs: vec![
                             model::function_declaration::FunctionParameterDeclaration {
                                 name: "str".to_string(),
-                                r#type: eval::EType::String(None),
+                                r#type: infer::EType::String(None),
                             },
                             model::function_declaration::FunctionParameterDeclaration {
                                 name: "i".to_string(),
-                                r#type: eval::EType::Int(None),
+                                r#type: infer::EType::Int(None),
                             },
                         ],
-                        output_type: eval::EType::SumType(vec![
-                            eval::EType::Char(None),
-                            eval::EType::Undefined,
+                        output_type: infer::EType::SumType(vec![
+                            infer::EType::Char(None),
+                            infer::EType::Undefined,
                         ]),
                     },
                 ),
@@ -119,9 +120,9 @@ impl Default for AstState {
                         name: "*(-1)".to_string(),
                         inputs: vec![model::function_declaration::FunctionParameterDeclaration {
                             name: "number".to_string(),
-                            r#type: eval::EType::Int(None),
+                            r#type: infer::EType::Int(None),
                         }],
-                        output_type: eval::EType::SumType(vec![eval::EType::Int(None)]),
+                        output_type: infer::EType::SumType(vec![infer::EType::Int(None)]),
                     },
                 ),
                 (
@@ -131,18 +132,18 @@ impl Default for AstState {
                         inputs: vec![
                             model::function_declaration::FunctionParameterDeclaration {
                                 name: "str".to_string(),
-                                r#type: eval::EType::String(None),
+                                r#type: infer::EType::String(None),
                             },
                             model::function_declaration::FunctionParameterDeclaration {
                                 name: "begin".to_string(),
-                                r#type: eval::EType::Int(None),
+                                r#type: infer::EType::Int(None),
                             },
                             model::function_declaration::FunctionParameterDeclaration {
                                 name: "length".to_string(),
-                                r#type: eval::EType::Int(None),
+                                r#type: infer::EType::Int(None),
                             },
                         ],
-                        output_type: eval::EType::SumType(vec![eval::EType::String(None)]),
+                        output_type: infer::EType::SumType(vec![infer::EType::String(None)]),
                     },
                 ),
             ]),
@@ -420,23 +421,24 @@ enum EvalPhase {
         inputs: Vec<(model::node::Id, String)>,
     },
     Running {
-        steps: Vec<std::collections::HashMap<model::node::Id, String>>,
+        /// Full step history; `current` indexes the snapshot on screen. Each
+        /// `Next` computes one more `eval_next_step`, `Prev` rewinds.
+        states: Vec<eval::State>,
         current: usize,
+        /// VarDecl values from the prompt modal, needed to keep stepping.
+        user_vardecl_values: std::collections::HashMap<model::node::Id, eval::EValue>,
     },
 }
 
 #[derive(Resource)]
 struct EvalState {
     phase: EvalPhase,
-    rng: rand::rngs::SmallRng,
 }
 
 impl Default for EvalState {
     fn default() -> Self {
-        use rand::SeedableRng;
         Self {
             phase: EvalPhase::Idle,
-            rng: rand::rngs::SmallRng::from_os_rng(),
         }
     }
 }
@@ -863,7 +865,7 @@ fn spawn_ast_nodes(
             let src_type = state
                 .program_ast()
                 .anchor_type(src_id, &state.function_declarations)
-                .unwrap_or(eval::EType::Undefined);
+                .unwrap_or(infer::EType::Undefined);
             let source_leaves = render::ordered_supported_leaves(&src_type);
             let n_src = source_leaves.len();
             if n_src == 0 {
@@ -2423,13 +2425,13 @@ fn handle_evaluate_button(
                     continue;
                 }
                 let ast = &state.program_ast().ast;
-                if !eval::sink_has_input(ast) {
+                if !infer::sink_has_input(ast) {
                     eval.phase = EvalPhase::ErrorModal(
                         "Cannot evaluate, because no node is connected to the sink".to_string(),
                     );
                     continue;
                 }
-                let var_decls = eval::collect_var_decls(ast);
+                let var_decls = infer::collect_var_decls(ast);
                 if !var_decls.is_empty() {
                     eval.phase = EvalPhase::VarDeclPrompt {
                         inputs: var_decls
@@ -2438,12 +2440,20 @@ fn handle_evaluate_button(
                             .collect(),
                     };
                 } else {
-                    let initial =
-                        eval::initial_values(ast, &std::collections::HashMap::new(), &mut eval.rng);
-                    eval.phase = EvalPhase::Running {
-                        steps: vec![initial],
-                        current: 0,
-                    };
+                    let user_vardecl_values = std::collections::HashMap::new();
+                    match eval::State::new(ast, &user_vardecl_values, &state.function_declarations)
+                    {
+                        Ok(initial) => {
+                            eval.phase = EvalPhase::Running {
+                                states: vec![initial],
+                                current: 0,
+                                user_vardecl_values,
+                            };
+                        }
+                        Err(errors) => {
+                            eval.phase = EvalPhase::ErrorModal(errors.join("\n"));
+                        }
+                    }
                 }
             }
             Interaction::Hovered => {
@@ -3208,17 +3218,41 @@ fn handle_modal_evaluate_button(
         let mut color = text_color_q.get_mut(children[0]).unwrap();
         match *interaction {
             Interaction::Pressed => {
-                let mut user_values: std::collections::HashMap<model::node::Id, String> =
-                    std::collections::HashMap::new();
+                let ast = &state.program_ast().ast;
+                let mut user_vardecl_values: std::collections::HashMap<
+                    model::node::Id,
+                    eval::EValue,
+                > = std::collections::HashMap::new();
+                let mut parse_errors: Vec<String> = Vec::new();
                 for (m, input) in input_q.iter() {
-                    user_values.insert(m.node_id.clone(), input.value.clone());
+                    if let Some(model::node::ENode::VarDecl { r#type, name, .. }) =
+                        ast.nodes.get(&m.node_id)
+                    {
+                        match eval::EValue::parse(r#type, &input.value) {
+                            Ok(value) => {
+                                user_vardecl_values.insert(m.node_id.clone(), value);
+                            }
+                            Err(error) => parse_errors.push(format!("{}: {}", name, error)),
+                        }
+                    }
                 }
-                let initial =
-                    eval::initial_values(&state.program_ast().ast, &user_values, &mut eval.rng);
-                eval.phase = EvalPhase::Running {
-                    steps: vec![initial],
-                    current: 0,
-                };
+                if !parse_errors.is_empty() {
+                    eval.phase = EvalPhase::ErrorModal(parse_errors.join("\n"));
+                } else {
+                    match eval::State::new(ast, &user_vardecl_values, &state.function_declarations)
+                    {
+                        Ok(initial) => {
+                            eval.phase = EvalPhase::Running {
+                                states: vec![initial],
+                                current: 0,
+                                user_vardecl_values,
+                            };
+                        }
+                        Err(errors) => {
+                            eval.phase = EvalPhase::ErrorModal(errors.join("\n"));
+                        }
+                    }
+                }
             }
             Interaction::Hovered => {
                 bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
@@ -3296,16 +3330,49 @@ fn handle_eval_step_buttons(
         }
     }
     if next_q.iter().any(|i| *i == Interaction::Pressed) {
-        // Split borrow: take a mutable reference to the whole struct, then
-        // disjoint-borrow `phase` and `rng` simultaneously.
-        let EvalState { phase, rng } = &mut *eval;
-        if let EvalPhase::Running { steps, current } = phase {
-            if let Some(snapshot) = eval::step_next(&state.program_ast().ast, &steps[*current], rng)
-            {
-                steps.truncate(*current + 1);
-                steps.push(snapshot);
-                *current += 1;
+        let ast = &state.program_ast().ast;
+        // Compute the next step first (immutable borrow of `eval.phase`), then
+        // apply it — `Err` reassigns `eval.phase`, which the borrow would block.
+        let step_result = if let EvalPhase::Running {
+            states,
+            current,
+            user_vardecl_values,
+        } = &eval.phase
+        {
+            ast.get_sink_node_id()
+                .and_then(|sink_id| ast.nodes.get(&sink_id).cloned().map(|node| (sink_id, node)))
+                .map(|(sink_id, sink_node)| {
+                    states[*current].eval_next_step(
+                        ast,
+                        user_vardecl_values,
+                        (sink_id, sink_node),
+                        &state.function_declarations,
+                    )
+                })
+        } else {
+            None
+        };
+        match step_result {
+            Some(Ok(next_state)) => {
+                if let EvalPhase::Running {
+                    states, current, ..
+                } = &mut eval.phase
+                {
+                    // Only record a new snapshot if the step actually resolved
+                    // more nodes, so a dead `Next` press does not grow history.
+                    if next_state.node_ids_to_values.len()
+                        > states[*current].node_ids_to_values.len()
+                    {
+                        states.truncate(*current + 1);
+                        states.push(next_state);
+                        *current += 1;
+                    }
+                }
             }
+            Some(Err(errors)) => {
+                eval.phase = EvalPhase::ErrorModal(errors.join("\n"));
+            }
+            None => {}
         }
     }
 }
@@ -3324,8 +3391,10 @@ fn update_step_button_visuals(
     mut text_color_q: Query<&mut TextColor>,
 ) {
     let (prev_enabled, next_enabled) = match &eval.phase {
-        EvalPhase::Running { steps, current } => {
-            let next_possible = eval::can_step_next(&state.program_ast().ast, &steps[*current]);
+        EvalPhase::Running {
+            states, current, ..
+        } => {
+            let next_possible = !states[*current].is_evaluated(&state.program_ast().ast);
             (*current > 0, next_possible)
         }
         _ => (false, false),
@@ -3376,8 +3445,10 @@ fn sync_value_labels(
     ui_font: Res<UiFont>,
     mut existing_q: Query<(Entity, &ValueLabel, &mut Text)>,
 ) {
-    let snapshot: Option<&std::collections::HashMap<model::node::Id, String>> = match &eval.phase {
-        EvalPhase::Running { steps, current } => Some(&steps[*current]),
+    let snapshot: Option<&eval::State> = match &eval.phase {
+        EvalPhase::Running {
+            states, current, ..
+        } => Some(&states[*current]),
         _ => None,
     };
     let Some(snapshot) = snapshot else {
@@ -3389,9 +3460,10 @@ fn sync_value_labels(
 
     let mut kept: std::collections::HashSet<model::node::Id> = std::collections::HashSet::new();
     for (entity, label, mut text) in existing_q.iter_mut() {
-        if let Some(value) = snapshot.get(&label.node_id) {
-            if text.0 != *value {
-                text.0 = value.clone();
+        if let Some(value) = snapshot.node_ids_to_values.get(&label.node_id) {
+            let rendered = value.to_string();
+            if text.0 != rendered {
+                text.0 = rendered;
             }
             kept.insert(label.node_id.clone());
         } else {
@@ -3399,7 +3471,7 @@ fn sync_value_labels(
         }
     }
 
-    for (id, value) in snapshot.iter() {
+    for (id, value) in snapshot.node_ids_to_values.iter() {
         if kept.contains(id) {
             continue;
         }
@@ -3408,7 +3480,7 @@ fn sync_value_labels(
         };
         let world_pos = layout_node.pos * Vec3::new(3.0, 1.5, 3.0);
         commands.spawn((
-            Text::new(value.clone()),
+            Text::new(value.to_string()),
             text_font(&ui_font.0, 28.0),
             TextColor(Color::srgb(1.0, 0.95, 0.3)),
             Node {
@@ -3857,7 +3929,7 @@ fn update_selection_display(
             text.0 = format!(
                 "{} : {}",
                 render::label_for_node(node, &state.function_declarations),
-                match eval::eval_type(
+                match infer::eval_type(
                     &node,
                     &selected_ast.ast,
                     &state.function_declarations,

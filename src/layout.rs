@@ -1541,7 +1541,7 @@ impl LayoutAst {
             crate::model::function_declaration::FunctionDeclarationId,
             crate::model::function_declaration::FunctionDeclaration,
         >,
-    ) -> Option<crate::eval::EType> {
+    ) -> Option<crate::infer::EType> {
         if let Some(node_id) = self.ast.anchor_to_node.get(anchor_id) {
             let node = self.ast.nodes.get(node_id)?;
             // A typecast whose incoming type differs from its target type may
@@ -1554,15 +1554,15 @@ impl LayoutAst {
             } = node
             {
                 if anchor_id == output_anchor {
-                    let target = crate::eval::ast_type_to_eval_type(r#type);
-                    if !matches!(target, crate::eval::EType::Any) {
+                    let target = crate::infer::ast_type_to_eval_type(r#type);
+                    if !matches!(target, crate::infer::EType::Any) {
                         if let Some(incoming) =
                             self.incoming_type(input_anchor, function_declarations)
                         {
                             if !eval_types_match(&incoming, &target) {
-                                return Some(crate::eval::EType::SumType(vec![
+                                return Some(crate::infer::EType::SumType(vec![
                                     target,
-                                    crate::eval::EType::Undefined,
+                                    crate::infer::EType::Undefined,
                                 ]));
                             }
                         }
@@ -1589,7 +1589,7 @@ impl LayoutAst {
             crate::model::function_declaration::FunctionDeclarationId,
             crate::model::function_declaration::FunctionDeclaration,
         >,
-    ) -> Option<crate::eval::EType> {
+    ) -> Option<crate::infer::EType> {
         let source = source_anchor_for_input(&self.ast, input)?;
         self.anchor_type(&source, function_declarations)
     }
@@ -1696,8 +1696,8 @@ fn source_anchor_for_input(
 
 /// Structural type equality, ignoring any carried value literal. Two `SumType`s
 /// match when their leaves match pairwise in order.
-fn eval_types_match(a: &crate::eval::EType, b: &crate::eval::EType) -> bool {
-    use crate::eval::EType::*;
+fn eval_types_match(a: &crate::infer::EType, b: &crate::infer::EType) -> bool {
+    use crate::infer::EType::*;
     match (a, b) {
         (Int(_), Int(_))
         | (Float(_), Float(_))
@@ -1721,12 +1721,12 @@ fn anchor_type_from_node(
         crate::model::function_declaration::FunctionDeclarationId,
         crate::model::function_declaration::FunctionDeclaration,
     >,
-) -> Option<crate::eval::EType> {
+) -> Option<crate::infer::EType> {
     match node {
         crate::model::node::ENode::ConstDecl { r#type, .. }
         | crate::model::node::ENode::VarDecl { r#type, .. }
         | crate::model::node::ENode::Pattern { r#type, .. } => {
-            Some(crate::eval::ast_type_to_eval_type(r#type))
+            Some(crate::infer::ast_type_to_eval_type(r#type))
         }
         crate::model::node::ENode::TypeCast {
             r#type,
@@ -1740,7 +1740,7 @@ fn anchor_type_from_node(
                 // Base output type. The `Sum(target, undefined)` override for
                 // a mismatched incoming type is applied in
                 // `LayoutAst::anchor_type`, which has edge access.
-                Some(crate::eval::ast_type_to_eval_type(r#type))
+                Some(crate::infer::ast_type_to_eval_type(r#type))
             }
         }
         crate::model::node::ENode::FunctionCall {

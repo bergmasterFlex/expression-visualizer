@@ -165,4 +165,30 @@ impl Ast {
             })
             .collect()
     }
+
+    pub fn get_connected_nodes_to_node_input_anchors(
+        &self,
+        node_id: &super::node::Id,
+    ) -> Vec<(super::anchor::Id, super::node::Id)> {
+        self.nodes
+            .get(node_id)
+            .into_iter()
+            .flat_map(|node| node.input_anchors())
+            .flat_map(|(anchor_id, _)| {
+                self.get_connected_nodes_to_anchor(anchor_id.clone())
+                    .into_iter()
+                    .map(move |node_id| (anchor_id.clone(), node_id))
+            })
+            .collect()
+    }
+
+    pub fn get_sink_node_id(&self) -> Option<super::node::Id> {
+        self.nodes.iter().find_map(|(id, node)| {
+            if let super::node::ENode::Sink { .. } = node {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+    }
 }

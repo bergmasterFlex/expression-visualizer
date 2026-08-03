@@ -74,38 +74,38 @@ const VALUE_LABEL_Z_PADDING: f32 = 0.1;
 
 /// Sort key that fixes the vertical order of type-marker rectangles.
 /// Returns `None` for variants that should not render a rectangle.
-fn type_marker_order(t: &crate::eval::EType) -> Option<u8> {
+fn type_marker_order(t: &crate::infer::EType) -> Option<u8> {
     match t {
-        crate::eval::EType::Bool(..) => Some(0),
-        crate::eval::EType::Char(..) => Some(1),
-        crate::eval::EType::Int(..) => Some(2),
-        crate::eval::EType::Float(..) => Some(3),
-        crate::eval::EType::String(..) => Some(4),
-        crate::eval::EType::Undefined => Some(5),
+        crate::infer::EType::Bool(..) => Some(0),
+        crate::infer::EType::Char(..) => Some(1),
+        crate::infer::EType::Int(..) => Some(2),
+        crate::infer::EType::Float(..) => Some(3),
+        crate::infer::EType::String(..) => Some(4),
+        crate::infer::EType::Undefined => Some(5),
         _ => None,
     }
 }
 
-fn type_marker_letter(t: &crate::eval::EType) -> &'static str {
+fn type_marker_letter(t: &crate::infer::EType) -> &'static str {
     match t {
-        crate::eval::EType::Bool(..) => "b",
-        crate::eval::EType::Char(..) => "c",
-        crate::eval::EType::Int(..) => "i",
-        crate::eval::EType::Float(..) => "f",
-        crate::eval::EType::String(..) => "s",
-        crate::eval::EType::Undefined => "u",
+        crate::infer::EType::Bool(..) => "b",
+        crate::infer::EType::Char(..) => "c",
+        crate::infer::EType::Int(..) => "i",
+        crate::infer::EType::Float(..) => "f",
+        crate::infer::EType::String(..) => "s",
+        crate::infer::EType::Undefined => "u",
         _ => "?",
     }
 }
 
-pub fn type_marker_color(t: &crate::eval::EType) -> Color {
+pub fn type_marker_color(t: &crate::infer::EType) -> Color {
     match t {
-        crate::eval::EType::Bool(..) => Color::srgba(0.65, 0.30, 0.95, TYPE_MARKER_ALPHA),
-        crate::eval::EType::Char(..) => Color::srgba(0.30, 0.90, 0.40, TYPE_MARKER_ALPHA),
-        crate::eval::EType::Int(..) => Color::srgba(0.40, 0.70, 1.00, TYPE_MARKER_ALPHA),
-        crate::eval::EType::Float(..) => Color::srgba(0.10, 0.25, 0.75, TYPE_MARKER_ALPHA),
-        crate::eval::EType::String(..) => Color::srgba(1.00, 0.90, 0.30, TYPE_MARKER_ALPHA),
-        crate::eval::EType::Undefined => Color::srgba(0.95, 0.30, 0.30, TYPE_MARKER_ALPHA),
+        crate::infer::EType::Bool(..) => Color::srgba(0.65, 0.30, 0.95, TYPE_MARKER_ALPHA),
+        crate::infer::EType::Char(..) => Color::srgba(0.30, 0.90, 0.40, TYPE_MARKER_ALPHA),
+        crate::infer::EType::Int(..) => Color::srgba(0.40, 0.70, 1.00, TYPE_MARKER_ALPHA),
+        crate::infer::EType::Float(..) => Color::srgba(0.10, 0.25, 0.75, TYPE_MARKER_ALPHA),
+        crate::infer::EType::String(..) => Color::srgba(1.00, 0.90, 0.30, TYPE_MARKER_ALPHA),
+        crate::infer::EType::Undefined => Color::srgba(0.95, 0.30, 0.30, TYPE_MARKER_ALPHA),
         _ => Color::srgba(0.5, 0.5, 0.5, TYPE_MARKER_ALPHA),
     }
 }
@@ -113,8 +113,8 @@ pub fn type_marker_color(t: &crate::eval::EType) -> Color {
 /// Flatten `t` (expanding sum types), filter to the six supported leaves, and
 /// sort into the fixed bottom-to-top stack order (undefined at bottom → bool
 /// at top).
-pub fn ordered_supported_leaves(t: &crate::eval::EType) -> Vec<crate::eval::EType> {
-    let mut leaves: Vec<_> = crate::eval::flatten_type(t)
+pub fn ordered_supported_leaves(t: &crate::infer::EType) -> Vec<crate::infer::EType> {
+    let mut leaves: Vec<_> = crate::infer::flatten_type(t)
         .into_iter()
         .filter_map(|leaf| type_marker_order(&leaf).map(|k| (k, leaf)))
         .collect();
@@ -134,7 +134,7 @@ pub fn ordered_supported_leaves(t: &crate::eval::EType) -> Vec<crate::eval::ETyp
 /// In practice value-carrying nodes have a single leaf, so this only fires
 /// on one marker per anchor.
 fn build_type_markers(
-    t: &crate::eval::EType,
+    t: &crate::infer::EType,
     ast_value: Option<&str>,
     anchor_world_pos: Vec3,
     is_input: bool,
@@ -302,7 +302,7 @@ pub fn layoutnode_to_rendernode(
             let color = Color::srgb(0.0, 0.9, 0.0);
             let output_local = Vec3::new(0.0, 0.0, -NODE_HALF_DEPTH);
             let output_world = node_pos + output_local;
-            let output_eval_type = crate::eval::ast_type_to_eval_type(r#type);
+            let output_eval_type = crate::infer::ast_type_to_eval_type(r#type);
             let output_value = crate::layout::value_of_etype(r#type);
             RenderNode {
                 node: RenderObject {
@@ -350,7 +350,7 @@ pub fn layoutnode_to_rendernode(
             // override lives in `anchor_type`, so read it back for the markers.
             let output_eval_type = layout_ast
                 .anchor_type(output_anchor, function_declarations)
-                .unwrap_or_else(|| crate::eval::ast_type_to_eval_type(r#type));
+                .unwrap_or_else(|| crate::infer::ast_type_to_eval_type(r#type));
             let elim_value = crate::layout::value_of_etype(r#type);
             let input_center = anchor_pick_center(input_world, true);
             RenderNode {
@@ -459,7 +459,7 @@ pub fn layoutnode_to_rendernode(
                             .inputs
                             .get(i_anchor)
                             .map(|param| param.r#type.clone())
-                            .unwrap_or(crate::eval::EType::Undefined);
+                            .unwrap_or(crate::infer::EType::Undefined);
                         (
                             anchor_id.clone(),
                             RenderAnchor {
@@ -528,7 +528,7 @@ pub fn layoutnode_to_rendernode(
             let color = Color::srgb(0.0, 0.6, 0.9);
             let output_local = Vec3::new(0.0, 0.0, -NODE_HALF_DEPTH);
             let output_world = node_pos + output_local;
-            let output_eval_type = crate::eval::ast_type_to_eval_type(r#type);
+            let output_eval_type = crate::infer::ast_type_to_eval_type(r#type);
             let output_value = crate::layout::value_of_etype(r#type);
             RenderNode {
                 node: RenderObject {
@@ -597,7 +597,7 @@ pub fn layoutnode_to_rendernode(
             let color = Color::srgb(0.9, 0.0, 0.0);
             let output_local = Vec3::new(0.0, 0.0, -NODE_HALF_DEPTH);
             let output_world = node_pos + output_local;
-            let eval_type = crate::eval::ast_type_to_eval_type(r#type);
+            let eval_type = crate::infer::ast_type_to_eval_type(r#type);
             let pattern_value = crate::layout::value_of_etype(r#type);
             RenderNode {
                 node: RenderObject {

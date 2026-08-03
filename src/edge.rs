@@ -8,7 +8,7 @@ use bevy::reflect::TypePath;
 use bevy::render::render_resource::*;
 use bevy::shader::ShaderRef;
 
-use crate::eval::EType;
+use crate::infer::EType;
 
 pub const RIBBON_HEIGHT: f32 = 1.0;
 /// Ribbon height used when a source anchor carries an AST literal. The band
