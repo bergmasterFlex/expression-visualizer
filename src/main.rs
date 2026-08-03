@@ -1,4 +1,3 @@
-mod ast;
 mod camera;
 mod colors;
 mod common;
@@ -7,11 +6,9 @@ mod eval;
 mod grid;
 mod layout;
 mod mesh;
+mod model;
 mod render;
 
-use std::{collections::hash_map, f32::consts::PI};
-
-use ast::FunctionParameterDeclaration;
 use bevy::core_pipeline::oit::OrderIndependentTransparencySettings;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::{input::keyboard::KeyboardInput, math::VectorSpace, prelude::*};
@@ -24,14 +21,16 @@ struct AstState {
     /// scene lives in `layout_ast.sub_layouts[program_id]`. Reads/writes go
     /// through `program_ast()` / `program_ast_mut()`.
     layout_ast: layout::LayoutAst,
-    program_id: ast::node::Id,
+    program_id: model::node::Id,
     /// Shared id domains for the whole LayoutAst tree. Threaded through every
     /// `plus_*` builder so node and anchor ids stay globally unique across the
     /// root, the program sub-layout, and all pattern sub-layouts.
-    node_id_domain: common::IdDomain<ast::node::Id>,
-    anchor_id_domain: common::IdDomain<ast::anchor::Id>,
-    function_declarations:
-        std::collections::HashMap<ast::FunctionDeclarationId, ast::FunctionDeclaration>,
+    node_id_domain: common::IdDomain<model::node::Id>,
+    anchor_id_domain: common::IdDomain<model::anchor::Id>,
+    function_declarations: std::collections::HashMap<
+        model::function_declaration::FunctionDeclarationId,
+        model::function_declaration::FunctionDeclaration,
+    >,
 }
 
 impl AstState {
@@ -58,15 +57,15 @@ impl Default for AstState {
             anchor_id_domain,
             function_declarations: std::collections::HashMap::from([
                 (
-                    ast::FunctionDeclarationId(0),
-                    ast::FunctionDeclaration {
+                    model::function_declaration::FunctionDeclarationId(0),
+                    model::function_declaration::FunctionDeclaration {
                         name: "+".to_string(),
                         inputs: vec![
-                            FunctionParameterDeclaration {
+                            model::function_declaration::FunctionParameterDeclaration {
                                 name: "summand1".to_string(),
                                 r#type: eval::EType::Int(None),
                             },
-                            FunctionParameterDeclaration {
+                            model::function_declaration::FunctionParameterDeclaration {
                                 name: "summand2".to_string(),
                                 r#type: eval::EType::Int(None),
                             },
@@ -75,15 +74,15 @@ impl Default for AstState {
                     },
                 ),
                 (
-                    ast::FunctionDeclarationId(1),
-                    ast::FunctionDeclaration {
+                    model::function_declaration::FunctionDeclarationId(1),
+                    model::function_declaration::FunctionDeclaration {
                         name: "/".to_string(),
                         inputs: vec![
-                            FunctionParameterDeclaration {
+                            model::function_declaration::FunctionParameterDeclaration {
                                 name: "dividend".to_string(),
                                 r#type: eval::EType::Int(None),
                             },
-                            FunctionParameterDeclaration {
+                            model::function_declaration::FunctionParameterDeclaration {
                                 name: "divisor".to_string(),
                                 r#type: eval::EType::Int(None),
                             },
@@ -95,15 +94,15 @@ impl Default for AstState {
                     },
                 ),
                 (
-                    ast::FunctionDeclarationId(2),
-                    ast::FunctionDeclaration {
+                    model::function_declaration::FunctionDeclarationId(2),
+                    model::function_declaration::FunctionDeclaration {
                         name: "charAt".to_string(),
                         inputs: vec![
-                            FunctionParameterDeclaration {
+                            model::function_declaration::FunctionParameterDeclaration {
                                 name: "str".to_string(),
                                 r#type: eval::EType::String(None),
                             },
-                            FunctionParameterDeclaration {
+                            model::function_declaration::FunctionParameterDeclaration {
                                 name: "i".to_string(),
                                 r#type: eval::EType::Int(None),
                             },
@@ -115,10 +114,10 @@ impl Default for AstState {
                     },
                 ),
                 (
-                    ast::FunctionDeclarationId(3),
-                    ast::FunctionDeclaration {
+                    model::function_declaration::FunctionDeclarationId(3),
+                    model::function_declaration::FunctionDeclaration {
                         name: "*(-1)".to_string(),
-                        inputs: vec![FunctionParameterDeclaration {
+                        inputs: vec![model::function_declaration::FunctionParameterDeclaration {
                             name: "number".to_string(),
                             r#type: eval::EType::Int(None),
                         }],
@@ -126,19 +125,19 @@ impl Default for AstState {
                     },
                 ),
                 (
-                    ast::FunctionDeclarationId(4),
-                    ast::FunctionDeclaration {
+                    model::function_declaration::FunctionDeclarationId(4),
+                    model::function_declaration::FunctionDeclaration {
                         name: "substr".to_string(),
                         inputs: vec![
-                            FunctionParameterDeclaration {
+                            model::function_declaration::FunctionParameterDeclaration {
                                 name: "str".to_string(),
                                 r#type: eval::EType::String(None),
                             },
-                            FunctionParameterDeclaration {
+                            model::function_declaration::FunctionParameterDeclaration {
                                 name: "begin".to_string(),
                                 r#type: eval::EType::Int(None),
                             },
-                            FunctionParameterDeclaration {
+                            model::function_declaration::FunctionParameterDeclaration {
                                 name: "length".to_string(),
                                 r#type: eval::EType::Int(None),
                             },
@@ -156,12 +155,12 @@ pub struct AnchorHovered;
 
 #[derive(Component)]
 pub enum EAnchor {
-    Input { id: ast::anchor::Id },
-    Output { id: ast::anchor::Id },
+    Input { id: model::anchor::Id },
+    Output { id: model::anchor::Id },
 }
 
 impl EAnchor {
-    pub fn id(&self) -> ast::anchor::Id {
+    pub fn id(&self) -> model::anchor::Id {
         match self {
             EAnchor::Input { id } | EAnchor::Output { id } => id.clone(),
         }
@@ -172,7 +171,7 @@ impl EAnchor {
 pub struct Edge {
     pub from_anchor: Entity,
     pub to_anchor: Entity,
-    pub source_anchor_id: ast::anchor::Id,
+    pub source_anchor_id: model::anchor::Id,
 }
 
 /// In-flight drag-to-connect state.
@@ -182,14 +181,14 @@ pub struct Edge {
 /// stale the moment anything sets `NeedsRebuild` mid-drag. Anchor identity is
 /// tracked by `AnchorId`, which survives rebuilds.
 pub struct DragInfo {
-    pub source_anchor_id: ast::anchor::Id,
+    pub source_anchor_id: model::anchor::Id,
     /// `true` if the drag started on an `EAnchor::Output`. Lets the target
     /// check reject same-kind pairs and lets drag-end store the edge in the
     /// canonical output → input direction without an AST lookup.
     pub source_is_output: bool,
     pub source_pos: Vec3,
     pub current_end: Vec3,
-    pub target_anchor_id: Option<ast::anchor::Id>,
+    pub target_anchor_id: Option<model::anchor::Id>,
 }
 
 #[derive(Resource, Default)]
@@ -200,7 +199,7 @@ pub struct DragState {
 /// Marker for AST node mesh entities (so we can despawn them on rebuild).
 #[derive(Component)]
 struct AstNodeEntity {
-    node_id: ast::node::Id,
+    node_id: model::node::Id,
 }
 
 /// Marker for a per-AST grid mesh (one per Program-Ast / Pattern sub-AST).
@@ -211,7 +210,7 @@ struct AstGridEntity {
     /// Owner path from the root LayoutAst down to this AST's LayoutAst.
     /// Empty = root (the outer container that owns the Program node).
     /// Length 1 with the Program's id = the Program-Ast itself.
-    context: Vec<ast::node::Id>,
+    context: Vec<model::node::Id>,
     /// Accumulated grid-space offset of this AST's origin from the root.
     origin_offset: Vec3,
     /// Local grid-space bounds this grid currently spans (inclusive).
@@ -290,7 +289,7 @@ struct PickState {
     /// Currently selected grid position (layout coordinates, always set).
     selected_pos: IVec3,
     /// Node under the cursor (ray-sphere hit), if any.
-    hovered_node: Option<ast::node::Id>,
+    hovered_node: Option<model::node::Id>,
     /// AST grid cell under the cursor (ray hit on an `AstGridEntity`), if
     /// any. Includes both the local cell coords and the owning AST's
     /// context path so click routing knows where to write.
@@ -311,14 +310,14 @@ struct PickState {
     /// delete/move handlers route through `current_ast(_mut)` so the
     /// change lands in the right sub-ast. Stays empty until Step 5 wires
     /// the "Select Ast" button.
-    context_path: Vec<ast::node::Id>,
+    context_path: Vec<model::node::Id>,
     /// Owner path from the Program-Ast to the LayoutAst that holds the
     /// currently selected node. Empty = selection lives in the Program-
     /// Ast. Independent of `context_path`: selection may land in a sub-
     /// AST while add/delete/move still target the Program (until Step 5
     /// adds "Select Ast"). `selected_pos` is expressed in the coordinate
     /// system of the LayoutAst identified by `selected_context`.
-    selected_context: Vec<ast::node::Id>,
+    selected_context: Vec<model::node::Id>,
 }
 
 /// Populated when the cursor is over a per-AST grid mesh.
@@ -327,7 +326,7 @@ struct HoveredGrid {
     /// Local grid coords inside the hovered AST.
     local_pos: IVec3,
     /// Owner path (from Program-Ast) to the hovered AST.
-    context: Vec<ast::node::Id>,
+    context: Vec<model::node::Id>,
     /// Entity of the `AstGridEntity` mesh that was hit — used so the hover
     /// shader wash flips only on the AST grid actually under the cursor.
     entity: Entity,
@@ -418,10 +417,10 @@ enum EvalPhase {
     ControlsModal,
     VarDeclPrompt {
         /// Stable node_id order; values mirror what the user has typed so far.
-        inputs: Vec<(ast::node::Id, String)>,
+        inputs: Vec<(model::node::Id, String)>,
     },
     Running {
-        steps: Vec<std::collections::HashMap<ast::node::Id, String>>,
+        steps: Vec<std::collections::HashMap<model::node::Id, String>>,
         current: usize,
     },
 }
@@ -474,7 +473,7 @@ struct ControlsModalOkButton;
 /// typed values per VarDecl when the user confirms.
 #[derive(Component)]
 struct ModalVarDeclInput {
-    node_id: ast::node::Id,
+    node_id: model::node::Id,
 }
 
 /// Tags entities that make up the Prev/Next/Exit bottom bar.
@@ -491,7 +490,7 @@ struct ExitEvaluationButton;
 /// World-space text node showing a node's current evaluated value.
 #[derive(Component)]
 struct ValueLabel {
-    node_id: ast::node::Id,
+    node_id: model::node::Id,
 }
 
 // ── Node editor panel ───────────────────────────────────────
@@ -512,7 +511,7 @@ enum NodeEditorField {
 
 #[derive(Component)]
 struct NodeEditorTextInput {
-    node_id: ast::node::Id,
+    node_id: model::node::Id,
     field: NodeEditorField,
 }
 
@@ -545,33 +544,33 @@ const TYPE_CHOICES: [TypeChoice; 6] = [
 #[derive(Clone, PartialEq, Eq)]
 enum DropdownChoice {
     Type(TypeChoice),
-    Function(ast::FunctionDeclarationId),
+    Function(model::function_declaration::FunctionDeclarationId),
     BoolValue(bool),
 }
 
 #[derive(Component)]
 struct Dropdown {
-    node_id: ast::node::Id,
+    node_id: model::node::Id,
     kind: DropdownKind,
 }
 
 #[derive(Component)]
 struct DropdownOption {
-    node_id: ast::node::Id,
+    node_id: model::node::Id,
     kind: DropdownKind,
     choice: DropdownChoice,
 }
 
 #[derive(Component)]
 struct ValueEnableCheckbox {
-    node_id: ast::node::Id,
+    node_id: model::node::Id,
 }
 
 /// At most one dropdown is open at a time; `open` identifies which one by
 /// `(node_id, kind)` — stable across panel rebuilds.
 #[derive(Resource, Default)]
 struct DropdownState {
-    open: Option<(ast::node::Id, DropdownKind)>,
+    open: Option<(model::node::Id, DropdownKind)>,
 }
 
 #[derive(Default, PartialEq, Eq, Clone, Copy)]
@@ -586,27 +585,27 @@ enum NodeVariantKind {
     Other,
 }
 
-fn variant_kind(node: Option<&ast::node::ENode>) -> NodeVariantKind {
+fn variant_kind(node: Option<&model::node::ENode>) -> NodeVariantKind {
     match node {
         None => NodeVariantKind::None,
-        Some(ast::node::ENode::ConstDecl { .. }) => NodeVariantKind::ConstDecl,
-        Some(ast::node::ENode::TypeCast { .. }) => NodeVariantKind::TypeCast,
-        Some(ast::node::ENode::VarDecl { .. }) => NodeVariantKind::VarDecl,
-        Some(ast::node::ENode::FunctionCall { .. }) => NodeVariantKind::FunctionCall,
-        Some(ast::node::ENode::Pattern { .. }) => NodeVariantKind::Pattern,
+        Some(model::node::ENode::ConstDecl { .. }) => NodeVariantKind::ConstDecl,
+        Some(model::node::ENode::TypeCast { .. }) => NodeVariantKind::TypeCast,
+        Some(model::node::ENode::VarDecl { .. }) => NodeVariantKind::VarDecl,
+        Some(model::node::ENode::FunctionCall { .. }) => NodeVariantKind::FunctionCall,
+        Some(model::node::ENode::Pattern { .. }) => NodeVariantKind::Pattern,
         Some(_) => NodeVariantKind::Other,
     }
 }
 
-fn type_choice_of(t: &ast::node::EType) -> Option<TypeChoice> {
+fn type_choice_of(t: &model::r#type::EType) -> Option<TypeChoice> {
     match t {
-        ast::node::EType::Bool { .. } => Some(TypeChoice::Bool),
-        ast::node::EType::Int { .. } => Some(TypeChoice::Int),
-        ast::node::EType::Float { .. } => Some(TypeChoice::Float),
-        ast::node::EType::String { .. } => Some(TypeChoice::String),
-        ast::node::EType::Char { .. } => Some(TypeChoice::Char),
-        ast::node::EType::Undefined { .. } => Some(TypeChoice::Undefined),
-        ast::node::EType::Any => None,
+        model::r#type::EType::Bool { .. } => Some(TypeChoice::Bool),
+        model::r#type::EType::Int { .. } => Some(TypeChoice::Int),
+        model::r#type::EType::Float { .. } => Some(TypeChoice::Float),
+        model::r#type::EType::String { .. } => Some(TypeChoice::String),
+        model::r#type::EType::Char { .. } => Some(TypeChoice::Char),
+        model::r#type::EType::Undefined { .. } => Some(TypeChoice::Undefined),
+        model::r#type::EType::Any => None,
     }
 }
 
@@ -623,14 +622,14 @@ fn type_choice_label(t: TypeChoice) -> &'static str {
 
 use layout::value_of_etype;
 
-fn make_etype(choice: TypeChoice, value: Option<String>) -> ast::node::EType {
+fn make_etype(choice: TypeChoice, value: Option<String>) -> model::r#type::EType {
     match choice {
-        TypeChoice::Bool => ast::node::EType::Bool { value },
-        TypeChoice::Int => ast::node::EType::Int { value },
-        TypeChoice::Float => ast::node::EType::Float { value },
-        TypeChoice::String => ast::node::EType::String { value },
-        TypeChoice::Char => ast::node::EType::Char { value },
-        TypeChoice::Undefined => ast::node::EType::Undefined { message: None },
+        TypeChoice::Bool => model::r#type::EType::Bool { value },
+        TypeChoice::Int => model::r#type::EType::Int { value },
+        TypeChoice::Float => model::r#type::EType::Float { value },
+        TypeChoice::String => model::r#type::EType::String { value },
+        TypeChoice::Char => model::r#type::EType::Char { value },
+        TypeChoice::Undefined => model::r#type::EType::Undefined { message: None },
     }
 }
 
@@ -727,9 +726,9 @@ fn spawn_ast_nodes(
     ui_font: Res<UiFont>,
     pick: Res<PickState>,
 ) {
-    let mut node_entites = std::collections::HashMap::<ast::node::Id, Entity>::new();
-    let mut anchor_entities = std::collections::HashMap::<ast::anchor::Id, Entity>::new();
-    let mut anchor_world_positions = std::collections::HashMap::<ast::anchor::Id, Vec3>::new();
+    let mut node_entites = std::collections::HashMap::<model::node::Id, Entity>::new();
+    let mut anchor_entities = std::collections::HashMap::<model::anchor::Id, Entity>::new();
+    let mut anchor_world_positions = std::collections::HashMap::<model::anchor::Id, Vec3>::new();
     for walked in state.layout_ast.walk_all() {
         let layout_node = walked.layout_node;
         let node_id = &layout_node.node_id;
@@ -818,10 +817,10 @@ fn spawn_ast_nodes(
                     .spawn((
                         Transform::from_translation(pick_center),
                         match layout_anchor.anchor {
-                            ast::anchor::EAnchor::Input { .. } => EAnchor::Input {
+                            model::anchor::EAnchor::Input { .. } => EAnchor::Input {
                                 id: anchor_id.clone(),
                             },
-                            ast::anchor::EAnchor::Output => EAnchor::Output {
+                            model::anchor::EAnchor::Output => EAnchor::Output {
                                 id: anchor_id.clone(),
                             },
                         },
@@ -1273,7 +1272,7 @@ fn handle_delete_node_button(
         if let Some(selected_node_id) = pick.selected_ast(&state).node_at(pick.selected_pos) {
             let is_sink = matches!(
                 pick.selected_ast(&state).ast.nodes.get(&selected_node_id),
-                Some(ast::node::ENode::Sink { .. })
+                Some(model::node::ENode::Sink { .. })
             );
             if !is_sink {
                 let updated = pick.selected_ast(&state).minus_node(&selected_node_id);
@@ -1301,7 +1300,7 @@ fn update_add_pattern_button_visuals(
             pick.current_ast(&state)
                 .node_at(pick.selected_pos)
                 .and_then(|id| pick.current_ast(&state).ast.nodes.get(&id).cloned()),
-            Some(ast::node::ENode::Pattern { .. })
+            Some(model::node::ENode::Pattern { .. })
         );
     for (interaction, mut bg, children, action) in button_q.iter_mut() {
         if *action != EAstActionButton::AddPatternButton {
@@ -1432,7 +1431,7 @@ fn update_delete_button_visuals(
     let enabled = match pick.selected_ast(&state).node_at(pick.selected_pos) {
         Some(id) => !matches!(
             pick.selected_ast(&state).ast.nodes.get(&id),
-            Some(ast::node::ENode::Sink { .. })
+            Some(model::node::ENode::Sink { .. })
         ),
         None => false,
     };
@@ -1517,7 +1516,7 @@ fn handle_add_node_button(
                     EAstActionButton::SelectAstButton => continue,
                     EAstActionButton::AddConstDeclButton => {
                         pick.current_ast(&state).plus_const_decl(
-                            ast::node::EType::Int { value: None },
+                            model::r#type::EType::Int { value: None },
                             new_pos,
                             node_id_domain,
                             anchor_id_domain,
@@ -1553,7 +1552,7 @@ fn handle_add_node_button(
                         )
                     }
                     EAstActionButton::AddTypeCastButton => pick.current_ast(&state).plus_type_cast(
-                        ast::node::EType::Int { value: None },
+                        model::r#type::EType::Int { value: None },
                         new_pos,
                         node_id_domain,
                         anchor_id_domain,
@@ -1568,7 +1567,7 @@ fn handle_add_node_button(
                             Some(id)
                                 if matches!(
                                     pick.current_ast(&state).ast.nodes.get(&id),
-                                    Some(ast::node::ENode::Pattern { .. })
+                                    Some(model::node::ENode::Pattern { .. })
                                 ) =>
                             {
                                 let updated = pick.current_ast(&state).plus_pattern_above(
@@ -1626,7 +1625,7 @@ fn handle_select_ast_button(
         };
         let is_pattern = matches!(
             pick.selected_ast(&state).ast.nodes.get(&selected_node_id),
-            Some(ast::node::ENode::Pattern { .. })
+            Some(model::node::ENode::Pattern { .. })
         );
         let mut new_context = pick.selected_context.clone();
         if is_pattern {
@@ -1661,12 +1660,12 @@ fn spawn_node_editor_panel(mut commands: Commands) {
 
 #[derive(Default, PartialEq, Eq, Clone)]
 struct NodeEditorFingerprint {
-    node_id: Option<ast::node::Id>,
+    node_id: Option<model::node::Id>,
     variant: NodeVariantKind,
     type_choice: Option<TypeChoice>,
     typecast_has_value: bool,
-    func_id: Option<ast::FunctionDeclarationId>,
-    dropdown_open: Option<(ast::node::Id, DropdownKind)>,
+    func_id: Option<model::function_declaration::FunctionDeclarationId>,
+    dropdown_open: Option<(model::node::Id, DropdownKind)>,
     visible: bool,
 }
 
@@ -1689,18 +1688,18 @@ fn sync_node_editor_ui(
         .and_then(|id| selected_ast.ast.nodes.get(id));
     let variant = variant_kind(node);
     let type_choice = node.and_then(|n| match n {
-        ast::node::ENode::ConstDecl { r#type, .. }
-        | ast::node::ENode::TypeCast { r#type, .. }
-        | ast::node::ENode::Pattern { r#type, .. } => type_choice_of(r#type),
+        model::node::ENode::ConstDecl { r#type, .. }
+        | model::node::ENode::TypeCast { r#type, .. }
+        | model::node::ENode::Pattern { r#type, .. } => type_choice_of(r#type),
         _ => None,
     });
     let typecast_has_value = match node {
-        Some(ast::node::ENode::TypeCast { r#type, .. })
-        | Some(ast::node::ENode::Pattern { r#type, .. }) => value_of_etype(r#type).is_some(),
+        Some(model::node::ENode::TypeCast { r#type, .. })
+        | Some(model::node::ENode::Pattern { r#type, .. }) => value_of_etype(r#type).is_some(),
         _ => false,
     };
     let func_id = match node {
-        Some(ast::node::ENode::FunctionCall {
+        Some(model::node::ENode::FunctionCall {
             function_declaration_id,
             ..
         }) => Some(function_declaration_id.clone()),
@@ -1755,12 +1754,12 @@ fn sync_node_editor_ui(
     commands
         .entity(panel_entity)
         .with_children(|panel| match node {
-            ast::node::ENode::ConstDecl { r#type, .. } => {
+            model::node::ENode::ConstDecl { r#type, .. } => {
                 spawn_editor_label(panel, font, "ConstDecl");
                 spawn_labeled_row(panel, font, "Type", |slot| {
                     spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
-                if !matches!(r#type, ast::node::EType::Undefined { .. }) {
+                if !matches!(r#type, model::r#type::EType::Undefined { .. }) {
                     spawn_labeled_row(panel, font, "Value", |slot| {
                         spawn_value_widget(
                             slot,
@@ -1773,7 +1772,7 @@ fn sync_node_editor_ui(
                     });
                 }
             }
-            ast::node::ENode::VarDecl { name, r#type, .. } => {
+            model::node::ENode::VarDecl { name, r#type, .. } => {
                 spawn_labeled_row(panel, font, "Name", |slot| {
                     spawn_name_input(slot, font, &node_id, name);
                 });
@@ -1781,12 +1780,12 @@ fn sync_node_editor_ui(
                     spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
             }
-            ast::node::ENode::TypeCast { r#type, .. } => {
+            model::node::ENode::TypeCast { r#type, .. } => {
                 spawn_editor_label(panel, font, "TypeCast");
                 spawn_labeled_row(panel, font, "Type", |slot| {
                     spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
-                if !matches!(r#type, ast::node::EType::Undefined { .. }) {
+                if !matches!(r#type, model::r#type::EType::Undefined { .. }) {
                     spawn_labeled_row(panel, font, "Value", |slot| {
                         spawn_typecast_checkbox_and_value(
                             slot,
@@ -1798,12 +1797,12 @@ fn sync_node_editor_ui(
                     });
                 }
             }
-            ast::node::ENode::Pattern { r#type, .. } => {
+            model::node::ENode::Pattern { r#type, .. } => {
                 spawn_editor_label(panel, font, "Pattern");
                 spawn_labeled_row(panel, font, "Type", |slot| {
                     spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
-                if !matches!(r#type, ast::node::EType::Undefined { .. }) {
+                if !matches!(r#type, model::r#type::EType::Undefined { .. }) {
                     spawn_labeled_row(panel, font, "Value", |slot| {
                         spawn_typecast_checkbox_and_value(
                             slot,
@@ -1815,7 +1814,7 @@ fn sync_node_editor_ui(
                     });
                 }
             }
-            ast::node::ENode::FunctionCall {
+            model::node::ENode::FunctionCall {
                 function_declaration_id,
                 ..
             } => {
@@ -1888,7 +1887,7 @@ fn spawn_labeled_row(
 fn spawn_name_input(
     panel: &mut ChildSpawnerCommands,
     font: &Handle<Font>,
-    node_id: &ast::node::Id,
+    node_id: &model::node::Id,
     current: &str,
 ) {
     panel
@@ -1923,9 +1922,9 @@ fn spawn_name_input(
 fn spawn_type_dropdown(
     panel: &mut ChildSpawnerCommands,
     font: &Handle<Font>,
-    node_id: &ast::node::Id,
-    current: &ast::node::EType,
-    open: &Option<(ast::node::Id, DropdownKind)>,
+    node_id: &model::node::Id,
+    current: &model::r#type::EType,
+    open: &Option<(model::node::Id, DropdownKind)>,
 ) {
     let current_choice = type_choice_of(current);
     let label = current_choice.map(type_choice_label).unwrap_or("?");
@@ -1956,19 +1955,23 @@ fn spawn_type_dropdown(
 fn spawn_function_dropdown(
     panel: &mut ChildSpawnerCommands,
     font: &Handle<Font>,
-    node_id: &ast::node::Id,
-    current: &ast::FunctionDeclarationId,
-    declarations: &std::collections::HashMap<ast::FunctionDeclarationId, ast::FunctionDeclaration>,
-    open: &Option<(ast::node::Id, DropdownKind)>,
+    node_id: &model::node::Id,
+    current: &model::function_declaration::FunctionDeclarationId,
+    declarations: &std::collections::HashMap<
+        model::function_declaration::FunctionDeclarationId,
+        model::function_declaration::FunctionDeclaration,
+    >,
+    open: &Option<(model::node::Id, DropdownKind)>,
 ) {
     let label = declarations
         .get(current)
         .map(|d| d.name.as_str())
         .unwrap_or("?");
-    let mut entries: Vec<(ast::FunctionDeclarationId, String)> = declarations
-        .iter()
-        .map(|(id, d)| (id.clone(), d.name.clone()))
-        .collect();
+    let mut entries: Vec<(model::function_declaration::FunctionDeclarationId, String)> =
+        declarations
+            .iter()
+            .map(|(id, d)| (id.clone(), d.name.clone()))
+            .collect();
     entries.sort_by(|a, b| a.1.cmp(&b.1));
 
     spawn_dropdown_root(
@@ -1998,14 +2001,14 @@ fn spawn_function_dropdown(
 fn spawn_value_widget(
     panel: &mut ChildSpawnerCommands,
     font: &Handle<Font>,
-    node_id: &ast::node::Id,
-    current: &ast::node::EType,
+    node_id: &model::node::Id,
+    current: &model::r#type::EType,
     enabled: bool,
-    open: &Option<(ast::node::Id, DropdownKind)>,
+    open: &Option<(model::node::Id, DropdownKind)>,
 ) {
     match current {
-        ast::node::EType::Undefined { .. } => {}
-        ast::node::EType::Bool { value } => {
+        model::r#type::EType::Undefined { .. } => {}
+        model::r#type::EType::Bool { value } => {
             let current_bool = value.as_deref() == Some("true");
             let label = value.as_deref().unwrap_or("bool");
             spawn_dropdown_root(
@@ -2080,9 +2083,9 @@ fn spawn_value_widget(
 fn spawn_typecast_checkbox_and_value(
     row: &mut ChildSpawnerCommands,
     font: &Handle<Font>,
-    node_id: &ast::node::Id,
-    current: &ast::node::EType,
-    open: &Option<(ast::node::Id, DropdownKind)>,
+    node_id: &model::node::Id,
+    current: &model::r#type::EType,
+    open: &Option<(model::node::Id, DropdownKind)>,
 ) {
     let enabled = value_of_etype(current).is_some();
     row.spawn((
@@ -2112,10 +2115,10 @@ fn spawn_typecast_checkbox_and_value(
 fn spawn_dropdown_root(
     panel: &mut ChildSpawnerCommands,
     font: &Handle<Font>,
-    node_id: &ast::node::Id,
+    node_id: &model::node::Id,
     kind: DropdownKind,
     label: &str,
-    open: &Option<(ast::node::Id, DropdownKind)>,
+    open: &Option<(model::node::Id, DropdownKind)>,
     spawn_options: impl FnOnce(&mut ChildSpawnerCommands),
 ) {
     let is_open = matches!(open, Some((oid, ok)) if oid == node_id && *ok == kind);
@@ -2183,7 +2186,7 @@ fn spawn_dropdown_root(
 fn spawn_dropdown_option(
     options: &mut ChildSpawnerCommands,
     font: &Handle<Font>,
-    node_id: &ast::node::Id,
+    node_id: &model::node::Id,
     kind: DropdownKind,
     choice: DropdownChoice,
     label: &str,
@@ -2268,10 +2271,10 @@ fn handle_dropdown_option_click(
                     .find_node_ast_mut(&option.node_id)
                     .and_then(|a| a.ast.nodes.get_mut(&option.node_id));
                 match node {
-                    Some(ast::node::ENode::ConstDecl { r#type, .. })
-                    | Some(ast::node::ENode::TypeCast { r#type, .. })
-                    | Some(ast::node::ENode::VarDecl { r#type, .. })
-                    | Some(ast::node::ENode::Pattern { r#type, .. }) => {
+                    Some(model::node::ENode::ConstDecl { r#type, .. })
+                    | Some(model::node::ENode::TypeCast { r#type, .. })
+                    | Some(model::node::ENode::VarDecl { r#type, .. })
+                    | Some(model::node::ENode::Pattern { r#type, .. }) => {
                         let value = value_of_etype(r#type);
                         *r#type = make_etype(*new_choice, value);
                         rebuild.0 = true;
@@ -2285,11 +2288,11 @@ fn handle_dropdown_option_click(
                     .find_node_ast_mut(&option.node_id)
                     .and_then(|a| a.ast.nodes.get_mut(&option.node_id));
                 match node {
-                    Some(ast::node::ENode::ConstDecl { r#type, .. })
-                    | Some(ast::node::ENode::TypeCast { r#type, .. })
-                    | Some(ast::node::ENode::VarDecl { r#type, .. })
-                    | Some(ast::node::ENode::Pattern { r#type, .. }) => {
-                        if let ast::node::EType::Bool { value } = r#type {
+                    Some(model::node::ENode::ConstDecl { r#type, .. })
+                    | Some(model::node::ENode::TypeCast { r#type, .. })
+                    | Some(model::node::ENode::VarDecl { r#type, .. })
+                    | Some(model::node::ENode::Pattern { r#type, .. }) => {
+                        if let model::r#type::EType::Bool { value } = r#type {
                             *value = Some(if *v { "true" } else { "false" }.to_string());
                             rebuild.0 = true;
                         }
@@ -2337,8 +2340,8 @@ fn handle_value_enable_checkbox(
             .find_node_ast_mut(&cb.node_id)
             .and_then(|a| a.ast.nodes.get_mut(&cb.node_id))
         {
-            Some(ast::node::ENode::TypeCast { r#type, .. })
-            | Some(ast::node::ENode::Pattern { r#type, .. }) => r#type,
+            Some(model::node::ENode::TypeCast { r#type, .. })
+            | Some(model::node::ENode::Pattern { r#type, .. }) => r#type,
             _ => continue,
         };
         let current = value_of_etype(r#type);
@@ -2369,7 +2372,7 @@ fn handle_node_editor_text_input(
         };
         match editor_input.field {
             NodeEditorField::VarDeclName => {
-                if let ast::node::ENode::VarDecl { name, .. } = node {
+                if let model::node::ENode::VarDecl { name, .. } = node {
                     if *name != input.value {
                         *name = input.value.clone();
                         rebuild.0 = true;
@@ -2378,10 +2381,10 @@ fn handle_node_editor_text_input(
             }
             NodeEditorField::Value => {
                 let r#type = match node {
-                    ast::node::ENode::ConstDecl { r#type, .. }
-                    | ast::node::ENode::TypeCast { r#type, .. }
-                    | ast::node::ENode::VarDecl { r#type, .. }
-                    | ast::node::ENode::Pattern { r#type, .. } => r#type,
+                    model::node::ENode::ConstDecl { r#type, .. }
+                    | model::node::ENode::TypeCast { r#type, .. }
+                    | model::node::ENode::VarDecl { r#type, .. }
+                    | model::node::ENode::Pattern { r#type, .. } => r#type,
                     _ => continue,
                 };
                 let Some(choice) = type_choice_of(r#type) else {
@@ -2502,11 +2505,11 @@ fn sync_modal_ui(
         }
         EvalPhase::VarDeclPrompt { inputs } => {
             let ast = &state.program_ast().ast;
-            let rows: Vec<(ast::node::Id, String)> = inputs
+            let rows: Vec<(model::node::Id, String)> = inputs
                 .iter()
                 .map(|(id, _)| {
                     let name = match ast.nodes.get(id) {
-                        Some(ast::node::ENode::VarDecl { name, .. }) => name.clone(),
+                        Some(model::node::ENode::VarDecl { name, .. }) => name.clone(),
                         _ => "?".to_string(),
                     };
                     (id.clone(), name)
@@ -2699,7 +2702,7 @@ fn spawn_controls_section(
 fn spawn_vardecl_modal(
     commands: &mut Commands,
     font: &Handle<Font>,
-    rows: Vec<(ast::node::Id, String)>,
+    rows: Vec<(model::node::Id, String)>,
 ) {
     commands
         .spawn((
@@ -3205,7 +3208,7 @@ fn handle_modal_evaluate_button(
         let mut color = text_color_q.get_mut(children[0]).unwrap();
         match *interaction {
             Interaction::Pressed => {
-                let mut user_values: std::collections::HashMap<ast::node::Id, String> =
+                let mut user_values: std::collections::HashMap<model::node::Id, String> =
                     std::collections::HashMap::new();
                 for (m, input) in input_q.iter() {
                     user_values.insert(m.node_id.clone(), input.value.clone());
@@ -3373,7 +3376,7 @@ fn sync_value_labels(
     ui_font: Res<UiFont>,
     mut existing_q: Query<(Entity, &ValueLabel, &mut Text)>,
 ) {
-    let snapshot: Option<&std::collections::HashMap<ast::node::Id, String>> = match &eval.phase {
+    let snapshot: Option<&std::collections::HashMap<model::node::Id, String>> = match &eval.phase {
         EvalPhase::Running { steps, current } => Some(&steps[*current]),
         _ => None,
     };
@@ -3384,7 +3387,7 @@ fn sync_value_labels(
         return;
     };
 
-    let mut kept: std::collections::HashSet<ast::node::Id> = std::collections::HashSet::new();
+    let mut kept: std::collections::HashSet<model::node::Id> = std::collections::HashSet::new();
     for (entity, label, mut text) in existing_q.iter_mut() {
         if let Some(value) = snapshot.get(&label.node_id) {
             if text.0 != *value {
@@ -3679,7 +3682,7 @@ fn pick_nodes(
 
     // Ray-sphere test against nodes (radius 0.35).
     let radius = 0.35_f32;
-    let mut closest: Option<(ast::node::Id, f32)> = None;
+    let mut closest: Option<(model::node::Id, f32)> = None;
     if !over_ui {
         for (node_ent, transform) in node_q.iter() {
             let center = transform.translation;
@@ -4089,7 +4092,7 @@ fn trigger_camera_focus_on_selection_change(
     state: Res<AstState>,
     orbit: Res<camera::OrbitCamera>,
     mut tween: ResMut<camera::CameraTween>,
-    mut last_selection: Local<Option<(IVec3, Vec<ast::node::Id>)>>,
+    mut last_selection: Local<Option<(IVec3, Vec<model::node::Id>)>>,
     start_menu: Res<StartMenu>,
 ) {
     if start_menu.showing {
@@ -4493,10 +4496,10 @@ fn update_crosshair(
 /// both orientations as connected.
 fn anchors_already_connected(
     layout_ast: &layout::LayoutAst,
-    a: &ast::anchor::Id,
-    b: &ast::anchor::Id,
+    a: &model::anchor::Id,
+    b: &model::anchor::Id,
 ) -> bool {
-    let joined = |from: &ast::anchor::Id, to: &ast::anchor::Id| {
+    let joined = |from: &model::anchor::Id, to: &model::anchor::Id| {
         layout_ast
             .ast
             .edges

@@ -1,11 +1,11 @@
 use bevy::prelude::*;
 
-type NodeIdDomain = crate::common::IdDomain<crate::ast::node::Id>;
-type AnchorIdDomain = crate::common::IdDomain<crate::ast::anchor::Id>;
+type NodeIdDomain = crate::common::IdDomain<crate::model::node::Id>;
+type AnchorIdDomain = crate::common::IdDomain<crate::model::anchor::Id>;
 
 #[derive(Debug, Clone)]
 pub struct LayoutNode {
-    pub node_id: crate::ast::node::Id,
+    pub node_id: crate::model::node::Id,
     pub pos: Vec3,
 }
 
@@ -17,9 +17,9 @@ pub struct LayoutEdge {
 
 #[derive(Debug, Clone)]
 pub struct LayoutAnchor {
-    pub anchor_id: crate::ast::anchor::Id,
-    pub node_id: crate::ast::node::Id,
-    pub anchor: crate::ast::anchor::EAnchor,
+    pub anchor_id: crate::model::anchor::Id,
+    pub node_id: crate::model::node::Id,
+    pub anchor: crate::model::anchor::EAnchor,
     pub pos: Vec3,
 }
 
@@ -40,7 +40,7 @@ pub struct WalkedAst<'a> {
     pub layout_ast: &'a LayoutAst,
     /// Owner path from the walk root to this AST. Empty at the outermost
     /// LayoutAst (the one `walk_all_asts` was called on).
-    pub context: Vec<crate::ast::node::Id>,
+    pub context: Vec<crate::model::node::Id>,
     /// Accumulated grid-space offset from the root to this AST's origin.
     pub extra_offset: Vec3,
 }
@@ -114,19 +114,19 @@ impl AABB {
 
 #[derive(Clone)]
 pub struct LayoutAst {
-    pub ast: crate::ast::Ast,
-    pub layout_nodes: std::collections::HashMap<crate::ast::node::Id, LayoutNode>,
+    pub ast: crate::model::ast::Ast,
+    pub layout_nodes: std::collections::HashMap<crate::model::node::Id, LayoutNode>,
     /// Per-owner nested layouts. Keyed by the container node id (Program in
     /// Step 1; Pattern in later steps). The `sub_layouts[program_id]` LayoutAst
     /// is the source of truth for the top-level context — the ENode::Program's
     /// own `ast` field is unused in Step 1 and stays empty.
-    pub sub_layouts: std::collections::HashMap<crate::ast::node::Id, LayoutAst>,
+    pub sub_layouts: std::collections::HashMap<crate::model::node::Id, LayoutAst>,
 }
 
 impl LayoutAst {
     pub fn empty() -> Self {
         Self {
-            ast: crate::ast::Ast::empty(),
+            ast: crate::model::ast::Ast::empty(),
             layout_nodes: std::collections::HashMap::new(),
             sub_layouts: std::collections::HashMap::new(),
         }
@@ -136,12 +136,12 @@ impl LayoutAst {
     /// `sub_layouts` entry keyed by the Program's id. The inner LayoutAst is
     /// where user-visible nodes live in Step 1 (mirrors the previous behavior
     /// of a flat `LayoutAst::empty()` root).
-    pub fn empty_with_program() -> (Self, crate::ast::node::Id, NodeIdDomain, AnchorIdDomain) {
+    pub fn empty_with_program() -> (Self, crate::model::node::Id, NodeIdDomain, AnchorIdDomain) {
         let node_id_domain = NodeIdDomain::new();
         let anchor_id_domain = AnchorIdDomain::new();
         let (node_id_domain, program_id) = node_id_domain.next_id();
-        let ast = crate::ast::Ast::empty()
-            .plus_node(program_id.clone(), crate::ast::node::ENode::Program {});
+        let ast = crate::model::ast::Ast::empty()
+            .plus_node(program_id.clone(), crate::model::node::ENode::Program {});
         let outer = Self {
             ast,
             layout_nodes: std::collections::HashMap::new(),
@@ -150,12 +150,12 @@ impl LayoutAst {
         (outer, program_id, node_id_domain, anchor_id_domain)
     }
 
-    pub fn minus_node(&self, node_id: &crate::ast::node::Id) -> Self {
+    pub fn minus_node(&self, node_id: &crate::model::node::Id) -> Self {
         match self.ast.nodes.get(node_id) {
-            Some(crate::ast::node::ENode::Pattern { parent_match, .. }) => {
+            Some(crate::model::node::ENode::Pattern { parent_match, .. }) => {
                 let parent_id = parent_match.clone();
-                let remaining: Vec<crate::ast::node::Id> = match self.ast.nodes.get(&parent_id) {
-                    Some(crate::ast::node::ENode::Match { patterns, .. }) => {
+                let remaining: Vec<crate::model::node::Id> = match self.ast.nodes.get(&parent_id) {
+                    Some(crate::model::node::ENode::Match { patterns, .. }) => {
                         patterns.iter().filter(|p| *p != node_id).cloned().collect()
                     }
                     _ => vec![],
@@ -191,7 +191,7 @@ impl LayoutAst {
                         .recompute_match_pos(&parent_id)
                 }
             }
-            Some(crate::ast::node::ENode::Match { patterns, .. }) => {
+            Some(crate::model::node::ENode::Match { patterns, .. }) => {
                 let child_ids: Vec<_> = patterns.clone();
                 let after_children = child_ids.iter().fold(
                     Self {
@@ -242,11 +242,11 @@ impl LayoutAst {
     /// Multi-cell nodes (matches implicitly, function calls with the
     /// minimum-extent rule) are selectable from any cell inside their
     /// `node_footprint`.
-    pub fn node_at(&self, pos: IVec3) -> Option<crate::ast::node::Id> {
+    pub fn node_at(&self, pos: IVec3) -> Option<crate::model::node::Id> {
         self.layout_nodes.keys().find_map(|id| {
             if matches!(
                 self.ast.nodes.get(id),
-                Some(crate::ast::node::ENode::Match { .. })
+                Some(crate::model::node::ENode::Match { .. })
             ) {
                 return None;
             }
@@ -264,13 +264,13 @@ impl LayoutAst {
     /// the minimum-extent rule (1–2 inputs → 1X×2Z toward −Z; ≥3 inputs →
     /// 2X×2Z extending +X and −Z). Every other node claims a single cell at
     /// its rounded position.
-    pub fn node_footprint(&self, id: &crate::ast::node::Id) -> Option<AABB> {
+    pub fn node_footprint(&self, id: &crate::model::node::Id) -> Option<AABB> {
         let ln = self.layout_nodes.get(id)?;
         let node = self.ast.nodes.get(id)?;
         let pos = ln.pos.round().as_ivec3();
         match node {
-            crate::ast::node::ENode::Match { .. } => self.match_footprint(id),
-            crate::ast::node::ENode::FunctionCall { input_anchors, .. } => {
+            crate::model::node::ENode::Match { .. } => self.match_footprint(id),
+            crate::model::node::ENode::FunctionCall { input_anchors, .. } => {
                 let (width_extra, depth_extra) = if input_anchors.len() >= 3 {
                     (1, 1)
                 } else {
@@ -291,8 +291,8 @@ impl LayoutAst {
     /// match column) the Pattern id wins, so intra-stack Y-swap still
     /// resolves the Pattern as target — matches are inserted first and
     /// non-matches overwrite them.
-    fn occupancy_map(&self) -> std::collections::HashMap<IVec3, crate::ast::node::Id> {
-        let mut map: std::collections::HashMap<IVec3, crate::ast::node::Id> =
+    fn occupancy_map(&self) -> std::collections::HashMap<IVec3, crate::model::node::Id> {
+        let mut map: std::collections::HashMap<IVec3, crate::model::node::Id> =
             std::collections::HashMap::new();
         for id in self.layout_nodes.keys() {
             if !self.is_match(id) {
@@ -319,16 +319,16 @@ impl LayoutAst {
         map
     }
 
-    fn is_pattern(&self, id: &crate::ast::node::Id) -> bool {
+    fn is_pattern(&self, id: &crate::model::node::Id) -> bool {
         matches!(
             self.ast.nodes.get(id),
-            Some(crate::ast::node::ENode::Pattern { .. })
+            Some(crate::model::node::ENode::Pattern { .. })
         )
     }
 
-    fn parent_match_of(&self, id: &crate::ast::node::Id) -> Option<crate::ast::node::Id> {
+    fn parent_match_of(&self, id: &crate::model::node::Id) -> Option<crate::model::node::Id> {
         match self.ast.nodes.get(id) {
-            Some(crate::ast::node::ENode::Pattern { parent_match, .. }) => {
+            Some(crate::model::node::ENode::Pattern { parent_match, .. }) => {
                 Some(parent_match.clone())
             }
             _ => None,
@@ -336,17 +336,17 @@ impl LayoutAst {
     }
 
     /// Return the sibling Pattern ids of a `Match`.
-    fn match_pattern_ids(&self, match_id: &crate::ast::node::Id) -> Vec<crate::ast::node::Id> {
+    fn match_pattern_ids(&self, match_id: &crate::model::node::Id) -> Vec<crate::model::node::Id> {
         match self.ast.nodes.get(match_id) {
-            Some(crate::ast::node::ENode::Match { patterns, .. }) => patterns.clone(),
+            Some(crate::model::node::ENode::Match { patterns, .. }) => patterns.clone(),
             _ => vec![],
         }
     }
 
-    fn is_match(&self, id: &crate::ast::node::Id) -> bool {
+    fn is_match(&self, id: &crate::model::node::Id) -> bool {
         matches!(
             self.ast.nodes.get(id),
-            Some(crate::ast::node::ENode::Match { .. })
+            Some(crate::model::node::ENode::Match { .. })
         )
     }
 
@@ -388,7 +388,7 @@ impl LayoutAst {
     ///     Pattern's own Z (i.e. the parent-facing side).
     /// Recursion via `inner_footprint` — inner matches inflate their host
     /// Pattern's sub-AST bbox and thus the outer footprint too.
-    pub fn match_footprint(&self, match_id: &crate::ast::node::Id) -> Option<AABB> {
+    pub fn match_footprint(&self, match_id: &crate::model::node::Id) -> Option<AABB> {
         if !self.is_match(match_id) {
             return None;
         }
@@ -424,7 +424,11 @@ impl LayoutAst {
     /// Returns the updated layout and the effective grid position of the
     /// primary node (which differs from `origin + delta` when the move
     /// jumped over a match).
-    pub fn move_node_delta(&self, node_id: crate::ast::node::Id, delta_pos: Vec3) -> (Self, IVec3) {
+    pub fn move_node_delta(
+        &self,
+        node_id: crate::model::node::Id,
+        delta_pos: Vec3,
+    ) -> (Self, IVec3) {
         let Some(primary_ln) = self.layout_nodes.get(&node_id) else {
             return (self.clone_shape(), IVec3::ZERO);
         };
@@ -432,7 +436,7 @@ impl LayoutAst {
         // VarDecls are pinned to the Program wall row (Y=0, Z=0);
         // every other node type must stay south of it (Z < 0).
         let delta_pos = match self.ast.nodes.get(&node_id) {
-            Some(crate::ast::node::ENode::VarDecl { .. }) => Vec3::new(delta_pos.x, 0.0, 0.0),
+            Some(crate::model::node::ENode::VarDecl { .. }) => Vec3::new(delta_pos.x, 0.0, 0.0),
             _ => {
                 let target_z = (primary_origin.z + delta_pos.z).round() as i32;
                 if target_z >= 0 {
@@ -446,9 +450,9 @@ impl LayoutAst {
 
         let primary_delta = self.jump_delta(&occupancy, &node_id, primary_origin, delta_pos);
 
-        let mut plan: std::collections::HashMap<crate::ast::node::Id, Vec3> =
+        let mut plan: std::collections::HashMap<crate::model::node::Id, Vec3> =
             std::collections::HashMap::new();
-        let mut worklist: std::collections::VecDeque<crate::ast::node::Id> =
+        let mut worklist: std::collections::VecDeque<crate::model::node::Id> =
             std::collections::VecDeque::new();
         for (id, d) in self.move_group(&node_id, primary_delta) {
             let origin = self
@@ -532,7 +536,7 @@ impl LayoutAst {
             sub_layouts: self.sub_layouts.clone(),
         };
 
-        let mut match_ids: std::collections::HashSet<crate::ast::node::Id> =
+        let mut match_ids: std::collections::HashSet<crate::model::node::Id> =
             std::collections::HashSet::new();
         for id in plan.keys() {
             if self.is_pattern(id) {
@@ -577,7 +581,7 @@ impl LayoutAst {
     /// `move_node_delta` for each bump so cascading collisions resolve
     /// automatically. Iterates until stable (128-step cap).
     pub fn settle_footprints(&self) -> Self {
-        let settled_subs: std::collections::HashMap<crate::ast::node::Id, LayoutAst> = self
+        let settled_subs: std::collections::HashMap<crate::model::node::Id, LayoutAst> = self
             .sub_layouts
             .iter()
             .map(|(k, v)| (k.clone(), v.settle_footprints()))
@@ -587,7 +591,7 @@ impl LayoutAst {
             layout_nodes: self.layout_nodes.clone(),
             sub_layouts: settled_subs,
         };
-        let owner_ids: Vec<crate::ast::node::Id> = layout
+        let owner_ids: Vec<crate::model::node::Id> = layout
             .layout_nodes
             .keys()
             .filter(|id| {
@@ -601,7 +605,7 @@ impl LayoutAst {
         for owner_id in &owner_ids {
             // Patterns of a Match ride along with their parent; skip them
             // as intruders. For non-match owners there are no related ids.
-            let related: Vec<crate::ast::node::Id> = if layout.is_match(owner_id) {
+            let related: Vec<crate::model::node::Id> = if layout.is_match(owner_id) {
                 layout.match_pattern_ids(owner_id)
             } else {
                 vec![]
@@ -635,7 +639,7 @@ impl LayoutAst {
                 // VarDecls are pinned to Y=0, Z=0 → only X-push can succeed.
                 let is_var_decl = matches!(
                     layout.ast.nodes.get(&intruder_id),
-                    Some(crate::ast::node::ENode::VarDecl { .. })
+                    Some(crate::model::node::ENode::VarDecl { .. })
                 );
                 // Priority: Z (deeper) → X (sideways) → Y (upward). Y is a
                 // last resort because it crosses row boundaries; XZ keeps
@@ -710,13 +714,13 @@ impl LayoutAst {
     }
 
     /// The single Sink node id of this LayoutAst, if present.
-    pub fn sink_id(&self) -> Option<crate::ast::node::Id> {
+    pub fn sink_id(&self) -> Option<crate::model::node::Id> {
         self.layout_nodes
             .keys()
             .find(|id| {
                 matches!(
                     self.ast.nodes.get(*id),
-                    Some(crate::ast::node::ENode::Sink { .. })
+                    Some(crate::model::node::ENode::Sink { .. })
                 )
             })
             .cloned()
@@ -730,7 +734,7 @@ impl LayoutAst {
     /// recursion, so this only needs to touch matches owned at this level.
     fn harmonize_match_sinks(&self) -> Self {
         let mut layout = self.clone_shape();
-        let match_ids: Vec<crate::ast::node::Id> = layout
+        let match_ids: Vec<crate::model::node::Id> = layout
             .layout_nodes
             .keys()
             .filter(|id| layout.is_match(id))
@@ -780,8 +784,8 @@ impl LayoutAst {
     /// unchanged so an intra-stack Y-swap can happen.
     fn jump_delta(
         &self,
-        occupancy: &std::collections::HashMap<IVec3, crate::ast::node::Id>,
-        mover: &crate::ast::node::Id,
+        occupancy: &std::collections::HashMap<IVec3, crate::model::node::Id>,
+        mover: &crate::model::node::Id,
         origin: Vec3,
         nominal_delta: Vec3,
     ) -> Vec3 {
@@ -835,11 +839,11 @@ impl LayoutAst {
     ///   match, all with the XZ delta (siblings without the Y component).
     fn move_group(
         &self,
-        seed: &crate::ast::node::Id,
+        seed: &crate::model::node::Id,
         seed_delta: Vec3,
-    ) -> Vec<(crate::ast::node::Id, Vec3)> {
+    ) -> Vec<(crate::model::node::Id, Vec3)> {
         if self.is_match(seed) {
-            let mut group: Vec<(crate::ast::node::Id, Vec3)> = vec![(seed.clone(), seed_delta)];
+            let mut group: Vec<(crate::model::node::Id, Vec3)> = vec![(seed.clone(), seed_delta)];
             for pid in self.match_pattern_ids(seed) {
                 group.push((pid, seed_delta));
             }
@@ -858,7 +862,7 @@ impl LayoutAst {
         // Sibling patterns co-move on XZ, and the parent Match must follow
         // so its footprint stays aligned during the swap-cascade phase.
         let xz_delta = Vec3::new(seed_delta.x, 0.0, seed_delta.z);
-        let mut group: Vec<(crate::ast::node::Id, Vec3)> = self
+        let mut group: Vec<(crate::model::node::Id, Vec3)> = self
             .match_pattern_ids(&match_id)
             .into_iter()
             .map(|sid| {
@@ -870,7 +874,7 @@ impl LayoutAst {
         group
     }
 
-    pub fn plus_edge(&self, from: crate::ast::anchor::Id, to: crate::ast::anchor::Id) -> Self {
+    pub fn plus_edge(&self, from: crate::model::anchor::Id, to: crate::model::anchor::Id) -> Self {
         Self {
             ast: self.ast.plus_edge(from, to),
             layout_nodes: self.layout_nodes.clone(),
@@ -887,7 +891,7 @@ impl LayoutAst {
         let (node_id_domain, node_id) = node_id_domain.next_id();
         let ast = self.ast.plus_node(
             node_id.clone(),
-            crate::ast::node::ENode::Sink {
+            crate::model::node::ENode::Sink {
                 input_anchor: input_anchor_id,
             },
         );
@@ -902,7 +906,7 @@ impl LayoutAst {
 
     pub fn plus_const_decl(
         &self,
-        r#type: crate::ast::node::EType,
+        r#type: crate::model::r#type::EType,
         pos: Vec3,
         node_id_domain: NodeIdDomain,
         anchor_id_domain: AnchorIdDomain,
@@ -911,7 +915,7 @@ impl LayoutAst {
         let (node_id_domain, node_id) = node_id_domain.next_id();
         let ast = self.ast.plus_node(
             node_id.clone(),
-            crate::ast::node::ENode::ConstDecl {
+            crate::model::node::ENode::ConstDecl {
                 r#type,
                 output_anchor: output_anchor_id,
             },
@@ -927,7 +931,7 @@ impl LayoutAst {
 
     pub fn plus_type_cast(
         &self,
-        r#type: crate::ast::node::EType,
+        r#type: crate::model::r#type::EType,
         pos: Vec3,
         node_id_domain: NodeIdDomain,
         anchor_id_domain: AnchorIdDomain,
@@ -937,7 +941,7 @@ impl LayoutAst {
         let (node_id_domain, node_id) = node_id_domain.next_id();
         let ast = self.ast.plus_node(
             node_id.clone(),
-            crate::ast::node::ENode::TypeCast {
+            crate::model::node::ENode::TypeCast {
                 r#type,
                 input_anchor: input_anchor_id,
                 output_anchor: output_anchor_id,
@@ -955,8 +959,8 @@ impl LayoutAst {
     pub fn plus_function_call(
         &self,
         function_declaration: (
-            crate::ast::FunctionDeclarationId,
-            &crate::ast::FunctionDeclaration,
+            crate::model::function_declaration::FunctionDeclarationId,
+            &crate::model::function_declaration::FunctionDeclaration,
         ),
         pos: Vec3,
         node_id_domain: NodeIdDomain,
@@ -967,7 +971,7 @@ impl LayoutAst {
                 .1
                 .inputs
                 .iter()
-                .fold::<(AnchorIdDomain, Vec<crate::ast::anchor::Id>), _>(
+                .fold::<(AnchorIdDomain, Vec<crate::model::anchor::Id>), _>(
                     (anchor_id_domain, vec![]),
                     |(anchor_id_domain, input_anchor_ids), _| {
                         let (anchor_id_domain, new_anchor_id) = anchor_id_domain.next_id();
@@ -984,7 +988,7 @@ impl LayoutAst {
         let (node_id_domain, node_id) = node_id_domain.next_id();
         let ast = self.ast.plus_node(
             node_id.clone(),
-            crate::ast::node::ENode::FunctionCall {
+            crate::model::node::ENode::FunctionCall {
                 function_declaration_id: function_declaration.0,
                 input_anchors: input_anchor_ids,
                 output_anchor: output_anchor_id,
@@ -1001,10 +1005,10 @@ impl LayoutAst {
 
     pub fn with_function_call_replaced(
         &self,
-        node_id: &crate::ast::node::Id,
+        node_id: &crate::model::node::Id,
         new_fn: (
-            crate::ast::FunctionDeclarationId,
-            &crate::ast::FunctionDeclaration,
+            crate::model::function_declaration::FunctionDeclarationId,
+            &crate::model::function_declaration::FunctionDeclaration,
         ),
         node_id_domain: NodeIdDomain,
         anchor_id_domain: AnchorIdDomain,
@@ -1031,7 +1035,7 @@ impl LayoutAst {
         let (node_id_domain, match_node_id) = node_id_domain.next_id();
         let ast = self.ast.plus_node(
             match_node_id.clone(),
-            crate::ast::node::ENode::Match {
+            crate::model::node::ENode::Match {
                 patterns: vec![],
                 input_anchor: match_input_anchor_id.clone(),
                 output_anchor: match_output_anchor_id.clone(),
@@ -1040,20 +1044,20 @@ impl LayoutAst {
         let (node_id_domain, pattern_node_id) = node_id_domain.next_id();
         let ast = ast.plus_node(
             pattern_node_id.clone(),
-            crate::ast::node::ENode::Pattern {
+            crate::model::node::ENode::Pattern {
                 parent_match: match_node_id.clone(),
-                r#type: crate::ast::node::EType::Int { value: None },
+                r#type: crate::model::r#type::EType::Int { value: None },
                 output_anchor: pattern_output_anchor_id,
             },
         );
         // The sub-AST draws its sink node and anchor ids from the same shared
         // id domains, so every id in the tree stays globally unique.
         let (node_id_domain, anchor_id_domain, pattern_sub_ast, sub_sink_id) =
-            crate::ast::Ast::new_pattern_sub_ast(node_id_domain, anchor_id_domain);
+            crate::model::ast::Ast::new_pattern_sub_ast(node_id_domain, anchor_id_domain);
         let pattern_sub_layout = Self::initial_pattern_sub_layout(&pattern_sub_ast, &sub_sink_id);
         let ast = ast.with_node_replaced(
             &match_node_id,
-            crate::ast::node::ENode::Match {
+            crate::model::node::ENode::Match {
                 patterns: vec![pattern_node_id.clone()],
                 input_anchor: match_input_anchor_id,
                 output_anchor: match_output_anchor_id,
@@ -1077,8 +1081,8 @@ impl LayoutAst {
     /// LayoutAst for a fresh Pattern's sub-AST: registers the initial sink at
     /// Pattern-local grid position (0, 0, -1).
     fn initial_pattern_sub_layout(
-        sub_ast: &crate::ast::Ast,
-        sub_sink_id: &crate::ast::node::Id,
+        sub_ast: &crate::model::ast::Ast,
+        sub_sink_id: &crate::model::node::Id,
     ) -> Self {
         Self {
             ast: sub_ast.clone(),
@@ -1101,12 +1105,12 @@ impl LayoutAst {
     /// selected Pattern (now one row higher).
     pub fn plus_pattern_above(
         &self,
-        selected_pattern_id: &crate::ast::node::Id,
+        selected_pattern_id: &crate::model::node::Id,
         node_id_domain: NodeIdDomain,
         anchor_id_domain: AnchorIdDomain,
     ) -> (Self, NodeIdDomain, AnchorIdDomain) {
         let (parent_id, selected_pos) = match self.ast.nodes.get(selected_pattern_id) {
-            Some(crate::ast::node::ENode::Pattern { parent_match, .. }) => {
+            Some(crate::model::node::ENode::Pattern { parent_match, .. }) => {
                 let ln = self.layout_nodes.get(selected_pattern_id).unwrap();
                 (parent_match.clone(), ln.pos)
             }
@@ -1128,7 +1132,7 @@ impl LayoutAst {
         // Shift only sibling Patterns of the same match at Y ≥ selected.Y.
         // External neighbours are handled by settle_footprints once the new
         // Pattern has grown the footprint.
-        let match_pattern_ids: std::collections::HashSet<crate::ast::node::Id> =
+        let match_pattern_ids: std::collections::HashSet<crate::model::node::Id> =
             self.match_pattern_ids(&parent_id).into_iter().collect();
         let shifted_layout_nodes = self
             .layout_nodes
@@ -1155,33 +1159,33 @@ impl LayoutAst {
             layout_nodes: shifted_layout_nodes,
             sub_layouts: self.sub_layouts.clone(),
         };
-        let sibling_ids: Vec<crate::ast::node::Id> = match shifted.ast.nodes.get(&parent_id) {
-            Some(crate::ast::node::ENode::Match { patterns, .. }) => patterns.clone(),
+        let sibling_ids: Vec<crate::model::node::Id> = match shifted.ast.nodes.get(&parent_id) {
+            Some(crate::model::node::ENode::Match { patterns, .. }) => patterns.clone(),
             _ => vec![],
         };
         let (anchor_id_domain, new_output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, new_pattern_id) = node_id_domain.next_id();
         let ast = shifted.ast.plus_node(
             new_pattern_id.clone(),
-            crate::ast::node::ENode::Pattern {
+            crate::model::node::ENode::Pattern {
                 parent_match: parent_id.clone(),
-                r#type: crate::ast::node::EType::Int { value: None },
+                r#type: crate::model::r#type::EType::Int { value: None },
                 output_anchor: new_output_anchor_id,
             },
         );
         // The sub-AST draws its ids from the same shared domains, keeping every
         // id in the tree globally unique (see plus_match).
         let (node_id_domain, anchor_id_domain, new_pattern_sub_ast, new_sub_sink_id) =
-            crate::ast::Ast::new_pattern_sub_ast(node_id_domain, anchor_id_domain);
+            crate::model::ast::Ast::new_pattern_sub_ast(node_id_domain, anchor_id_domain);
         let new_pattern_sub_layout =
             Self::initial_pattern_sub_layout(&new_pattern_sub_ast, &new_sub_sink_id);
-        let new_patterns: Vec<crate::ast::node::Id> = sibling_ids
+        let new_patterns: Vec<crate::model::node::Id> = sibling_ids
             .iter()
             .cloned()
             .chain([new_pattern_id.clone()])
             .collect();
         let (match_input_anchor, match_output_anchor) = match ast.nodes.get(&parent_id) {
-            Some(crate::ast::node::ENode::Match {
+            Some(crate::model::node::ENode::Match {
                 input_anchor,
                 output_anchor,
                 ..
@@ -1190,7 +1194,7 @@ impl LayoutAst {
         };
         let ast = ast.with_node_replaced(
             &parent_id,
-            crate::ast::node::ENode::Match {
+            crate::model::node::ENode::Match {
                 patterns: new_patterns,
                 input_anchor: match_input_anchor,
                 output_anchor: match_output_anchor,
@@ -1206,12 +1210,12 @@ impl LayoutAst {
                 .collect(),
         }
         ._plus_layout_node(&new_pattern_id, Vec3::new(column_x, selected_y, column_z));
-        let match_ids: Vec<crate::ast::node::Id> = with_new
+        let match_ids: Vec<crate::model::node::Id> = with_new
             .ast
             .nodes
             .iter()
             .filter_map(|(id, n)| {
-                if matches!(n, crate::ast::node::ENode::Match { .. }) {
+                if matches!(n, crate::model::node::ENode::Match { .. }) {
                     Some(id.clone())
                 } else {
                     None
@@ -1227,9 +1231,9 @@ impl LayoutAst {
     /// Refresh a Match's synthetic LayoutNode to sit at the lowest sibling
     /// Pattern's grid position (needed after any add/remove/shift of Patterns
     /// so the render pass finds the container at the correct origin).
-    pub fn recompute_match_pos(&self, match_id: &crate::ast::node::Id) -> Self {
-        let pattern_ids: Vec<crate::ast::node::Id> = match self.ast.nodes.get(match_id) {
-            Some(crate::ast::node::ENode::Match { patterns, .. }) => patterns.clone(),
+    pub fn recompute_match_pos(&self, match_id: &crate::model::node::Id) -> Self {
+        let pattern_ids: Vec<crate::model::node::Id> = match self.ast.nodes.get(match_id) {
+            Some(crate::model::node::ENode::Match { patterns, .. }) => patterns.clone(),
             _ => {
                 return Self {
                     ast: self.ast.clone(),
@@ -1274,11 +1278,11 @@ impl LayoutAst {
 
     fn _with_match_patterns(
         &self,
-        match_id: &crate::ast::node::Id,
-        new_patterns: Vec<crate::ast::node::Id>,
+        match_id: &crate::model::node::Id,
+        new_patterns: Vec<crate::model::node::Id>,
     ) -> Self {
         let (input_anchor, output_anchor) = match self.ast.nodes.get(match_id) {
-            Some(crate::ast::node::ENode::Match {
+            Some(crate::model::node::ENode::Match {
                 input_anchor,
                 output_anchor,
                 ..
@@ -1294,7 +1298,7 @@ impl LayoutAst {
         Self {
             ast: self.ast.with_node_replaced(
                 match_id,
-                crate::ast::node::ENode::Match {
+                crate::model::node::ENode::Match {
                     patterns: new_patterns,
                     input_anchor,
                     output_anchor,
@@ -1317,9 +1321,9 @@ impl LayoutAst {
         let (node_id_domain, node_id) = node_id_domain.next_id();
         let ast = self.ast.plus_node(
             node_id.clone(),
-            crate::ast::node::ENode::VarDecl {
+            crate::model::node::ENode::VarDecl {
                 name: "v".to_string(),
-                r#type: crate::ast::node::EType::Any,
+                r#type: crate::model::r#type::EType::Any,
                 output_anchor: output_anchor_id,
             },
         );
@@ -1332,7 +1336,7 @@ impl LayoutAst {
         (layout, node_id_domain, anchor_id_domain)
     }
 
-    fn _plus_layout_node(&self, node_id: &crate::ast::node::Id, pos: Vec3) -> Self {
+    fn _plus_layout_node(&self, node_id: &crate::model::node::Id, pos: Vec3) -> Self {
         Self {
             ast: self.ast.clone(),
             layout_nodes: self
@@ -1384,7 +1388,7 @@ impl LayoutAst {
             let sub_offset = offset + owner_grid_pos;
             let sub_scale = if matches!(
                 self.ast.nodes.get(owner_id),
-                Some(crate::ast::node::ENode::Pattern { .. })
+                Some(crate::model::node::ENode::Pattern { .. })
             ) {
                 1.0 / 3.0
             } else {
@@ -1405,7 +1409,7 @@ impl LayoutAst {
 
     fn walk_all_asts_into<'a>(
         &'a self,
-        context: Vec<crate::ast::node::Id>,
+        context: Vec<crate::model::node::Id>,
         offset: Vec3,
         out: &mut Vec<WalkedAst<'a>>,
     ) {
@@ -1446,7 +1450,9 @@ impl LayoutAst {
             self.layout_nodes
                 .iter()
                 .find_map(|(id, ln)| match self.ast.nodes.get(id) {
-                    Some(crate::ast::node::ENode::Sink { .. }) => Some(ln.pos.round().as_ivec3().z),
+                    Some(crate::model::node::ENode::Sink { .. }) => {
+                        Some(ln.pos.round().as_ivec3().z)
+                    }
                     _ => None,
                 })?;
         let z_min = sink_z + 1;
@@ -1498,7 +1504,7 @@ impl LayoutAst {
             .collect()
     }
 
-    pub fn layout_anchor(&self, anchor_id: crate::ast::anchor::Id) -> LayoutAnchor {
+    pub fn layout_anchor(&self, anchor_id: crate::model::anchor::Id) -> LayoutAnchor {
         self.try_layout_anchor(&anchor_id).unwrap_or_else(|| {
             panic!(
                 "layout_anchor: anchor {:?} not found in any (sub-)ast",
@@ -1507,7 +1513,7 @@ impl LayoutAst {
         })
     }
 
-    fn try_layout_anchor(&self, anchor_id: &crate::ast::anchor::Id) -> Option<LayoutAnchor> {
+    fn try_layout_anchor(&self, anchor_id: &crate::model::anchor::Id) -> Option<LayoutAnchor> {
         if let Some(anchor) = self.ast.anchors.get(anchor_id) {
             let node_id = self.ast.anchor_to_node.get(anchor_id).unwrap().clone();
             return Some(LayoutAnchor {
@@ -1530,10 +1536,10 @@ impl LayoutAst {
     /// `None` for anchors that carry no type (Sink input, Match, …).
     pub fn anchor_type(
         &self,
-        anchor_id: &crate::ast::anchor::Id,
+        anchor_id: &crate::model::anchor::Id,
         function_declarations: &std::collections::HashMap<
-            crate::ast::FunctionDeclarationId,
-            crate::ast::FunctionDeclaration,
+            crate::model::function_declaration::FunctionDeclarationId,
+            crate::model::function_declaration::FunctionDeclaration,
         >,
     ) -> Option<crate::eval::EType> {
         if let Some(node_id) = self.ast.anchor_to_node.get(anchor_id) {
@@ -1541,7 +1547,7 @@ impl LayoutAst {
             // A typecast whose incoming type differs from its target type may
             // fail: model that by adding `undefined` to the output type, i.e.
             // `Sum(target, undefined)`. `any` casts never fail, so skip them.
-            if let crate::ast::node::ENode::TypeCast {
+            if let crate::model::node::ENode::TypeCast {
                 r#type,
                 input_anchor,
                 output_anchor,
@@ -1578,10 +1584,10 @@ impl LayoutAst {
     /// `None` when the input is unconnected or the source carries no type.
     fn incoming_type(
         &self,
-        input: &crate::ast::anchor::Id,
+        input: &crate::model::anchor::Id,
         function_declarations: &std::collections::HashMap<
-            crate::ast::FunctionDeclarationId,
-            crate::ast::FunctionDeclaration,
+            crate::model::function_declaration::FunctionDeclarationId,
+            crate::model::function_declaration::FunctionDeclaration,
         >,
     ) -> Option<crate::eval::EType> {
         let source = source_anchor_for_input(&self.ast, input)?;
@@ -1590,8 +1596,8 @@ impl LayoutAst {
 
     /// AST-level literal string attached to this anchor's type, if any.
     /// Walks sub-layouts. Returns `None` when the anchor's node kind doesn't
-    /// carry an `ast::node::EType` field, or the field's value is `None`.
-    pub fn anchor_ast_value(&self, anchor_id: &crate::ast::anchor::Id) -> Option<String> {
+    /// carry an `model::r#type::EType` field, or the field's value is `None`.
+    pub fn anchor_ast_value(&self, anchor_id: &crate::model::anchor::Id) -> Option<String> {
         if let Some(node_id) = self.ast.anchor_to_node.get(anchor_id) {
             let node = self.ast.nodes.get(node_id)?;
             return anchor_ast_value_from_node(node, anchor_id);
@@ -1610,8 +1616,8 @@ impl LayoutAst {
     /// .sub_layouts[b]`. `None` = not found.
     pub fn context_of_node(
         &self,
-        target: &crate::ast::node::Id,
-    ) -> Option<Vec<crate::ast::node::Id>> {
+        target: &crate::model::node::Id,
+    ) -> Option<Vec<crate::model::node::Id>> {
         if self.layout_nodes.contains_key(target) {
             return Some(vec![]);
         }
@@ -1628,7 +1634,7 @@ impl LayoutAst {
     /// Return the LayoutAst that holds `target` in its `ast.nodes` map.
     /// Used by editor handlers to mutate node fields without needing to
     /// know which sub-layout the node lives in.
-    pub fn find_node_ast_mut(&mut self, target: &crate::ast::node::Id) -> Option<&mut LayoutAst> {
+    pub fn find_node_ast_mut(&mut self, target: &crate::model::node::Id) -> Option<&mut LayoutAst> {
         if self.ast.nodes.contains_key(target) {
             return Some(self);
         }
@@ -1644,7 +1650,7 @@ impl LayoutAst {
     /// corresponding sub-LayoutAst reference. Panics if the path names a
     /// key that no longer exists — callers are expected to have obtained
     /// the path from a fresh lookup in the same frame.
-    pub fn resolve_context<'a>(&'a self, path: &[crate::ast::node::Id]) -> &'a LayoutAst {
+    pub fn resolve_context<'a>(&'a self, path: &[crate::model::node::Id]) -> &'a LayoutAst {
         let mut ast = self;
         for id in path {
             ast = ast.sub_layouts.get(id).unwrap();
@@ -1655,7 +1661,7 @@ impl LayoutAst {
     /// Sum of grid-space owner positions along `path`. Used by crosshair to
     /// place its anchor for sub-AST-selected nodes when no rendered entity
     /// is around to read from.
-    pub fn context_offset(&self, path: &[crate::ast::node::Id]) -> Vec3 {
+    pub fn context_offset(&self, path: &[crate::model::node::Id]) -> Vec3 {
         let mut offset = Vec3::ZERO;
         let mut ast = self;
         for id in path {
@@ -1674,9 +1680,9 @@ impl LayoutAst {
 /// Source anchor feeding into `input`, if connected. Drag-to-connect records
 /// an edge from either end, so both directions are checked.
 fn source_anchor_for_input(
-    ast: &crate::ast::Ast,
-    input: &crate::ast::anchor::Id,
-) -> Option<crate::ast::anchor::Id> {
+    ast: &crate::model::ast::Ast,
+    input: &crate::model::anchor::Id,
+) -> Option<crate::model::anchor::Id> {
     for (from, edges) in &ast.edges {
         if edges.iter().any(|e| &e.to == input) {
             return Some(from.clone());
@@ -1709,20 +1715,20 @@ fn eval_types_match(a: &crate::eval::EType, b: &crate::eval::EType) -> bool {
 }
 
 fn anchor_type_from_node(
-    node: &crate::ast::node::ENode,
-    anchor_id: &crate::ast::anchor::Id,
+    node: &crate::model::node::ENode,
+    anchor_id: &crate::model::anchor::Id,
     function_declarations: &std::collections::HashMap<
-        crate::ast::FunctionDeclarationId,
-        crate::ast::FunctionDeclaration,
+        crate::model::function_declaration::FunctionDeclarationId,
+        crate::model::function_declaration::FunctionDeclaration,
     >,
 ) -> Option<crate::eval::EType> {
     match node {
-        crate::ast::node::ENode::ConstDecl { r#type, .. }
-        | crate::ast::node::ENode::VarDecl { r#type, .. }
-        | crate::ast::node::ENode::Pattern { r#type, .. } => {
+        crate::model::node::ENode::ConstDecl { r#type, .. }
+        | crate::model::node::ENode::VarDecl { r#type, .. }
+        | crate::model::node::ENode::Pattern { r#type, .. } => {
             Some(crate::eval::ast_type_to_eval_type(r#type))
         }
-        crate::ast::node::ENode::TypeCast {
+        crate::model::node::ENode::TypeCast {
             r#type,
             input_anchor,
             ..
@@ -1737,7 +1743,7 @@ fn anchor_type_from_node(
                 Some(crate::eval::ast_type_to_eval_type(r#type))
             }
         }
-        crate::ast::node::ENode::FunctionCall {
+        crate::model::node::ENode::FunctionCall {
             function_declaration_id,
             input_anchors,
             output_anchor,
@@ -1750,48 +1756,48 @@ fn anchor_type_from_node(
             decl.inputs.get(idx).map(|p| p.r#type.clone())
         }
         // Anchors that don't currently carry a rendered type.
-        crate::ast::node::ENode::Sink { .. }
-        | crate::ast::node::ENode::Match { .. }
-        | crate::ast::node::ENode::Program {} => None,
+        crate::model::node::ENode::Sink { .. }
+        | crate::model::node::ENode::Match { .. }
+        | crate::model::node::ENode::Program {} => None,
     }
 }
 
-/// Concrete literal string on an `ast::node::EType`, if any. Only the
+/// Concrete literal string on an `model::r#type::EType`, if any. Only the
 /// value-carrying variants have an `Option<String>`; `Any`, `Undefined`,
 /// `Exception` return `None`.
-pub fn value_of_etype(t: &crate::ast::node::EType) -> Option<String> {
+pub fn value_of_etype(t: &crate::model::r#type::EType) -> Option<String> {
     match t {
-        crate::ast::node::EType::Bool { value }
-        | crate::ast::node::EType::Int { value }
-        | crate::ast::node::EType::Float { value }
-        | crate::ast::node::EType::String { value }
-        | crate::ast::node::EType::Char { value } => value.clone(),
+        crate::model::r#type::EType::Bool { value }
+        | crate::model::r#type::EType::Int { value }
+        | crate::model::r#type::EType::Float { value }
+        | crate::model::r#type::EType::String { value }
+        | crate::model::r#type::EType::Char { value } => value.clone(),
         _ => None,
     }
 }
 
 /// Return the AST-level literal attached to `anchor_id`'s type, if any.
 ///
-/// Only anchors on nodes whose type is a first-class `ast::node::EType` field
+/// Only anchors on nodes whose type is a first-class `model::r#type::EType` field
 /// (ConstDecl, VarDecl, Pattern, TypeCast) can carry a literal.
 /// FunctionCall inputs/outputs bind to `eval::EType` on the declaration, which
 /// has no AST-level literal — treated as `None`. Match / Sink / Program
 /// don't carry types at all.
 pub fn anchor_ast_value_from_node(
-    node: &crate::ast::node::ENode,
-    anchor_id: &crate::ast::anchor::Id,
+    node: &crate::model::node::ENode,
+    anchor_id: &crate::model::anchor::Id,
 ) -> Option<String> {
     match node {
-        crate::ast::node::ENode::ConstDecl {
+        crate::model::node::ENode::ConstDecl {
             r#type,
             output_anchor,
         }
-        | crate::ast::node::ENode::VarDecl {
+        | crate::model::node::ENode::VarDecl {
             r#type,
             output_anchor,
             ..
         }
-        | crate::ast::node::ENode::Pattern {
+        | crate::model::node::ENode::Pattern {
             r#type,
             output_anchor,
             ..
@@ -1802,7 +1808,7 @@ pub fn anchor_ast_value_from_node(
                 None
             }
         }
-        crate::ast::node::ENode::TypeCast {
+        crate::model::node::ENode::TypeCast {
             r#type,
             input_anchor,
             output_anchor,

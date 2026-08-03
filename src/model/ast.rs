@@ -1,17 +1,9 @@
-pub mod anchor;
-pub mod node;
-
-#[derive(Clone, Debug)]
-pub struct Edge {
-    pub to: anchor::Id,
-}
-
 #[derive(Clone, Debug)]
 pub struct Ast {
-    pub nodes: std::collections::HashMap<node::Id, node::ENode>,
-    pub anchors: std::collections::HashMap<anchor::Id, anchor::EAnchor>,
-    pub anchor_to_node: std::collections::HashMap<anchor::Id, node::Id>,
-    pub edges: std::collections::HashMap<anchor::Id, Vec<Edge>>,
+    pub nodes: std::collections::HashMap<super::node::Id, super::node::ENode>,
+    pub anchors: std::collections::HashMap<super::anchor::Id, super::anchor::EAnchor>,
+    pub anchor_to_node: std::collections::HashMap<super::anchor::Id, super::node::Id>,
+    pub edges: std::collections::HashMap<super::anchor::Id, Vec<super::edge::Edge>>,
 }
 
 impl Ast {
@@ -25,27 +17,27 @@ impl Ast {
     }
 
     pub fn new_pattern_sub_ast(
-        node_id_domain: crate::common::IdDomain<node::Id>,
-        anchor_id_domain: crate::common::IdDomain<anchor::Id>,
+        node_id_domain: crate::common::IdDomain<super::node::Id>,
+        anchor_id_domain: crate::common::IdDomain<super::anchor::Id>,
     ) -> (
-        crate::common::IdDomain<node::Id>,
-        crate::common::IdDomain<anchor::Id>,
+        crate::common::IdDomain<super::node::Id>,
+        crate::common::IdDomain<super::anchor::Id>,
         Self,
-        node::Id,
+        super::node::Id,
     ) {
         let (node_id_domain, sink_node_id) = node_id_domain.next_id();
         let (anchor_id_domain, sink_input_anchor_id) = anchor_id_domain.next_id();
         let sub_ast = Self::empty().plus_node(
             sink_node_id.clone(),
-            node::ENode::Sink {
+            super::node::ENode::Sink {
                 input_anchor: sink_input_anchor_id,
             },
         );
         (node_id_domain, anchor_id_domain, sub_ast, sink_node_id)
     }
 
-    pub fn plus_edge(&self, from: anchor::Id, to: anchor::Id) -> Self {
-        let edge = Edge { to };
+    pub fn plus_edge(&self, from: super::anchor::Id, to: super::anchor::Id) -> Self {
+        let edge = super::edge::Edge { to };
         Self {
             anchors: self.anchors.clone(),
             nodes: self.nodes.clone(),
@@ -64,7 +56,7 @@ impl Ast {
         }
     }
 
-    pub fn plus_node(&self, node_id: node::Id, n: node::ENode) -> Self {
+    pub fn plus_node(&self, node_id: super::node::Id, n: super::node::ENode) -> Self {
         let anchors = n.anchors();
         Self {
             anchors: self
@@ -92,7 +84,7 @@ impl Ast {
     /// Replace `n_id`'s node with `new_node`. Anchor tables are untouched;
     /// callers are responsible for ensuring the replacement has the same
     /// anchors (used e.g. to update a `Match`'s `patterns` list).
-    pub fn with_node_replaced(&self, n_id: &node::Id, new_node: node::ENode) -> Self {
+    pub fn with_node_replaced(&self, n_id: &super::node::Id, new_node: super::node::ENode) -> Self {
         Self {
             nodes: self
                 .nodes
@@ -112,7 +104,7 @@ impl Ast {
         }
     }
 
-    pub fn minus_node(&self, n_id: &node::Id) -> Self {
+    pub fn minus_node(&self, n_id: &super::node::Id) -> Self {
         let anchor_ids = self
             .nodes
             .get(n_id)
@@ -146,7 +138,7 @@ impl Ast {
                 .into_iter()
                 .filter(|(from, _)| !anchor_ids.contains(from))
                 .filter_map(|(from, edges)| {
-                    let kept: Vec<Edge> = edges
+                    let kept: Vec<super::edge::Edge> = edges
                         .into_iter()
                         .filter(|e| !anchor_ids.contains(&e.to))
                         .collect();
@@ -160,7 +152,7 @@ impl Ast {
         }
     }
 
-    pub fn get_connected_nodes_to_anchor(&self, anchor: anchor::Id) -> Vec<node::Id> {
+    pub fn get_connected_nodes_to_anchor(&self, anchor: super::anchor::Id) -> Vec<super::node::Id> {
         self.edges
             .iter()
             .flat_map(|(from, edges)| edges.iter().map(|e| (from.clone(), e)))
@@ -173,20 +165,4 @@ impl Ast {
             })
             .collect()
     }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub struct FunctionDeclarationId(pub usize);
-
-#[derive(Clone)]
-pub struct FunctionDeclaration {
-    pub name: String,
-    pub inputs: Vec<FunctionParameterDeclaration>,
-    pub output_type: crate::eval::EType,
-}
-
-#[derive(Clone)]
-pub struct FunctionParameterDeclaration {
-    pub name: String,
-    pub r#type: crate::eval::EType,
 }

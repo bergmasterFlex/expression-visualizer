@@ -24,22 +24,22 @@ pub enum ENode {
         input_anchor: super::anchor::Id,
     },
     FunctionCall {
-        function_declaration_id: super::FunctionDeclarationId,
+        function_declaration_id: super::function_declaration::FunctionDeclarationId,
         input_anchors: Vec<super::anchor::Id>,
         output_anchor: super::anchor::Id,
     },
     ConstDecl {
-        r#type: EType,
+        r#type: super::r#type::EType,
         output_anchor: super::anchor::Id,
     },
     TypeCast {
-        r#type: EType,
+        r#type: super::r#type::EType,
         input_anchor: super::anchor::Id,
         output_anchor: super::anchor::Id,
     },
     VarDecl {
         name: String,
-        r#type: EType,
+        r#type: super::r#type::EType,
         output_anchor: super::anchor::Id,
     },
     Match {
@@ -49,20 +49,9 @@ pub enum ENode {
     },
     Pattern {
         parent_match: super::node::Id,
-        r#type: EType,
+        r#type: super::r#type::EType,
         output_anchor: super::anchor::Id,
     },
-}
-
-#[derive(Debug, Clone)]
-pub enum EType {
-    Bool { value: Option<String> },
-    Int { value: Option<String> },
-    Float { value: Option<String> },
-    String { value: Option<String> },
-    Char { value: Option<String> },
-    Any,
-    Undefined { message: Option<String> },
 }
 
 impl ENode {
@@ -135,32 +124,6 @@ impl ENode {
                 vec![(output_anchor.clone(), super::anchor::EAnchor::Output)]
             }
             ENode::Program { .. } => vec![],
-        }
-    }
-}
-
-impl ToString for EType {
-    fn to_string(&self) -> String {
-        match self.clone() {
-            EType::Bool { value } => value.unwrap_or("bool".to_string()),
-            EType::Int { value } => value.unwrap_or("int".to_string()),
-            EType::Float { value } => value.unwrap_or("float".to_string()),
-            EType::String { value } => {
-                if let Some(value) = value {
-                    format!("\"{}\"", value)
-                } else {
-                    "string".to_string()
-                }
-            }
-            EType::Char { value } => {
-                if let Some(value) = value {
-                    format!("'{}'", value)
-                } else {
-                    "char".to_string()
-                }
-            }
-            EType::Any => "any".to_string(),
-            EType::Undefined { message } => message.unwrap_or("undefined".to_string()),
         }
     }
 }

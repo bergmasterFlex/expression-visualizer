@@ -1,7 +1,5 @@
 use bevy::prelude::*;
 
-use crate::ast::FunctionDeclaration;
-
 /// Scale factor from layout coordinates to world coordinates.
 pub const LAYOUT_SCALE: Vec3 = Vec3::new(3.0, 3.0, 3.0);
 
@@ -18,7 +16,7 @@ pub struct RenderObject {
 
 pub struct RenderNode {
     pub node: RenderObject,
-    pub anchors: std::collections::HashMap<crate::ast::anchor::Id, RenderAnchor>,
+    pub anchors: std::collections::HashMap<crate::model::anchor::Id, RenderAnchor>,
     pub labels: Vec<RenderLabel>,
     /// Extra decorative meshes with no associated anchor (e.g. the grey
     /// sink-tip hull of a Match). Spawned alongside `node` by the renderer.
@@ -286,8 +284,8 @@ pub fn layoutnode_to_rendernode(
     layout_node: &crate::layout::LayoutNode,
     layout_ast: &crate::layout::LayoutAst,
     function_declarations: &std::collections::HashMap<
-        crate::ast::FunctionDeclarationId,
-        crate::ast::FunctionDeclaration,
+        crate::model::function_declaration::FunctionDeclarationId,
+        crate::model::function_declaration::FunctionDeclaration,
     >,
     extra_offset: Vec3,
     sink_scale: f32,
@@ -297,7 +295,7 @@ pub fn layoutnode_to_rendernode(
     let node_pos_tf = Transform::from_translation(node_pos);
     let node = ast.nodes.get(&layout_node.node_id).unwrap();
     return match node {
-        crate::ast::node::ENode::ConstDecl {
+        crate::model::node::ENode::ConstDecl {
             r#type,
             output_anchor,
         } => {
@@ -337,7 +335,7 @@ pub fn layoutnode_to_rendernode(
                 decorations: vec![],
             }
         }
-        crate::ast::node::ENode::TypeCast {
+        crate::model::node::ENode::TypeCast {
             r#type,
             input_anchor,
             output_anchor,
@@ -399,7 +397,7 @@ pub fn layoutnode_to_rendernode(
                 decorations: vec![],
             }
         }
-        crate::ast::node::ENode::FunctionCall {
+        crate::model::node::ENode::FunctionCall {
             function_declaration_id,
             input_anchors,
             output_anchor,
@@ -522,7 +520,7 @@ pub fn layoutnode_to_rendernode(
                 decorations: vec![],
             }
         }
-        crate::ast::node::ENode::VarDecl {
+        crate::model::node::ENode::VarDecl {
             r#type,
             output_anchor,
             ..
@@ -569,7 +567,7 @@ pub fn layoutnode_to_rendernode(
                 decorations: vec![],
             }
         }
-        crate::ast::node::ENode::Sink { input_anchor } => RenderNode {
+        crate::model::node::ENode::Sink { input_anchor } => RenderNode {
             node: RenderObject {
                 mesh: crate::mesh::square_pyramid_z_mesh(6.0 * sink_scale, 9.0 * sink_scale),
                 material: StandardMaterial {
@@ -591,7 +589,7 @@ pub fn layoutnode_to_rendernode(
             labels: vec![],
             decorations: vec![],
         },
-        crate::ast::node::ENode::Pattern {
+        crate::model::node::ENode::Pattern {
             r#type,
             output_anchor,
             ..
@@ -632,7 +630,7 @@ pub fn layoutnode_to_rendernode(
                 decorations: vec![],
             }
         }
-        crate::ast::node::ENode::Match {
+        crate::model::node::ENode::Match {
             patterns,
             input_anchor,
             output_anchor,
@@ -746,7 +744,7 @@ pub fn layoutnode_to_rendernode(
                 decorations,
             }
         }
-        crate::ast::node::ENode::Program { .. } => {
+        crate::model::node::ENode::Program { .. } => {
             unreachable!("Program node has no layout position and is never rendered directly")
         }
     };
@@ -758,16 +756,15 @@ pub fn emissive_color(color: Color) -> LinearRgba {
 }
 
 pub fn label_for_node(
-    node: &crate::ast::node::ENode,
+    node: &crate::model::node::ENode,
     function_declarations: &std::collections::HashMap<
-        crate::ast::FunctionDeclarationId,
-        FunctionDeclaration,
+        crate::model::function_declaration::FunctionDeclarationId,
+        crate::model::function_declaration::FunctionDeclaration,
     >,
 ) -> String {
-    use crate::ast::node::ENode;
     match node {
-        ENode::Sink { .. } => "sink".to_string(),
-        ENode::FunctionCall {
+        crate::model::node::ENode::Sink { .. } => "sink".to_string(),
+        crate::model::node::ENode::FunctionCall {
             function_declaration_id,
             ..
         } => function_declarations
@@ -775,10 +772,13 @@ pub fn label_for_node(
             .unwrap()
             .name
             .to_string(),
-        ENode::ConstDecl { r#type, .. } | ENode::TypeCast { r#type, .. } => r#type.to_string(),
-        ENode::VarDecl { name, r#type, .. } => format!("{}: {}", name, r#type.to_string()),
-        ENode::Match { .. } => "match".to_string(),
-        ENode::Pattern { r#type, .. } => r#type.to_string(),
-        ENode::Program { .. } => "program".to_string(),
+        crate::model::node::ENode::ConstDecl { r#type, .. }
+        | crate::model::node::ENode::TypeCast { r#type, .. } => r#type.to_string(),
+        crate::model::node::ENode::VarDecl { name, r#type, .. } => {
+            format!("{}: {}", name, r#type.to_string())
+        }
+        crate::model::node::ENode::Match { .. } => "match".to_string(),
+        crate::model::node::ENode::Pattern { r#type, .. } => r#type.to_string(),
+        crate::model::node::ENode::Program { .. } => "program".to_string(),
     }
 }
