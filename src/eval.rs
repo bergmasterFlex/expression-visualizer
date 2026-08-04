@@ -28,21 +28,17 @@ impl State {
             crate::model::function_declaration::FunctionDeclaration,
         >,
     ) -> Result<Self, Vec<String>> {
-        ast.get_sink_node_id()
-            .ok_or(vec!["sink node id not present".to_owned()])
-            .and_then(|sink_node_id| {
-                ast.nodes
-                    .get(&sink_node_id)
-                    .cloned()
-                    .ok_or(vec![format!("sink node {} not found", sink_node_id)])
-                    .and_then(|sink_node| {
-                        Self::empty().eval_next_step(
-                            ast,
-                            user_vardecl_values,
-                            (sink_node_id, sink_node),
-                            function_declarations,
-                        )
-                    })
+        ast.nodes
+            .get(&ast.sink_node_id)
+            .cloned()
+            .ok_or(vec![format!("sink node {} not found", ast.sink_node_id)])
+            .and_then(|sink_node| {
+                Self::empty().eval_next_step(
+                    ast,
+                    user_vardecl_values,
+                    (ast.sink_node_id.clone(), sink_node),
+                    function_declarations,
+                )
             })
     }
 
@@ -70,7 +66,7 @@ impl State {
                 })
                 .collect::<std::collections::HashMap<_, _>>();
             if input_anchor_ids_to_node_ids.len() == input_anchor_ids_to_values.len() {
-                Self::eval_value_for_node(
+                self.eval_value_for_node(
                     &visitor_node_id,
                     visitor_node,
                     input_anchor_ids_to_values,
@@ -78,15 +74,6 @@ impl State {
                     ast,
                     function_declarations,
                 )
-                .map(|value| Self {
-                    node_ids_to_values: self
-                        .node_ids_to_values
-                        .clone()
-                        .into_iter()
-                        .chain(vec![(visitor_node_id, value)])
-                        .collect(),
-                })
-                .map_err(|error| vec![error])
             } else {
                 let next_step_sub_evals = input_anchor_ids_to_node_ids
                     .into_iter()
@@ -107,19 +94,10 @@ impl State {
                     .cloned()
                     .collect::<Vec<String>>();
                 if errors.is_empty() {
-                    Ok(Self {
-                        node_ids_to_values: self
-                            .node_ids_to_values
-                            .clone()
-                            .into_iter()
-                            .chain(
-                                next_step_sub_evals
-                                    .into_iter()
-                                    .filter_map(Result::ok)
-                                    .flat_map(|state| state.node_ids_to_values),
-                            )
-                            .collect(),
-                    })
+                    Ok(next_step_sub_evals
+                        .into_iter()
+                        .filter_map(Result::ok)
+                        .fold(self.clone(), Self::merged_with))
                 } else {
                     Err(errors)
                 }
@@ -127,7 +105,29 @@ impl State {
         }
     }
 
+    fn with_value(&self, node_id: &crate::model::node::Id, value: EValue) -> Self {
+        Self {
+            node_ids_to_values: self
+                .node_ids_to_values
+                .clone()
+                .into_iter()
+                .chain(vec![(node_id.clone(), value)])
+                .collect(),
+        }
+    }
+
+    fn merged_with(self, other: Self) -> Self {
+        Self {
+            node_ids_to_values: self
+                .node_ids_to_values
+                .into_iter()
+                .chain(other.node_ids_to_values)
+                .collect(),
+        }
+    }
+
     pub fn eval_value_for_node(
+        &self,
         node_id: &crate::model::node::Id,
         node: crate::model::node::ENode,
         input_anchor_ids_to_values: std::collections::HashMap<crate::model::anchor::Id, EValue>,
@@ -137,15 +137,16 @@ impl State {
             crate::model::function_declaration::FunctionDeclarationId,
             crate::model::function_declaration::FunctionDeclaration,
         >,
-    ) -> Result<EValue, String> {
+    ) -> Result<Self, Vec<String>> {
         match node {
             crate::model::node::ENode::Program {} => {
-                Err("cannot get value of a program node".to_string())
+                Err(vec!["cannot get value of a program node".to_string()])
             }
             crate::model::node::ENode::Sink { input_anchor } => input_anchor_ids_to_values
                 .get(&input_anchor)
                 .cloned()
-                .ok_or("no value found for input node for sink".to_string()),
+                .map(|value| self.with_value(node_id, value))
+                .ok_or_else(|| vec!["no value found for input anchor for sink".to_string()]),
             crate::model::node::ENode::FunctionCall {
                 function_declaration_id,
                 input_anchors,
@@ -158,7 +159,7 @@ impl State {
                     }
                     _ => usize::MAX,
                 });
-                let arguments = sorted_input_anchors
+                sorted_input_anchors
                     .iter()
                     .map(|anchor_id| {
                         input_anchor_ids_to_values
@@ -166,19 +167,25 @@ impl State {
                             .cloned()
                             .ok_or(format!("no value found for input anchor {:?}", anchor_id))
                     })
-                    .collect::<Result<Vec<EValue>, String>>()?;
-                function_declarations
-                    .get(&function_declaration_id)
-                    .ok_or(format!(
-                        "function declaration with id {} not found",
-                        function_declaration_id.0
-                    ))
-                    .and_then(|function_declaration| {
-                        Self::eval_value_for_function_call(function_declaration, arguments)
+                    .collect::<Result<Vec<EValue>, String>>()
+                    .and_then(|arguments| {
+                        function_declarations
+                            .get(&function_declaration_id)
+                            .ok_or(format!(
+                                "function declaration with id {} not found",
+                                function_declaration_id.0
+                            ))
+                            .and_then(|function_declaration| {
+                                Self::eval_value_for_function_call(function_declaration, arguments)
+                            })
                     })
+                    .map(|value| self.with_value(node_id, value))
+                    .map_err(|error| vec![error])
             }
             crate::model::node::ENode::ConstDecl { r#type, .. } => {
                 Self::eval_value_for_type(r#type)
+                    .map(|value| self.with_value(node_id, value))
+                    .map_err(|error| vec![error])
             }
             crate::model::node::ENode::TypeCast {
                 r#type,
@@ -186,18 +193,118 @@ impl State {
                 ..
             } => input_anchor_ids_to_values
                 .get(&input_anchor)
-                .ok_or("no value found for input node for type cast".to_string())
-                .map(|value| Self::eval_value_for_type_cast(value.clone(), r#type)),
+                .ok_or_else(|| vec!["no value found for input anchor for type cast".to_string()])
+                .map(|value| {
+                    self.with_value(
+                        node_id,
+                        Self::eval_value_for_type_cast(value.clone(), r#type),
+                    )
+                }),
             crate::model::node::ENode::VarDecl { name, .. } => user_vardecl_values
                 .get(node_id)
                 .cloned()
-                .ok_or(format!("no value for var-decl provided: {}", name)),
-            crate::model::node::ENode::Match { .. } => {
-                Err("match eval not implemented yet".to_string())
+                .map(|value| self.with_value(node_id, value))
+                .ok_or_else(|| vec![format!("no value for var-decl provided: {}", name)]),
+            crate::model::node::ENode::Match {
+                patterns,
+                input_anchor,
+                ..
+            } => input_anchor_ids_to_values
+                .get(&input_anchor)
+                .cloned()
+                .ok_or_else(|| vec!["no value found for input anchor for match".to_string()])
+                .and_then(|input_value| {
+                    Self::eval_pattern_match(patterns, ast, input_value)
+                        .map_err(|error| vec![error])
+                })
+                .and_then(
+                    |matching_pattern_id| match ast.nodes.get(&matching_pattern_id) {
+                        Some(crate::model::node::ENode::Pattern { sink_node_id, .. }) => match self
+                            .node_ids_to_values
+                            .get(sink_node_id)
+                        {
+                            Some(sink_value) => Ok(self.with_value(node_id, sink_value.clone())),
+                            None => match ast.nodes.get(sink_node_id).cloned() {
+                                Some(sink_node) => self.eval_next_step(
+                                    ast,
+                                    user_vardecl_values,
+                                    (sink_node_id.clone(), sink_node),
+                                    function_declarations,
+                                ),
+                                None => Err(vec![format!("node {} not found", sink_node_id)]),
+                            },
+                        },
+                        Some(_) => Err(vec![format!(
+                            "matched node {} is not a pattern",
+                            matching_pattern_id
+                        )]),
+                        None => Err(vec![format!("node {} not found", matching_pattern_id)]),
+                    },
+                ),
+            crate::model::node::ENode::Pattern { parent_match, .. } => {
+                match ast.nodes.get(&parent_match) {
+                    Some(crate::model::node::ENode::Match { input_anchor, .. }) => ast
+                        .get_connected_nodes_to_anchor(input_anchor.clone())
+                        .into_iter()
+                        .find_map(|source_node_id| {
+                            self.node_ids_to_values.get(&source_node_id).cloned()
+                        })
+                        .map(|value| self.with_value(node_id, value))
+                        .ok_or_else(|| {
+                            vec![format!(
+                                "no value at parent match input anchor for pattern {}",
+                                node_id
+                            )]
+                        }),
+                    Some(_) => Err(vec![format!(
+                        "parent match {} of pattern {} is not a match node",
+                        parent_match, node_id
+                    )]),
+                    None => Err(vec![format!("parent match {} not found", parent_match)]),
+                }
             }
-            crate::model::node::ENode::Pattern { .. } => {
-                Err("pattern eval not implemented yet".to_string())
+        }
+    }
+
+    fn eval_pattern_match(
+        patterns: Vec<crate::model::node::Id>,
+        ast: &crate::model::ast::Ast,
+        input_value: EValue,
+    ) -> Result<crate::model::node::Id, String> {
+        patterns
+            .into_iter()
+            .find(|pattern_id| match ast.nodes.get(pattern_id) {
+                Some(crate::model::node::ENode::Pattern { r#type, .. }) => {
+                    Self::value_matches_type(&input_value, r#type)
+                }
+                _ => false,
+            })
+            .ok_or_else(|| format!("no pattern matched value {}", input_value))
+    }
+
+    fn value_matches_type(
+        input_value: &EValue,
+        pattern_type: &crate::model::r#type::EType,
+    ) -> bool {
+        match (pattern_type, input_value) {
+            (crate::model::r#type::EType::Any, _) => true,
+            (crate::model::r#type::EType::Bool { value }, EValue::Bool(b)) => value
+                .as_ref()
+                .is_none_or(|v| v.parse::<bool>().ok() == Some(*b)),
+            (crate::model::r#type::EType::Int { value }, EValue::Int(i)) => value
+                .as_ref()
+                .is_none_or(|v| v.parse::<i32>().ok() == Some(*i)),
+            (crate::model::r#type::EType::Float { value }, EValue::Float(f)) => value
+                .as_ref()
+                .is_none_or(|v| v.parse::<f32>().ok() == Some(*f)),
+            (crate::model::r#type::EType::String { value }, EValue::String(s)) => {
+                value.as_ref().is_none_or(|v| v == s)
             }
+            (crate::model::r#type::EType::Char { value }, EValue::Char(c)) => value
+                .as_ref()
+                .is_none_or(|v| v.parse::<char>().ok() == Some(*c)),
+            (crate::model::r#type::EType::Undefined { .. }, EValue::Undefined(_)) => true,
+            _ => false,
         }
     }
 
@@ -225,7 +332,7 @@ impl State {
                         .map_err(|_| format!("could not parse \"{}\" as float", v))
                 }),
             crate::model::r#type::EType::String { value } => value
-                .map(|v| EValue::String(v))
+                .map(EValue::String)
                 .ok_or("string type did not have a specific value!".to_string()),
             crate::model::r#type::EType::Char { value } => value
                 .ok_or("char type did not have a specific value!".to_string())
@@ -238,7 +345,7 @@ impl State {
                 Err("any-type cannot provide a specific value!".to_string())
             }
             crate::model::r#type::EType::Undefined { message } => message
-                .map(|v| EValue::Undefined(v))
+                .map(EValue::Undefined)
                 .ok_or("undefined type did not have a specific value!".to_string()),
         }
     }
@@ -367,8 +474,7 @@ impl State {
     /// root and stepping further would not add anything. Used to grey out the
     /// `Next` button.
     pub fn is_evaluated(&self, ast: &crate::model::ast::Ast) -> bool {
-        ast.get_sink_node_id()
-            .is_some_and(|sink_id| self.node_ids_to_values.contains_key(&sink_id))
+        self.node_ids_to_values.contains_key(&ast.sink_node_id)
     }
 }
 

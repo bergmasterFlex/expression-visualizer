@@ -51,6 +51,7 @@ pub enum ENode {
         parent_match: super::node::Id,
         r#type: super::r#type::EType,
         output_anchor: super::anchor::Id,
+        sink_node_id: super::node::Id,
     },
 }
 

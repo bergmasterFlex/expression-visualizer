@@ -4,16 +4,39 @@ pub struct Ast {
     pub anchors: std::collections::HashMap<super::anchor::Id, super::anchor::EAnchor>,
     pub anchor_to_node: std::collections::HashMap<super::anchor::Id, super::node::Id>,
     pub edges: std::collections::HashMap<super::anchor::Id, Vec<super::edge::Edge>>,
+    /// The Sink node that terminates this AST. Always present: an `Ast` is born
+    /// with its sink in `new`, and every builder carries it forward unchanged.
+    pub sink_node_id: super::node::Id,
 }
 
 impl Ast {
-    pub fn empty() -> Self {
-        Self {
+    /// Create an AST that already contains its terminating `Sink` node (with a
+    /// fresh input anchor), pointed to by `sink_node_id`. The id domains are
+    /// threaded through so every id stays globally unique.
+    pub fn new(
+        node_id_domain: crate::common::IdDomain<super::node::Id>,
+        anchor_id_domain: crate::common::IdDomain<super::anchor::Id>,
+    ) -> (
+        Self,
+        crate::common::IdDomain<super::node::Id>,
+        crate::common::IdDomain<super::anchor::Id>,
+    ) {
+        let (node_id_domain, sink_node_id) = node_id_domain.next_id();
+        let (anchor_id_domain, sink_input_anchor_id) = anchor_id_domain.next_id();
+        let ast = Self {
             nodes: std::collections::HashMap::new(),
             anchors: std::collections::HashMap::new(),
             anchor_to_node: std::collections::HashMap::new(),
             edges: std::collections::HashMap::new(),
+            sink_node_id: sink_node_id.clone(),
         }
+        .plus_node(
+            sink_node_id,
+            super::node::ENode::Sink {
+                input_anchor: sink_input_anchor_id,
+            },
+        );
+        (ast, node_id_domain, anchor_id_domain)
     }
 
     pub fn new_pattern_sub_ast(
@@ -25,15 +48,32 @@ impl Ast {
         Self,
         super::node::Id,
     ) {
-        let (node_id_domain, sink_node_id) = node_id_domain.next_id();
-        let (anchor_id_domain, sink_input_anchor_id) = anchor_id_domain.next_id();
-        let sub_ast = Self::empty().plus_node(
-            sink_node_id.clone(),
-            super::node::ENode::Sink {
-                input_anchor: sink_input_anchor_id,
-            },
-        );
+        let (sub_ast, node_id_domain, anchor_id_domain) =
+            Self::new(node_id_domain, anchor_id_domain);
+        let sink_node_id = sub_ast.sink_node_id.clone();
         (node_id_domain, anchor_id_domain, sub_ast, sink_node_id)
+    }
+
+    /// Union another AST's nodes/anchors/edges into this one, keeping this AST's
+    /// `sink_node_id` as the root. Node/anchor ids are globally unique across a
+    /// (sub-)AST tree, so those maps never collide; edge lists that share a
+    /// `from` anchor are concatenated defensively.
+    pub fn merged_with(self, other: Self) -> Self {
+        let mut edges = self.edges;
+        for (from, list) in other.edges {
+            edges.entry(from).or_default().extend(list);
+        }
+        Self {
+            nodes: self.nodes.into_iter().chain(other.nodes).collect(),
+            anchors: self.anchors.into_iter().chain(other.anchors).collect(),
+            anchor_to_node: self
+                .anchor_to_node
+                .into_iter()
+                .chain(other.anchor_to_node)
+                .collect(),
+            edges,
+            sink_node_id: self.sink_node_id,
+        }
     }
 
     pub fn plus_edge(&self, from: super::anchor::Id, to: super::anchor::Id) -> Self {
@@ -42,6 +82,7 @@ impl Ast {
             anchors: self.anchors.clone(),
             nodes: self.nodes.clone(),
             anchor_to_node: self.anchor_to_node.clone(),
+            sink_node_id: self.sink_node_id.clone(),
             edges: self
                 .edges
                 .clone()
@@ -78,6 +119,7 @@ impl Ast {
                 .chain(anchors.into_iter().map(|(id, _)| (id, node_id.clone())))
                 .collect(),
             edges: self.edges.clone(),
+            sink_node_id: self.sink_node_id.clone(),
         }
     }
 
@@ -101,6 +143,7 @@ impl Ast {
             anchors: self.anchors.clone(),
             anchor_to_node: self.anchor_to_node.clone(),
             edges: self.edges.clone(),
+            sink_node_id: self.sink_node_id.clone(),
         }
     }
 
@@ -149,6 +192,7 @@ impl Ast {
                     }
                 })
                 .collect(),
+            sink_node_id: self.sink_node_id.clone(),
         }
     }
 
@@ -180,15 +224,5 @@ impl Ast {
                     .map(move |node_id| (anchor_id.clone(), node_id))
             })
             .collect()
-    }
-
-    pub fn get_sink_node_id(&self) -> Option<super::node::Id> {
-        self.nodes.iter().find_map(|(id, node)| {
-            if let super::node::ENode::Sink { .. } = node {
-                Some(id.clone())
-            } else {
-                None
-            }
-        })
     }
 }

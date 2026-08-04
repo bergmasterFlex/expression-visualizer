@@ -2424,14 +2424,16 @@ fn handle_evaluate_button(
                     // Already showing a modal or running — ignore.
                     continue;
                 }
-                let ast = &state.program_ast().ast;
-                if !infer::sink_has_input(ast) {
+                if !infer::sink_has_input(&state.program_ast().ast) {
                     eval.phase = EvalPhase::ErrorModal(
                         "Cannot evaluate, because no node is connected to the sink".to_string(),
                     );
                     continue;
                 }
-                let var_decls = infer::collect_var_decls(ast);
+                // Flatten pattern sub-scenes in so eval and var-decl collection
+                // see every node, not just the program-level ones.
+                let ast = state.program_ast().flattened_ast();
+                let var_decls = infer::collect_var_decls(&ast);
                 if !var_decls.is_empty() {
                     eval.phase = EvalPhase::VarDeclPrompt {
                         inputs: var_decls
@@ -2441,7 +2443,7 @@ fn handle_evaluate_button(
                     };
                 } else {
                     let user_vardecl_values = std::collections::HashMap::new();
-                    match eval::State::new(ast, &user_vardecl_values, &state.function_declarations)
+                    match eval::State::new(&ast, &user_vardecl_values, &state.function_declarations)
                     {
                         Ok(initial) => {
                             eval.phase = EvalPhase::Running {
@@ -2514,7 +2516,7 @@ fn sync_modal_ui(
             spawn_controls_modal(&mut commands, &ui_font.0);
         }
         EvalPhase::VarDeclPrompt { inputs } => {
-            let ast = &state.program_ast().ast;
+            let ast = state.program_ast().flattened_ast();
             let rows: Vec<(model::node::Id, String)> = inputs
                 .iter()
                 .map(|(id, _)| {
@@ -2982,7 +2984,7 @@ fn handle_start_menu_new_button(
                 let node_id_domain = state.node_id_domain.clone();
                 let anchor_id_domain = state.anchor_id_domain.clone();
                 let (fresh, new_node_id_domain, new_anchor_id_domain) =
-                    layout::LayoutAst::empty().plus_sink(node_id_domain, anchor_id_domain);
+                    layout::LayoutAst::new(node_id_domain, anchor_id_domain);
                 *state.program_ast_mut() = fresh;
                 state.node_id_domain = new_node_id_domain;
                 state.anchor_id_domain = new_anchor_id_domain;
@@ -3218,7 +3220,7 @@ fn handle_modal_evaluate_button(
         let mut color = text_color_q.get_mut(children[0]).unwrap();
         match *interaction {
             Interaction::Pressed => {
-                let ast = &state.program_ast().ast;
+                let ast = state.program_ast().flattened_ast();
                 let mut user_vardecl_values: std::collections::HashMap<
                     model::node::Id,
                     eval::EValue,
@@ -3239,7 +3241,7 @@ fn handle_modal_evaluate_button(
                 if !parse_errors.is_empty() {
                     eval.phase = EvalPhase::ErrorModal(parse_errors.join("\n"));
                 } else {
-                    match eval::State::new(ast, &user_vardecl_values, &state.function_declarations)
+                    match eval::State::new(&ast, &user_vardecl_values, &state.function_declarations)
                     {
                         Ok(initial) => {
                             eval.phase = EvalPhase::Running {
@@ -3330,7 +3332,7 @@ fn handle_eval_step_buttons(
         }
     }
     if next_q.iter().any(|i| *i == Interaction::Pressed) {
-        let ast = &state.program_ast().ast;
+        let ast = state.program_ast().flattened_ast();
         // Compute the next step first (immutable borrow of `eval.phase`), then
         // apply it — `Err` reassigns `eval.phase`, which the borrow would block.
         let step_result = if let EvalPhase::Running {
@@ -3339,16 +3341,14 @@ fn handle_eval_step_buttons(
             user_vardecl_values,
         } = &eval.phase
         {
-            ast.get_sink_node_id()
-                .and_then(|sink_id| ast.nodes.get(&sink_id).cloned().map(|node| (sink_id, node)))
-                .map(|(sink_id, sink_node)| {
-                    states[*current].eval_next_step(
-                        ast,
-                        user_vardecl_values,
-                        (sink_id, sink_node),
-                        &state.function_declarations,
-                    )
-                })
+            ast.nodes.get(&ast.sink_node_id).cloned().map(|sink_node| {
+                states[*current].eval_next_step(
+                    &ast,
+                    user_vardecl_values,
+                    (ast.sink_node_id.clone(), sink_node),
+                    &state.function_declarations,
+                )
+            })
         } else {
             None
         };

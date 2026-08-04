@@ -124,28 +124,45 @@ pub struct LayoutAst {
 }
 
 impl LayoutAst {
-    pub fn empty() -> Self {
-        Self {
-            ast: crate::model::ast::Ast::empty(),
+    /// A LayoutAst whose AST already holds its terminating `Sink` (via
+    /// `Ast::new`), with a matching LayoutNode placed at the sink's default
+    /// grid position. Replaces the former `empty()` + `plus_sink()` pairing.
+    pub fn new(
+        node_id_domain: NodeIdDomain,
+        anchor_id_domain: AnchorIdDomain,
+    ) -> (Self, NodeIdDomain, AnchorIdDomain) {
+        let (ast, node_id_domain, anchor_id_domain) =
+            crate::model::ast::Ast::new(node_id_domain, anchor_id_domain);
+        let sink_node_id = ast.sink_node_id.clone();
+        let layout = Self {
+            ast,
             layout_nodes: std::collections::HashMap::new(),
             sub_layouts: std::collections::HashMap::new(),
         }
+        ._plus_layout_node(&sink_node_id, Vec3::new(0.0, 0.0, -4.0));
+        (layout, node_id_domain, anchor_id_domain)
     }
 
-    /// Build a root LayoutAst that holds a single Program node plus an empty
+    /// Build a root LayoutAst that holds a single Program node plus a
     /// `sub_layouts` entry keyed by the Program's id. The inner LayoutAst is
-    /// where user-visible nodes live in Step 1 (mirrors the previous behavior
-    /// of a flat `LayoutAst::empty()` root).
+    /// where user-visible nodes live, and starts with its own terminating sink.
     pub fn empty_with_program() -> (Self, crate::model::node::Id, NodeIdDomain, AnchorIdDomain) {
         let node_id_domain = NodeIdDomain::new();
         let anchor_id_domain = AnchorIdDomain::new();
         let (node_id_domain, program_id) = node_id_domain.next_id();
-        let ast = crate::model::ast::Ast::empty()
-            .plus_node(program_id.clone(), crate::model::node::ENode::Program {});
+        // The outer wrapper only carries the Program node; the sink `Ast::new`
+        // mandates goes unused here (this AST is never rendered or evaluated —
+        // rendering and eval both operate on `sub_layouts[program_id]`).
+        let (outer_ast, node_id_domain, anchor_id_domain) =
+            crate::model::ast::Ast::new(node_id_domain, anchor_id_domain);
+        let outer_ast =
+            outer_ast.plus_node(program_id.clone(), crate::model::node::ENode::Program {});
+        let (program_sub, node_id_domain, anchor_id_domain) =
+            Self::new(node_id_domain, anchor_id_domain);
         let outer = Self {
-            ast,
+            ast: outer_ast,
             layout_nodes: std::collections::HashMap::new(),
-            sub_layouts: std::collections::HashMap::from([(program_id.clone(), Self::empty())]),
+            sub_layouts: std::collections::HashMap::from([(program_id.clone(), program_sub)]),
         };
         (outer, program_id, node_id_domain, anchor_id_domain)
     }
@@ -882,26 +899,17 @@ impl LayoutAst {
         }
     }
 
-    pub fn plus_sink(
-        &self,
-        node_id_domain: NodeIdDomain,
-        anchor_id_domain: AnchorIdDomain,
-    ) -> (Self, NodeIdDomain, AnchorIdDomain) {
-        let (anchor_id_domain, input_anchor_id) = anchor_id_domain.next_id();
-        let (node_id_domain, node_id) = node_id_domain.next_id();
-        let ast = self.ast.plus_node(
-            node_id.clone(),
-            crate::model::node::ENode::Sink {
-                input_anchor: input_anchor_id,
-            },
-        );
-        let layout = Self {
-            ast,
-            layout_nodes: self.layout_nodes.clone(),
-            sub_layouts: self.sub_layouts.clone(),
-        }
-        ._plus_layout_node(&node_id, Vec3::new(0.0, 0.0, -4.0));
-        (layout, node_id_domain, anchor_id_domain)
+    /// Merge this scene's AST with every nested sub-layout's AST (recursively)
+    /// into one flat `Ast`. Pattern sub-scenes keep their nodes in `sub_layouts`
+    /// — invisible to this scene's own `ast` — so evaluation, which walks a
+    /// single `Ast`, needs this combined view. The result's `sink_node_id` stays
+    /// this scene's root sink (folding starts from `self.ast`).
+    pub fn flattened_ast(&self) -> crate::model::ast::Ast {
+        self.sub_layouts
+            .values()
+            .fold(self.ast.clone(), |acc, sub| {
+                acc.merged_with(sub.flattened_ast())
+            })
     }
 
     pub fn plus_const_decl(
@@ -1042,18 +1050,19 @@ impl LayoutAst {
             },
         );
         let (node_id_domain, pattern_node_id) = node_id_domain.next_id();
+        // The sub-AST draws its sink node and anchor ids from the same shared
+        // id domains, so every id in the tree stays globally unique.
+        let (node_id_domain, anchor_id_domain, pattern_sub_ast, sub_sink_id) =
+            crate::model::ast::Ast::new_pattern_sub_ast(node_id_domain, anchor_id_domain);
         let ast = ast.plus_node(
             pattern_node_id.clone(),
             crate::model::node::ENode::Pattern {
                 parent_match: match_node_id.clone(),
                 r#type: crate::model::r#type::EType::Int { value: None },
                 output_anchor: pattern_output_anchor_id,
+                sink_node_id: sub_sink_id.clone(),
             },
         );
-        // The sub-AST draws its sink node and anchor ids from the same shared
-        // id domains, so every id in the tree stays globally unique.
-        let (node_id_domain, anchor_id_domain, pattern_sub_ast, sub_sink_id) =
-            crate::model::ast::Ast::new_pattern_sub_ast(node_id_domain, anchor_id_domain);
         let pattern_sub_layout = Self::initial_pattern_sub_layout(&pattern_sub_ast, &sub_sink_id);
         let ast = ast.with_node_replaced(
             &match_node_id,
@@ -1165,18 +1174,19 @@ impl LayoutAst {
         };
         let (anchor_id_domain, new_output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, new_pattern_id) = node_id_domain.next_id();
+        // The sub-AST draws its ids from the same shared domains, keeping every
+        // id in the tree globally unique (see plus_match).
+        let (node_id_domain, anchor_id_domain, new_pattern_sub_ast, new_sub_sink_id) =
+            crate::model::ast::Ast::new_pattern_sub_ast(node_id_domain, anchor_id_domain);
         let ast = shifted.ast.plus_node(
             new_pattern_id.clone(),
             crate::model::node::ENode::Pattern {
                 parent_match: parent_id.clone(),
                 r#type: crate::model::r#type::EType::Int { value: None },
                 output_anchor: new_output_anchor_id,
+                sink_node_id: new_sub_sink_id.clone(),
             },
         );
-        // The sub-AST draws its ids from the same shared domains, keeping every
-        // id in the tree globally unique (see plus_match).
-        let (node_id_domain, anchor_id_domain, new_pattern_sub_ast, new_sub_sink_id) =
-            crate::model::ast::Ast::new_pattern_sub_ast(node_id_domain, anchor_id_domain);
         let new_pattern_sub_layout =
             Self::initial_pattern_sub_layout(&new_pattern_sub_ast, &new_sub_sink_id);
         let new_patterns: Vec<crate::model::node::Id> = sibling_ids

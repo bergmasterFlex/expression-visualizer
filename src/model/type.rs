@@ -9,9 +9,9 @@ pub enum EType {
     Undefined { message: Option<String> },
 }
 
-impl ToString for EType {
-    fn to_string(&self) -> String {
-        match self.clone() {
+impl std::fmt::Display for EType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self.clone() {
             EType::Bool { value } => value.unwrap_or("bool".to_string()),
             EType::Int { value } => value.unwrap_or("int".to_string()),
             EType::Float { value } => value.unwrap_or("float".to_string()),
@@ -31,6 +31,7 @@ impl ToString for EType {
             }
             EType::Any => "any".to_string(),
             EType::Undefined { message } => message.unwrap_or("undefined".to_string()),
-        }
+        };
+        write!(f, "{}", text)
     }
 }

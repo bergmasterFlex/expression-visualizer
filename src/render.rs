@@ -294,7 +294,7 @@ pub fn layoutnode_to_rendernode(
     let node_pos = layout_to_world(layout_node.pos + extra_offset);
     let node_pos_tf = Transform::from_translation(node_pos);
     let node = ast.nodes.get(&layout_node.node_id).unwrap();
-    return match node {
+    match node {
         crate::model::node::ENode::ConstDecl {
             r#type,
             output_anchor,
@@ -747,7 +747,7 @@ pub fn layoutnode_to_rendernode(
         crate::model::node::ENode::Program { .. } => {
             unreachable!("Program node has no layout position and is never rendered directly")
         }
-    };
+    }
 }
 
 pub fn emissive_color(color: Color) -> LinearRgba {
