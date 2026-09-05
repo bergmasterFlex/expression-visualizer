@@ -2,13 +2,109 @@ use bevy::prelude::*;
 
 type NodeIdDomain = crate::common::IdDomain<crate::model::node::Id>;
 type AnchorIdDomain = crate::common::IdDomain<crate::model::anchor::Id>;
+type FunctionDeclarations = std::collections::HashMap<
+    crate::model::function_declaration::FunctionDeclarationId,
+    crate::model::function_declaration::FunctionDeclaration,
+>;
+
+/// What a single cell of a node stands for.
+///
+/// The whole point of the per-part cell layout is that an address names at
+/// most one thing: a specific anchor row, or the node's own property. That is
+/// what lets the caret alone decide what an edit acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CellRole {
+    /// Row `leaf` of input anchor number `index`.
+    Input { index: usize, leaf: usize },
+    /// Row `leaf` of the output anchor.
+    Output { leaf: usize },
+    /// The node's own property: the type it declares, or the function it calls.
+    Body,
+}
+
+/// Node-local cell layout: every cell a node claims, and what each one means.
+///
+/// Built by `LayoutAst::with_shapes` from the node kind plus its anchor types,
+/// and cached on the `LayoutNode`. It never depends on positions, only on
+/// types and wiring — which is why it stays valid across a whole
+/// `settle_footprints` pass.
+#[derive(Debug, Clone)]
+pub struct NodeShape {
+    cells: Vec<(IVec3, CellRole)>,
+}
+
+impl NodeShape {
+    pub fn new(cells: Vec<(IVec3, CellRole)>) -> Self {
+        Self { cells }
+    }
+
+    /// Placeholder for a node whose shape has not been computed yet: a single
+    /// body cell at the origin. Every edit path ends in `with_shapes`, so this
+    /// only ever survives between a builder and the next re-settle.
+    pub fn placeholder() -> Self {
+        Self::new(vec![(IVec3::ZERO, CellRole::Body)])
+    }
+
+    pub fn cells(&self) -> &[(IVec3, CellRole)] {
+        &self.cells
+    }
+
+    /// Node-local bounding box. Never empty — a shape always has at least one
+    /// cell.
+    pub fn bbox(&self) -> AABB {
+        self.cells
+            .iter()
+            .fold(None, |acc, (c, _)| {
+                AABB::union_opt(acc, Some(AABB::point(*c)))
+            })
+            .unwrap_or(AABB::point(IVec3::ZERO))
+    }
+
+    /// What the node-local cell `local` stands for, if it belongs to the node.
+    /// This is the lookup an edit acts on.
+    pub fn role_at(&self, local: IVec3) -> Option<&CellRole> {
+        self.cells
+            .iter()
+            .find(|(c, _)| *c == local)
+            .map(|(_, role)| role)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LayoutNode {
     pub node_id: crate::model::node::Id,
     pub pos: Vec3,
+    /// Cell layout, refreshed by `LayoutAst::with_shapes` whenever types or
+    /// wiring change. Independent of `pos`, so it survives the settle pass.
+    pub shape: NodeShape,
 }
 
+impl LayoutNode {
+    /// A node at `pos` whose shape is not known yet (see
+    /// `NodeShape::placeholder`).
+    pub fn unshaped(node_id: crate::model::node::Id, pos: Vec3) -> Self {
+        Self {
+            node_id,
+            pos,
+            shape: NodeShape::placeholder(),
+        }
+    }
+}
+
+/// Cells an anchor claims: `infer::anchor_rows` of them, growing along +Y from
+/// row 0, all in column `x` at depth `z`.
+fn anchor_cells(
+    flat_ast: &crate::model::ast::Ast,
+    function_declarations: &FunctionDeclarations,
+    anchor: &crate::model::anchor::Id,
+    x: i32,
+    z: i32,
+    role: impl Fn(usize) -> CellRole,
+) -> Vec<(IVec3, CellRole)> {
+    (0..crate::infer::anchor_rows(flat_ast, anchor, function_declarations))
+        .map(|leaf| (IVec3::new(x, leaf as i32, z), role(leaf)))
+        .collect()
+}
 #[derive(Debug, Clone)]
 pub struct LayoutEdge {
     pub from_anchor: LayoutAnchor,
@@ -291,30 +387,21 @@ impl LayoutAst {
         })
     }
 
-    /// AABB (in this LayoutAst's local grid coords) that a node claims.
-    /// Delegates to `match_footprint` for matches; for FunctionCall applies
-    /// the minimum-extent rule (1–2 inputs → 1X×2Z toward +Z; ≥3 inputs →
-    /// 2X×2Z extending +X and +Z). Every other node claims a single cell at
-    /// its rounded position.
+    /// AABB (in this LayoutAst's local grid coords) that a node claims: the
+    /// bounding box of its `NodeShape`, translated to its position.
+    ///
+    /// A Match delegates to `match_footprint` instead, because its extent also
+    /// covers its Patterns and their branch volumes — separate nodes and
+    /// sub-layouts that its own shape knows nothing about.
     pub fn node_footprint(&self, id: &crate::model::node::Id) -> Option<AABB> {
-        let ln = self.layout_nodes.get(id)?;
-        let node = self.ast.nodes.get(id)?;
-        let pos = ln.pos.round().as_ivec3();
-        match node {
-            crate::model::node::ENode::Match { .. } => self.match_footprint(id),
-            crate::model::node::ENode::FunctionCall { input_anchors, .. } => {
-                let (width_extra, depth_extra) = if input_anchors.len() >= 3 {
-                    (1, 1)
-                } else {
-                    (0, 1)
-                };
-                Some(AABB {
-                    min: IVec3::new(pos.x, pos.y, pos.z),
-                    max: IVec3::new(pos.x + width_extra, pos.y, pos.z + depth_extra),
-                })
-            }
-            _ => Some(AABB::point(pos)),
+        if matches!(
+            self.ast.nodes.get(id),
+            Some(crate::model::node::ENode::Match { .. })
+        ) {
+            return self.match_footprint(id);
         }
+        let ln = self.layout_nodes.get(id)?;
+        Some(ln.shape.bbox().translated(ln.pos.round().as_ivec3()))
     }
 
     /// Build a `grid position -> node id` lookup over all selectable nodes.
@@ -382,6 +469,180 @@ impl LayoutAst {
         )
     }
 
+    /// Recompute every node's `NodeShape` from the current types and wiring.
+    ///
+    /// `flat_ast` must be the flattened AST — anchor heights depend on edges,
+    /// and only the program-level table holds them. Sub-layouts are shaped
+    /// first, because a Match places its output behind its deepest branch and
+    /// needs those branches measured already.
+    ///
+    /// Must run before `settle_footprints`, never during it: shapes decide
+    /// footprints, and footprints decide displacement.
+    pub fn with_shapes(
+        &self,
+        flat_ast: &crate::model::ast::Ast,
+        function_declarations: &FunctionDeclarations,
+    ) -> Self {
+        let staged = Self {
+            ast: self.ast.clone(),
+            layout_nodes: self.layout_nodes.clone(),
+            sub_layouts: self
+                .sub_layouts
+                .iter()
+                .map(|(k, v)| (k.clone(), v.with_shapes(flat_ast, function_declarations)))
+                .collect(),
+        };
+        let layout_nodes = staged
+            .layout_nodes
+            .iter()
+            .map(|(id, ln)| {
+                let shape = flat_ast
+                    .nodes
+                    .get(id)
+                    .map(|node| staged.node_shape(node, flat_ast, function_declarations))
+                    .unwrap_or_else(NodeShape::placeholder);
+                (
+                    id.clone(),
+                    LayoutNode {
+                        node_id: ln.node_id.clone(),
+                        pos: ln.pos,
+                        shape,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            ast: staged.ast,
+            layout_nodes,
+            sub_layouts: staged.sub_layouts,
+        }
+    }
+    /// Cell layout of one node, in node-local coordinates (`x`, `y`, `z`).
+    ///
+    /// Every part gets its own cell so that an address names one property:
+    ///
+    /// | node | cells (`x|z`) |
+    /// |---|---|
+    /// | Sink | `0\|0` input |
+    /// | VarDecl / ConstDecl | `0\|0` body, `0\|1` output |
+    /// | TypeCast | `0\|0` input, `0\|1` body, `0\|2` output |
+    /// | FunctionCall (n inputs) | `i\|0` input i, `(0..n)\|1..2` body, `0\|3` output |
+    /// | Match | `0\|0` input, output directly behind the deepest branch |
+    /// | Pattern | one cell |
+    /// | BranchSource | `0\|0` output |
+    ///
+    /// An anchor claims `infer::anchor_rows` cells along +Y from its own row.
+    /// A Match's Patterns and branch volumes are separate nodes and
+    /// sub-layouts, so they are not part of its shape — `match_footprint`
+    /// unions those in.
+    fn node_shape(
+        &self,
+        node: &crate::model::node::ENode,
+        flat_ast: &crate::model::ast::Ast,
+        fds: &FunctionDeclarations,
+    ) -> NodeShape {
+        let mut cells: Vec<(IVec3, CellRole)> = Vec::new();
+        match node {
+            crate::model::node::ENode::Sink { input_anchor } => {
+                cells.extend(anchor_cells(flat_ast, fds, input_anchor, 0, 0, |leaf| {
+                    CellRole::Input { index: 0, leaf }
+                }));
+            }
+            crate::model::node::ENode::VarDecl { output_anchor, .. }
+            | crate::model::node::ENode::ConstDecl { output_anchor, .. } => {
+                cells.push((IVec3::ZERO, CellRole::Body));
+                cells.extend(anchor_cells(flat_ast, fds, output_anchor, 0, 1, |leaf| {
+                    CellRole::Output { leaf }
+                }));
+            }
+            // Mirror of the Sink: one anchor and nothing else. It declares no
+            // type of its own — that comes from its Pattern — so no body cell.
+            crate::model::node::ENode::BranchSource { output_anchor, .. } => {
+                cells.extend(anchor_cells(flat_ast, fds, output_anchor, 0, 0, |leaf| {
+                    CellRole::Output { leaf }
+                }));
+            }
+            crate::model::node::ENode::TypeCast {
+                input_anchor,
+                output_anchor,
+                ..
+            } => {
+                cells.extend(anchor_cells(flat_ast, fds, input_anchor, 0, 0, |leaf| {
+                    CellRole::Input { index: 0, leaf }
+                }));
+                cells.push((IVec3::new(0, 0, 1), CellRole::Body));
+                cells.extend(anchor_cells(flat_ast, fds, output_anchor, 0, 2, |leaf| {
+                    CellRole::Output { leaf }
+                }));
+            }
+            crate::model::node::ENode::FunctionCall {
+                input_anchors,
+                output_anchor,
+                ..
+            } => {
+                for (index, anchor) in input_anchors.iter().enumerate() {
+                    cells.extend(anchor_cells(
+                        flat_ast,
+                        fds,
+                        anchor,
+                        index as i32,
+                        0,
+                        move |leaf| CellRole::Input { index, leaf },
+                    ));
+                }
+                // Body spans the full input width, two cells deep — it carries
+                // the name of the referenced function.
+                for x in 0..input_anchors.len().max(1) as i32 {
+                    for z in 1..=2 {
+                        cells.push((IVec3::new(x, 0, z), CellRole::Body));
+                    }
+                }
+                // Output stays in column 0 so its address does not move when
+                // the call is swapped for a function of different arity.
+                cells.extend(anchor_cells(flat_ast, fds, output_anchor, 0, 3, |leaf| {
+                    CellRole::Output { leaf }
+                }));
+            }
+            crate::model::node::ENode::Match {
+                input_anchor,
+                output_anchor,
+                patterns,
+            } => {
+                cells.extend(anchor_cells(flat_ast, fds, input_anchor, 0, 0, |leaf| {
+                    CellRole::Input { index: 0, leaf }
+                }));
+                cells.extend(anchor_cells(
+                    flat_ast,
+                    fds,
+                    output_anchor,
+                    0,
+                    self.match_output_z(patterns),
+                    |leaf| CellRole::Output { leaf },
+                ));
+            }
+            // A Pattern owns no anchor: one cell declaring the arm's type.
+            // Program is never laid out.
+            crate::model::node::ENode::Pattern { .. } | crate::model::node::ENode::Program {} => {
+                cells.push((IVec3::ZERO, CellRole::Body));
+            }
+        }
+        NodeShape::new(cells)
+    }
+
+    /// Match-local Z of the output anchor: directly behind the deepest branch.
+    ///
+    /// Patterns sit at match-local Z=1 and their branch volumes start at Z=2,
+    /// so a branch reaching branch-local Z=d ends at match-local `2 + d`.
+    pub fn match_output_z(&self, patterns: &[crate::model::node::Id]) -> i32 {
+        let deepest = patterns
+            .iter()
+            .filter_map(|pid| self.sub_layouts.get(pid))
+            .filter_map(|sub| sub.inner_footprint())
+            .map(|b| b.max.z)
+            .max()
+            .unwrap_or(0);
+        2 + deepest + 1
+    }
     /// Union of all visible grid cells in this LayoutAst's local coords.
     /// Match nodes contribute their `match_footprint` (recursive over
     /// nested sub-ASTs); every other node contributes its rounded cell.
@@ -393,7 +654,7 @@ impl LayoutAst {
             let node_bbox = if self.is_match(id) {
                 self.match_footprint(id)
             } else {
-                Some(AABB::point(ln.pos.round().as_ivec3()))
+                Some(ln.shape.bbox().translated(ln.pos.round().as_ivec3()))
             };
             bbox = AABB::union_opt(bbox, node_bbox);
         }
@@ -470,7 +731,12 @@ impl LayoutAst {
             return None;
         }
         let pattern_ids = self.match_pattern_ids(match_id);
-        let mut bbox: Option<AABB> = None;
+        // The Match's own cells (input anchor, and its output behind the
+        // branches) come from its shape; the arms are unioned in below.
+        let mut bbox: Option<AABB> = self
+            .layout_nodes
+            .get(match_id)
+            .map(|ln| ln.shape.bbox().translated(ln.pos.round().as_ivec3()));
         for pid in &pattern_ids {
             let Some(p_ln) = self.layout_nodes.get(pid) else {
                 continue;
@@ -516,8 +782,11 @@ impl LayoutAst {
             Some(crate::model::node::ENode::VarDecl { .. }) => Vec3::new(delta_pos.x, 0.0, 0.0),
             Some(crate::model::node::ENode::BranchSource { .. }) => Vec3::ZERO,
             _ => {
+                // Z=0 is the source row and the sink's Z is the sink's alone,
+                // so everything else lives strictly between them.
                 let target_z = (primary_origin.z + delta_pos.z).round() as i32;
-                if target_z <= 0 {
+                let sink_z = self.sink_z();
+                if target_z <= 0 || sink_z.is_some_and(|s| target_z >= s) {
                     Vec3::new(delta_pos.x, delta_pos.y, 0.0)
                 } else {
                     delta_pos
@@ -619,6 +888,7 @@ impl LayoutAst {
                         LayoutNode {
                             node_id: id.clone(),
                             pos: new_pos,
+                            shape: ln.shape.clone(),
                         },
                     )
                 })
@@ -833,6 +1103,14 @@ impl LayoutAst {
         layout
     }
 
+    /// Layout-Z of this scope's Sink, if it has one. The Sink always sits on
+    /// the scope's maximum Z and that row is reserved for it.
+    pub fn sink_z(&self) -> Option<i32> {
+        let sink_id = self.sink_id()?;
+        self.layout_nodes
+            .get(&sink_id)
+            .map(|ln| ln.pos.round().as_ivec3().z)
+    }
     /// The single Sink node id of this LayoutAst, if present.
     pub fn sink_id(&self) -> Option<crate::model::node::Id> {
         self.layout_nodes
@@ -1213,17 +1491,11 @@ impl LayoutAst {
             layout_nodes: std::collections::HashMap::from([
                 (
                     branch_source_id.clone(),
-                    LayoutNode {
-                        node_id: branch_source_id.clone(),
-                        pos: Vec3::ZERO,
-                    },
+                    LayoutNode::unshaped(branch_source_id.clone(), Vec3::ZERO),
                 ),
                 (
                     sub_sink_id.clone(),
-                    LayoutNode {
-                        node_id: sub_sink_id.clone(),
-                        pos: Vec3::new(0.0, 0.0, 2.0),
-                    },
+                    LayoutNode::unshaped(sub_sink_id.clone(), Vec3::new(0.0, 0.0, 2.0)),
                 ),
             ]),
             sub_layouts: std::collections::HashMap::new(),
@@ -1286,6 +1558,7 @@ impl LayoutAst {
                         LayoutNode {
                             node_id: id.clone(),
                             pos: ln.pos + Vec3::new(0.0, 1.0, 0.0),
+                            shape: ln.shape.clone(),
                         },
                     )
                 } else {
@@ -1418,6 +1691,7 @@ impl LayoutAst {
                             LayoutNode {
                                 node_id: id.clone(),
                                 pos: new_pos,
+                                shape: ln.shape.clone(),
                             },
                         )
                     } else {
@@ -1520,13 +1794,7 @@ impl LayoutAst {
                 .layout_nodes
                 .clone()
                 .into_iter()
-                .chain([(
-                    node_id.clone(),
-                    LayoutNode {
-                        node_id: node_id.clone(),
-                        pos,
-                    },
-                )])
+                .chain([(node_id.clone(), LayoutNode::unshaped(node_id.clone(), pos))])
                 .collect(),
             sub_layouts: self.sub_layouts.clone(),
         }
@@ -1600,10 +1868,10 @@ impl LayoutAst {
 
     /// Compute the grid bounds for this AST in its own local coordinates.
     ///
-    /// - Z range: `[0, sink.z - 1]` where `sink.z` is the single Sink's
-    ///   layout-Z. Every scope owns a source row at its local Z=0: the root
-    ///   scope holds VarDecls there, a branch holds its single BranchSource.
-    ///   Returns `None` if the corridor collapses or no Sink exists.
+    /// - Z range: `[0, sink.z]` where `sink.z` is the single Sink's layout-Z.
+    ///   Both ends are reserved: local Z=0 is the source row (VarDecls in the
+    ///   root scope, the BranchSource in a branch) and `sink.z` belongs to the
+    ///   Sink alone. Returns `None` if no Sink exists.
     /// - X range: min/max over every node's footprint X-span, unioned with
     ///   `active_selection.x` when provided. Multi-cell footprints (matches,
     ///   ≥3-input function calls) grow the grid so the extra cell is
@@ -1628,10 +1896,7 @@ impl LayoutAst {
                     _ => None,
                 })?;
         let z_min = 0;
-        let z_max = sink_z - 1;
-        if z_min > z_max {
-            return None;
-        }
+        let z_max = sink_z;
         let mut x_min = i32::MAX;
         let mut x_max = i32::MIN;
         let mut y_min = i32::MAX;

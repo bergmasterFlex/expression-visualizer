@@ -45,13 +45,29 @@ impl AstState {
             .get_mut(&self.program_id)
             .unwrap()
     }
+
+    /// Recompute every node's cell shape from the current types and wiring,
+    /// then re-settle the layout.
+    ///
+    /// Shapes decide footprints and footprints decide displacement, so the two
+    /// always run in this order. Anchor heights depend on edges as well as on
+    /// declared types — a constraint-less input takes the height of whatever is
+    /// wired into it — which is why connecting, disconnecting and deleting all
+    /// have to come through here, not just moving and adding.
+    fn resettle(&mut self) {
+        let flat = self.program_ast().flattened_ast();
+        self.layout_ast = self
+            .layout_ast
+            .with_shapes(&flat, &self.function_declarations)
+            .settle_footprints();
+    }
 }
 
 impl Default for AstState {
     fn default() -> Self {
         let (layout_ast, program_id, node_id_domain, anchor_id_domain) =
             layout::LayoutAst::empty_with_program();
-        Self {
+        let mut state = Self {
             layout_ast,
             program_id,
             node_id_domain,
@@ -147,7 +163,11 @@ impl Default for AstState {
                     },
                 ),
             ]),
-        }
+        };
+        // The initial scene already has a Sink; give it a real shape rather
+        // than the placeholder, so the first grid and caret resolve correctly.
+        state.resettle();
+        state
     }
 }
 
@@ -723,17 +743,58 @@ fn spawn_ast_nodes(
             walked.extra_offset,
             walked.sink_scale,
         );
-        let node_entity = commands
-            .spawn((
-                Mesh3d(meshes.add(render_node.node.mesh)),
-                MeshMaterial3d(materials.add(render_node.node.material)),
-                render_node.node.transform,
-                AstNodeEntity {
-                    node_id: node_id.clone(),
-                },
-                AstSceneEntity,
-            ))
-            .id();
+        // A node whose body is a band has no mesh of its own; the entity is
+        // still spawned so picking and selection keep working.
+        let node_entity = match render_node.node {
+            Some(obj) => commands
+                .spawn((
+                    Mesh3d(meshes.add(obj.mesh)),
+                    MeshMaterial3d(materials.add(obj.material)),
+                    obj.transform,
+                    AstNodeEntity {
+                        node_id: node_id.clone(),
+                    },
+                    AstSceneEntity,
+                ))
+                .id(),
+            None => commands
+                .spawn((
+                    Transform::from_translation(render::cell_center_world(
+                        layout_node.pos + walked.extra_offset,
+                    )),
+                    AstNodeEntity {
+                        node_id: node_id.clone(),
+                    },
+                    AstSceneEntity,
+                ))
+                .id(),
+        };
+
+        // Body bands (source nodes): the same marquee ribbon the edges use, so
+        // a source reads as the start of its own wire.
+        if let Some(edge_labels) = edge_labels.as_ref() {
+            for band in render_node.bands {
+                commands.spawn((
+                    Mesh3d(meshes.add(band.mesh)),
+                    MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
+                        band_color: band.color.to_linear(),
+                        letter_color: LinearRgba::WHITE,
+                        scroll_speed: 1.5,
+                        tile_length: 3.0,
+                        time: 0.0,
+                        line_mode: 0.0,
+                        line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
+                        _pad0: 0.0,
+                        _pad1: 0.0,
+                        _pad2: 0.0,
+                        label: edge_labels.by_kind[&band.kind].clone(),
+                    })),
+                    Transform::IDENTITY,
+                    Visibility::Inherited,
+                    AstSceneEntity,
+                ));
+            }
+        }
 
         // Decorative meshes with no associated anchor (e.g. a Match's grey
         // sink-tip hull).
@@ -846,17 +907,21 @@ fn spawn_ast_nodes(
             let src_type = infer::anchor_type(&flat_ast, src_id, &state.function_declarations)
                 .unwrap_or(infer::EType::Pending);
             let source_leaves = render::ordered_supported_leaves(&src_type);
-            let n_src = source_leaves.len();
-            if n_src == 0 {
+            if source_leaves.is_empty() {
                 continue;
             }
 
-            let tgt_type = infer::anchor_type(&flat_ast, tgt_id, &state.function_declarations);
+            // A target that constrains nothing renders as tall as what arrives,
+            // so the ribbons must use that same type — otherwise every leaf
+            // would collapse onto the anchor's first row.
+            let tgt_type = infer::anchor_type(&flat_ast, tgt_id, &state.function_declarations)
+                .or_else(|| {
+                    infer::incoming_anchor_type(&flat_ast, tgt_id, &state.function_declarations)
+                });
             let target_leaves = tgt_type
                 .as_ref()
                 .map(|t| render::ordered_supported_leaves(t))
                 .unwrap_or_default();
-            let n_tgt = target_leaves.len();
 
             // AST-level literal on the source anchor (VarDecl / ConstDecl
             // / Pattern / TypeCast). `None` for FunctionCall outputs and
@@ -880,14 +945,17 @@ fn spawn_ast_nodes(
                 .id();
 
             for (k, leaf) in source_leaves.iter().enumerate() {
-                let y_src = (k as f32 - (n_src as f32 - 1.0) / 2.0) * render::TYPE_MARKER_Y_STEP;
+                // Same row offsets the marker stack uses, so each ribbon meets
+                // its marker exactly.
+                let y_src = render::leaf_row_offset(k);
                 let leaf_kind = edge::leaf_kind_of(leaf);
                 let y_tgt = if let Some(idx) = target_leaves
                     .iter()
                     .position(|l| edge::leaf_kind_of(l) == leaf_kind)
                 {
-                    (idx as f32 - (n_tgt as f32 - 1.0) / 2.0) * render::TYPE_MARKER_Y_STEP
+                    render::leaf_row_offset(idx)
                 } else {
+                    // No matching leaf at the target: aim at its first row.
                     0.0
                 };
                 let Some(kind) = edge::leaf_kind_of(leaf) else {
@@ -1291,6 +1359,9 @@ fn handle_delete_node_button(
         let updated = caret_ast.minus_node(&selected_node_id);
         if let Some((caret_ast_mut, _)) = state.caret_ast_mut(&pick) {
             *caret_ast_mut = updated;
+            // Removing a node can shrink a constraint-less input that fed off
+            // it, so shapes have to be recomputed, not just the layout.
+            state.resettle();
             rebuild.0 = true;
         }
     }
@@ -1362,6 +1433,10 @@ fn update_add_generic_button_visuals(
         .unwrap_or(false);
     let source_row = in_program_scope && caret.map(|(_, local)| local.z == 0).unwrap_or(false);
     let vardecl_slot = source_row && caret.map(|(_, local)| local.y == 0).unwrap_or(false);
+    // The scope's last Z row belongs to its Sink alone.
+    let sink_row = caret
+        .map(|(ast, local)| ast.sink_z().is_some_and(|z| local.z >= z))
+        .unwrap_or(false);
     for (interaction, mut bg, children, action) in button_q.iter_mut() {
         if *action == EAstActionButton::AddPatternButton {
             continue;
@@ -1378,7 +1453,7 @@ fn update_add_generic_button_visuals(
                     | EAstActionButton::AddTypeCastButton
                     | EAstActionButton::AddMatchButton
             );
-        let enabled = pos_free && !vardecl_locked && !source_row_locked;
+        let enabled = pos_free && !vardecl_locked && !source_row_locked && !sink_row;
         if !enabled {
             bg.0 = Color::srgba(0.10, 0.10, 0.13, 0.9);
             text_color.0 = Color::srgb(0.35, 0.35, 0.4);
@@ -1481,6 +1556,10 @@ fn handle_add_node_button(
                 // every other creation action defensively.
                 let is_source_row = local.z == 0;
                 let vardecl_allowed = is_source_row && is_program_scope && local.y == 0;
+                // The scope's last Z row belongs to its Sink alone.
+                if scope_ast.sink_z().is_some_and(|z| local.z >= z) {
+                    continue;
+                }
                 if is_source_row
                     && !matches!(*action, EAstActionButton::AddPatternButton)
                     && !(vardecl_allowed && *action == EAstActionButton::AddVarDeclButton)
@@ -1544,7 +1623,7 @@ fn handle_add_node_button(
                 }
                 state.node_id_domain = new_node_id_domain;
                 state.anchor_id_domain = new_anchor_id_domain;
-                state.layout_ast = state.layout_ast.settle_footprints();
+                state.resettle();
                 rebuild.0 = true;
             }
             Interaction::Hovered => {
@@ -1605,7 +1684,14 @@ fn sync_node_editor_ui(
     mut cache: Local<NodeEditorFingerprint>,
 ) {
     let caret = state.caret_ast(&pick);
-    let node_id = caret.and_then(|(ast, local)| ast.node_at(local));
+    // The panel edits the property this address stands for, so it only opens
+    // on a node's body cell — never on one of its anchor rows.
+    let node_id = caret.and_then(|(ast, local)| {
+        let id = ast.node_at(local)?;
+        let ln = ast.layout_nodes.get(&id)?;
+        let node_local = local - ln.pos.round().as_ivec3();
+        matches!(ln.shape.role_at(node_local), Some(layout::CellRole::Body)).then_some(id)
+    });
     let node = node_id
         .as_ref()
         .and_then(|id| caret.and_then(|(ast, _)| ast.ast.nodes.get(id)));
@@ -2239,7 +2325,7 @@ fn handle_dropdown_option_click(
                         *owning_ast = new_layout;
                         state.node_id_domain = new_node_id_domain;
                         state.anchor_id_domain = new_anchor_id_domain;
-                        state.layout_ast = state.layout_ast.settle_footprints();
+                        state.resettle();
                         rebuild.0 = true;
                     }
                 }
@@ -2906,6 +2992,7 @@ fn handle_start_menu_new_button(
                 state.node_id_domain = new_node_id_domain;
                 state.anchor_id_domain = new_anchor_id_domain;
                 pick.selected_pos = IVec3::ZERO;
+                state.resettle();
                 rebuild.0 = true;
                 start_menu.showing = false;
                 start_menu.has_cancel = false;
@@ -4142,7 +4229,7 @@ fn handle_arrow_keys(
             if let Some(target) = state.program_ast_mut().resolve_context_mut(&scope.path) {
                 *target = new_layout;
             }
-            state.layout_ast = state.layout_ast.settle_footprints();
+            state.resettle();
             // `move_node_delta` may report a different cell than
             // `local + delta` when the move jumped a match footprint.
             pick.selected_pos = effective_local + scope_origin;
@@ -4362,6 +4449,9 @@ fn drag_end_system(
                 if from != to && !anchors_already_connected(state.program_ast(), &from, &to) {
                     let updated = state.program_ast().plus_edge(from, to);
                     *state.program_ast_mut() = updated;
+                    // A new edge can grow the target's anchor, which changes
+                    // its footprint.
+                    state.resettle();
                     rebuild.0 = true;
                 }
             }

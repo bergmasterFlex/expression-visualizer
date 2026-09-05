@@ -10,11 +10,13 @@ use bevy::shader::ShaderRef;
 
 use crate::infer::EType;
 
-pub const RIBBON_HEIGHT: f32 = 1.0;
+/// Height of a solid edge band: one anchor row, so band and type marker line
+/// up exactly.
+pub const RIBBON_HEIGHT: f32 = 3.0;
 /// Ribbon height used when a source anchor carries an AST literal. The band
 /// itself is invisible in that mode (see `edge_band.wgsl`); the height is
 /// kept as-is so the rasterised marquee glyphs stay readable.
-pub const RIBBON_LINE_HEIGHT: f32 = 0.25;
+pub const RIBBON_LINE_HEIGHT: f32 = 0.75;
 /// Half-thickness of the value-edge hairline in `uv.y` space (i.e. as a
 /// fraction of `RIBBON_LINE_HEIGHT`). 0.1 * 0.25 = 0.025 world units — thin
 /// like a grid line.

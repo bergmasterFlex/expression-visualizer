@@ -79,6 +79,65 @@ pub fn flatten_type(t: &EType) -> Vec<EType> {
     }
 }
 
+/// Leaves of `t` that each claim their own row: the four concrete value types
+/// plus `none`. Sum types are expanded first; `Pending` and `Exception` claim
+/// no row of their own.
+///
+/// This lives here rather than in the renderer because the row count is an
+/// *addressing* fact — it decides how many cells an anchor occupies — which
+/// the rendering merely follows.
+pub fn row_leaves(t: &EType) -> Vec<EType> {
+    flatten_type(t)
+        .into_iter()
+        .filter(|leaf| {
+            matches!(
+                leaf,
+                EType::Bool(_) | EType::Char(_) | EType::Int(_) | EType::String(_) | EType::None
+            )
+        })
+        .collect()
+}
+
+/// How many cells an anchor occupies along Y: one per sum-type member, never
+/// fewer than one.
+///
+/// An input the node does not constrain (Sink, Match, TypeCast) takes the
+/// height of whatever is wired into it, so its band lines up with the source's
+/// — which means connecting or disconnecting an edge changes the node's
+/// footprint and has to be followed by a re-settle.
+pub fn anchor_rows(
+    ast: &crate::model::ast::Ast,
+    anchor_id: &crate::model::anchor::Id,
+    function_declarations: &FunctionDeclarations,
+) -> usize {
+    let declared = anchor_type(ast, anchor_id, function_declarations);
+    let rows = match declared {
+        Some(t) => row_leaves(&t).len(),
+        None => match ast.anchors.get(anchor_id) {
+            Some(crate::model::anchor::EAnchor::Input(_)) => {
+                incoming_anchor_type(ast, anchor_id, function_declarations)
+                    .map(|t| row_leaves(&t).len())
+                    .unwrap_or(0)
+            }
+            _ => 0,
+        },
+    };
+    rows.max(1)
+}
+
+/// Type flowing into `input` from its connected source anchor, if any.
+pub fn incoming_anchor_type(
+    ast: &crate::model::ast::Ast,
+    input: &crate::model::anchor::Id,
+    function_declarations: &FunctionDeclarations,
+) -> Option<EType> {
+    incoming_type(
+        ast,
+        input,
+        function_declarations,
+        &mut std::collections::HashSet::new(),
+    )
+}
 /// Collect every VarDecl in the AST as (node_id, name).
 pub fn collect_var_decls(ast: &crate::model::ast::Ast) -> Vec<(crate::model::node::Id, String)> {
     let mut out: Vec<_> = ast
