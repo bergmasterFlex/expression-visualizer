@@ -796,16 +796,15 @@ fn spawn_ast_nodes(
             }
         }
 
-        // Decorative meshes with no associated anchor (e.g. a Match's grey
-        // sink-tip hull).
-        for deco in render_node.decorations {
-            commands.spawn((
-                Mesh3d(meshes.add(deco.mesh)),
-                MeshMaterial3d(materials.add(deco.material)),
-                deco.transform,
-                AstSceneEntity,
-            ));
-        }
+        // Markers the node owns directly rather than through an anchor: a
+        // Pattern is drawn as the band of the type its arm matches.
+        spawn_type_markers(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &ui_font.0,
+            render_node.markers,
+        );
 
         render_node
             .anchors
@@ -817,32 +816,13 @@ fn spawn_ast_nodes(
                     plain_body,
                 } = render_anchor;
 
-                for marker in type_markers {
-                    let render::RenderTypeMarker {
-                        rect,
-                        label,
-                        value_line,
-                        value_label,
-                    } = marker;
-                    commands.spawn((
-                        Mesh3d(meshes.add(rect.mesh)),
-                        MeshMaterial3d(materials.add(rect.material)),
-                        rect.transform,
-                        AstSceneEntity,
-                    ));
-                    spawn_world_label(&mut commands, &ui_font.0, label, AstSceneEntity);
-                    if let Some(line) = value_line {
-                        commands.spawn((
-                            Mesh3d(meshes.add(line.mesh)),
-                            MeshMaterial3d(materials.add(line.material)),
-                            line.transform,
-                            AstSceneEntity,
-                        ));
-                    }
-                    if let Some(vlabel) = value_label {
-                        spawn_world_label(&mut commands, &ui_font.0, vlabel, AstSceneEntity);
-                    }
-                }
+                spawn_type_markers(
+                    &mut commands,
+                    &mut meshes,
+                    &mut materials,
+                    &ui_font.0,
+                    type_markers,
+                );
 
                 // Neutral cuboid for anchors without type markers.
                 if let Some(body) = plain_body {
@@ -923,11 +903,10 @@ fn spawn_ast_nodes(
                 .map(|t| render::ordered_supported_leaves(t))
                 .unwrap_or_default();
 
-            // AST-level literal on the source anchor (VarDecl / ConstDecl
-            // / Pattern / TypeCast). `None` for FunctionCall outputs and
-            // structural nodes. When present, the sole rendered leaf swaps to
-            // the thin "value line" style.
-            let src_ast_value = state.program_ast().anchor_ast_value(src_id);
+            // AST-level literal on the source anchor. When present, the sole
+            // rendered leaf swaps to the thin "value line" style — same rule
+            // the anchor markers follow, via the same lookup.
+            let src_ast_value = infer::anchor_literal(&flat_ast, src_id);
 
             let curve = edge::EdgeCurve::from_endpoints(from_world, to_world);
 
@@ -2286,6 +2265,9 @@ fn handle_dropdown_option_click(
                     | Some(model::node::ENode::Pattern { r#type, .. }) => {
                         let value = value_of_etype(r#type);
                         *r#type = make_etype(*new_choice, value);
+                        // Anchor heights follow declared types, so a type
+                        // change reshapes the node and its neighbours.
+                        state.resettle();
                         rebuild.0 = true;
                     }
                     _ => {}
@@ -2303,6 +2285,7 @@ fn handle_dropdown_option_click(
                     | Some(model::node::ENode::Pattern { r#type, .. }) => {
                         if let model::r#type::EType::Bool { value } = r#type {
                             *value = Some(if *v { "true" } else { "false" }.to_string());
+                            state.resettle();
                             rebuild.0 = true;
                         }
                     }
@@ -2360,6 +2343,9 @@ fn handle_value_enable_checkbox(
             Some(String::new())
         };
         *r#type = make_etype(type_choice_of(r#type), toggled);
+        // Pinning or unpinning a literal changes how the anchor renders and,
+        // through a BranchSource, what its branch declares.
+        state.resettle();
         rebuild.0 = true;
     }
 }
@@ -2403,6 +2389,9 @@ fn handle_node_editor_text_input(
                 let new_value = Some(input.value.clone());
                 if value_of_etype(r#type) != new_value {
                     *r#type = make_etype(choice, new_value);
+                    // A literal reaches the branch through its BranchSource,
+                    // so the shapes downstream have to be refreshed too.
+                    state.resettle();
                     rebuild.0 = true;
                 }
             }
@@ -3575,6 +3564,50 @@ pub struct WorldLabel {
 }
 
 /// Spawn a UI text label that tracks a world position.
+
+/// Spawn one type-marker stack: the coloured rect and its letter per leaf,
+/// plus the gizmo line and value label when the anchor carries a literal.
+///
+/// Shared by the per-anchor markers and the node-level ones a Pattern uses, so
+/// a Pattern's band is built exactly like an anchor's.
+fn spawn_type_markers(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    font: &Handle<Font>,
+    markers: Vec<render::RenderTypeMarker>,
+) {
+    for marker in markers {
+        let render::RenderTypeMarker {
+            rect,
+            label,
+            value_line,
+            value_label,
+        } = marker;
+        if let Some(rect) = rect {
+            commands.spawn((
+                Mesh3d(meshes.add(rect.mesh)),
+                MeshMaterial3d(materials.add(rect.material)),
+                rect.transform,
+                AstSceneEntity,
+            ));
+        }
+        if let Some(label) = label {
+            spawn_world_label(commands, font, label, AstSceneEntity);
+        }
+        if let Some(line) = value_line {
+            commands.spawn((
+                Mesh3d(meshes.add(line.mesh)),
+                MeshMaterial3d(materials.add(line.material)),
+                line.transform,
+                AstSceneEntity,
+            ));
+        }
+        if let Some(vlabel) = value_label {
+            spawn_world_label(commands, font, vlabel, AstSceneEntity);
+        }
+    }
+}
 fn spawn_world_label(
     commands: &mut Commands,
     font: &Handle<Font>,

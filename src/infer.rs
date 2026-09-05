@@ -420,6 +420,60 @@ pub fn node_output_type(
     anchor_type(ast, &output_anchor, function_declarations)
 }
 
+
+/// AST-level literal an anchor's type is pinned to, if any.
+///
+/// A BranchSource borrows its Pattern's whole declaration, literal included:
+/// inside the branch the matched value is known to be exactly that literal, so
+/// the source shows it rather than the bare type.
+///
+/// Lives here rather than on `LayoutAst` because resolving a BranchSource
+/// means reaching its Pattern, which sits in the *parent* scope — only the
+/// flattened AST has both.
+pub fn anchor_literal(
+    ast: &crate::model::ast::Ast,
+    anchor_id: &crate::model::anchor::Id,
+) -> Option<String> {
+    let node_id = ast.anchor_to_node.get(anchor_id)?;
+    match ast.nodes.get(node_id)? {
+        crate::model::node::ENode::ConstDecl {
+            r#type,
+            output_anchor,
+        }
+        | crate::model::node::ENode::VarDecl {
+            r#type,
+            output_anchor,
+            ..
+        } => (anchor_id == output_anchor)
+            .then(|| crate::layout::value_of_etype(r#type))
+            .flatten(),
+        crate::model::node::ENode::TypeCast {
+            r#type,
+            input_anchor,
+            output_anchor,
+        } => (anchor_id == input_anchor || anchor_id == output_anchor)
+            .then(|| crate::layout::value_of_etype(r#type))
+            .flatten(),
+        crate::model::node::ENode::BranchSource {
+            pattern,
+            output_anchor,
+        } => {
+            if anchor_id != output_anchor {
+                return None;
+            }
+            match ast.nodes.get(pattern)? {
+                crate::model::node::ENode::Pattern { r#type, .. } => {
+                    crate::layout::value_of_etype(r#type)
+                }
+                _ => None,
+            }
+        }
+        // FunctionCall anchors bind to declaration types, which carry no
+        // AST-level literal; Match, Pattern, Sink and Program carry no
+        // anchored type at all.
+        _ => None,
+    }
+}
 /// Structural type equality, ignoring any carried value literal. Two `SumType`s
 /// match when their leaves match pairwise in order.
 pub fn types_match(a: &EType, b: &EType) -> bool {

@@ -122,15 +122,16 @@ pub struct RenderBand {
 }
 
 pub struct RenderNode {
-    /// `None` for nodes whose body is a band rather than a solid mesh; the
-    /// node entity is still spawned so picking and selection keep working.
+    /// `None` for nodes drawn purely as bands or markers; the node entity is
+    /// still spawned so picking and selection keep working.
     pub node: Option<RenderObject>,
     pub anchors: std::collections::HashMap<crate::model::anchor::Id, RenderAnchor>,
+    /// Type markers belonging to the node itself rather than to an anchor. A
+    /// Pattern uses this: it declares the type its arm matches and is drawn as
+    /// that type's band, but owns no anchor to hang it on.
+    pub markers: Vec<RenderTypeMarker>,
     pub bands: Vec<RenderBand>,
     pub labels: Vec<RenderLabel>,
-    /// Extra decorative meshes with no associated anchor (e.g. the grey
-    /// sink-tip hull of a Match). Spawned alongside `node` by the renderer.
-    pub decorations: Vec<RenderObject>,
 }
 
 pub struct RenderAnchor {
@@ -144,11 +145,13 @@ pub struct RenderAnchor {
 }
 
 pub struct RenderTypeMarker {
-    pub rect: RenderObject,
-    pub label: RenderLabel,
-    /// Present iff this leaf's anchor carries an AST-level literal. Rendered
-    /// as a thin coloured segment along Z in the far 2/3 of the original
-    /// rect footprint, at the rect's Y-middle.
+    /// The type band and its letter. Absent when the leaf carries a literal:
+    /// the value line then replaces the band entirely, matching how a
+    /// value-carrying edge drops its band for a hairline.
+    pub rect: Option<RenderObject>,
+    pub label: Option<RenderLabel>,
+    /// Present iff this leaf's anchor carries an AST-level literal. A thin
+    /// coloured segment spanning the anchor's full depth, at its Y-middle.
     pub value_line: Option<RenderObject>,
     /// Present alongside `value_line`. Text is the literal itself, projected
     /// into screen space past the line's tip.
@@ -169,14 +172,18 @@ const TYPE_MARKER_ALPHA: f32 = 0.6;
 /// slim in X and Z, so a sum type reads as an unbroken band while the graph
 /// keeps its airy look.
 pub const TYPE_MARKER_Y_STEP: f32 = CELL;
-const TYPE_MARKER_HALF_DEPTH: f32 = CELL / 12.0;
-/// Full Z-depth of an anchor cuboid.
+const TYPE_MARKER_HALF_DEPTH: f32 = CELL / 4.0;
+/// Full Z-depth of an anchor cuboid: half its cell.
+///
+/// An anchor occupies the half of its cell that faces the node body, so it
+/// visibly hangs off the thing it belongs to instead of floating mid-cell. In
+/// cell-local terms an input takes `0.5..1` and an output `0..0.5`; since
+/// layout +Z is world −Z, that is the −Z half for inputs and the +Z half for
+/// outputs. Both meet the cell centre, which is where their edges attach.
 const ANCHOR_DEPTH: f32 = 2.0 * TYPE_MARKER_HALF_DEPTH;
 /// X-width of an anchor cuboid. Shared with the slab nodes so anchor and node
 /// line up exactly in X.
 pub const ANCHOR_X: f32 = CELL * 0.075;
-/// Margin between a Match envelope and the slim Patterns it encloses.
-pub const ENVELOPE_MARGIN: f32 = CELL / 60.0;
 /// Y-thickness of the gizmo line drawn in the far 2/3 of a value-carrying
 /// type marker.
 const VALUE_LINE_THICKNESS: f32 = CELL * 0.02;
@@ -261,19 +268,23 @@ pub fn source_body_curve(cell_center: Vec3) -> crate::edge::EdgeCurve {
         p3: back,
     }
 }
+
 /// Build the stack of translucent type rectangles at an anchor.
 ///
 /// `anchor_world_pos` is the world centre of the anchor's **first row** cell.
 /// Each further leaf sits one cell further along +Y in layout space (see
 /// `leaf_row_offset`), so the stack grows downward from the anchor's address
-/// rather than being centred on it. `is_input` decides which way the rect
-/// extends in Z from the cell centre.
+/// rather than being centred on it.
+///
+/// In Z each rect fills the half of its cell facing the node body — the far
+/// half for an input, the near half for an output — so the stack hangs off the
+/// node rather than floating mid-cell. `is_input` picks the side.
 ///
 /// `ast_value` is the AST-level literal on the anchor's type, if any. When
-/// present, every rendered leaf collapses its rect to the third nearest the
-/// anchor and grows a horizontal gizmo line + value label in the far 2/3.
-/// In practice value-carrying nodes have a single leaf, so this only fires
-/// on one marker per anchor.
+/// present the band is dropped entirely and the leaf is drawn as a single
+/// thin line plus the literal — a value is shown as the value, not as its
+/// type. In practice value-carrying nodes have a single leaf, so this only
+/// fires on one marker per anchor.
 fn build_type_markers(
     t: &crate::infer::EType,
     ast_value: Option<&str>,
@@ -284,17 +295,13 @@ fn build_type_markers(
     if leaves.is_empty() {
         return vec![];
     }
-    // Sign: +1 for inputs (stack extends +Z from the anchor), -1 for outputs.
-    let sign = if is_input { 1.0 } else { -1.0 };
-    let full_depth = 2.0 * TYPE_MARKER_HALF_DEPTH;
-    let stub_depth = full_depth / 3.0;
-    let line_depth = full_depth - stub_depth;
-    // Rect (full-value case) is centred at ±HALF_DEPTH from the anchor;
-    // the stub rect is centred at ±stub_depth/2 so its near face still
-    // touches the anchor at anchor.z.
+    // Direction the anchor body extends from the cell centre: toward the node,
+    // i.e. −Z for an input (cell-local 0.5..1) and +Z for an output (0..0.5).
+    let sign = if is_input { -1.0 } else { 1.0 };
+    let full_depth = ANCHOR_DEPTH;
+    // The cell centre is the anchor's outward face — the point its edge meets —
+    // so every span is measured from there into the anchor's own half.
     let full_rect_z_center = anchor_world_pos.z + sign * TYPE_MARKER_HALF_DEPTH;
-    let stub_rect_z_center = anchor_world_pos.z + sign * (stub_depth * 0.5);
-    let line_z_center = anchor_world_pos.z + sign * (stub_depth + line_depth * 0.5);
     let line_tip_z = anchor_world_pos.z + sign * full_depth;
 
     leaves
@@ -304,38 +311,23 @@ fn build_type_markers(
             let y_center = anchor_world_pos.y + leaf_row_offset(k);
             let color = type_marker_color(&leaf);
             let letter = type_marker_letter(&leaf).to_string();
+            let center = Vec3::new(anchor_world_pos.x, y_center, full_rect_z_center);
 
             if let Some(value) = ast_value {
-                let stub_center = Vec3::new(anchor_world_pos.x, y_center, stub_rect_z_center);
-                let line_center = Vec3::new(anchor_world_pos.x, y_center, line_z_center);
+                // A leaf pinned to a literal is drawn as that literal and
+                // nothing else: one thin line across the anchor's full depth,
+                // its colour carrying the type. No band, no type letter — the
+                // same choice the edge shader makes for value-carrying edges.
                 let label_world = Vec3::new(
                     anchor_world_pos.x,
                     y_center,
                     line_tip_z + sign * VALUE_LABEL_Z_PADDING,
                 );
                 RenderTypeMarker {
-                    rect: RenderObject {
-                        mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, stub_depth)
-                            .mesh()
-                            .build(),
-                        material: StandardMaterial {
-                            base_color: color,
-                            alpha_mode: AlphaMode::Blend,
-                            cull_mode: None,
-                            unlit: true,
-                            ..default()
-                        },
-                        transform: Transform::from_translation(stub_center),
-                    },
-                    label: RenderLabel {
-                        text: letter,
-                        color: Color::WHITE,
-                        font_size: 14.0,
-                        world_pos: stub_center,
-                        offset: Vec2::ZERO,
-                    },
+                    rect: None,
+                    label: None,
                     value_line: Some(RenderObject {
-                        mesh: Cuboid::new(0.0, VALUE_LINE_THICKNESS, line_depth)
+                        mesh: Cuboid::new(0.0, VALUE_LINE_THICKNESS, full_depth)
                             .mesh()
                             .build(),
                         material: StandardMaterial {
@@ -345,7 +337,7 @@ fn build_type_markers(
                             unlit: true,
                             ..default()
                         },
-                        transform: Transform::from_translation(line_center),
+                        transform: Transform::from_translation(center),
                     }),
                     value_label: Some(RenderLabel {
                         text: value.to_string(),
@@ -356,9 +348,8 @@ fn build_type_markers(
                     }),
                 }
             } else {
-                let center = Vec3::new(anchor_world_pos.x, y_center, full_rect_z_center);
                 RenderTypeMarker {
-                    rect: RenderObject {
+                    rect: Some(RenderObject {
                         mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, full_depth)
                             .mesh()
                             .build(),
@@ -370,14 +361,14 @@ fn build_type_markers(
                             ..default()
                         },
                         transform: Transform::from_translation(center),
-                    },
-                    label: RenderLabel {
+                    }),
+                    label: Some(RenderLabel {
                         text: letter,
                         color: Color::WHITE,
                         font_size: 14.0,
                         world_pos: center,
                         offset: Vec2::ZERO,
-                    },
+                    }),
                     value_line: None,
                     value_label: None,
                 }
@@ -393,30 +384,30 @@ fn build_type_markers(
 fn typed_anchor(
     t: &crate::infer::EType,
     ast_value: Option<&str>,
-    anchor_world_pos: Vec3,
+    cell_center: Vec3,
     is_input: bool,
-    pick_center: Vec3,
 ) -> RenderAnchor {
-    let type_markers = build_type_markers(t, ast_value, anchor_world_pos, is_input);
-    if type_markers.is_empty() {
-        RenderAnchor {
-            pick_center,
-            type_markers,
-            plain_body: Some(plain_anchor_body(pick_center)),
-        }
-    } else {
-        RenderAnchor {
-            pick_center,
-            type_markers,
-            plain_body: None,
-        }
+    let type_markers = build_type_markers(t, ast_value, cell_center, is_input);
+    RenderAnchor {
+        // The cell centre is the anchor's outward face, so edges meet it there
+        // no matter how many rows the anchor spans.
+        pick_center: cell_center,
+        plain_body: type_markers
+            .is_empty()
+            .then(|| plain_anchor_body(cell_center, is_input)),
+        type_markers,
     }
 }
 
-/// A neutral grey anchor cuboid centred at `center`. Used for anchors that
-/// carry no type markers (unconstrained inputs, pending outputs) so they stay
-/// visible and pickable once the spheres are gone.
-fn plain_anchor_body(center: Vec3) -> RenderObject {
+/// A neutral grey anchor cuboid for anchors that carry no type markers
+/// (unconstrained inputs, pending outputs), so they stay visible and pickable.
+/// `cell_center` is the anchor cell's centre; the cuboid fills that cell's
+/// body-facing half, like a type marker would.
+fn plain_anchor_body(cell_center: Vec3, is_input: bool) -> RenderObject {
+    // Same half of the cell a type marker would occupy, so a typeless anchor
+    // hangs off its node exactly like a typed one.
+    let sign = if is_input { -1.0 } else { 1.0 };
+    let center = cell_center + Vec3::new(0.0, 0.0, sign * ANCHOR_DEPTH * 0.5);
     RenderObject {
         mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, ANCHOR_DEPTH)
             .mesh()
@@ -463,7 +454,6 @@ pub fn layoutnode_to_rendernode(
     let cell = |x: i32, y: i32, z: i32| {
         cell_center_world(layout_node.pos + extra_offset + Vec3::new(x as f32, y as f32, z as f32))
     };
-    let node_pos_tf = Transform::from_translation(node_pos);
     let node = ast.nodes.get(&layout_node.node_id).unwrap();
     match node {
         // Source nodes (a declared constant, a named variable): body band at
@@ -509,6 +499,7 @@ pub fn layoutnode_to_rendernode(
                         plain_body: None,
                     },
                 )]),
+                markers: vec![],
                 bands,
                 labels: match node {
                     crate::model::node::ENode::VarDecl { .. } => vec![RenderLabel {
@@ -520,7 +511,6 @@ pub fn layoutnode_to_rendernode(
                     }],
                     _ => vec![],
                 },
-                decorations: vec![],
             }
         }
         // Input anchor at `0|0`, body (the target type) at `0|1`, output at
@@ -563,11 +553,11 @@ pub fn layoutnode_to_rendernode(
                         match input_eval_type {
                             // A typecast constrains nothing, so its input shows
                             // whatever arrives — and a neutral body when idle.
-                            Some(t) => typed_anchor(&t, None, input_world, true, input_world),
+                            Some(t) => typed_anchor(&t, None, input_world, true),
                             None => RenderAnchor {
                                 pick_center: input_world,
                                 type_markers: vec![],
-                                plain_body: Some(plain_anchor_body(input_world)),
+                                plain_body: Some(plain_anchor_body(input_world, true)),
                             },
                         },
                     ),
@@ -578,13 +568,12 @@ pub fn layoutnode_to_rendernode(
                             elim_value.as_deref(),
                             output_world,
                             false,
-                            output_world,
                         ),
                     ),
                 ]),
+                markers: vec![],
                 bands: vec![],
                 labels: vec![],
-                decorations: vec![],
             }
         }
         // Input anchors along `i|0`, body spanning the full width at `z=1..2`,
@@ -673,20 +662,15 @@ pub fn layoutnode_to_rendernode(
                             .unwrap_or(crate::infer::EType::None);
                         (
                             anchor_id.clone(),
-                            typed_anchor(&input_type, None, input_world, true, input_world),
+                            typed_anchor(&input_type, None, input_world, true),
                         )
                     })
                     .chain([(
                         output_anchor.clone(),
-                        typed_anchor(
-                            &function_declaration.output_type,
-                            None,
-                            output_world,
-                            false,
-                            output_world,
-                        ),
+                        typed_anchor(&function_declaration.output_type, None, output_world, false),
                     )])
                     .collect(),
+                markers: vec![],
                 bands: vec![],
                 labels: std::iter::once(RenderLabel {
                     text: label_for_node(node, function_declarations),
@@ -714,7 +698,6 @@ pub fn layoutnode_to_rendernode(
                         }),
                 )
                 .collect(),
-                decorations: vec![],
             }
         }
         // Nothing but an input anchor, sitting alone on the scope's last Z row.
@@ -739,63 +722,60 @@ pub fn layoutnode_to_rendernode(
                 anchors: std::collections::HashMap::from([(
                     input_anchor.clone(),
                     match incoming {
-                        Some(t) => typed_anchor(&t, None, input_world, true, input_world),
+                        Some(t) => typed_anchor(&t, None, input_world, true),
                         None => RenderAnchor {
                             pick_center: input_world,
                             type_markers: vec![],
-                            plain_body: Some(plain_anchor_body(input_world)),
+                            plain_body: Some(plain_anchor_body(input_world, true)),
                         },
                     },
                 )]),
+                markers: vec![],
                 bands: vec![],
                 labels: vec![],
-                decorations: vec![],
             }
         }
-        // A Pattern declares the arm's type and fixes its branch's row, but
-        // owns no anchor — the branch draws its value from its own
-        // BranchSource, one cell behind in the branch volume.
-        crate::model::node::ENode::Pattern { .. } => RenderNode {
-            node: Some(RenderObject {
-                mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, ANCHOR_X)
-                    .mesh()
-                    .build(),
-                material: StandardMaterial {
-                    base_color: Color::srgb(0.9, 0.0, 0.0),
-                    emissive: emissive_color(Color::srgb(0.9, 0.0, 0.0)),
-                    metallic: 0.3,
-                    perceptual_roughness: 0.6,
-                    ..default()
-                },
-                transform: node_pos_tf,
-            }),
+        // A Pattern declares the type its arm matches and fixes its branch's
+        // row, but owns no anchor — the branch draws its value from its own
+        // BranchSource, one cell behind in the branch volume. It is drawn as
+        // that type's band, like an input anchor: the value it accepts is what
+        // the band names.
+        crate::model::node::ENode::Pattern { r#type, .. } => RenderNode {
+            node: None,
             anchors: std::collections::HashMap::new(),
+            markers: build_type_markers(
+                &crate::infer::ast_type_to_eval_type(r#type),
+                crate::layout::value_of_etype(r#type).as_deref(),
+                node_pos,
+                true,
+            ),
             bands: vec![],
-            labels: vec![RenderLabel {
-                text: label_for_node(node, function_declarations),
-                color: Color::WHITE,
-                font_size: 18.0,
-                world_pos: node_pos,
-                offset: Vec2::ZERO,
-            }],
-            decorations: vec![],
+            labels: vec![],
         },
         // Mirror of the Sink: a single output anchor at the branch origin. Its
         // type is the owning Pattern's, resolved through `infer::anchor_type`.
         crate::model::node::ENode::BranchSource { output_anchor, .. } => {
             let output_world = cell(0, 0, 0);
+            // Both type and literal come from the owning Pattern, so the
+            // source shows exactly what its arm matched.
             let output_eval_type =
                 crate::infer::anchor_type(flat_ast, output_anchor, function_declarations)
                     .unwrap_or(crate::infer::EType::Pending);
+            let output_value = crate::infer::anchor_literal(flat_ast, output_anchor);
             RenderNode {
                 node: None,
                 anchors: std::collections::HashMap::from([(
                     output_anchor.clone(),
-                    typed_anchor(&output_eval_type, None, output_world, false, output_world),
+                    typed_anchor(
+                        &output_eval_type,
+                        output_value.as_deref(),
+                        output_world,
+                        false,
+                    ),
                 )]),
+                markers: vec![],
                 bands: vec![],
                 labels: vec![],
-                decorations: vec![],
             }
         }
         crate::model::node::ENode::Match {
@@ -803,120 +783,43 @@ pub fn layoutnode_to_rendernode(
             input_anchor,
             output_anchor,
         } => {
-            // The Match's LayoutNode sits at the lowest Pattern's grid pos
-            // (see LayoutAst::recompute_match_pos). Find the highest sibling
-            // to size the envelope.
-            let max_y_grid = patterns
-                .iter()
-                .filter_map(|pid| layout_ast.layout_nodes.get(pid).map(|ln| ln.pos.y))
-                .fold(layout_node.pos.y, f32::max);
-            let y_diff_grid = max_y_grid - layout_node.pos.y;
-            // LAYOUT_SCALE.y is negative (layout +Y renders downward), so the
-            // signed span is used for the centre but its magnitude for the size.
-            let y_diff_world = y_diff_grid * LAYOUT_SCALE.y;
-            // Pad by a full anchor-rect height so the top/bottom patterns (now
-            // TYPE_MARKER_Y_STEP tall) stay enclosed by the envelope.
-            let height = y_diff_world.abs() + TYPE_MARKER_Y_STEP;
-            let center_local = Vec3::new(0.0, y_diff_world / 2.0, 0.0);
-            // Envelope hugs the slim patterns with a margin per side.
-            let envelope_xz = ANCHOR_X + 2.0 * ENVELOPE_MARGIN;
+            // The Match draws no body of its own: each Pattern is its own type
+            // band, and the branches speak for themselves. All it contributes
+            // are its two anchors.
+            //
             // Input anchor owns the Match's own cell at local 0|0.
             let input_world = cell(0, 0, 0);
             let incoming =
                 crate::infer::incoming_anchor_type(flat_ast, input_anchor, function_declarations);
-            let mut anchors = std::collections::HashMap::from([(
-                input_anchor.clone(),
-                match incoming {
-                    Some(t) => typed_anchor(&t, None, input_world, true, input_world),
-                    None => RenderAnchor {
-                        pick_center: input_world,
-                        type_markers: vec![],
-                        plain_body: Some(plain_anchor_body(input_world)),
-                    },
-                },
-            )]);
-            let mut decorations = Vec::new();
-
-            // Grey sink-tip hull: the mirror of the red pattern envelope, drawn
-            // along the −Z tips of every sibling Pattern's Sink. Each
-            // Pattern's sink lives in its sub-layout; `harmonize_match_sinks`
-            // aligns all sibling sinks to a common (x, z), so the tips form a
-            // vertical Y column. Tip world = cell_center_world(sink_local +
-            // pattern_grid + extra_offset) + (0, 0, −SINK_TIP_DEPTH). Pattern
-            // sub-content always renders at sink_scale 1/3 (see walk_all_into),
-            // so the pyramid depth is CELL·3 · 1/3 = one cell.
-            const SINK_TIP_DEPTH: f32 = CELL;
-            let mut tip_x = node_pos.x;
-            let mut tip_z = node_pos.z;
-            let mut min_tip_y = f32::MAX;
-            let mut max_tip_y = f32::MIN;
-            for pid in patterns {
-                let Some(pattern_ln) = layout_ast.layout_nodes.get(pid) else {
-                    continue;
-                };
-                let Some(sub) = layout_ast.sub_layouts.get(pid) else {
-                    continue;
-                };
-                let Some(sink_id) = sub.sink_id() else {
-                    continue;
-                };
-                let Some(sink_ln) = sub.layout_nodes.get(&sink_id) else {
-                    continue;
-                };
-                let tip = cell_center_world(sink_ln.pos + pattern_ln.pos + extra_offset)
-                    + Vec3::new(0.0, 0.0, -SINK_TIP_DEPTH);
-                tip_x = tip.x;
-                tip_z = tip.z;
-                min_tip_y = min_tip_y.min(tip.y);
-                max_tip_y = max_tip_y.max(tip.y);
-            }
-
-            if min_tip_y <= max_tip_y {
-                let hull_height = (max_tip_y - min_tip_y) + TYPE_MARKER_Y_STEP;
-                let hull_center = Vec3::new(tip_x, (min_tip_y + max_tip_y) * 0.5, tip_z);
-                decorations.push(RenderObject {
-                    mesh: Cuboid::new(envelope_xz, hull_height, envelope_xz)
-                        .mesh()
-                        .build(),
-                    material: StandardMaterial {
-                        base_color: Color::srgba(0.5, 0.5, 0.5, 0.35),
-                        alpha_mode: AlphaMode::Blend,
-                        cull_mode: None,
-                        ..default()
-                    },
-                    transform: Transform::from_translation(hull_center),
-                });
-                // Output port mirrors the input port: flush against the hull's
-                // −Z back face, at the base (lowest) Pattern's Y (node_pos.y).
-                // The output owns its own cell directly behind the deepest
-                // branch; `match_output_z` decides which one.
-                let out_world = cell(0, 0, layout_ast.match_output_z(patterns));
-                // Union of the branch types, or `Pending` while the inferer
-                // cannot decide it yet.
-                let output_eval_type =
-                    crate::infer::anchor_type(flat_ast, output_anchor, function_declarations)
-                        .unwrap_or(crate::infer::EType::Pending);
-                anchors.insert(
-                    output_anchor.clone(),
-                    typed_anchor(&output_eval_type, None, out_world, false, out_world),
-                );
-            }
-
+            // The output owns its own cell directly behind the deepest branch;
+            // `match_output_z` decides which one. Its type is the union of the
+            // branch types, or `Pending` while the inferer cannot decide it.
+            let out_world = cell(0, 0, layout_ast.match_output_z(patterns));
+            let output_eval_type =
+                crate::infer::anchor_type(flat_ast, output_anchor, function_declarations)
+                    .unwrap_or(crate::infer::EType::Pending);
             RenderNode {
-                node: Some(RenderObject {
-                    mesh: Cuboid::new(envelope_xz, height, envelope_xz).mesh().build(),
-                    material: StandardMaterial {
-                        base_color: Color::srgba(0.9, 0.0, 0.0, 0.35),
-                        alpha_mode: AlphaMode::Blend,
-                        cull_mode: None,
-                        ..default()
-                    },
-                    transform: node_pos_tf * Transform::from_translation(center_local),
-                }),
-                anchors,
+                node: None,
+                anchors: std::collections::HashMap::from([
+                    (
+                        input_anchor.clone(),
+                        match incoming {
+                            Some(t) => typed_anchor(&t, None, input_world, true),
+                            None => RenderAnchor {
+                                pick_center: input_world,
+                                type_markers: vec![],
+                                plain_body: Some(plain_anchor_body(input_world, true)),
+                            },
+                        },
+                    ),
+                    (
+                        output_anchor.clone(),
+                        typed_anchor(&output_eval_type, None, out_world, false),
+                    ),
+                ]),
+                markers: vec![],
                 bands: vec![],
                 labels: vec![],
-                decorations,
             }
         }
         crate::model::node::ENode::Program { .. } => {

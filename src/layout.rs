@@ -91,6 +91,10 @@ impl LayoutNode {
     }
 }
 
+/// Match-local Z of the Pattern row. The Match's own input anchor owns local
+/// Z=0, so the arms start one cell behind it and their branch volumes one
+/// further still (see `LayoutAst::sub_layout_origin`).
+pub const PATTERN_LOCAL_Z: f32 = 1.0;
 /// Cells an anchor claims: `infer::anchor_rows` of them, growing along +Y from
 /// row 0, all in column `x` at depth `z`.
 fn anchor_cells(
@@ -629,20 +633,24 @@ impl LayoutAst {
         NodeShape::new(cells)
     }
 
-    /// Match-local Z of the output anchor: directly behind the deepest branch.
+    /// Match-local Z of the output anchor, one empty cell behind the deepest
+    /// branch.
     ///
     /// Patterns sit at match-local Z=1 and their branch volumes start at Z=2,
-    /// so a branch reaching branch-local Z=d ends at match-local `2 + d`.
+    /// so a branch reaching branch-local Z=d ends at match-local `2 + d` — its
+    /// Sink. The gap keeps that Sink and the Match's own output from butting
+    /// up against each other.
     pub fn match_output_z(&self, patterns: &[crate::model::node::Id]) -> i32 {
-        let deepest = patterns
+        let deepest_sink = patterns
             .iter()
             .filter_map(|pid| self.sub_layouts.get(pid))
             .filter_map(|sub| sub.inner_footprint())
             .map(|b| b.max.z)
             .max()
             .unwrap_or(0);
-        2 + deepest + 1
+        2 + deepest_sink + 2
     }
+
     /// Union of all visible grid cells in this LayoutAst's local coords.
     /// Match nodes contribute their `match_footprint` (recursive over
     /// nested sub-ASTs); every other node contributes its rounded cell.
@@ -1469,7 +1477,9 @@ impl LayoutAst {
                 .chain([(pattern_node_id.clone(), pattern_sub_layout)])
                 .collect(),
         }
-        ._plus_layout_node(&pattern_node_id, pos)
+        // The Match keeps `pos` for its input anchor; the Pattern sits one cell
+        // behind it, and its branch one further (`sub_layout_origin`).
+        ._plus_layout_node(&pattern_node_id, pos + Vec3::new(0.0, 0.0, PATTERN_LOCAL_Z))
         ._plus_layout_node(&match_node_id, pos);
         (layout, node_id_domain, anchor_id_domain)
     }
@@ -1654,9 +1664,11 @@ impl LayoutAst {
         (layout, node_id_domain, anchor_id_domain)
     }
 
-    /// Refresh a Match's synthetic LayoutNode to sit at the lowest sibling
-    /// Pattern's grid position (needed after any add/remove/shift of Patterns
-    /// so the render pass finds the container at the correct origin).
+    /// Refresh a Match's synthetic LayoutNode: same X and lowest sibling Y as
+    /// its Patterns, but one cell *before* them in Z, because the Match's own
+    /// input anchor owns that cell (`PATTERN_LOCAL_Z`). Needed after any
+    /// add/remove/shift of Patterns so the render pass finds the container at
+    /// the correct origin.
     pub fn recompute_match_pos(&self, match_id: &crate::model::node::Id) -> Self {
         let pattern_ids: Vec<crate::model::node::Id> = match self.ast.nodes.get(match_id) {
             Some(crate::model::node::ENode::Match { patterns, .. }) => patterns.clone(),
@@ -1672,13 +1684,14 @@ impl LayoutAst {
             .iter()
             .filter_map(|pid| self.layout_nodes.get(pid).map(|ln| ln.pos))
             .min_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
-        let Some(new_pos) = lowest_pos else {
+        let Some(lowest_pos) = lowest_pos else {
             return Self {
                 ast: self.ast.clone(),
                 layout_nodes: self.layout_nodes.clone(),
                 sub_layouts: self.sub_layouts.clone(),
             };
         };
+        let new_pos = lowest_pos - Vec3::new(0.0, 0.0, PATTERN_LOCAL_Z);
         Self {
             ast: self.ast.clone(),
             layout_nodes: self
@@ -1968,22 +1981,6 @@ impl LayoutAst {
         None
     }
 
-    /// AST-level literal string attached to this anchor's type, if any.
-    /// Walks sub-layouts. Returns `None` when the anchor's node kind doesn't
-    /// carry an `model::r#type::EType` field, or the field's value is `None`.
-    pub fn anchor_ast_value(&self, anchor_id: &crate::model::anchor::Id) -> Option<String> {
-        if let Some(node_id) = self.ast.anchor_to_node.get(anchor_id) {
-            let node = self.ast.nodes.get(node_id)?;
-            return anchor_ast_value_from_node(node, anchor_id);
-        }
-        for sub in self.sub_layouts.values() {
-            if let Some(v) = sub.anchor_ast_value(anchor_id) {
-                return Some(v);
-            }
-        }
-        None
-    }
-
     /// Owner path from this LayoutAst down to the LayoutAst whose
     /// `layout_nodes` contains `target`. `Some(vec![])` = target lives in
     /// `self`; `Some(vec![a, b])` = target lives in `self.sub_layouts[a]
@@ -2117,49 +2114,6 @@ pub fn value_of_etype(t: &crate::model::r#type::EType) -> Option<String> {
         | crate::model::r#type::EType::Int { value }
         | crate::model::r#type::EType::String { value }
         | crate::model::r#type::EType::Char { value } => value.clone(),
-        _ => None,
-    }
-}
-
-/// Return the AST-level literal attached to `anchor_id`'s type, if any.
-///
-/// Only anchors on nodes whose type is a first-class `model::r#type::EType` field
-/// (ConstDecl, VarDecl, TypeCast) can carry a literal. FunctionCall
-/// inputs/outputs bind to `eval::EType` on the declaration, and a BranchSource
-/// borrows its Pattern's type — neither has an AST-level literal of its own,
-/// so both are treated as `None`. Match / Pattern / Sink / Program don't carry
-/// anchored types at all.
-pub fn anchor_ast_value_from_node(
-    node: &crate::model::node::ENode,
-    anchor_id: &crate::model::anchor::Id,
-) -> Option<String> {
-    match node {
-        crate::model::node::ENode::ConstDecl {
-            r#type,
-            output_anchor,
-        }
-        | crate::model::node::ENode::VarDecl {
-            r#type,
-            output_anchor,
-            ..
-        } => {
-            if anchor_id == output_anchor {
-                value_of_etype(r#type)
-            } else {
-                None
-            }
-        }
-        crate::model::node::ENode::TypeCast {
-            r#type,
-            input_anchor,
-            output_anchor,
-        } => {
-            if anchor_id == input_anchor || anchor_id == output_anchor {
-                value_of_etype(r#type)
-            } else {
-                None
-            }
-        }
         _ => None,
     }
 }
