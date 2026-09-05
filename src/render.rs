@@ -427,9 +427,7 @@ fn plain_anchor_body(cell_center: Vec3, is_input: bool) -> RenderObject {
 ///
 /// `extra_offset` (grid units) is added to `layout_node.pos` before the
 /// grid→world conversion; used for pattern sub-AST nodes whose positions are
-/// relative to the containing pattern. `sink_scale` shrinks a Sink's mesh
-/// (anchor sphere and its transform stay unchanged so it remains clickable);
-/// non-Sink node kinds ignore it.
+/// relative to the containing pattern.
 ///
 /// `flat_ast` is the program's flattened AST. Type inference needs it because
 /// every edge — including those inside Pattern branches — lives in the
@@ -444,7 +442,6 @@ pub fn layoutnode_to_rendernode(
         crate::model::function_declaration::FunctionDeclaration,
     >,
     extra_offset: Vec3,
-    sink_scale: f32,
 ) -> RenderNode {
     let ast = &layout_ast.ast;
     let node_pos = cell_center_world(layout_node.pos + extra_offset);
@@ -701,24 +698,14 @@ pub fn layoutnode_to_rendernode(
             }
         }
         // Nothing but an input anchor, sitting alone on the scope's last Z row.
+        // It constrains nothing, so it renders exactly like a Match or
+        // TypeCast input: whatever type arrives, a neutral body when idle.
         crate::model::node::ENode::Sink { input_anchor } => {
             let input_world = cell(0, 0, 0);
             let incoming =
                 crate::infer::incoming_anchor_type(flat_ast, input_anchor, function_declarations);
             RenderNode {
-                node: Some(RenderObject {
-                    mesh: crate::mesh::square_pyramid_z_mesh(
-                        CELL * 2.0 * sink_scale,
-                        CELL * 3.0 * sink_scale,
-                    ),
-                    material: StandardMaterial {
-                        base_color: Color::srgba(0.5, 0.5, 0.5, 0.5),
-                        alpha_mode: AlphaMode::Blend,
-                        cull_mode: None,
-                        ..default()
-                    },
-                    transform: Transform::from_translation(input_world),
-                }),
+                node: None,
                 anchors: std::collections::HashMap::from([(
                     input_anchor.clone(),
                     match incoming {

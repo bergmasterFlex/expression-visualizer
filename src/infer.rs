@@ -420,7 +420,6 @@ pub fn node_output_type(
     anchor_type(ast, &output_anchor, function_declarations)
 }
 
-
 /// AST-level literal an anchor's type is pinned to, if any.
 ///
 /// A BranchSource borrows its Pattern's whole declaration, literal included:

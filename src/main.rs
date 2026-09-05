@@ -741,7 +741,6 @@ fn spawn_ast_nodes(
             &flat_ast,
             &state.function_declarations,
             walked.extra_offset,
-            walked.sink_scale,
         );
         // A node whose body is a band has no mesh of its own; the entity is
         // still spawned so picking and selection keep working.

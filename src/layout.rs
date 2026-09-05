@@ -124,14 +124,13 @@ pub struct LayoutAnchor {
 }
 
 /// A single entry produced by `LayoutAst::walk_all`. Groups a LayoutNode with
-/// enough context (its owning LayoutAst for anchor lookups, the accumulated
-/// grid-space offset, and a sink-scale hint) so the render layer can place
-/// pattern sub-AST nodes correctly without re-doing the traversal.
+/// enough context (its owning LayoutAst for anchor lookups and the accumulated
+/// grid-space offset) so the render layer can place pattern sub-AST nodes
+/// correctly without re-doing the traversal.
 pub struct WalkedNode<'a> {
     pub layout_ast: &'a LayoutAst,
     pub layout_node: &'a LayoutNode,
     pub extra_offset: Vec3,
-    pub sink_scale: f32,
 }
 
 /// One entry per LayoutAst reached from a root. Used by the per-AST grid
@@ -1815,39 +1814,29 @@ impl LayoutAst {
 
     /// Recursively walk every node in this LayoutAst and its `sub_layouts`.
     /// Each entry carries the containing LayoutAst (for anchor lookups), the
-    /// LayoutNode, the accumulated grid-space offset from the outer root, and
-    /// a sink-scale hint (1.0 outside patterns, 1/3 inside).
+    /// LayoutNode, and the accumulated grid-space offset from the outer root.
     ///
     /// Descent into a sub-layout uses the owner node's grid position as the
     /// additional offset. The outer root's `layout_nodes` is expected to be
     /// empty (Program has no LayoutNode) so `sub_layouts[program_id]` is
-    /// entered with offset (0,0,0) and scale 1.
+    /// entered with offset (0,0,0).
     pub fn walk_all(&self) -> Vec<WalkedNode> {
         let mut out = Vec::new();
-        self.walk_all_into(Vec3::ZERO, 1.0, &mut out);
+        self.walk_all_into(Vec3::ZERO, &mut out);
         out
     }
 
-    fn walk_all_into<'a>(&'a self, offset: Vec3, sink_scale: f32, out: &mut Vec<WalkedNode<'a>>) {
+    fn walk_all_into<'a>(&'a self, offset: Vec3, out: &mut Vec<WalkedNode<'a>>) {
         for layout_node in self.layout_nodes.values() {
             out.push(WalkedNode {
                 layout_ast: self,
                 layout_node,
                 extra_offset: offset,
-                sink_scale,
             });
         }
         for (owner_id, sub_layout) in &self.sub_layouts {
             let sub_offset = offset + self.sub_layout_origin(owner_id);
-            let sub_scale = if matches!(
-                self.ast.nodes.get(owner_id),
-                Some(crate::model::node::ENode::Pattern { .. })
-            ) {
-                1.0 / 3.0
-            } else {
-                sink_scale
-            };
-            sub_layout.walk_all_into(sub_offset, sub_scale, out);
+            sub_layout.walk_all_into(sub_offset, out);
         }
     }
 
