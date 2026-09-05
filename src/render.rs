@@ -251,9 +251,36 @@ fn anchor_pick_center(face: Vec3, is_input: bool) -> Vec3 {
     face + Vec3::new(0.0, 0.0, sign * ANCHOR_DEPTH * 0.5)
 }
 
+/// Anchor rendered from an inferred type: a type-marker stack when the type
+/// has renderable leaves, otherwise the neutral grey body. `Pending` has no
+/// leaves, so an output whose type the inferer cannot decide yet reads exactly
+/// like the typeless (unconstrained) inputs.
+fn typed_anchor(
+    t: &crate::infer::EType,
+    ast_value: Option<&str>,
+    anchor_world_pos: Vec3,
+    is_input: bool,
+    pick_center: Vec3,
+) -> RenderAnchor {
+    let type_markers = build_type_markers(t, ast_value, anchor_world_pos, is_input);
+    if type_markers.is_empty() {
+        RenderAnchor {
+            pick_center,
+            type_markers,
+            plain_body: Some(plain_anchor_body(pick_center)),
+        }
+    } else {
+        RenderAnchor {
+            pick_center,
+            type_markers,
+            plain_body: None,
+        }
+    }
+}
+
 /// A neutral grey anchor cuboid centred at `center`. Used for anchors that
-/// carry no type markers (Sink, Match) so they stay visible
-/// and pickable once the spheres are gone.
+/// carry no type markers (unconstrained inputs, pending outputs) so they stay
+/// visible and pickable once the spheres are gone.
 fn plain_anchor_body(center: Vec3) -> RenderObject {
     RenderObject {
         mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, ANCHOR_DEPTH)
@@ -277,9 +304,15 @@ fn plain_anchor_body(center: Vec3) -> RenderObject {
 /// relative to the containing pattern. `sink_scale` shrinks a Sink's mesh
 /// (anchor sphere and its transform stay unchanged so it remains clickable);
 /// non-Sink node kinds ignore it.
+///
+/// `flat_ast` is the program's flattened AST. Type inference needs it because
+/// every edge — including those inside Pattern branches — lives in the
+/// program-level edge table, while `layout_ast` may be a sub-layout that holds
+/// only nodes.
 pub fn layoutnode_to_rendernode(
     layout_node: &crate::layout::LayoutNode,
     layout_ast: &crate::layout::LayoutAst,
+    flat_ast: &crate::model::ast::Ast,
     function_declarations: &std::collections::HashMap<
         crate::model::function_declaration::FunctionDeclarationId,
         crate::model::function_declaration::FunctionDeclaration,
@@ -343,11 +376,12 @@ pub fn layoutnode_to_rendernode(
             let input_world = node_pos + input_local;
             let output_world = node_pos + output_local;
             // The output type reflects a possibly failed cast as
-            // `Sum(target, none)` when a mismatched type flows in; that
-            // override lives in `anchor_type`, so read it back for the markers.
-            let output_eval_type = layout_ast
-                .anchor_type(output_anchor, function_declarations)
-                .unwrap_or_else(|| crate::infer::ast_type_to_eval_type(r#type));
+            // `Sum(target, none)` when a mismatched type flows in, and stays
+            // `Pending` while no type flows in at all; that logic lives in
+            // `infer::anchor_type`, so read it back for the markers.
+            let output_eval_type =
+                crate::infer::anchor_type(flat_ast, output_anchor, function_declarations)
+                    .unwrap_or_else(|| crate::infer::ast_type_to_eval_type(r#type));
             let elim_value = crate::layout::value_of_etype(r#type);
             let input_center = anchor_pick_center(input_world, true);
             RenderNode {
@@ -378,16 +412,13 @@ pub fn layoutnode_to_rendernode(
                     ),
                     (
                         output_anchor.clone(),
-                        RenderAnchor {
-                            pick_center: anchor_pick_center(output_world, false),
-                            type_markers: build_type_markers(
-                                &output_eval_type,
-                                elim_value.as_deref(),
-                                output_world,
-                                false,
-                            ),
-                            plain_body: None,
-                        },
+                        typed_anchor(
+                            &output_eval_type,
+                            elim_value.as_deref(),
+                            output_world,
+                            false,
+                            anchor_pick_center(output_world, false),
+                        ),
                     ),
                 ]),
                 labels: vec![],
@@ -715,13 +746,15 @@ pub fn layoutnode_to_rendernode(
                 // −Z back face, at the base (lowest) Pattern's Y (node_pos.y).
                 let back_face = Vec3::new(tip_x, node_pos.y, tip_z - envelope_xz / 2.0);
                 let out_center = anchor_pick_center(back_face, false);
+                // Union of the branch types, or `Pending` while the inferer
+                // cannot decide it yet — which renders as the neutral body the
+                // Match output had unconditionally before.
+                let output_eval_type =
+                    crate::infer::anchor_type(flat_ast, output_anchor, function_declarations)
+                        .unwrap_or(crate::infer::EType::Pending);
                 anchors.insert(
                     output_anchor.clone(),
-                    RenderAnchor {
-                        pick_center: out_center,
-                        type_markers: vec![],
-                        plain_body: Some(plain_anchor_body(out_center)),
-                    },
+                    typed_anchor(&output_eval_type, None, back_face, false, out_center),
                 );
             }
 

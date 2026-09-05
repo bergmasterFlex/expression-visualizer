@@ -1333,7 +1333,7 @@ impl LayoutAst {
             node_id.clone(),
             crate::model::node::ENode::VarDecl {
                 name: "v".to_string(),
-                r#type: crate::model::r#type::EType::Any,
+                r#type: crate::model::r#type::EType::Int { value: None },
                 output_anchor: output_anchor_id,
             },
         );
@@ -1541,69 +1541,6 @@ impl LayoutAst {
         None
     }
 
-    /// Return the `EType` an output anchor produces, or an input anchor
-    /// expects — whichever the anchor happens to be. Walks sub-layouts.
-    /// `None` for anchors that carry no type (Sink input, Match, …).
-    pub fn anchor_type(
-        &self,
-        anchor_id: &crate::model::anchor::Id,
-        function_declarations: &std::collections::HashMap<
-            crate::model::function_declaration::FunctionDeclarationId,
-            crate::model::function_declaration::FunctionDeclaration,
-        >,
-    ) -> Option<crate::infer::EType> {
-        if let Some(node_id) = self.ast.anchor_to_node.get(anchor_id) {
-            let node = self.ast.nodes.get(node_id)?;
-            // A typecast whose incoming type differs from its target type may
-            // fail: model that by adding `none` to the output type, i.e.
-            // `Sum(target, none)`. `any` casts never fail, so skip them.
-            if let crate::model::node::ENode::TypeCast {
-                r#type,
-                input_anchor,
-                output_anchor,
-            } = node
-            {
-                if anchor_id == output_anchor {
-                    let target = crate::infer::ast_type_to_eval_type(r#type);
-                    if !matches!(target, crate::infer::EType::Any) {
-                        if let Some(incoming) =
-                            self.incoming_type(input_anchor, function_declarations)
-                        {
-                            if !eval_types_match(&incoming, &target) {
-                                return Some(crate::infer::EType::SumType(vec![
-                                    target,
-                                    crate::infer::EType::None,
-                                ]));
-                            }
-                        }
-                    }
-                    return Some(target);
-                }
-            }
-            return anchor_type_from_node(node, anchor_id, function_declarations);
-        }
-        for sub in self.sub_layouts.values() {
-            if let Some(t) = sub.anchor_type(anchor_id, function_declarations) {
-                return Some(t);
-            }
-        }
-        None
-    }
-
-    /// Eval type flowing into `input` from a connected source anchor, if any.
-    /// `None` when the input is unconnected or the source carries no type.
-    fn incoming_type(
-        &self,
-        input: &crate::model::anchor::Id,
-        function_declarations: &std::collections::HashMap<
-            crate::model::function_declaration::FunctionDeclarationId,
-            crate::model::function_declaration::FunctionDeclaration,
-        >,
-    ) -> Option<crate::infer::EType> {
-        let source = source_anchor_for_input(&self.ast, input)?;
-        self.anchor_type(&source, function_declarations)
-    }
-
     /// AST-level literal string attached to this anchor's type, if any.
     /// Walks sub-layouts. Returns `None` when the anchor's node kind doesn't
     /// carry an `model::r#type::EType` field, or the field's value is `None`.
@@ -1687,92 +1624,9 @@ impl LayoutAst {
     }
 }
 
-/// Source anchor feeding into `input`, if connected. Drag-to-connect records
-/// an edge from either end, so both directions are checked.
-fn source_anchor_for_input(
-    ast: &crate::model::ast::Ast,
-    input: &crate::model::anchor::Id,
-) -> Option<crate::model::anchor::Id> {
-    for (from, edges) in &ast.edges {
-        if edges.iter().any(|e| &e.to == input) {
-            return Some(from.clone());
-        }
-    }
-    ast.edges
-        .get(input)
-        .and_then(|edges| edges.first())
-        .map(|e| e.to.clone())
-}
-
-/// Structural type equality, ignoring any carried value literal. Two `SumType`s
-/// match when their leaves match pairwise in order.
-fn eval_types_match(a: &crate::infer::EType, b: &crate::infer::EType) -> bool {
-    match (a, b) {
-        (crate::infer::EType::Int(_), crate::infer::EType::Int(_))
-        | (crate::infer::EType::Bool(_), crate::infer::EType::Bool(_))
-        | (crate::infer::EType::String(_), crate::infer::EType::String(_))
-        | (crate::infer::EType::Char(_), crate::infer::EType::Char(_))
-        | (crate::infer::EType::Any, crate::infer::EType::Any)
-        | (crate::infer::EType::None, crate::infer::EType::None)
-        | (crate::infer::EType::Exception, crate::infer::EType::Exception) => true,
-        (crate::infer::EType::SumType(x), crate::infer::EType::SumType(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| eval_types_match(p, q))
-        }
-        _ => false,
-    }
-}
-
-fn anchor_type_from_node(
-    node: &crate::model::node::ENode,
-    anchor_id: &crate::model::anchor::Id,
-    function_declarations: &std::collections::HashMap<
-        crate::model::function_declaration::FunctionDeclarationId,
-        crate::model::function_declaration::FunctionDeclaration,
-    >,
-) -> Option<crate::infer::EType> {
-    match node {
-        crate::model::node::ENode::ConstDecl { r#type, .. }
-        | crate::model::node::ENode::VarDecl { r#type, .. }
-        | crate::model::node::ENode::Pattern { r#type, .. } => {
-            Some(crate::infer::ast_type_to_eval_type(r#type))
-        }
-        crate::model::node::ENode::TypeCast {
-            r#type,
-            input_anchor,
-            ..
-        } => {
-            if anchor_id == input_anchor {
-                // The input type is unconstrained — the cast accepts any value.
-                None
-            } else {
-                // Base output type. The `Sum(target, none)` override for
-                // a mismatched incoming type is applied in
-                // `LayoutAst::anchor_type`, which has edge access.
-                Some(crate::infer::ast_type_to_eval_type(r#type))
-            }
-        }
-        crate::model::node::ENode::FunctionCall {
-            function_declaration_id,
-            input_anchors,
-            output_anchor,
-        } => {
-            let decl = function_declarations.get(function_declaration_id)?;
-            if anchor_id == output_anchor {
-                return Some(decl.output_type.clone());
-            }
-            let idx = input_anchors.iter().position(|a| a == anchor_id)?;
-            decl.inputs.get(idx).map(|p| p.r#type.clone())
-        }
-        // Anchors that don't currently carry a rendered type.
-        crate::model::node::ENode::Sink { .. }
-        | crate::model::node::ENode::Match { .. }
-        | crate::model::node::ENode::Program {} => None,
-    }
-}
-
 /// Concrete literal string on an `model::r#type::EType`, if any. Only the
-/// value-carrying variants have an `Option<String>`; the `Any` and `None`
-/// type variants yield no literal.
+/// value-carrying variants have an `Option<String>`; the `None` type variant
+/// yields no literal.
 pub fn value_of_etype(t: &crate::model::r#type::EType) -> Option<String> {
     match t {
         crate::model::r#type::EType::Bool { value }

@@ -21,9 +21,8 @@
 
 
 
-- make message settable von none value of a constDecl node
 - make ordering of patterns determine the evaluation order -> which one is the default?
 - evaluation values rendered at correct positions for match/pattern/patternsink
-- make "any" type available for pattern
 - typecast shall have none output type (sum) if type is not fully castable
+- match shall have none in its output type (sum) if the patterns do not cover the incoming type
 

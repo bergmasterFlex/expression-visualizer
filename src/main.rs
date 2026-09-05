@@ -597,14 +597,13 @@ fn variant_kind(node: Option<&model::node::ENode>) -> NodeVariantKind {
     }
 }
 
-fn type_choice_of(t: &model::r#type::EType) -> Option<TypeChoice> {
+fn type_choice_of(t: &model::r#type::EType) -> TypeChoice {
     match t {
-        model::r#type::EType::Bool { .. } => Some(TypeChoice::Bool),
-        model::r#type::EType::Int { .. } => Some(TypeChoice::Int),
-        model::r#type::EType::String { .. } => Some(TypeChoice::String),
-        model::r#type::EType::Char { .. } => Some(TypeChoice::Char),
-        model::r#type::EType::None { .. } => Some(TypeChoice::None),
-        model::r#type::EType::Any => None,
+        model::r#type::EType::Bool { .. } => TypeChoice::Bool,
+        model::r#type::EType::Int { .. } => TypeChoice::Int,
+        model::r#type::EType::String { .. } => TypeChoice::String,
+        model::r#type::EType::Char { .. } => TypeChoice::Char,
+        model::r#type::EType::None { .. } => TypeChoice::None,
     }
 }
 
@@ -726,6 +725,10 @@ fn spawn_ast_nodes(
     let mut node_entites = std::collections::HashMap::<model::node::Id, Entity>::new();
     let mut anchor_entities = std::collections::HashMap::<model::anchor::Id, Entity>::new();
     let mut anchor_world_positions = std::collections::HashMap::<model::anchor::Id, Vec3>::new();
+    // Type inference resolves edges, and every edge (pattern branches included)
+    // lives in the program-level edge table — so flatten once here instead of
+    // per anchor, and hand the same view to the renderer and the edge pass.
+    let flat_ast = state.program_ast().flattened_ast();
     for walked in state.layout_ast.walk_all() {
         let layout_node = walked.layout_node;
         let node_id = &layout_node.node_id;
@@ -733,6 +736,7 @@ fn spawn_ast_nodes(
         let render_node = render::layoutnode_to_rendernode(
             layout_node,
             walked.layout_ast,
+            &flat_ast,
             &state.function_declarations,
             walked.extra_offset,
             walked.sink_scale,
@@ -857,19 +861,15 @@ fn spawn_ast_nodes(
                 continue;
             };
 
-            let src_type = state
-                .program_ast()
-                .anchor_type(src_id, &state.function_declarations)
-                .unwrap_or(infer::EType::None);
+            let src_type = infer::anchor_type(&flat_ast, src_id, &state.function_declarations)
+                .unwrap_or(infer::EType::Pending);
             let source_leaves = render::ordered_supported_leaves(&src_type);
             let n_src = source_leaves.len();
             if n_src == 0 {
                 continue;
             }
 
-            let tgt_type = state
-                .program_ast()
-                .anchor_type(tgt_id, &state.function_declarations);
+            let tgt_type = infer::anchor_type(&flat_ast, tgt_id, &state.function_declarations);
             let target_leaves = tgt_type
                 .as_ref()
                 .map(|t| render::ordered_supported_leaves(t))
@@ -1687,7 +1687,7 @@ fn sync_node_editor_ui(
     let type_choice = node.and_then(|n| match n {
         model::node::ENode::ConstDecl { r#type, .. }
         | model::node::ENode::TypeCast { r#type, .. }
-        | model::node::ENode::Pattern { r#type, .. } => type_choice_of(r#type),
+        | model::node::ENode::Pattern { r#type, .. } => Some(type_choice_of(r#type)),
         _ => None,
     });
     let typecast_has_value = match node {
@@ -1924,7 +1924,7 @@ fn spawn_type_dropdown(
     open: &Option<(model::node::Id, DropdownKind)>,
 ) {
     let current_choice = type_choice_of(current);
-    let label = current_choice.map(type_choice_label).unwrap_or("?");
+    let label = type_choice_label(current_choice);
     spawn_dropdown_root(
         panel,
         font,
@@ -1934,7 +1934,7 @@ fn spawn_type_dropdown(
         open,
         |options| {
             for tc in TYPE_CHOICES {
-                let is_current = Some(tc) == current_choice;
+                let is_current = tc == current_choice;
                 spawn_dropdown_option(
                     options,
                     font,
@@ -2347,10 +2347,8 @@ fn handle_value_enable_checkbox(
         } else {
             Some(String::new())
         };
-        if let Some(choice) = type_choice_of(r#type) {
-            *r#type = make_etype(choice, toggled);
-            rebuild.0 = true;
-        }
+        *r#type = make_etype(type_choice_of(r#type), toggled);
+        rebuild.0 = true;
     }
 }
 
@@ -2384,9 +2382,7 @@ fn handle_node_editor_text_input(
                     | model::node::ENode::Pattern { r#type, .. } => r#type,
                     _ => continue,
                 };
-                let Some(choice) = type_choice_of(r#type) else {
-                    continue;
-                };
+                let choice = type_choice_of(r#type);
                 // Ignore the initial spawn's Added-tick: an empty input against
                 // a None value is not a user edit.
                 if input.value.is_empty() && value_of_etype(r#type).is_none() {
@@ -3924,14 +3920,14 @@ fn update_selection_display(
             text.0 = format!(
                 "{} : {}",
                 render::label_for_node(node, &state.function_declarations),
-                match infer::eval_type(
-                    &node,
-                    &selected_ast.ast,
+                match infer::node_output_type(
+                    &state.program_ast().flattened_ast(),
+                    &id,
                     &state.function_declarations,
-                    vec![]
                 ) {
-                    Ok(r#type) => r#type.to_string(),
-                    Err(message) => format!("error: {}", message),
+                    Some(r#type) => r#type.to_string(),
+                    // Sink and Program produce nothing at all.
+                    None => "-".to_string(),
                 }
             );
             color.0 = Color::WHITE;

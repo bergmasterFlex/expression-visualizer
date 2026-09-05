@@ -286,7 +286,6 @@ impl State {
         pattern_type: &crate::model::r#type::EType,
     ) -> bool {
         match (pattern_type, input_value) {
-            (crate::model::r#type::EType::Any, _) => true,
             (crate::model::r#type::EType::Bool { value }, EValue::Bool(b)) => value
                 .as_ref()
                 .is_none_or(|v| v.parse::<bool>().ok() == Some(*b)),
@@ -330,9 +329,6 @@ impl State {
                         .map(EValue::Char)
                         .map_err(|_| format!("could not parse \"{}\" as char", v))
                 }),
-            crate::model::r#type::EType::Any => {
-                Err("any-type cannot provide a specific value!".to_string())
-            }
             crate::model::r#type::EType::None { message } => message
                 .map(EValue::None)
                 .ok_or("none type did not have a specific value!".to_string()),
@@ -439,7 +435,6 @@ impl State {
                 }),
                 _ => EValue::None(format!("cannot cast {} to char", input_type)),
             },
-            crate::model::r#type::EType::Any => input_value,
             crate::model::r#type::EType::None { message } => {
                 EValue::None(message.unwrap_or_else(|| "none".to_string()))
             }
@@ -486,9 +481,6 @@ impl EValue {
                 .parse::<char>()
                 .map(EValue::Char)
                 .map_err(|_| format!("could not parse \"{}\" as char", raw)),
-            crate::model::r#type::EType::Any => {
-                Err("any-typed var-decl needs a concrete type".to_string())
-            }
             crate::model::r#type::EType::None { .. } => Ok(EValue::None(raw.to_string())),
         }
     }
