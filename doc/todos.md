@@ -1,6 +1,5 @@
 # TODOs
 
-- remove float type
 - volumes only in positiv direction
 - nodes/anchors visualization and anchors one address
   - Source

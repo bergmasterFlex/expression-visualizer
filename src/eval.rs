@@ -7,7 +7,6 @@ pub struct State {
 pub enum EValue {
     Bool(bool),
     Int(i32),
-    Float(f32),
     String(String),
     Char(char),
     Undefined(String),
@@ -294,9 +293,6 @@ impl State {
             (crate::model::r#type::EType::Int { value }, EValue::Int(i)) => value
                 .as_ref()
                 .is_none_or(|v| v.parse::<i32>().ok() == Some(*i)),
-            (crate::model::r#type::EType::Float { value }, EValue::Float(f)) => value
-                .as_ref()
-                .is_none_or(|v| v.parse::<f32>().ok() == Some(*f)),
             (crate::model::r#type::EType::String { value }, EValue::String(s)) => {
                 value.as_ref().is_none_or(|v| v == s)
             }
@@ -323,13 +319,6 @@ impl State {
                     v.parse::<i32>()
                         .map(EValue::Int)
                         .map_err(|_| format!("could not parse \"{}\" as int", v))
-                }),
-            crate::model::r#type::EType::Float { value } => value
-                .ok_or("float type did not have a specific value!".to_string())
-                .and_then(|v| {
-                    v.parse::<f32>()
-                        .map(EValue::Float)
-                        .map_err(|_| format!("could not parse \"{}\" as float", v))
                 }),
             crate::model::r#type::EType::String { value } => value
                 .map(EValue::String)
@@ -360,7 +349,7 @@ impl State {
                 if *b == 0 {
                     Ok(EValue::Undefined("division by zero".to_string()))
                 } else {
-                    Ok(EValue::Float(*a as f32 / *b as f32))
+                    Ok(EValue::Int(a.wrapping_div(*b)))
                 }
             }
             ("charAt", [EValue::String(s), EValue::Int(i)]) => {
@@ -401,7 +390,6 @@ impl State {
         match &target_type {
             crate::model::r#type::EType::Bool { value: Some(_) }
             | crate::model::r#type::EType::Int { value: Some(_) }
-            | crate::model::r#type::EType::Float { value: Some(_) }
             | crate::model::r#type::EType::String { value: Some(_) }
             | crate::model::r#type::EType::Char { value: Some(_) } => {
                 return Self::eval_value_for_type(target_type).unwrap_or_else(EValue::Undefined);
@@ -418,7 +406,6 @@ impl State {
             crate::model::r#type::EType::Bool { .. } => match input_value {
                 EValue::Bool(b) => EValue::Bool(b),
                 EValue::Int(i) => EValue::Bool(i != 0),
-                EValue::Float(f) => EValue::Bool(f != 0.0),
                 EValue::String(s) => s.parse::<bool>().map(EValue::Bool).unwrap_or_else(|_| {
                     EValue::Undefined(format!("cannot cast string \"{}\" to bool", s))
                 }),
@@ -427,26 +414,15 @@ impl State {
             crate::model::r#type::EType::Int { .. } => match input_value {
                 EValue::Bool(b) => EValue::Int(if b { 1 } else { 0 }),
                 EValue::Int(i) => EValue::Int(i),
-                EValue::Float(f) => EValue::Int(f as i32),
                 EValue::Char(c) => EValue::Int(c as i32),
                 EValue::String(s) => s.parse::<i32>().map(EValue::Int).unwrap_or_else(|_| {
                     EValue::Undefined(format!("cannot cast string \"{}\" to int", s))
                 }),
                 _ => EValue::Undefined(format!("cannot cast {} to int", input_type)),
             },
-            crate::model::r#type::EType::Float { .. } => match input_value {
-                EValue::Bool(b) => EValue::Float(if b { 1.0 } else { 0.0 }),
-                EValue::Int(i) => EValue::Float(i as f32),
-                EValue::Float(f) => EValue::Float(f),
-                EValue::String(s) => s.parse::<f32>().map(EValue::Float).unwrap_or_else(|_| {
-                    EValue::Undefined(format!("cannot cast string \"{}\" to float", s))
-                }),
-                _ => EValue::Undefined(format!("cannot cast {} to float", input_type)),
-            },
             crate::model::r#type::EType::String { .. } => EValue::String(match input_value {
                 EValue::Bool(b) => b.to_string(),
                 EValue::Int(i) => i.to_string(),
-                EValue::Float(f) => f.to_string(),
                 EValue::String(s) => s,
                 EValue::Char(c) => c.to_string(),
                 EValue::Undefined(message) => message,
@@ -483,7 +459,6 @@ impl std::fmt::Display for EValue {
         match self {
             EValue::Bool(value) => write!(f, "{}", value),
             EValue::Int(value) => write!(f, "{}", value),
-            EValue::Float(value) => write!(f, "{}", value),
             EValue::String(value) => write!(f, "{}", value),
             EValue::Char(value) => write!(f, "{}", value),
             EValue::Undefined(_) => write!(f, "undefined"),
@@ -506,10 +481,6 @@ impl EValue {
                 .parse::<i32>()
                 .map(EValue::Int)
                 .map_err(|_| format!("could not parse \"{}\" as int", raw)),
-            crate::model::r#type::EType::Float { .. } => raw
-                .parse::<f32>()
-                .map(EValue::Float)
-                .map_err(|_| format!("could not parse \"{}\" as float", raw)),
             crate::model::r#type::EType::String { .. } => Ok(EValue::String(raw.to_string())),
             crate::model::r#type::EType::Char { .. } => raw
                 .parse::<char>()
@@ -526,7 +497,6 @@ impl EValue {
         match self {
             EValue::Bool(_) => "bool",
             EValue::Int(_) => "int",
-            EValue::Float(_) => "float",
             EValue::String(_) => "string",
             EValue::Char(_) => "char",
             EValue::Undefined(_) => "undefined",

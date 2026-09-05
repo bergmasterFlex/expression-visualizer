@@ -2,7 +2,6 @@
 pub enum EType {
     Bool { value: Option<String> },
     Int { value: Option<String> },
-    Float { value: Option<String> },
     String { value: Option<String> },
     Char { value: Option<String> },
     Any,
@@ -14,7 +13,6 @@ impl std::fmt::Display for EType {
         let text = match self.clone() {
             EType::Bool { value } => value.unwrap_or("bool".to_string()),
             EType::Int { value } => value.unwrap_or("int".to_string()),
-            EType::Float { value } => value.unwrap_or("float".to_string()),
             EType::String { value } => {
                 if let Some(value) = value {
                     format!("\"{}\"", value)

@@ -68,13 +68,12 @@ impl EdgeCurve {
     }
 }
 
-/// Six-way discriminant matching the leaf-type ordering used by anchor stacks.
+/// Five-way discriminant matching the leaf-type ordering used by anchor stacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LeafKind {
     Bool,
     Char,
     Int,
-    Float,
     String,
     Undefined,
 }
@@ -87,7 +86,6 @@ impl LeafKind {
             LeafKind::Bool => "  bool  ",
             LeafKind::Char => "  char  ",
             LeafKind::Int => "  int  ",
-            LeafKind::Float => "  float  ",
             LeafKind::String => "  string  ",
             LeafKind::Undefined => "  undefined  ",
         }
@@ -100,17 +98,15 @@ impl LeafKind {
             LeafKind::Bool => "bool",
             LeafKind::Char => "char",
             LeafKind::Int => "int",
-            LeafKind::Float => "float",
             LeafKind::String => "string",
             LeafKind::Undefined => "undefined",
         }
     }
 
-    pub const ALL: [LeafKind; 6] = [
+    pub const ALL: [LeafKind; 5] = [
         LeafKind::Bool,
         LeafKind::Char,
         LeafKind::Int,
-        LeafKind::Float,
         LeafKind::String,
         LeafKind::Undefined,
     ];
@@ -123,7 +119,6 @@ pub fn leaf_kind_of(t: &EType) -> Option<LeafKind> {
         EType::Bool(..) => Some(LeafKind::Bool),
         EType::Char(..) => Some(LeafKind::Char),
         EType::Int(..) => Some(LeafKind::Int),
-        EType::Float(..) => Some(LeafKind::Float),
         EType::String(..) => Some(LeafKind::String),
         EType::Undefined => Some(LeafKind::Undefined),
         _ => None,
@@ -270,7 +265,7 @@ fn update_edge_material_time(time: Res<Time>, mut materials: ResMut<Assets<EdgeM
     }
 }
 
-/// Rasterize the six leaf-type labels into repeat-tileable R8Unorm images.
+/// Rasterize the five leaf-type labels into repeat-tileable R8Unorm images.
 ///
 /// Uses `include_bytes!` on the JetBrainsMono TTF rather than the asset system
 /// to sidestep WASM async-load races — the startup system must have a font
@@ -288,7 +283,7 @@ fn rasterize_label_textures(mut images: ResMut<Assets<Image>>, mut commands: Com
 
 /// Rasterise `text` fitted horizontally across a `LABEL_TEX_WIDTH`-wide
 /// R8Unorm texture with wrap-repeat sampling, matching what the marquee
-/// shader expects. Callers that only need the six per-leaf textures should
+/// shader expects. Callers that only need the five per-leaf textures should
 /// use the `EdgeLabelTextures` resource; this is for on-demand text
 /// (e.g. value+type marquee strings on value-carrying edges).
 pub fn rasterize_marquee_text(

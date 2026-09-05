@@ -1,7 +1,6 @@
 #[derive(Debug, Clone)]
 pub enum EType {
     Int(Option<i32>),
-    Float(Option<f32>),
     Bool(Option<bool>),
     String(Option<String>),
     Char(Option<char>),
@@ -19,13 +18,6 @@ impl ToString for EType {
                     value.to_string()
                 } else {
                     "int".to_string()
-                }
-            }
-            EType::Float(value) => {
-                if let Some(value) = value {
-                    value.to_string()
-                } else {
-                    "float".to_string()
                 }
             }
             EType::Bool(value) => {
@@ -67,7 +59,6 @@ pub fn ast_type_to_eval_type(t: &crate::model::r#type::EType) -> EType {
     match t {
         crate::model::r#type::EType::Bool { .. } => EType::Bool(None),
         crate::model::r#type::EType::Int { .. } => EType::Int(None),
-        crate::model::r#type::EType::Float { .. } => EType::Float(None),
         crate::model::r#type::EType::Char { .. } => EType::Char(None),
         crate::model::r#type::EType::String { .. } => EType::String(None),
         crate::model::r#type::EType::Any => EType::Any,
@@ -135,7 +126,6 @@ pub fn eval_type(
         | crate::model::node::ENode::Pattern { r#type, .. } => Ok(match r#type {
             crate::model::r#type::EType::Bool { value } => EType::Bool(None),
             crate::model::r#type::EType::Int { value } => EType::Int(None),
-            crate::model::r#type::EType::Float { value } => EType::Float(None),
             crate::model::r#type::EType::Char { value } => EType::Char(None),
             crate::model::r#type::EType::String { value } => EType::String(None),
             crate::model::r#type::EType::Any => EType::Any,

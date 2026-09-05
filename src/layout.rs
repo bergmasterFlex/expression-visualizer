@@ -1710,7 +1710,6 @@ fn eval_types_match(a: &crate::infer::EType, b: &crate::infer::EType) -> bool {
     use crate::infer::EType::*;
     match (a, b) {
         (Int(_), Int(_))
-        | (Float(_), Float(_))
         | (Bool(_), Bool(_))
         | (String(_), String(_))
         | (Char(_), Char(_))
@@ -1779,7 +1778,6 @@ pub fn value_of_etype(t: &crate::model::r#type::EType) -> Option<String> {
     match t {
         crate::model::r#type::EType::Bool { value }
         | crate::model::r#type::EType::Int { value }
-        | crate::model::r#type::EType::Float { value }
         | crate::model::r#type::EType::String { value }
         | crate::model::r#type::EType::Char { value } => value.clone(),
         _ => None,

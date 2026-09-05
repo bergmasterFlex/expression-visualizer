@@ -79,9 +79,8 @@ fn type_marker_order(t: &crate::infer::EType) -> Option<u8> {
         crate::infer::EType::Bool(..) => Some(0),
         crate::infer::EType::Char(..) => Some(1),
         crate::infer::EType::Int(..) => Some(2),
-        crate::infer::EType::Float(..) => Some(3),
-        crate::infer::EType::String(..) => Some(4),
-        crate::infer::EType::Undefined => Some(5),
+        crate::infer::EType::String(..) => Some(3),
+        crate::infer::EType::Undefined => Some(4),
         _ => None,
     }
 }
@@ -91,7 +90,6 @@ fn type_marker_letter(t: &crate::infer::EType) -> &'static str {
         crate::infer::EType::Bool(..) => "b",
         crate::infer::EType::Char(..) => "c",
         crate::infer::EType::Int(..) => "i",
-        crate::infer::EType::Float(..) => "f",
         crate::infer::EType::String(..) => "s",
         crate::infer::EType::Undefined => "u",
         _ => "?",
@@ -103,14 +101,13 @@ pub fn type_marker_color(t: &crate::infer::EType) -> Color {
         crate::infer::EType::Bool(..) => Color::srgba(0.65, 0.30, 0.95, TYPE_MARKER_ALPHA),
         crate::infer::EType::Char(..) => Color::srgba(0.30, 0.90, 0.40, TYPE_MARKER_ALPHA),
         crate::infer::EType::Int(..) => Color::srgba(0.40, 0.70, 1.00, TYPE_MARKER_ALPHA),
-        crate::infer::EType::Float(..) => Color::srgba(0.10, 0.25, 0.75, TYPE_MARKER_ALPHA),
         crate::infer::EType::String(..) => Color::srgba(1.00, 0.90, 0.30, TYPE_MARKER_ALPHA),
         crate::infer::EType::Undefined => Color::srgba(0.95, 0.30, 0.30, TYPE_MARKER_ALPHA),
         _ => Color::srgba(0.5, 0.5, 0.5, TYPE_MARKER_ALPHA),
     }
 }
 
-/// Flatten `t` (expanding sum types), filter to the six supported leaves, and
+/// Flatten `t` (expanding sum types), filter to the five supported leaves, and
 /// sort into the fixed bottom-to-top stack order (undefined at bottom → bool
 /// at top).
 pub fn ordered_supported_leaves(t: &crate::infer::EType) -> Vec<crate::infer::EType> {

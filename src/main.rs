@@ -89,7 +89,7 @@ impl Default for AstState {
                             },
                         ],
                         output_type: infer::EType::SumType(vec![
-                            infer::EType::Float(None),
+                            infer::EType::Int(None),
                             infer::EType::Undefined,
                         ]),
                     },
@@ -530,16 +530,14 @@ enum TypeChoice {
     Char,
     Bool,
     Int,
-    Float,
     Undefined,
 }
 
-const TYPE_CHOICES: [TypeChoice; 6] = [
+const TYPE_CHOICES: [TypeChoice; 5] = [
     TypeChoice::String,
     TypeChoice::Char,
     TypeChoice::Bool,
     TypeChoice::Int,
-    TypeChoice::Float,
     TypeChoice::Undefined,
 ];
 
@@ -603,7 +601,6 @@ fn type_choice_of(t: &model::r#type::EType) -> Option<TypeChoice> {
     match t {
         model::r#type::EType::Bool { .. } => Some(TypeChoice::Bool),
         model::r#type::EType::Int { .. } => Some(TypeChoice::Int),
-        model::r#type::EType::Float { .. } => Some(TypeChoice::Float),
         model::r#type::EType::String { .. } => Some(TypeChoice::String),
         model::r#type::EType::Char { .. } => Some(TypeChoice::Char),
         model::r#type::EType::Undefined { .. } => Some(TypeChoice::Undefined),
@@ -617,7 +614,6 @@ fn type_choice_label(t: TypeChoice) -> &'static str {
         TypeChoice::Char => "char",
         TypeChoice::Bool => "bool",
         TypeChoice::Int => "int",
-        TypeChoice::Float => "float",
         TypeChoice::Undefined => "undefined",
     }
 }
@@ -628,7 +624,6 @@ fn make_etype(choice: TypeChoice, value: Option<String>) -> model::r#type::EType
     match choice {
         TypeChoice::Bool => model::r#type::EType::Bool { value },
         TypeChoice::Int => model::r#type::EType::Int { value },
-        TypeChoice::Float => model::r#type::EType::Float { value },
         TypeChoice::String => model::r#type::EType::String { value },
         TypeChoice::Char => model::r#type::EType::Char { value },
         TypeChoice::Undefined => model::r#type::EType::Undefined { message: None },
