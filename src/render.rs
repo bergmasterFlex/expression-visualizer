@@ -16,28 +16,85 @@ use bevy::prelude::*;
 /// by the layout-space sign convention.
 pub const LAYOUT_SCALE: Vec3 = Vec3::new(3.0, -3.0, -3.0);
 
-/// Convert a layout position to a world-space position.
+/// Convert a layout *address* to its world-space position.
+///
+/// A cell is anchored at its address by the corner facing the origin: cell
+/// `N` occupies `[N, N+1)` on every axis. So this returns the cell's origin
+/// corner, not its centre — use `cell_center_world` to place something inside
+/// the cell.
 pub fn layout_to_world(pos: Vec3) -> Vec3 {
     pos * LAYOUT_SCALE
 }
 
+/// World-space centre of the cell at `cell`. Node meshes and anchors sit here.
+pub fn cell_center_world(cell: Vec3) -> Vec3 {
+    layout_to_world(cell + Vec3::splat(0.5))
+}
+
 /// Inverse of `layout_to_world`. Turns a world-space point (e.g. a grid
-/// raycast hit) back into a cell address.
+/// raycast hit) back into layout space; `floor` it to get the containing cell
+/// address.
 pub fn world_to_layout(world: Vec3) -> Vec3 {
     world / LAYOUT_SCALE
 }
 
-/// World-space AABB of an inclusive layout-space cell range.
+/// World-space AABB covering the inclusive cell range `min..=max`, i.e. the
+/// volume from the `min` corner to the far corner of `max`. `pad` widens it by
+/// that many cells per side.
 ///
 /// `LAYOUT_SCALE` negates Y and Z, so a layout `min` maps to a world `max` on
-/// those axes. Callers needing a world rect (grid borders, the footprint
-/// uniforms the grid shader compares against) must go through this rather than
-/// scaling `min`/`max` individually — otherwise the rect comes out inverted,
-/// i.e. empty. `pad` widens the range by that many cells per side first.
+/// those axes; the result is re-normalised. Callers needing a world rect (grid
+/// borders, the footprint uniforms the grid shader compares against) must go
+/// through this rather than scaling `min`/`max` individually — otherwise the
+/// rect comes out inverted, i.e. empty.
 pub fn layout_range_to_world(min: Vec3, max: Vec3, pad: f32) -> (Vec3, Vec3) {
     let a = layout_to_world(min - Vec3::splat(pad));
-    let b = layout_to_world(max + Vec3::splat(pad));
+    let b = layout_to_world(max + Vec3::splat(1.0 + pad));
     (a.min(b), a.max(b))
+}
+
+/// Edge thickness of the selection caret's cell outline, in world units.
+const CARET_EDGE_THICKNESS: f32 = 0.05;
+
+/// Wireframe outline of the cell at `cell`: twelve thin cuboids spanning the
+/// volume from `cell` to `cell + (1,1,1)`. This is the selection caret — it
+/// encloses the addressed cell space itself rather than marking a point, and
+/// is drawn whether or not a node occupies the cell.
+pub fn cell_caret_edges(cell: Vec3) -> Vec<RenderObject> {
+    let a = layout_to_world(cell);
+    let b = layout_to_world(cell + Vec3::ONE);
+    let (lo, hi) = (a.min(b), a.max(b));
+    let center = (lo + hi) * 0.5;
+    let span = hi - lo;
+    let t = CARET_EDGE_THICKNESS;
+    let mut out = Vec::with_capacity(12);
+    for axis in 0..3usize {
+        // The two axes the edge is offset along; the edge runs along `axis`.
+        let (u, v) = match axis {
+            0 => (1usize, 2usize),
+            1 => (0usize, 2usize),
+            _ => (0usize, 1usize),
+        };
+        let mut size = Vec3::splat(t);
+        size[axis] = span[axis] + t;
+        for (su, sv) in [(-1.0f32, -1.0f32), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
+            let mut pos = center;
+            pos[u] = center[u] + su * span[u] * 0.5;
+            pos[v] = center[v] + sv * span[v] * 0.5;
+            out.push(RenderObject {
+                mesh: Cuboid::new(size.x, size.y, size.z).mesh().build(),
+                material: StandardMaterial {
+                    base_color: Color::srgba(0.85, 0.84, 0.80, 0.7),
+                    alpha_mode: AlphaMode::Blend,
+                    cull_mode: None,
+                    unlit: true,
+                    ..default()
+                },
+                transform: Transform::from_translation(pos),
+            });
+        }
+    }
+    out
 }
 
 pub struct RenderObject {
@@ -353,7 +410,7 @@ pub fn layoutnode_to_rendernode(
     sink_scale: f32,
 ) -> RenderNode {
     let ast = &layout_ast.ast;
-    let node_pos = layout_to_world(layout_node.pos + extra_offset);
+    let node_pos = cell_center_world(layout_node.pos + extra_offset);
     let node_pos_tf = Transform::from_translation(node_pos);
     let node = ast.nodes.get(&layout_node.node_id).unwrap();
     match node {
@@ -474,8 +531,10 @@ pub fn layoutnode_to_rendernode(
             let footprint = layout_ast
                 .node_footprint(&layout_node.node_id)
                 .expect("function call must have a footprint");
-            let fp_center_x_grid = (footprint.min.x + footprint.max.x) as f32 * 0.5;
-            let fp_center_z_grid = (footprint.min.z + footprint.max.z) as f32 * 0.5;
+            // Cells are corner-anchored, so the inclusive range min..=max spans
+            // [min, max+1] and its centre is (min + max + 1) / 2.
+            let fp_center_x_grid = (footprint.min.x + footprint.max.x + 1) as f32 * 0.5;
+            let fp_center_z_grid = (footprint.min.z + footprint.max.z + 1) as f32 * 0.5;
             let n = input_anchors.len() as f32;
             let mesh_base_x_world = n * 0.5;
             let mesh_depth_world = 1.0;
@@ -484,7 +543,8 @@ pub fn layoutnode_to_rendernode(
             // at local Z=0, tip at local Z=−depth). Shift the transform by
             // +depth/2 so the mesh's Z-bbox centres on the footprint centre.
             let fp_center_world = layout_to_world(
-                Vec3::new(fp_center_x_grid, layout_node.pos.y, fp_center_z_grid) + extra_offset,
+                Vec3::new(fp_center_x_grid, layout_node.pos.y + 0.5, fp_center_z_grid)
+                    + extra_offset,
             );
             let mesh_center_world = fp_center_world + Vec3::new(0.0, 0.0, mesh_depth_world * 0.5);
             let mesh_tf = Transform::from_translation(mesh_center_world);
@@ -731,7 +791,7 @@ pub fn layoutnode_to_rendernode(
             // along the −Z tips of every sibling Pattern's Sink. Each
             // Pattern's sink lives in its sub-layout; `harmonize_match_sinks`
             // aligns all sibling sinks to a common (x, z), so the tips form a
-            // vertical Y column. Tip world = layout_to_world(sink_local +
+            // vertical Y column. Tip world = cell_center_world(sink_local +
             // pattern_grid + extra_offset) + (0, 0, −SINK_TIP_DEPTH). Pattern
             // sub-content always renders at sink_scale 1/3 (see walk_all_into),
             // so the pyramid depth is 9 · 1/3 = 3.0 world units.
@@ -753,7 +813,7 @@ pub fn layoutnode_to_rendernode(
                 let Some(sink_ln) = sub.layout_nodes.get(&sink_id) else {
                     continue;
                 };
-                let tip = layout_to_world(sink_ln.pos + pattern_ln.pos + extra_offset)
+                let tip = cell_center_world(sink_ln.pos + pattern_ln.pos + extra_offset)
                     + Vec3::new(0.0, 0.0, -SINK_TIP_DEPTH);
                 tip_x = tip.x;
                 tip_z = tip.z;

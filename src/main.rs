@@ -958,10 +958,13 @@ fn spawn_ast_nodes(
         let depth_cells = (bounds.max.z - bounds.min.z + 1) as f32;
         let size_x = width_cells * render::LAYOUT_SCALE.x.abs();
         let size_z = depth_cells * render::LAYOUT_SCALE.z.abs();
+        // Cells are corner-anchored, so the inclusive range spans [min, max+1]
+        // and its centre is (min + max + 1) / 2. Y stays on the address plane:
+        // the grid is the upper bounding plane of the row it belongs to.
         let center_local = Vec3::new(
-            (bounds.min.x + bounds.max.x) as f32 * 0.5,
+            (bounds.min.x + bounds.max.x + 1) as f32 * 0.5,
             0.0,
-            (bounds.min.z + bounds.max.z) as f32 * 0.5,
+            (bounds.min.z + bounds.max.z + 1) as f32 * 0.5,
         );
         let world_center = render::layout_to_world(center_local + walked_ast.extra_offset);
         let offset = walked_ast.extra_offset;
@@ -971,7 +974,7 @@ fn spawn_ast_nodes(
         let (border_lo, border_hi) = render::layout_range_to_world(
             bounds.min.as_vec3() + offset,
             bounds.max.as_vec3() + offset,
-            0.5,
+            0.0,
         );
         let border_min = Vec2::new(border_lo.x, border_lo.z);
         let border_max = Vec2::new(border_hi.x, border_hi.z);
@@ -997,7 +1000,7 @@ fn spawn_ast_nodes(
             let (fp_lo, fp_hi) = render::layout_range_to_world(
                 fp.min.as_vec3() + offset,
                 fp.max.as_vec3() + offset,
-                0.5,
+                0.0,
             );
             footprints[footprint_count as usize] = Vec4::new(fp_lo.x, fp_lo.z, fp_hi.x, fp_hi.z);
             footprint_count += 1;
@@ -1033,16 +1036,16 @@ fn spawn_ast_nodes(
             AstSceneEntity,
         ));
 
-        // Program scope: the front wall is drawn flush against the grid's Z=0
-        // edge, i.e. at layout Z=-0.5 — the source row it borders is part of
-        // the grid now and is picked like any other cell. Grid-wide plus half
-        // a cell of padding on each side, so VarDecls at the outermost grid X
-        // still have wall beside them.
+        // Program scope: the front wall sits on the exact Z=0 plane — the face
+        // of the source row that looks toward the origin. The source row is
+        // part of the grid and is picked like any other cell. Grid-wide plus
+        // half a cell of padding on each side, so VarDecls at the outermost
+        // grid X still have wall beside them.
         if walked_ast.context.is_empty() {
             let wall_width_cells = width_cells + 1.0;
             let wall_size_x = wall_width_cells * render::LAYOUT_SCALE.x.abs();
             let wall_center_x = render::layout_to_world(Vec3::new(
-                (bounds.min.x + bounds.max.x) as f32 * 0.5 + walked_ast.extra_offset.x,
+                (bounds.min.x + bounds.max.x + 1) as f32 * 0.5 + walked_ast.extra_offset.x,
                 0.0,
                 0.0,
             ))
@@ -1052,7 +1055,7 @@ fn spawn_ast_nodes(
             let wall_height_cells = WALL_HEIGHT_CELLS;
             let wall_size_y = wall_height_cells * render::LAYOUT_SCALE.y.abs();
             let wall_center_y = -wall_size_y * 0.5;
-            let wall_z = render::layout_to_world(Vec3::new(0.0, 0.0, -0.5)).z;
+            let wall_z = render::layout_to_world(Vec3::ZERO).z;
             commands.spawn((
                 Mesh3d(meshes.add(Cuboid::new(wall_size_x, wall_size_y, 0.05))),
                 MeshMaterial3d(materials.add(StandardMaterial {
@@ -1065,6 +1068,18 @@ fn spawn_ast_nodes(
                 AstSceneEntity,
             ));
         }
+    }
+
+    // Selection caret: a wireframe box enclosing the addressed cell volume,
+    // from the caret address to address + (1,1,1). Rebuild-driven, like every
+    // other scene entity — caret moves already flag a rebuild.
+    for edge in render::cell_caret_edges(pick.selected_pos.as_vec3()) {
+        commands.spawn((
+            Mesh3d(meshes.add(edge.mesh)),
+            MeshMaterial3d(materials.add(edge.material)),
+            edge.transform,
+            AstSceneEntity,
+        ));
     }
 
     /*
@@ -3380,7 +3395,7 @@ fn sync_value_labels(
         let Some(layout_node) = state.program_ast().layout_nodes.get(id) else {
             continue;
         };
-        let world_pos = render::layout_to_world(layout_node.pos);
+        let world_pos = render::cell_center_world(layout_node.pos);
         commands.spawn((
             Text::new(value.to_string()),
             text_font(&ui_font.0, 28.0),
@@ -3699,9 +3714,11 @@ fn pick_nodes(
                 continue;
             }
             let hit = ray.origin + *ray.direction * t;
+            // Cells are corner-anchored — cell N covers [N, N+1) — so the
+            // containing cell is the floor, not the nearest address.
             let local = render::world_to_layout(hit - origin_world);
-            let local_x = local.x.round() as i32;
-            let local_z = local.z.round() as i32;
+            let local_x = local.x.floor() as i32;
+            let local_z = local.z.floor() as i32;
             if local_x < ag.min.x || local_x > ag.max.x {
                 continue;
             }
@@ -3709,7 +3726,7 @@ fn pick_nodes(
                 continue;
             }
             let cell_local = IVec3::new(local_x, 0, local_z);
-            let center_world = render::layout_to_world(cell_local.as_vec3() + ag.origin_offset);
+            let center_world = render::cell_center_world(cell_local.as_vec3() + ag.origin_offset);
             best_t = t;
             grid_hit = Some(HoveredGrid {
                 global_pos: cell_local + ag.origin_offset.round().as_ivec3(),
@@ -4056,7 +4073,7 @@ fn trigger_camera_focus_on_selection_change(
         if last_selection.is_some() {
             // The caret is already a global address, so it converts to world
             // space directly.
-            tween.focus_on(&orbit, render::layout_to_world(current.as_vec3()));
+            tween.focus_on(&orbit, render::cell_center_world(current.as_vec3()));
         }
         *last_selection = Some(current);
     }
@@ -4293,157 +4310,6 @@ fn drag_update_system(
     }
 }
 
-#[derive(Component, Clone, Copy)]
-enum CrosshairPart {
-    LineUp,
-    LineDown,
-    LineLeft,
-    LineRight,
-    TickUp,
-    TickDown,
-    TickLeft,
-    TickRight,
-}
-
-fn spawn_crosshair(mut commands: Commands) {
-    let color = Color::srgba(0.55, 0.54, 0.52, 0.22);
-
-    for part in [
-        CrosshairPart::LineUp,
-        CrosshairPart::LineDown,
-        CrosshairPart::LineLeft,
-        CrosshairPart::LineRight,
-        CrosshairPart::TickUp,
-        CrosshairPart::TickDown,
-        CrosshairPart::TickLeft,
-        CrosshairPart::TickRight,
-    ] {
-        commands.spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                ..default()
-            },
-            BackgroundColor(color),
-            Visibility::Hidden,
-            part,
-        ));
-    }
-}
-
-fn update_crosshair(
-    pick: Res<PickState>,
-    state: Res<AstState>,
-    grid_config: Res<grid::GridConfig>,
-    camera_q: Query<(&Camera, &GlobalTransform), With<camera::OrbitCameraTag>>,
-    node_q: Query<(&AstNodeEntity, &GlobalTransform)>,
-    windows: Query<&Window>,
-    mut crosshair_q: Query<(&CrosshairPart, &mut Node, &mut Visibility)>,
-) {
-    let hide_all = |q: &mut Query<(&CrosshairPart, &mut Node, &mut Visibility)>| {
-        for (_, _, mut vis) in q.iter_mut() {
-            *vis = Visibility::Hidden;
-        }
-    };
-
-    let Ok((camera, cam_tf)) = camera_q.single() else {
-        hide_all(&mut crosshair_q);
-        return;
-    };
-    let Ok(window) = windows.single() else {
-        hide_all(&mut crosshair_q);
-        return;
-    };
-
-    // Anchor world position: use the node transform if a node lives at the
-    // caret (accounts for any drift), otherwise convert the caret directly —
-    // it is a global address, so no owner offset is involved.
-    let anchor_world = state
-        .caret_ast(&pick)
-        .and_then(|(ast, local)| ast.node_at(local))
-        .and_then(|id| {
-            node_q
-                .iter()
-                .find(|(e, _)| e.node_id == id)
-                .map(|(_, tf)| tf.translation())
-        })
-        .unwrap_or_else(|| render::layout_to_world(pick.selected_pos.as_vec3()));
-
-    let Ok(screen) = camera.world_to_viewport(cam_tf, anchor_world) else {
-        hide_all(&mut crosshair_q);
-        return;
-    };
-
-    // Project a world-space offset of half a cell onto the screen so the
-    // crosshair frames the selected cell (perspective-correct, distance-aware).
-    let crosshair_radius = grid_config.spacing * 0.5;
-    let edge_world = anchor_world + *cam_tf.right() * crosshair_radius;
-    let Ok(edge_screen) = camera.world_to_viewport(cam_tf, edge_world) else {
-        hide_all(&mut crosshair_q);
-        return;
-    };
-    let half: f32 = (edge_screen - screen).length();
-    let thickness: f32 = 2.0;
-    let w = window.width();
-    let h = window.height();
-
-    let tick_len = half;
-    let tick_half = tick_len * 0.5;
-
-    for (part, mut style, mut vis) in crosshair_q.iter_mut() {
-        *vis = Visibility::Visible;
-        match *part {
-            CrosshairPart::LineUp => {
-                style.left = Val::Px(screen.x - thickness * 0.5);
-                style.top = Val::Px(0.0);
-                style.width = Val::Px(thickness);
-                style.height = Val::Px((screen.y - half).max(0.0));
-            }
-            CrosshairPart::LineDown => {
-                style.left = Val::Px(screen.x - thickness * 0.5);
-                style.top = Val::Px(screen.y + half);
-                style.width = Val::Px(thickness);
-                style.height = Val::Px((h - screen.y - half).max(0.0));
-            }
-            CrosshairPart::LineLeft => {
-                style.left = Val::Px(0.0);
-                style.top = Val::Px(screen.y - thickness * 0.5);
-                style.width = Val::Px((screen.x - half).max(0.0));
-                style.height = Val::Px(thickness);
-            }
-            CrosshairPart::LineRight => {
-                style.left = Val::Px(screen.x + half);
-                style.top = Val::Px(screen.y - thickness * 0.5);
-                style.width = Val::Px((w - screen.x - half).max(0.0));
-                style.height = Val::Px(thickness);
-            }
-            CrosshairPart::TickUp => {
-                style.left = Val::Px(screen.x - tick_half);
-                style.top = Val::Px(screen.y - half - thickness * 0.5);
-                style.width = Val::Px(tick_len);
-                style.height = Val::Px(thickness);
-            }
-            CrosshairPart::TickDown => {
-                style.left = Val::Px(screen.x - tick_half);
-                style.top = Val::Px(screen.y + half - thickness * 0.5);
-                style.width = Val::Px(tick_len);
-                style.height = Val::Px(thickness);
-            }
-            CrosshairPart::TickLeft => {
-                style.left = Val::Px(screen.x - half - thickness * 0.5);
-                style.top = Val::Px(screen.y - tick_half);
-                style.width = Val::Px(thickness);
-                style.height = Val::Px(tick_len);
-            }
-            CrosshairPart::TickRight => {
-                style.left = Val::Px(screen.x + half - thickness * 0.5);
-                style.top = Val::Px(screen.y - tick_half);
-                style.width = Val::Px(thickness);
-                style.height = Val::Px(tick_len);
-            }
-        }
-    }
-}
-
 /// True if `a` and `b` are already joined by an edge, in either stored
 /// direction.
 ///
@@ -4544,7 +4410,6 @@ fn main() {
                 spawn_node_editor_panel,
                 spawn_fps_display,
                 spawn_breadcrumb_display,
-                spawn_crosshair,
                 spawn_start_menu,
             )
                 .chain(),
@@ -4592,7 +4457,6 @@ fn main() {
             Update,
             (
                 update_world_labels,
-                update_crosshair,
                 update_fps_display,
                 update_breadcrumb_display,
             ),

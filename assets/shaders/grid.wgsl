@@ -52,23 +52,24 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let world_pos = in.world_position.xz;
 
     let coord = world_pos / params.spacing;
-    // Lines drawn at half-integer coord so integer grid positions
-    // (world = int * spacing) sit at cell centers, not crossings.
-    let grid = abs(fract(coord) - 0.5);
+    // Cells are corner-anchored: cell N covers [N, N+1), so the lines are the
+    // integer coords themselves and a cell centre sits at half-integer.
+    let grid = abs(fract(coord + 0.5) - 0.5);
     let line_width = fwidth(coord);
 
     var line_x = 1.0 - saturate(grid.x / (line_width.x * params.line_thickness));
     var line_y = 1.0 - saturate(grid.y / (line_width.y * params.line_thickness));
 
-    // Suppress interior grid lines of multi-cell node footprints. The nearest
-    // line along each axis separates the current cell (round(coord)) from
-    // its neighbour on the same side as the fragment (`sign(coord - cell)`).
-    // If both cells are inside the same footprint we skip that line.
-    let cell = round(coord);
-    let side = sign(coord - cell);
-    let curr_center = cell * params.spacing;
-    let x_neighbour = vec2<f32>(cell.x + side.x, cell.y) * params.spacing;
-    let y_neighbour = vec2<f32>(cell.x, cell.y + side.y) * params.spacing;
+    // Suppress interior grid lines of multi-cell node footprints. The current
+    // cell is floor(coord); the nearest line along each axis separates it from
+    // the neighbour on the same side as the fragment. If both cells are inside
+    // the same footprint we skip that line. Footprints are compared by cell
+    // centre, hence the +0.5.
+    let cell = floor(coord);
+    let curr_center = (cell + vec2<f32>(0.5, 0.5)) * params.spacing;
+    let side = sign(coord - (cell + vec2<f32>(0.5, 0.5)));
+    let x_neighbour = (vec2<f32>(cell.x + side.x, cell.y) + vec2<f32>(0.5, 0.5)) * params.spacing;
+    let y_neighbour = (vec2<f32>(cell.x, cell.y + side.y) + vec2<f32>(0.5, 0.5)) * params.spacing;
     let suppress_x = line_between_inside_same_footprint(curr_center, x_neighbour);
     let suppress_y = line_between_inside_same_footprint(curr_center, y_neighbour);
     line_x = line_x * (1.0 - suppress_x);
