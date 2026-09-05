@@ -90,7 +90,7 @@ impl Default for AstState {
                         ],
                         output_type: infer::EType::SumType(vec![
                             infer::EType::Int(None),
-                            infer::EType::Undefined,
+                            infer::EType::None,
                         ]),
                     },
                 ),
@@ -110,7 +110,7 @@ impl Default for AstState {
                         ],
                         output_type: infer::EType::SumType(vec![
                             infer::EType::Char(None),
-                            infer::EType::Undefined,
+                            infer::EType::None,
                         ]),
                     },
                 ),
@@ -530,7 +530,7 @@ enum TypeChoice {
     Char,
     Bool,
     Int,
-    Undefined,
+    None,
 }
 
 const TYPE_CHOICES: [TypeChoice; 5] = [
@@ -538,7 +538,7 @@ const TYPE_CHOICES: [TypeChoice; 5] = [
     TypeChoice::Char,
     TypeChoice::Bool,
     TypeChoice::Int,
-    TypeChoice::Undefined,
+    TypeChoice::None,
 ];
 
 #[derive(Clone, PartialEq, Eq)]
@@ -603,7 +603,7 @@ fn type_choice_of(t: &model::r#type::EType) -> Option<TypeChoice> {
         model::r#type::EType::Int { .. } => Some(TypeChoice::Int),
         model::r#type::EType::String { .. } => Some(TypeChoice::String),
         model::r#type::EType::Char { .. } => Some(TypeChoice::Char),
-        model::r#type::EType::Undefined { .. } => Some(TypeChoice::Undefined),
+        model::r#type::EType::None { .. } => Some(TypeChoice::None),
         model::r#type::EType::Any => None,
     }
 }
@@ -614,7 +614,7 @@ fn type_choice_label(t: TypeChoice) -> &'static str {
         TypeChoice::Char => "char",
         TypeChoice::Bool => "bool",
         TypeChoice::Int => "int",
-        TypeChoice::Undefined => "undefined",
+        TypeChoice::None => "none",
     }
 }
 
@@ -626,7 +626,7 @@ fn make_etype(choice: TypeChoice, value: Option<String>) -> model::r#type::EType
         TypeChoice::Int => model::r#type::EType::Int { value },
         TypeChoice::String => model::r#type::EType::String { value },
         TypeChoice::Char => model::r#type::EType::Char { value },
-        TypeChoice::Undefined => model::r#type::EType::Undefined { message: None },
+        TypeChoice::None => model::r#type::EType::None { message: None },
     }
 }
 
@@ -860,7 +860,7 @@ fn spawn_ast_nodes(
             let src_type = state
                 .program_ast()
                 .anchor_type(src_id, &state.function_declarations)
-                .unwrap_or(infer::EType::Undefined);
+                .unwrap_or(infer::EType::None);
             let source_leaves = render::ordered_supported_leaves(&src_type);
             let n_src = source_leaves.len();
             if n_src == 0 {
@@ -1756,7 +1756,7 @@ fn sync_node_editor_ui(
                 spawn_labeled_row(panel, font, "Type", |slot| {
                     spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
-                if !matches!(r#type, model::r#type::EType::Undefined { .. }) {
+                if !matches!(r#type, model::r#type::EType::None { .. }) {
                     spawn_labeled_row(panel, font, "Value", |slot| {
                         spawn_value_widget(
                             slot,
@@ -1782,7 +1782,7 @@ fn sync_node_editor_ui(
                 spawn_labeled_row(panel, font, "Type", |slot| {
                     spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
-                if !matches!(r#type, model::r#type::EType::Undefined { .. }) {
+                if !matches!(r#type, model::r#type::EType::None { .. }) {
                     spawn_labeled_row(panel, font, "Value", |slot| {
                         spawn_typecast_checkbox_and_value(
                             slot,
@@ -1799,7 +1799,7 @@ fn sync_node_editor_ui(
                 spawn_labeled_row(panel, font, "Type", |slot| {
                     spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
-                if !matches!(r#type, model::r#type::EType::Undefined { .. }) {
+                if !matches!(r#type, model::r#type::EType::None { .. }) {
                     spawn_labeled_row(panel, font, "Value", |slot| {
                         spawn_typecast_checkbox_and_value(
                             slot,
@@ -2004,7 +2004,7 @@ fn spawn_value_widget(
     open: &Option<(model::node::Id, DropdownKind)>,
 ) {
     match current {
-        model::r#type::EType::Undefined { .. } => {}
+        model::r#type::EType::None { .. } => {}
         model::r#type::EType::Bool { value } => {
             let current_bool = value.as_deref() == Some("true");
             let label = value.as_deref().unwrap_or("bool");

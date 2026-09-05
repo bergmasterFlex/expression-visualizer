@@ -5,7 +5,7 @@ pub enum EType {
     String { value: Option<String> },
     Char { value: Option<String> },
     Any,
-    Undefined { message: Option<String> },
+    None { message: Option<String> },
 }
 
 impl std::fmt::Display for EType {
@@ -28,7 +28,7 @@ impl std::fmt::Display for EType {
                 }
             }
             EType::Any => "any".to_string(),
-            EType::Undefined { message } => message.unwrap_or("undefined".to_string()),
+            EType::None { message } => message.unwrap_or("none".to_string()),
         };
         write!(f, "{}", text)
     }

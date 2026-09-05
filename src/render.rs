@@ -80,7 +80,7 @@ fn type_marker_order(t: &crate::infer::EType) -> Option<u8> {
         crate::infer::EType::Char(..) => Some(1),
         crate::infer::EType::Int(..) => Some(2),
         crate::infer::EType::String(..) => Some(3),
-        crate::infer::EType::Undefined => Some(4),
+        crate::infer::EType::None => Some(4),
         _ => None,
     }
 }
@@ -91,7 +91,7 @@ fn type_marker_letter(t: &crate::infer::EType) -> &'static str {
         crate::infer::EType::Char(..) => "c",
         crate::infer::EType::Int(..) => "i",
         crate::infer::EType::String(..) => "s",
-        crate::infer::EType::Undefined => "u",
+        crate::infer::EType::None => "n",
         _ => "?",
     }
 }
@@ -102,13 +102,13 @@ pub fn type_marker_color(t: &crate::infer::EType) -> Color {
         crate::infer::EType::Char(..) => Color::srgba(0.30, 0.90, 0.40, TYPE_MARKER_ALPHA),
         crate::infer::EType::Int(..) => Color::srgba(0.40, 0.70, 1.00, TYPE_MARKER_ALPHA),
         crate::infer::EType::String(..) => Color::srgba(1.00, 0.90, 0.30, TYPE_MARKER_ALPHA),
-        crate::infer::EType::Undefined => Color::srgba(0.95, 0.30, 0.30, TYPE_MARKER_ALPHA),
+        crate::infer::EType::None => Color::srgba(0.95, 0.30, 0.30, TYPE_MARKER_ALPHA),
         _ => Color::srgba(0.5, 0.5, 0.5, TYPE_MARKER_ALPHA),
     }
 }
 
 /// Flatten `t` (expanding sum types), filter to the five supported leaves, and
-/// sort into the fixed bottom-to-top stack order (undefined at bottom → bool
+/// sort into the fixed bottom-to-top stack order (none at bottom → bool
 /// at top).
 pub fn ordered_supported_leaves(t: &crate::infer::EType) -> Vec<crate::infer::EType> {
     let mut leaves: Vec<_> = crate::infer::flatten_type(t)
@@ -343,7 +343,7 @@ pub fn layoutnode_to_rendernode(
             let input_world = node_pos + input_local;
             let output_world = node_pos + output_local;
             // The output type reflects a possibly failed cast as
-            // `Sum(target, undefined)` when a mismatched type flows in; that
+            // `Sum(target, none)` when a mismatched type flows in; that
             // override lives in `anchor_type`, so read it back for the markers.
             let output_eval_type = layout_ast
                 .anchor_type(output_anchor, function_declarations)
@@ -369,7 +369,7 @@ pub fn layoutnode_to_rendernode(
                         input_anchor.clone(),
                         RenderAnchor {
                             pick_center: input_center,
-                            // A typecast's input type is undefined: it accepts
+                            // A typecast's input type is unconstrained: it accepts
                             // any incoming value, so render a neutral grey body
                             // like the Sink and Match inputs.
                             type_markers: vec![],
@@ -456,7 +456,7 @@ pub fn layoutnode_to_rendernode(
                             .inputs
                             .get(i_anchor)
                             .map(|param| param.r#type.clone())
-                            .unwrap_or(crate::infer::EType::Undefined);
+                            .unwrap_or(crate::infer::EType::None);
                         (
                             anchor_id.clone(),
                             RenderAnchor {

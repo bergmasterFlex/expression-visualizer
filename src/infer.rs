@@ -5,7 +5,7 @@ pub enum EType {
     String(Option<String>),
     Char(Option<char>),
     Any,
-    Undefined,
+    None,
     Exception,
     SumType(Vec<EType>),
 }
@@ -42,7 +42,7 @@ impl ToString for EType {
                 }
             }
             EType::Any => "any".to_string(),
-            EType::Undefined => "undefined".to_string(),
+            EType::None => "none".to_string(),
             EType::Exception => "exception".to_string(),
             EType::SumType(sub_types) => sub_types
                 .iter()
@@ -62,7 +62,7 @@ pub fn ast_type_to_eval_type(t: &crate::model::r#type::EType) -> EType {
         crate::model::r#type::EType::Char { .. } => EType::Char(None),
         crate::model::r#type::EType::String { .. } => EType::String(None),
         crate::model::r#type::EType::Any => EType::Any,
-        crate::model::r#type::EType::Undefined { .. } => EType::Undefined,
+        crate::model::r#type::EType::None { .. } => EType::None,
     }
 }
 
@@ -129,7 +129,7 @@ pub fn eval_type(
             crate::model::r#type::EType::Char { value } => EType::Char(None),
             crate::model::r#type::EType::String { value } => EType::String(None),
             crate::model::r#type::EType::Any => EType::Any,
-            crate::model::r#type::EType::Undefined { .. } => EType::Undefined,
+            crate::model::r#type::EType::None { .. } => EType::None,
         }),
         crate::model::node::ENode::Match { .. } => Err("match has no type".to_string()),
         crate::model::node::ENode::Program { .. } => Err("program has no type".to_string()),

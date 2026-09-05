@@ -75,7 +75,7 @@ pub enum LeafKind {
     Char,
     Int,
     String,
-    Undefined,
+    None,
 }
 
 impl LeafKind {
@@ -87,7 +87,7 @@ impl LeafKind {
             LeafKind::Char => "  char  ",
             LeafKind::Int => "  int  ",
             LeafKind::String => "  string  ",
-            LeafKind::Undefined => "  undefined  ",
+            LeafKind::None => "  none  ",
         }
     }
 
@@ -99,7 +99,7 @@ impl LeafKind {
             LeafKind::Char => "char",
             LeafKind::Int => "int",
             LeafKind::String => "string",
-            LeafKind::Undefined => "undefined",
+            LeafKind::None => "none",
         }
     }
 
@@ -108,7 +108,7 @@ impl LeafKind {
         LeafKind::Char,
         LeafKind::Int,
         LeafKind::String,
-        LeafKind::Undefined,
+        LeafKind::None,
     ];
 }
 
@@ -120,7 +120,7 @@ pub fn leaf_kind_of(t: &EType) -> Option<LeafKind> {
         EType::Char(..) => Some(LeafKind::Char),
         EType::Int(..) => Some(LeafKind::Int),
         EType::String(..) => Some(LeafKind::String),
-        EType::Undefined => Some(LeafKind::Undefined),
+        EType::None => Some(LeafKind::None),
         _ => None,
     }
 }

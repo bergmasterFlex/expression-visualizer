@@ -1555,8 +1555,8 @@ impl LayoutAst {
         if let Some(node_id) = self.ast.anchor_to_node.get(anchor_id) {
             let node = self.ast.nodes.get(node_id)?;
             // A typecast whose incoming type differs from its target type may
-            // fail: model that by adding `undefined` to the output type, i.e.
-            // `Sum(target, undefined)`. `any` casts never fail, so skip them.
+            // fail: model that by adding `none` to the output type, i.e.
+            // `Sum(target, none)`. `any` casts never fail, so skip them.
             if let crate::model::node::ENode::TypeCast {
                 r#type,
                 input_anchor,
@@ -1572,7 +1572,7 @@ impl LayoutAst {
                             if !eval_types_match(&incoming, &target) {
                                 return Some(crate::infer::EType::SumType(vec![
                                     target,
-                                    crate::infer::EType::Undefined,
+                                    crate::infer::EType::None,
                                 ]));
                             }
                         }
@@ -1707,16 +1707,15 @@ fn source_anchor_for_input(
 /// Structural type equality, ignoring any carried value literal. Two `SumType`s
 /// match when their leaves match pairwise in order.
 fn eval_types_match(a: &crate::infer::EType, b: &crate::infer::EType) -> bool {
-    use crate::infer::EType::*;
     match (a, b) {
-        (Int(_), Int(_))
-        | (Bool(_), Bool(_))
-        | (String(_), String(_))
-        | (Char(_), Char(_))
-        | (Any, Any)
-        | (Undefined, Undefined)
-        | (Exception, Exception) => true,
-        (SumType(x), SumType(y)) => {
+        (crate::infer::EType::Int(_), crate::infer::EType::Int(_))
+        | (crate::infer::EType::Bool(_), crate::infer::EType::Bool(_))
+        | (crate::infer::EType::String(_), crate::infer::EType::String(_))
+        | (crate::infer::EType::Char(_), crate::infer::EType::Char(_))
+        | (crate::infer::EType::Any, crate::infer::EType::Any)
+        | (crate::infer::EType::None, crate::infer::EType::None)
+        | (crate::infer::EType::Exception, crate::infer::EType::Exception) => true,
+        (crate::infer::EType::SumType(x), crate::infer::EType::SumType(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| eval_types_match(p, q))
         }
         _ => false,
@@ -1743,10 +1742,10 @@ fn anchor_type_from_node(
             ..
         } => {
             if anchor_id == input_anchor {
-                // The input type is undefined — the cast accepts any value.
+                // The input type is unconstrained — the cast accepts any value.
                 None
             } else {
-                // Base output type. The `Sum(target, undefined)` override for
+                // Base output type. The `Sum(target, none)` override for
                 // a mismatched incoming type is applied in
                 // `LayoutAst::anchor_type`, which has edge access.
                 Some(crate::infer::ast_type_to_eval_type(r#type))
@@ -1772,8 +1771,8 @@ fn anchor_type_from_node(
 }
 
 /// Concrete literal string on an `model::r#type::EType`, if any. Only the
-/// value-carrying variants have an `Option<String>`; `Any`, `Undefined`,
-/// `Exception` return `None`.
+/// value-carrying variants have an `Option<String>`; the `Any` and `None`
+/// type variants yield no literal.
 pub fn value_of_etype(t: &crate::model::r#type::EType) -> Option<String> {
     match t {
         crate::model::r#type::EType::Bool { value }

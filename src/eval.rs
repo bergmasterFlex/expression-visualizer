@@ -9,7 +9,7 @@ pub enum EValue {
     Int(i32),
     String(String),
     Char(char),
-    Undefined(String),
+    None(String),
 }
 
 impl State {
@@ -299,7 +299,7 @@ impl State {
             (crate::model::r#type::EType::Char { value }, EValue::Char(c)) => value
                 .as_ref()
                 .is_none_or(|v| v.parse::<char>().ok() == Some(*c)),
-            (crate::model::r#type::EType::Undefined { .. }, EValue::Undefined(_)) => true,
+            (crate::model::r#type::EType::None { .. }, EValue::None(_)) => true,
             _ => false,
         }
     }
@@ -333,9 +333,9 @@ impl State {
             crate::model::r#type::EType::Any => {
                 Err("any-type cannot provide a specific value!".to_string())
             }
-            crate::model::r#type::EType::Undefined { message } => message
-                .map(EValue::Undefined)
-                .ok_or("undefined type did not have a specific value!".to_string()),
+            crate::model::r#type::EType::None { message } => message
+                .map(EValue::None)
+                .ok_or("none type did not have a specific value!".to_string()),
         }
     }
 
@@ -347,7 +347,7 @@ impl State {
             ("+", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(a.wrapping_add(*b))),
             ("/", [EValue::Int(a), EValue::Int(b)]) => {
                 if *b == 0 {
-                    Ok(EValue::Undefined("division by zero".to_string()))
+                    Ok(EValue::None("division by zero".to_string()))
                 } else {
                     Ok(EValue::Int(a.wrapping_div(*b)))
                 }
@@ -355,7 +355,7 @@ impl State {
             ("charAt", [EValue::String(s), EValue::Int(i)]) => {
                 match usize::try_from(*i).ok().and_then(|i| s.chars().nth(i)) {
                     Some(c) => Ok(EValue::Char(c)),
-                    None => Ok(EValue::Undefined(format!(
+                    None => Ok(EValue::None(format!(
                         "charAt: index {} out of bounds for string of length {}",
                         i,
                         s.chars().count()
@@ -392,13 +392,13 @@ impl State {
             | crate::model::r#type::EType::Int { value: Some(_) }
             | crate::model::r#type::EType::String { value: Some(_) }
             | crate::model::r#type::EType::Char { value: Some(_) } => {
-                return Self::eval_value_for_type(target_type).unwrap_or_else(EValue::Undefined);
+                return Self::eval_value_for_type(target_type).unwrap_or_else(EValue::None);
             }
             _ => {}
         }
 
-        if let EValue::Undefined(message) = input_value {
-            return EValue::Undefined(message);
+        if let EValue::None(message) = input_value {
+            return EValue::None(message);
         }
 
         let input_type = input_value.type_name();
@@ -407,25 +407,25 @@ impl State {
                 EValue::Bool(b) => EValue::Bool(b),
                 EValue::Int(i) => EValue::Bool(i != 0),
                 EValue::String(s) => s.parse::<bool>().map(EValue::Bool).unwrap_or_else(|_| {
-                    EValue::Undefined(format!("cannot cast string \"{}\" to bool", s))
+                    EValue::None(format!("cannot cast string \"{}\" to bool", s))
                 }),
-                _ => EValue::Undefined(format!("cannot cast {} to bool", input_type)),
+                _ => EValue::None(format!("cannot cast {} to bool", input_type)),
             },
             crate::model::r#type::EType::Int { .. } => match input_value {
                 EValue::Bool(b) => EValue::Int(if b { 1 } else { 0 }),
                 EValue::Int(i) => EValue::Int(i),
                 EValue::Char(c) => EValue::Int(c as i32),
                 EValue::String(s) => s.parse::<i32>().map(EValue::Int).unwrap_or_else(|_| {
-                    EValue::Undefined(format!("cannot cast string \"{}\" to int", s))
+                    EValue::None(format!("cannot cast string \"{}\" to int", s))
                 }),
-                _ => EValue::Undefined(format!("cannot cast {} to int", input_type)),
+                _ => EValue::None(format!("cannot cast {} to int", input_type)),
             },
             crate::model::r#type::EType::String { .. } => EValue::String(match input_value {
                 EValue::Bool(b) => b.to_string(),
                 EValue::Int(i) => i.to_string(),
                 EValue::String(s) => s,
                 EValue::Char(c) => c.to_string(),
-                EValue::Undefined(message) => message,
+                EValue::None(message) => message,
             }),
             crate::model::r#type::EType::Char { .. } => match input_value {
                 EValue::Char(c) => EValue::Char(c),
@@ -433,15 +433,15 @@ impl State {
                     .ok()
                     .and_then(char::from_u32)
                     .map(EValue::Char)
-                    .unwrap_or_else(|| EValue::Undefined(format!("cannot cast int {} to char", i))),
+                    .unwrap_or_else(|| EValue::None(format!("cannot cast int {} to char", i))),
                 EValue::String(s) => s.parse::<char>().map(EValue::Char).unwrap_or_else(|_| {
-                    EValue::Undefined(format!("cannot cast string \"{}\" to char", s))
+                    EValue::None(format!("cannot cast string \"{}\" to char", s))
                 }),
-                _ => EValue::Undefined(format!("cannot cast {} to char", input_type)),
+                _ => EValue::None(format!("cannot cast {} to char", input_type)),
             },
             crate::model::r#type::EType::Any => input_value,
-            crate::model::r#type::EType::Undefined { message } => {
-                EValue::Undefined(message.unwrap_or_else(|| "undefined".to_string()))
+            crate::model::r#type::EType::None { message } => {
+                EValue::None(message.unwrap_or_else(|| "none".to_string()))
             }
         }
     }
@@ -461,7 +461,7 @@ impl std::fmt::Display for EValue {
             EValue::Int(value) => write!(f, "{}", value),
             EValue::String(value) => write!(f, "{}", value),
             EValue::Char(value) => write!(f, "{}", value),
-            EValue::Undefined(_) => write!(f, "undefined"),
+            EValue::None(_) => write!(f, "none"),
         }
     }
 }
@@ -489,7 +489,7 @@ impl EValue {
             crate::model::r#type::EType::Any => {
                 Err("any-typed var-decl needs a concrete type".to_string())
             }
-            crate::model::r#type::EType::Undefined { .. } => Ok(EValue::Undefined(raw.to_string())),
+            crate::model::r#type::EType::None { .. } => Ok(EValue::None(raw.to_string())),
         }
     }
 
@@ -499,7 +499,7 @@ impl EValue {
             EValue::Int(_) => "int",
             EValue::String(_) => "string",
             EValue::Char(_) => "char",
-            EValue::Undefined(_) => "undefined",
+            EValue::None(_) => "none",
         }
     }
 }
