@@ -398,15 +398,60 @@ impl LayoutAst {
             bbox = AABB::union_opt(bbox, node_bbox);
         }
         for (owner_id, sub) in &self.sub_layouts {
-            let owner_pos = self
-                .layout_nodes
-                .get(owner_id)
-                .map(|ln| ln.pos.round().as_ivec3())
-                .unwrap_or(IVec3::ZERO);
+            let owner_pos = self.sub_layout_origin(owner_id).round().as_ivec3();
             let sub_bbox = sub.inner_footprint().map(|b| b.translated(owner_pos));
             bbox = AABB::union_opt(bbox, sub_bbox);
         }
         bbox
+    }
+
+    /// How many Y rows a Pattern's branch occupies. A branch holding a nested
+    /// Match is as tall as that Match's own arm stack, which is what lets
+    /// growth propagate outward.
+    fn branch_row_height(&self, pattern_id: &crate::model::node::Id) -> i32 {
+        self.sub_layouts
+            .get(pattern_id)
+            .and_then(|s| s.inner_footprint())
+            .map(|b| (b.max.y - b.min.y + 1).max(1))
+            .unwrap_or(1)
+    }
+
+    /// Re-space a Match's Patterns so each arm clears the branch above it.
+    ///
+    /// Patterns are only ever *inserted* one row apart, so a branch that grew
+    /// — because something nested inside it grew — would overlap its lower
+    /// sibling. Re-spacing packs the arms by their actual heights instead.
+    ///
+    /// `settle_footprints` runs this bottom-up: an inner Match re-spaces its
+    /// own arms first, which grows its branch's `inner_footprint`, which grows
+    /// the enclosing arm, which re-spaces the outer Match. That chain is what
+    /// makes growth cascade out of arbitrarily deep nesting.
+    ///
+    /// The lowest Pattern keeps its row, so the Match's origin stays put and
+    /// the stack only ever grows in +Y.
+    fn respace_match_patterns(&self, match_id: &crate::model::node::Id) -> Self {
+        let mut ordered: Vec<(crate::model::node::Id, f32)> = self
+            .match_pattern_ids(match_id)
+            .into_iter()
+            .filter_map(|pid| self.layout_nodes.get(&pid).map(|ln| (pid, ln.pos.y)))
+            .collect();
+        if ordered.is_empty() {
+            return self.clone_shape();
+        }
+        ordered.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut layout_nodes = self.layout_nodes.clone();
+        let mut row = ordered[0].1;
+        for (pid, _) in &ordered {
+            if let Some(ln) = layout_nodes.get_mut(pid) {
+                ln.pos.y = row;
+            }
+            row += self.branch_row_height(pid) as f32;
+        }
+        Self {
+            ast: self.ast.clone(),
+            layout_nodes,
+            sub_layouts: self.sub_layouts.clone(),
+        }
     }
 
     /// Grid-space AABB (in this LayoutAst's local coords) that a Match
@@ -415,9 +460,9 @@ impl LayoutAst {
     ///     Pattern's own y (patterns are assumed to occupy consecutive rows).
     ///   - X: union of every Pattern's sub-AST X extent, translated by the
     ///     Pattern's outer position.
-    ///   - Z: each Pattern's sub-AST Z range padded by 2 additional cells in
-    ///     the +Z direction (to contain the sub-sink), lower-bounded by the
-    ///     Pattern's own Z (i.e. the parent-facing side).
+    ///   - Z: from the Pattern's own Z (the parent-facing side) out to its
+    ///     branch: the branch origin sits one cell behind the Pattern, so the
+    ///     sub-AST Z range is offset by 1, plus one further cell of padding.
     /// Recursion via `inner_footprint` — inner matches inflate their host
     /// Pattern's sub-AST bbox and thus the outer footprint too.
     pub fn match_footprint(&self, match_id: &crate::model::node::Id) -> Option<AABB> {
@@ -433,13 +478,10 @@ impl LayoutAst {
             let p_pos = p_ln.pos.round().as_ivec3();
             let sub = self.sub_layouts.get(pid);
             let sub_bbox = sub.and_then(|s| s.inner_footprint());
-            let (arm_y, x_min, x_max, z_max) = match sub_bbox {
-                Some(b) => {
-                    let sub_y_extent = b.max.y - b.min.y + 1;
-                    let arm_y = sub_y_extent.max(1);
-                    (arm_y, b.min.x, b.max.x, b.max.z)
-                }
-                None => (1, 0, 0, 0),
+            let arm_y = self.branch_row_height(pid);
+            let (x_min, x_max, z_max) = match sub_bbox {
+                Some(b) => (b.min.x, b.max.x, b.max.z),
+                None => (0, 0, 0),
             };
             let arm = AABB {
                 min: IVec3::new(p_pos.x + x_min, p_pos.y, p_pos.z),
@@ -465,12 +507,14 @@ impl LayoutAst {
             return (self.clone_shape(), IVec3::ZERO);
         };
         let primary_origin = primary_ln.pos;
-        // VarDecls are pinned to the Program wall row (Y=0, Z=0); every other
-        // node type must stay beyond it (Z >= 1), because Z=0 is the wall
-        // plane itself. Layout space is non-negative, so X and Y are clamped
-        // at 0 as well.
+        // VarDecls are pinned to the source row (Y=0, Z=0) and may only be
+        // reordered along X. A BranchSource is pinned outright: it must stay
+        // at branch-local (0,0,0). Every other node type has to stay beyond
+        // the source row (Z >= 1). Layout space is non-negative, so X and Y
+        // are clamped at 0 as well.
         let delta_pos = match self.ast.nodes.get(&node_id) {
             Some(crate::model::node::ENode::VarDecl { .. }) => Vec3::new(delta_pos.x, 0.0, 0.0),
+            Some(crate::model::node::ENode::BranchSource { .. }) => Vec3::ZERO,
             _ => {
                 let target_z = (primary_origin.z + delta_pos.z).round() as i32;
                 if target_z <= 0 {
@@ -628,17 +672,33 @@ impl LayoutAst {
     /// a footprint touching x=0 is pushed out the high side instead. Uses
     /// `move_node_delta` for each bump so cascading collisions resolve
     /// automatically. Iterates until stable (128-step cap).
+    ///
+    /// Between the recursion and the intruder pass, every Match at this level
+    /// re-spaces its arms (`respace_match_patterns`). By then the branches
+    /// below have settled, so their heights are final — that ordering is what
+    /// carries growth out of nested Matches into their enclosing ones.
     pub fn settle_footprints(&self) -> Self {
         let settled_subs: std::collections::HashMap<crate::model::node::Id, LayoutAst> = self
             .sub_layouts
             .iter()
             .map(|(k, v)| (k.clone(), v.settle_footprints()))
             .collect();
-        let mut layout = Self {
+        let layout = Self {
             ast: self.ast.clone(),
             layout_nodes: self.layout_nodes.clone(),
             sub_layouts: settled_subs,
         };
+        // Branch heights are final now, so pack every arm stack before any
+        // footprint is measured below.
+        let match_ids: Vec<crate::model::node::Id> = layout
+            .layout_nodes
+            .keys()
+            .filter(|id| layout.is_match(id))
+            .cloned()
+            .collect();
+        let mut layout = match_ids.iter().fold(layout, |acc, mid| {
+            acc.respace_match_patterns(mid).recompute_match_pos(mid)
+        });
         let owner_ids: Vec<crate::model::node::Id> = layout
             .layout_nodes
             .keys()
@@ -664,6 +724,15 @@ impl LayoutAst {
                 };
                 let intruder = layout.layout_nodes.iter().find_map(|(id, ln)| {
                     if id == owner_id || related.contains(id) {
+                        return None;
+                    }
+                    // A BranchSource cannot be displaced — it is pinned to its
+                    // branch origin — so never pick one as the intruder, or the
+                    // settle loop would spin until its iteration cap.
+                    if matches!(
+                        layout.ast.nodes.get(id),
+                        Some(crate::model::node::ENode::BranchSource { .. })
+                    ) {
                         return None;
                     }
                     let p = ln.pos.round().as_ivec3();
@@ -1064,8 +1133,10 @@ impl LayoutAst {
     /// Create a `Match` container plus its initial `Pattern` child at `pos`.
     /// The Match's synthetic LayoutNode mirrors the lowest Pattern's pos so
     /// rendering can iterate `layout_nodes` uniformly. The Pattern is created
-    /// with a fresh sub-AST (single Sink) and a matching entry in
-    /// `sub_layouts[pattern_id]` positioning that sink at Pattern-local (0,0,2).
+    /// with a fresh sub-AST (BranchSource + Sink) and a matching entry in
+    /// `sub_layouts[pattern_id]`. The branch volume starts one cell behind the
+    /// Pattern, so branch-local (0,0,0) — the BranchSource — is the cell
+    /// adjoining the Pattern in +Z.
     pub fn plus_match(
         &self,
         pos: Vec3,
@@ -1074,7 +1145,6 @@ impl LayoutAst {
     ) -> (Self, NodeIdDomain, AnchorIdDomain) {
         let (anchor_id_domain, match_input_anchor_id) = anchor_id_domain.next_id();
         let (anchor_id_domain, match_output_anchor_id) = anchor_id_domain.next_id();
-        let (anchor_id_domain, pattern_output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, match_node_id) = node_id_domain.next_id();
         let ast = self.ast.plus_node(
             match_node_id.clone(),
@@ -1087,18 +1157,22 @@ impl LayoutAst {
         let (node_id_domain, pattern_node_id) = node_id_domain.next_id();
         // The sub-AST draws its sink node and anchor ids from the same shared
         // id domains, so every id in the tree stays globally unique.
-        let (node_id_domain, anchor_id_domain, pattern_sub_ast, sub_sink_id) =
-            crate::model::ast::Ast::new_pattern_sub_ast(node_id_domain, anchor_id_domain);
+        let (node_id_domain, anchor_id_domain, pattern_sub_ast, sub_sink_id, branch_source_id) =
+            crate::model::ast::Ast::new_pattern_sub_ast(
+                node_id_domain,
+                anchor_id_domain,
+                pattern_node_id.clone(),
+            );
         let ast = ast.plus_node(
             pattern_node_id.clone(),
             crate::model::node::ENode::Pattern {
                 parent_match: match_node_id.clone(),
                 r#type: crate::model::r#type::EType::Int { value: None },
-                output_anchor: pattern_output_anchor_id,
                 sink_node_id: sub_sink_id.clone(),
             },
         );
-        let pattern_sub_layout = Self::initial_pattern_sub_layout(&pattern_sub_ast, &sub_sink_id);
+        let pattern_sub_layout =
+            Self::initial_pattern_sub_layout(&pattern_sub_ast, &sub_sink_id, &branch_source_id);
         let ast = ast.with_node_replaced(
             &match_node_id,
             crate::model::node::ENode::Match {
@@ -1122,27 +1196,36 @@ impl LayoutAst {
         (layout, node_id_domain, anchor_id_domain)
     }
 
-    /// LayoutAst for a fresh Pattern's sub-AST: registers the initial sink at
-    /// Pattern-local grid position (0, 0, 2).
+    /// LayoutAst for a fresh Pattern's sub-AST: the branch's `BranchSource` at
+    /// branch-local (0,0,0) and its Sink at (0,0,2).
     ///
-    /// Z=2 rather than Z=1 so the branch has at least one addressable cell
-    /// from birth (`ast_grid_bounds` spans the wall-to-sink corridor, i.e.
-    /// `1..=sink_z-1`). Since the caret alone selects the editing scope, a
-    /// branch with an empty volume could never be addressed and would stay
-    /// permanently uneditable.
+    /// Branch-local (0,0,0) is the Pattern's cell + Z1 (see
+    /// `sub_layout_origin`), so the source sits directly behind its Pattern.
+    /// The Sink at Z=2 leaves exactly one free working cell at Z=1 from birth;
+    /// `settle_sink` pushes it further back as the branch fills up.
     fn initial_pattern_sub_layout(
         sub_ast: &crate::model::ast::Ast,
         sub_sink_id: &crate::model::node::Id,
+        branch_source_id: &crate::model::node::Id,
     ) -> Self {
         Self {
             ast: sub_ast.clone(),
-            layout_nodes: std::collections::HashMap::from([(
-                sub_sink_id.clone(),
-                LayoutNode {
-                    node_id: sub_sink_id.clone(),
-                    pos: Vec3::new(0.0, 0.0, 2.0),
-                },
-            )]),
+            layout_nodes: std::collections::HashMap::from([
+                (
+                    branch_source_id.clone(),
+                    LayoutNode {
+                        node_id: branch_source_id.clone(),
+                        pos: Vec3::ZERO,
+                    },
+                ),
+                (
+                    sub_sink_id.clone(),
+                    LayoutNode {
+                        node_id: sub_sink_id.clone(),
+                        pos: Vec3::new(0.0, 0.0, 2.0),
+                    },
+                ),
+            ]),
             sub_layouts: std::collections::HashMap::new(),
         }
     }
@@ -1219,23 +1302,33 @@ impl LayoutAst {
             Some(crate::model::node::ENode::Match { patterns, .. }) => patterns.clone(),
             _ => vec![],
         };
-        let (anchor_id_domain, new_output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, new_pattern_id) = node_id_domain.next_id();
         // The sub-AST draws its ids from the same shared domains, keeping every
         // id in the tree globally unique (see plus_match).
-        let (node_id_domain, anchor_id_domain, new_pattern_sub_ast, new_sub_sink_id) =
-            crate::model::ast::Ast::new_pattern_sub_ast(node_id_domain, anchor_id_domain);
+        let (
+            node_id_domain,
+            anchor_id_domain,
+            new_pattern_sub_ast,
+            new_sub_sink_id,
+            new_branch_source_id,
+        ) = crate::model::ast::Ast::new_pattern_sub_ast(
+            node_id_domain,
+            anchor_id_domain,
+            new_pattern_id.clone(),
+        );
         let ast = shifted.ast.plus_node(
             new_pattern_id.clone(),
             crate::model::node::ENode::Pattern {
                 parent_match: parent_id.clone(),
                 r#type: crate::model::r#type::EType::Int { value: None },
-                output_anchor: new_output_anchor_id,
                 sink_node_id: new_sub_sink_id.clone(),
             },
         );
-        let new_pattern_sub_layout =
-            Self::initial_pattern_sub_layout(&new_pattern_sub_ast, &new_sub_sink_id);
+        let new_pattern_sub_layout = Self::initial_pattern_sub_layout(
+            &new_pattern_sub_ast,
+            &new_sub_sink_id,
+            &new_branch_source_id,
+        );
         let new_patterns: Vec<crate::model::node::Id> = sibling_ids
             .iter()
             .cloned()
@@ -1396,6 +1489,30 @@ impl LayoutAst {
         (layout, node_id_domain, anchor_id_domain)
     }
 
+    /// Grid-space origin of `owner_id`'s sub-layout, in this LayoutAst's own
+    /// coordinates.
+    ///
+    /// A Pattern's branch volume starts one cell *behind* the Pattern (+Z):
+    /// the Pattern itself belongs to the Match volume, not to the branch, so
+    /// branch-local (0,0,0) — where the `BranchSource` sits — lands at the
+    /// Pattern's Z+1. Every other owner (the Program wrapper) contributes no
+    /// shift.
+    fn sub_layout_origin(&self, owner_id: &crate::model::node::Id) -> Vec3 {
+        let base = self
+            .layout_nodes
+            .get(owner_id)
+            .map(|ln| ln.pos)
+            .unwrap_or(Vec3::ZERO);
+        if matches!(
+            self.ast.nodes.get(owner_id),
+            Some(crate::model::node::ENode::Pattern { .. })
+        ) {
+            base + Vec3::new(0.0, 0.0, 1.0)
+        } else {
+            base
+        }
+    }
+
     fn _plus_layout_node(&self, node_id: &crate::model::node::Id, pos: Vec3) -> Self {
         Self {
             ast: self.ast.clone(),
@@ -1440,12 +1557,7 @@ impl LayoutAst {
             });
         }
         for (owner_id, sub_layout) in &self.sub_layouts {
-            let owner_grid_pos = self
-                .layout_nodes
-                .get(owner_id)
-                .map(|ln| ln.pos)
-                .unwrap_or(Vec3::ZERO);
-            let sub_offset = offset + owner_grid_pos;
+            let sub_offset = offset + self.sub_layout_origin(owner_id);
             let sub_scale = if matches!(
                 self.ast.nodes.get(owner_id),
                 Some(crate::model::node::ENode::Pattern { .. })
@@ -1479,26 +1591,19 @@ impl LayoutAst {
             extra_offset: offset,
         });
         for (owner_id, sub_layout) in &self.sub_layouts {
-            let owner_grid_pos = self
-                .layout_nodes
-                .get(owner_id)
-                .map(|ln| ln.pos)
-                .unwrap_or(Vec3::ZERO);
+            let sub_origin = self.sub_layout_origin(owner_id);
             let mut sub_context = context.clone();
             sub_context.push(owner_id.clone());
-            sub_layout.walk_all_asts_into(sub_context, offset + owner_grid_pos, out);
+            sub_layout.walk_all_asts_into(sub_context, offset + sub_origin, out);
         }
     }
 
     /// Compute the grid bounds for this AST in its own local coordinates.
     ///
-    /// - Z range: `[z_min, sink.z - 1]` where `sink.z` is the single Sink's
-    ///   layout-Z. `owns_source_row` decides `z_min`: the root scope owns the
-    ///   source row at Z=0 (VarDecls live there and nothing else may), so its
-    ///   grid starts at 0 and the wall is drawn at that edge. A Pattern
-    ///   sub-AST starts at 1 instead — its local Z=0 is the Pattern node
-    ///   itself, which lives in and must stay selectable from the parent
-    ///   scope. Returns `None` if the corridor collapses or no Sink exists.
+    /// - Z range: `[0, sink.z - 1]` where `sink.z` is the single Sink's
+    ///   layout-Z. Every scope owns a source row at its local Z=0: the root
+    ///   scope holds VarDecls there, a branch holds its single BranchSource.
+    ///   Returns `None` if the corridor collapses or no Sink exists.
     /// - X range: min/max over every node's footprint X-span, unioned with
     ///   `active_selection.x` when provided. Multi-cell footprints (matches,
     ///   ≥3-input function calls) grow the grid so the extra cell is
@@ -1512,11 +1617,7 @@ impl LayoutAst {
     ///
     /// `active_selection` is the currently-selected cell in this AST's local
     /// coords, passed only when this AST is the scope the caret addresses.
-    pub fn ast_grid_bounds(
-        &self,
-        active_selection: Option<IVec3>,
-        owns_source_row: bool,
-    ) -> Option<AstGridBounds> {
+    pub fn ast_grid_bounds(&self, active_selection: Option<IVec3>) -> Option<AstGridBounds> {
         let sink_z =
             self.layout_nodes
                 .iter()
@@ -1526,7 +1627,7 @@ impl LayoutAst {
                     }
                     _ => None,
                 })?;
-        let z_min = if owns_source_row { 0 } else { 1 };
+        let z_min = 0;
         let z_max = sink_z - 1;
         if z_min > z_max {
             return None;
@@ -1678,20 +1779,17 @@ impl LayoutAst {
     /// corridor including the cells that are still empty — otherwise the caret
     /// could not be placed where a node is about to be inserted.
     ///
-    /// The root scope claims the source row at Z=0 as part of its grid; a
-    /// sub-scope must not claim its own Z=0, because that cell is the Pattern
-    /// node itself, which lives in — and has to stay selectable from — the
-    /// parent scope. `ast_grid_bounds` encodes that distinction.
+    /// Every scope claims its own source row at local Z=0. A Pattern is not
+    /// part of its branch volume — the branch starts one cell behind it — so
+    /// the Pattern stays addressable in the Match's scope while branch-local
+    /// Z=0 belongs to the branch's BranchSource.
     ///
     /// `None` when the address lies outside every scope; callers treat that as
     /// "nothing to edit here".
     pub fn scope_at(&self, global: IVec3) -> Option<(Vec<crate::model::node::Id>, IVec3)> {
         let mut best: Option<(Vec<crate::model::node::Id>, IVec3)> = None;
         for walked in self.walk_all_asts() {
-            let Some(bounds) = walked
-                .layout_ast
-                .ast_grid_bounds(None, walked.context.is_empty())
-            else {
+            let Some(bounds) = walked.layout_ast.ast_grid_bounds(None) else {
                 continue;
             };
             let offset = walked.extra_offset.round().as_ivec3();
@@ -1723,9 +1821,7 @@ impl LayoutAst {
         let mut offset = IVec3::ZERO;
         let mut ast = self;
         for id in path {
-            if let Some(ln) = ast.layout_nodes.get(id) {
-                offset += ln.pos.round().as_ivec3();
-            }
+            offset += ast.sub_layout_origin(id).round().as_ivec3();
             let Some(next) = ast.sub_layouts.get(id) else {
                 break;
             };
@@ -1763,10 +1859,11 @@ pub fn value_of_etype(t: &crate::model::r#type::EType) -> Option<String> {
 /// Return the AST-level literal attached to `anchor_id`'s type, if any.
 ///
 /// Only anchors on nodes whose type is a first-class `model::r#type::EType` field
-/// (ConstDecl, VarDecl, Pattern, TypeCast) can carry a literal.
-/// FunctionCall inputs/outputs bind to `eval::EType` on the declaration, which
-/// has no AST-level literal — treated as `None`. Match / Sink / Program
-/// don't carry types at all.
+/// (ConstDecl, VarDecl, TypeCast) can carry a literal. FunctionCall
+/// inputs/outputs bind to `eval::EType` on the declaration, and a BranchSource
+/// borrows its Pattern's type — neither has an AST-level literal of its own,
+/// so both are treated as `None`. Match / Pattern / Sink / Program don't carry
+/// anchored types at all.
 pub fn anchor_ast_value_from_node(
     node: &crate::model::node::ENode,
     anchor_id: &crate::model::anchor::Id,
@@ -1777,11 +1874,6 @@ pub fn anchor_ast_value_from_node(
             output_anchor,
         }
         | crate::model::node::ENode::VarDecl {
-            r#type,
-            output_anchor,
-            ..
-        }
-        | crate::model::node::ENode::Pattern {
             r#type,
             output_anchor,
             ..

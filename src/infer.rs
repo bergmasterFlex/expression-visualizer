@@ -187,12 +187,24 @@ fn anchor_type_uncycled(
             r#type,
             output_anchor,
             ..
-        }
-        | crate::model::node::ENode::Pattern {
-            r#type,
-            output_anchor,
-            ..
         } => (anchor_id == output_anchor).then(|| ast_type_to_eval_type(r#type)),
+        // A branch source hands the matched value into its branch, so it
+        // carries its Pattern's declared type — the narrowing the Match
+        // performs. It has no type of its own to declare.
+        crate::model::node::ENode::BranchSource {
+            pattern,
+            output_anchor,
+        } => {
+            if anchor_id != output_anchor {
+                return None;
+            }
+            match ast.nodes.get(pattern)? {
+                crate::model::node::ENode::Pattern { r#type, .. } => {
+                    Some(ast_type_to_eval_type(r#type))
+                }
+                _ => None,
+            }
+        }
         crate::model::node::ENode::FunctionCall {
             function_declaration_id,
             input_anchors,
@@ -219,8 +231,10 @@ fn anchor_type_uncycled(
         } => (anchor_id == output_anchor).then(|| {
             match_output_type(ast, patterns, input_anchor, function_declarations, visiting)
         }),
-        // Sink input takes anything; Program has no anchors at all.
-        crate::model::node::ENode::Sink { .. } | crate::model::node::ENode::Program {} => None,
+        // Sink input takes anything; Pattern and Program have no anchors.
+        crate::model::node::ENode::Sink { .. }
+        | crate::model::node::ENode::Pattern { .. }
+        | crate::model::node::ENode::Program {} => None,
     }
 }
 

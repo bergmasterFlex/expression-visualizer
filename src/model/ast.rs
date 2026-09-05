@@ -39,19 +39,40 @@ impl Ast {
         (ast, node_id_domain, anchor_id_domain)
     }
 
+    /// Sub-AST for a Match branch: the terminating Sink plus the branch's
+    /// single `BranchSource`, which belongs to `pattern`. Both are
+    /// constitutive — a branch is never without them — so they are created
+    /// here rather than by any user action.
     pub fn new_pattern_sub_ast(
         node_id_domain: crate::common::IdDomain<super::node::Id>,
         anchor_id_domain: crate::common::IdDomain<super::anchor::Id>,
+        pattern: super::node::Id,
     ) -> (
         crate::common::IdDomain<super::node::Id>,
         crate::common::IdDomain<super::anchor::Id>,
         Self,
         super::node::Id,
+        super::node::Id,
     ) {
         let (sub_ast, node_id_domain, anchor_id_domain) =
             Self::new(node_id_domain, anchor_id_domain);
         let sink_node_id = sub_ast.sink_node_id.clone();
-        (node_id_domain, anchor_id_domain, sub_ast, sink_node_id)
+        let (node_id_domain, branch_source_id) = node_id_domain.next_id();
+        let (anchor_id_domain, branch_source_anchor_id) = anchor_id_domain.next_id();
+        let sub_ast = sub_ast.plus_node(
+            branch_source_id.clone(),
+            super::node::ENode::BranchSource {
+                pattern,
+                output_anchor: branch_source_anchor_id,
+            },
+        );
+        (
+            node_id_domain,
+            anchor_id_domain,
+            sub_ast,
+            sink_node_id,
+            branch_source_id,
+        )
     }
 
     /// Union another AST's nodes/anchors/edges into this one, keeping this AST's

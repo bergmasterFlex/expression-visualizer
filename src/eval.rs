@@ -240,7 +240,25 @@ impl State {
                         None => Err(vec![format!("node {} not found", matching_pattern_id)]),
                     },
                 ),
-            crate::model::node::ENode::Pattern { parent_match, .. } => {
+            // A Pattern is a type declaration in the Match's volume, not a
+            // value producer — the branch reads from its BranchSource instead,
+            // and the Match evaluates the branch's Sink directly.
+            crate::model::node::ENode::Pattern { .. } => {
+                Err(vec!["a pattern produces no value".to_string()])
+            }
+            // The branch's entry point: hand through whatever arrived at the
+            // owning Match's input anchor. Reached only once that Match has
+            // selected this branch, so the value is the matched one.
+            crate::model::node::ENode::BranchSource { pattern, .. } => {
+                let parent_match = match ast.nodes.get(&pattern) {
+                    Some(crate::model::node::ENode::Pattern { parent_match, .. }) => {
+                        parent_match.clone()
+                    }
+                    Some(_) => {
+                        return Err(vec![format!("node {} is not a pattern", pattern)]);
+                    }
+                    None => return Err(vec![format!("pattern {} not found", pattern)]),
+                };
                 match ast.nodes.get(&parent_match) {
                     Some(crate::model::node::ENode::Match { input_anchor, .. }) => ast
                         .get_connected_nodes_to_anchor(input_anchor.clone())
@@ -251,13 +269,13 @@ impl State {
                         .map(|value| self.with_value(node_id, value))
                         .ok_or_else(|| {
                             vec![format!(
-                                "no value at parent match input anchor for pattern {}",
+                                "no value at parent match input anchor for branch source {}",
                                 node_id
                             )]
                         }),
                     Some(_) => Err(vec![format!(
                         "parent match {} of pattern {} is not a match node",
-                        parent_match, node_id
+                        parent_match, pattern
                     )]),
                     None => Err(vec![format!("parent match {} not found", parent_match)]),
                 }

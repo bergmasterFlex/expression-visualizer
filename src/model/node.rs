@@ -47,11 +47,23 @@ pub enum ENode {
         input_anchor: super::anchor::Id,
         output_anchor: super::anchor::Id,
     },
+    /// One arm of a Match. Lives in the Match's volume, not in its branch:
+    /// it declares the type the arm matches and fixes the branch's Y row, but
+    /// carries no anchor. The branch reads the matched value from its own
+    /// `BranchSource` instead, so no edge crosses the volume boundary.
     Pattern {
         parent_match: super::node::Id,
         r#type: super::r#type::EType,
-        output_anchor: super::anchor::Id,
         sink_node_id: super::node::Id,
+    },
+    /// The single entry point of a Match branch, at branch-local (0,0,0) —
+    /// directly behind its Pattern. Exactly one exists per branch and it is
+    /// created with the branch, never by the user. Its output carries the
+    /// matched value, typed by `pattern`'s declared type; it is the branch's
+    /// equivalent of a top-level VarDecl source.
+    BranchSource {
+        pattern: super::node::Id,
+        output_anchor: super::anchor::Id,
     },
 }
 
@@ -121,10 +133,12 @@ impl ENode {
                 ),
                 (output_anchor.clone(), super::anchor::EAnchor::Output),
             ],
-            ENode::Pattern { output_anchor, .. } => {
+            ENode::BranchSource { output_anchor, .. } => {
                 vec![(output_anchor.clone(), super::anchor::EAnchor::Output)]
             }
-            ENode::Program { .. } => vec![],
+            // A Pattern carries no anchor: the branch reads its value from
+            // the branch's own BranchSource.
+            ENode::Pattern { .. } | ENode::Program { .. } => vec![],
         }
     }
 

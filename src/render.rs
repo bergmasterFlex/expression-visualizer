@@ -709,16 +709,41 @@ pub fn layoutnode_to_rendernode(
             labels: vec![],
             decorations: vec![],
         },
-        crate::model::node::ENode::Pattern {
-            r#type,
-            output_anchor,
-            ..
-        } => {
-            let color = Color::srgb(0.9, 0.0, 0.0);
-            let output_local = Vec3::new(0.0, 0.0, -NODE_HALF_DEPTH);
-            let output_world = node_pos + output_local;
-            let eval_type = crate::infer::ast_type_to_eval_type(r#type);
-            let pattern_value = crate::layout::value_of_etype(r#type);
+        // A Pattern declares the arm's type and fixes its branch's row, but
+        // owns no anchor — the branch draws its value from its own
+        // BranchSource, which sits one cell behind in the branch volume.
+        crate::model::node::ENode::Pattern { .. } => RenderNode {
+            node: RenderObject {
+                mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, ANCHOR_X)
+                    .mesh()
+                    .build(),
+                material: StandardMaterial {
+                    base_color: Color::srgb(0.9, 0.0, 0.0),
+                    emissive: emissive_color(Color::srgb(0.9, 0.0, 0.0)),
+                    metallic: 0.3,
+                    perceptual_roughness: 0.6,
+                    ..default()
+                },
+                transform: node_pos_tf,
+            },
+            anchors: std::collections::HashMap::new(),
+            labels: vec![RenderLabel {
+                text: label_for_node(node, function_declarations),
+                color: Color::WHITE,
+                font_size: 18.0,
+                world_pos: node_pos,
+                offset: Vec2::ZERO,
+            }],
+            decorations: vec![],
+        },
+        // The branch's source: same shape as a VarDecl, but its type is the
+        // owning Pattern's, resolved through `infer::anchor_type`.
+        crate::model::node::ENode::BranchSource { output_anchor, .. } => {
+            let color = Color::srgb(0.9, 0.35, 0.0);
+            let output_world = node_pos + Vec3::new(0.0, 0.0, -NODE_HALF_DEPTH);
+            let output_eval_type =
+                crate::infer::anchor_type(flat_ast, output_anchor, function_declarations)
+                    .unwrap_or(crate::infer::EType::Pending);
             RenderNode {
                 node: RenderObject {
                     mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, ANCHOR_X)
@@ -735,16 +760,13 @@ pub fn layoutnode_to_rendernode(
                 },
                 anchors: std::collections::HashMap::from([(
                     output_anchor.clone(),
-                    RenderAnchor {
-                        pick_center: anchor_pick_center(output_world, false),
-                        type_markers: build_type_markers(
-                            &eval_type,
-                            pattern_value.as_deref(),
-                            output_world,
-                            false,
-                        ),
-                        plain_body: None,
-                    },
+                    typed_anchor(
+                        &output_eval_type,
+                        None,
+                        output_world,
+                        false,
+                        anchor_pick_center(output_world, false),
+                    ),
                 )]),
                 labels: vec![],
                 decorations: vec![],
@@ -903,6 +925,7 @@ pub fn label_for_node(
         }
         crate::model::node::ENode::Match { .. } => "match".to_string(),
         crate::model::node::ENode::Pattern { r#type, .. } => r#type.to_string(),
+        crate::model::node::ENode::BranchSource { .. } => "branch source".to_string(),
         crate::model::node::ENode::Program { .. } => "program".to_string(),
     }
 }

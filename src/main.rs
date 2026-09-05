@@ -948,10 +948,7 @@ fn spawn_ast_nodes(
         } else {
             None
         };
-        let Some(bounds) = walked_ast
-            .layout_ast
-            .ast_grid_bounds(active_selection, walked_ast.context.is_empty())
-        else {
+        let Some(bounds) = walked_ast.layout_ast.ast_grid_bounds(active_selection) else {
             continue;
         };
         let width_cells = (bounds.max.x - bounds.min.x + 1) as f32;
@@ -1282,11 +1279,13 @@ fn handle_delete_node_button(
         let Some(selected_node_id) = caret_ast.node_at(local) else {
             continue;
         };
-        let is_sink = matches!(
+        // Sink and BranchSource are constitutive parts of their scope, not
+        // user-placed nodes — neither can be deleted.
+        let is_fixture = matches!(
             caret_ast.ast.nodes.get(&selected_node_id),
-            Some(model::node::ENode::Sink { .. })
+            Some(model::node::ENode::Sink { .. } | model::node::ENode::BranchSource { .. })
         );
-        if is_sink {
+        if is_fixture {
             continue;
         }
         let updated = caret_ast.minus_node(&selected_node_id);
@@ -1408,7 +1407,7 @@ fn update_delete_button_visuals(
         Some((ast, local)) => match ast.node_at(local) {
             Some(id) => !matches!(
                 ast.ast.nodes.get(&id),
-                Some(model::node::ENode::Sink { .. })
+                Some(model::node::ENode::Sink { .. } | model::node::ENode::BranchSource { .. })
             ),
             None => false,
         },
@@ -1476,15 +1475,15 @@ fn handle_add_node_button(
                 if target_occupied && *action != EAstActionButton::AddPatternButton {
                     continue;
                 }
-                // The whole Z=0 plane of the Program scope is the source row:
-                // only VarDecls may live there. Refuse every other creation
-                // action defensively.
-                let is_source_row = is_program_scope && local.z == 0;
+                // Every scope reserves its Z=0 plane as the source row. Only a
+                // VarDecl may be created there, and only in the Program scope
+                // — a branch's Z=0 already holds its BranchSource. Refuse
+                // every other creation action defensively.
+                let is_source_row = local.z == 0;
+                let vardecl_allowed = is_source_row && is_program_scope && local.y == 0;
                 if is_source_row
-                    && !matches!(
-                        *action,
-                        EAstActionButton::AddVarDeclButton | EAstActionButton::AddPatternButton
-                    )
+                    && !matches!(*action, EAstActionButton::AddPatternButton)
+                    && !(vardecl_allowed && *action == EAstActionButton::AddVarDeclButton)
                 {
                     continue;
                 }
@@ -1498,10 +1497,10 @@ fn handle_add_node_button(
                         anchor_id_domain,
                     ),
                     EAstActionButton::AddVarDeclButton => {
-                        // VarDecls occupy the source row at (x, 0, 0) — refuse
-                        // anything else defensively; the enable-check normally
-                        // greys the button out first.
-                        if !is_source_row || local.y != 0 {
+                        // VarDecls occupy the Program scope's source row at
+                        // (x, 0, 0) — refuse anything else defensively; the
+                        // enable-check normally greys the button out first.
+                        if !vardecl_allowed {
                             continue;
                         }
                         scope_ast.plus_var_decl(new_pos, node_id_domain, anchor_id_domain)
