@@ -1,6 +1,5 @@
 # TODOs
 
-- volumes only in positiv direction
 - nodes/anchors visualization and anchors one address
   - Source
   - TypeCast

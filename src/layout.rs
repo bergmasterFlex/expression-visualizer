@@ -46,7 +46,8 @@ pub struct WalkedAst<'a> {
 }
 
 /// Bounds of an AST grid in that AST's local grid coordinates. Both corners
-/// are inclusive; `y = 0` for both.
+/// are inclusive. X/Z size the drawn grid plane; Y spans the rows the scope
+/// owns and is read only when resolving a caret address to its scope.
 #[derive(Debug, Clone, Copy)]
 pub struct AstGridBounds {
     pub min: IVec3,
@@ -60,8 +61,21 @@ pub struct AABB {
     pub max: IVec3,
 }
 
+/// Layout space is the non-negative octant. Constructing a box that reaches
+/// below the origin means some placement or displacement rule leaked a
+/// negative address; fail loudly in debug builds rather than propagating it
+/// silently into grid bounds, picking and the caret.
+fn debug_assert_non_negative(min: IVec3) {
+    debug_assert!(
+        min.x >= 0 && min.y >= 0 && min.z >= 0,
+        "layout AABB reaches into negative space: min={:?}",
+        min
+    );
+}
+
 impl AABB {
     pub fn point(p: IVec3) -> Self {
+        debug_assert_non_negative(p);
         Self { min: p, max: p }
     }
 
@@ -89,6 +103,7 @@ impl AABB {
     }
 
     pub fn translated(self, delta: IVec3) -> Self {
+        debug_assert_non_negative(self.min + delta);
         Self {
             min: self.min + delta,
             max: self.max + delta,
@@ -139,7 +154,7 @@ impl LayoutAst {
             layout_nodes: std::collections::HashMap::new(),
             sub_layouts: std::collections::HashMap::new(),
         }
-        ._plus_layout_node(&sink_node_id, Vec3::new(0.0, 0.0, -4.0));
+        ._plus_layout_node(&sink_node_id, Vec3::new(0.0, 0.0, 4.0));
         (layout, node_id_domain, anchor_id_domain)
     }
 
@@ -278,8 +293,8 @@ impl LayoutAst {
 
     /// AABB (in this LayoutAst's local grid coords) that a node claims.
     /// Delegates to `match_footprint` for matches; for FunctionCall applies
-    /// the minimum-extent rule (1–2 inputs → 1X×2Z toward −Z; ≥3 inputs →
-    /// 2X×2Z extending +X and −Z). Every other node claims a single cell at
+    /// the minimum-extent rule (1–2 inputs → 1X×2Z toward +Z; ≥3 inputs →
+    /// 2X×2Z extending +X and +Z). Every other node claims a single cell at
     /// its rounded position.
     pub fn node_footprint(&self, id: &crate::model::node::Id) -> Option<AABB> {
         let ln = self.layout_nodes.get(id)?;
@@ -294,8 +309,8 @@ impl LayoutAst {
                     (0, 1)
                 };
                 Some(AABB {
-                    min: IVec3::new(pos.x, pos.y, pos.z - depth_extra),
-                    max: IVec3::new(pos.x + width_extra, pos.y, pos.z),
+                    min: IVec3::new(pos.x, pos.y, pos.z),
+                    max: IVec3::new(pos.x + width_extra, pos.y, pos.z + depth_extra),
                 })
             }
             _ => Some(AABB::point(pos)),
@@ -401,7 +416,7 @@ impl LayoutAst {
     ///   - X: union of every Pattern's sub-AST X extent, translated by the
     ///     Pattern's outer position.
     ///   - Z: each Pattern's sub-AST Z range padded by 2 additional cells in
-    ///     the −Z direction (to contain the sub-sink), upper-bounded by the
+    ///     the +Z direction (to contain the sub-sink), lower-bounded by the
     ///     Pattern's own Z (i.e. the parent-facing side).
     /// Recursion via `inner_footprint` — inner matches inflate their host
     /// Pattern's sub-AST bbox and thus the outer footprint too.
@@ -418,17 +433,17 @@ impl LayoutAst {
             let p_pos = p_ln.pos.round().as_ivec3();
             let sub = self.sub_layouts.get(pid);
             let sub_bbox = sub.and_then(|s| s.inner_footprint());
-            let (arm_y, x_min, x_max, z_min) = match sub_bbox {
+            let (arm_y, x_min, x_max, z_max) = match sub_bbox {
                 Some(b) => {
                     let sub_y_extent = b.max.y - b.min.y + 1;
                     let arm_y = sub_y_extent.max(1);
-                    (arm_y, b.min.x, b.max.x, b.min.z)
+                    (arm_y, b.min.x, b.max.x, b.max.z)
                 }
                 None => (1, 0, 0, 0),
             };
             let arm = AABB {
-                min: IVec3::new(p_pos.x + x_min, p_pos.y, p_pos.z + z_min - 2),
-                max: IVec3::new(p_pos.x + x_max, p_pos.y + arm_y - 1, p_pos.z),
+                min: IVec3::new(p_pos.x + x_min, p_pos.y, p_pos.z),
+                max: IVec3::new(p_pos.x + x_max, p_pos.y + arm_y - 1, p_pos.z + z_max + 2),
             };
             bbox = AABB::union_opt(bbox, Some(arm));
         }
@@ -450,19 +465,33 @@ impl LayoutAst {
             return (self.clone_shape(), IVec3::ZERO);
         };
         let primary_origin = primary_ln.pos;
-        // VarDecls are pinned to the Program wall row (Y=0, Z=0);
-        // every other node type must stay south of it (Z < 0).
+        // VarDecls are pinned to the Program wall row (Y=0, Z=0); every other
+        // node type must stay beyond it (Z >= 1), because Z=0 is the wall
+        // plane itself. Layout space is non-negative, so X and Y are clamped
+        // at 0 as well.
         let delta_pos = match self.ast.nodes.get(&node_id) {
             Some(crate::model::node::ENode::VarDecl { .. }) => Vec3::new(delta_pos.x, 0.0, 0.0),
             _ => {
                 let target_z = (primary_origin.z + delta_pos.z).round() as i32;
-                if target_z >= 0 {
+                if target_z <= 0 {
                     Vec3::new(delta_pos.x, delta_pos.y, 0.0)
                 } else {
                     delta_pos
                 }
             }
         };
+        let clamp_axis = |origin: f32, delta: f32| {
+            if (origin + delta).round() as i32 >= 0 {
+                delta
+            } else {
+                0.0
+            }
+        };
+        let delta_pos = Vec3::new(
+            clamp_axis(primary_origin.x, delta_pos.x),
+            clamp_axis(primary_origin.y, delta_pos.y),
+            delta_pos.z,
+        );
         let occupancy = self.occupancy_map();
 
         let primary_delta = self.jump_delta(&occupancy, &node_id, primary_origin, delta_pos);
@@ -593,8 +622,10 @@ impl LayoutAst {
     /// At each level, for every such owner: scan `layout_nodes` for
     /// non-related nodes whose rounded position falls inside the footprint
     /// and bump them along the axis with the smallest exit distance — +Y for
-    /// Y-overlap, ±X toward the near footprint edge, −Z toward the sub-sink
-    /// side (never +Z; that side faces the parent wall). Uses
+    /// Y-overlap, ±X toward the near footprint edge, +Z toward the sub-sink
+    /// side (never −Z; that side faces the parent wall). Every push target is
+    /// clamped to the non-negative octant, so an intruder on the low-X side of
+    /// a footprint touching x=0 is pushed out the high side instead. Uses
     /// `move_node_delta` for each bump so cascading collisions resolve
     /// automatically. Iterates until stable (128-step cap).
     pub fn settle_footprints(&self) -> Self {
@@ -645,20 +676,22 @@ impl LayoutAst {
                 let Some((intruder_id, ipos)) = intruder else {
                     break;
                 };
+                // Exit toward the near X edge, unless that would leave the
+                // non-negative octant — then out the far edge.
                 let center_x = (bbox.min.x + bbox.max.x) / 2;
-                let push_x = if ipos.x <= center_x {
+                let push_x = if ipos.x <= center_x && bbox.min.x - 1 >= 0 {
                     bbox.min.x - 1 - ipos.x
                 } else {
                     bbox.max.x + 1 - ipos.x
                 };
                 let push_y = bbox.max.y + 1 - ipos.y;
-                let push_z = bbox.min.z - 1 - ipos.z;
+                let push_z = bbox.max.z + 1 - ipos.z;
                 // VarDecls are pinned to Y=0, Z=0 → only X-push can succeed.
                 let is_var_decl = matches!(
                     layout.ast.nodes.get(&intruder_id),
                     Some(crate::model::node::ENode::VarDecl { .. })
                 );
-                // Priority: Z (deeper) → X (sideways) → Y (upward). Y is a
+                // Priority: Z (deeper) → X (sideways) → Y (downward). Y is a
                 // last resort because it crosses row boundaries; XZ keeps
                 // the intruder on the same floor.
                 let (best_axis, best_dist) = if is_var_decl {
@@ -685,13 +718,14 @@ impl LayoutAst {
         layout.settle_sink().harmonize_match_sinks()
     }
 
-    /// Push the Sink back (−Z) so the grid encapsulates the deepest node,
-    /// regardless of where on X/Y it sits. `deepest_z` is the minimum over
-    /// every non-sink node's `node_footprint` min.z (so multi-cell owners —
-    /// function calls, Match footprints extending into −Z — are contained
-    /// too). The sink lands one cell behind that (`deepest_z - 1`), matching
-    /// the convention the swap constraint already produces. Expand-only: the
-    /// sink never moves forward, preserving the initial roomy corridor.
+    /// Push the Sink back (+Z, away from the wall) so the grid encapsulates
+    /// the deepest node, regardless of where on X/Y it sits. `deepest_z` is
+    /// the maximum over every non-sink node's `node_footprint` max.z (so
+    /// multi-cell owners — function calls, Match footprints extending into
+    /// +Z — are contained too). The sink lands one cell beyond that
+    /// (`deepest_z + 1`), matching the convention the swap constraint already
+    /// produces. Expand-only: the sink never moves back toward the wall,
+    /// preserving the initial roomy corridor.
     fn settle_sink(&self) -> Self {
         let Some(sink_id) = self.sink_id() else {
             return self.clone_shape();
@@ -702,7 +736,7 @@ impl LayoutAst {
         let sink_pos = sink_ln.pos;
         let current_sink_z = sink_pos.round().as_ivec3().z;
 
-        let mut deepest_z = i32::MAX;
+        let mut deepest_z = i32::MIN;
         for id in self.layout_nodes.keys() {
             if *id == sink_id {
                 continue;
@@ -710,15 +744,15 @@ impl LayoutAst {
             let Some(fp) = self.node_footprint(id) else {
                 continue;
             };
-            if fp.min.z < deepest_z {
-                deepest_z = fp.min.z;
+            if fp.max.z > deepest_z {
+                deepest_z = fp.max.z;
             }
         }
-        if deepest_z == i32::MAX {
+        if deepest_z == i32::MIN {
             return self.clone_shape();
         }
 
-        let new_sink_z = current_sink_z.min(deepest_z - 1);
+        let new_sink_z = current_sink_z.max(deepest_z + 1);
         if new_sink_z == current_sink_z {
             return self.clone_shape();
         }
@@ -759,7 +793,7 @@ impl LayoutAst {
             .collect();
         for match_id in &match_ids {
             let pattern_ids = layout.match_pattern_ids(match_id);
-            // Reference = the sibling sink furthest back (smallest Z).
+            // Reference = the sibling sink furthest back (largest Z).
             let mut reference: Option<(f32, f32)> = None;
             for pid in &pattern_ids {
                 let Some(sub) = layout.sub_layouts.get(pid) else {
@@ -771,7 +805,7 @@ impl LayoutAst {
                 let Some(ln) = sub.layout_nodes.get(&sink_id) else {
                     continue;
                 };
-                if reference.map(|(_, z)| ln.pos.z < z).unwrap_or(true) {
+                if reference.map(|(_, z)| ln.pos.z > z).unwrap_or(true) {
                     reference = Some((ln.pos.x, ln.pos.z));
                 }
             }
@@ -838,10 +872,11 @@ impl LayoutAst {
             let Some(bbox) = self.match_footprint(&match_id) else {
                 return target - origin;
             };
+            // Clamp the upward jump at 0: layout space has no negative row.
             target.y = if step > 0.0 {
                 bbox.max.y as f32 + step
             } else {
-                bbox.min.y as f32 + step
+                (bbox.min.y as f32 + step).max(0.0)
             };
         }
         nominal_delta
@@ -1030,7 +1065,7 @@ impl LayoutAst {
     /// The Match's synthetic LayoutNode mirrors the lowest Pattern's pos so
     /// rendering can iterate `layout_nodes` uniformly. The Pattern is created
     /// with a fresh sub-AST (single Sink) and a matching entry in
-    /// `sub_layouts[pattern_id]` positioning that sink at Pattern-local (0,0,-1).
+    /// `sub_layouts[pattern_id]` positioning that sink at Pattern-local (0,0,2).
     pub fn plus_match(
         &self,
         pos: Vec3,
@@ -1088,7 +1123,13 @@ impl LayoutAst {
     }
 
     /// LayoutAst for a fresh Pattern's sub-AST: registers the initial sink at
-    /// Pattern-local grid position (0, 0, -1).
+    /// Pattern-local grid position (0, 0, 2).
+    ///
+    /// Z=2 rather than Z=1 so the branch has at least one addressable cell
+    /// from birth (`ast_grid_bounds` spans the wall-to-sink corridor, i.e.
+    /// `1..=sink_z-1`). Since the caret alone selects the editing scope, a
+    /// branch with an empty volume could never be addressed and would stay
+    /// permanently uneditable.
     fn initial_pattern_sub_layout(
         sub_ast: &crate::model::ast::Ast,
         sub_sink_id: &crate::model::node::Id,
@@ -1099,20 +1140,25 @@ impl LayoutAst {
                 sub_sink_id.clone(),
                 LayoutNode {
                     node_id: sub_sink_id.clone(),
-                    pos: Vec3::new(0.0, 0.0, -1.0),
+                    pos: Vec3::new(0.0, 0.0, 2.0),
                 },
             )]),
             sub_layouts: std::collections::HashMap::new(),
         }
     }
 
-    /// Insert a new Pattern into `selected_pattern_id`'s parent Match,
-    /// occupying the selected slot. Sibling Patterns of the same match at
-    /// Y ≥ selected.Y shift up by 1 to make room; the growing match footprint
-    /// then displaces any external neighbors via `settle_footprints`. The caller
-    /// bumps `pick.selected_pos.y` by 1 so selection tracks the originally-
-    /// selected Pattern (now one row higher).
-    pub fn plus_pattern_above(
+    /// Insert a new Pattern directly below `selected_pattern_id` in its parent
+    /// Match — i.e. into the row at `selected.Y + 1`, since layout `+Y` renders
+    /// downward. Works from any Pattern of the stack, not just the topmost.
+    ///
+    /// Sibling Patterns strictly *after* the selected row shift by +1 to make
+    /// room; the selected Pattern itself stays put, so the caret needs no
+    /// adjustment. The growing match footprint then displaces any external
+    /// neighbours via `settle_footprints`.
+    ///
+    /// Growth is +Y only, which keeps the stack inside the non-negative octant
+    /// and leaves the Pattern at the match's lowest Y as its origin row.
+    pub fn plus_pattern_below(
         &self,
         selected_pattern_id: &crate::model::node::Id,
         node_id_domain: NodeIdDomain,
@@ -1138,9 +1184,10 @@ impl LayoutAst {
         let selected_y = selected_pos.y;
         let column_x = selected_pos.x;
         let column_z = selected_pos.z;
-        // Shift only sibling Patterns of the same match at Y ≥ selected.Y.
-        // External neighbours are handled by settle_footprints once the new
-        // Pattern has grown the footprint.
+        // Shift only sibling Patterns of the same match strictly below the
+        // selected row — the selected Pattern keeps its slot and the new one
+        // takes the row right after it. External neighbours are handled by
+        // settle_footprints once the new Pattern has grown the footprint.
         let match_pattern_ids: std::collections::HashSet<crate::model::node::Id> =
             self.match_pattern_ids(&parent_id).into_iter().collect();
         let shifted_layout_nodes = self
@@ -1150,7 +1197,7 @@ impl LayoutAst {
                 if !match_pattern_ids.contains(id) {
                     return (id.clone(), ln.clone());
                 }
-                if ln.pos.y >= selected_y - 0.001 {
+                if ln.pos.y > selected_y + 0.001 {
                     (
                         id.clone(),
                         LayoutNode {
@@ -1219,7 +1266,10 @@ impl LayoutAst {
                 .chain([(new_pattern_id.clone(), new_pattern_sub_layout)])
                 .collect(),
         }
-        ._plus_layout_node(&new_pattern_id, Vec3::new(column_x, selected_y, column_z));
+        ._plus_layout_node(
+            &new_pattern_id,
+            Vec3::new(column_x, selected_y + 1.0, column_z),
+        );
         let match_ids: Vec<crate::model::node::Id> = with_new
             .ast
             .nodes
@@ -1442,20 +1492,31 @@ impl LayoutAst {
 
     /// Compute the grid bounds for this AST in its own local coordinates.
     ///
-    /// - Z range: `[sink.z + 1, -1]` where `sink.z` is the single Sink's
-    ///   layout-Z. The front wall is treated as Z=0 for both the Program-Ast
-    ///   (which has no explicit front node) and Pattern sub-ASTs (where the
-    ///   Pattern itself is the implicit front). If the corridor collapses
-    ///   (`sink.z >= -1`) or no Sink exists, returns `None`.
+    /// - Z range: `[z_min, sink.z - 1]` where `sink.z` is the single Sink's
+    ///   layout-Z. `owns_source_row` decides `z_min`: the root scope owns the
+    ///   source row at Z=0 (VarDecls live there and nothing else may), so its
+    ///   grid starts at 0 and the wall is drawn at that edge. A Pattern
+    ///   sub-AST starts at 1 instead — its local Z=0 is the Pattern node
+    ///   itself, which lives in and must stay selectable from the parent
+    ///   scope. Returns `None` if the corridor collapses or no Sink exists.
     /// - X range: min/max over every node's footprint X-span, unioned with
     ///   `active_selection.x` when provided. Multi-cell footprints (matches,
     ///   ≥3-input function calls) grow the grid so the extra cell is
     ///   drawable. If the AST has no nodes at all the sink is the only
     ///   node — X min/max = 0 (sink is at X=0).
+    /// - Y range: min/max over every node's footprint Y-span. A Match
+    ///   contributes its whole Pattern stack, so a scope containing one spans
+    ///   every row its patterns occupy. Only `scope_at` reads this — the grid
+    ///   mesh is a single plane and uses X/Z alone — but without it a caret on
+    ///   any Pattern below the first row would fall outside every scope.
     ///
     /// `active_selection` is the currently-selected cell in this AST's local
-    /// coords, passed only when this AST is the active editing context.
-    pub fn ast_grid_bounds(&self, active_selection: Option<IVec3>) -> Option<AstGridBounds> {
+    /// coords, passed only when this AST is the scope the caret addresses.
+    pub fn ast_grid_bounds(
+        &self,
+        active_selection: Option<IVec3>,
+        owns_source_row: bool,
+    ) -> Option<AstGridBounds> {
         let sink_z =
             self.layout_nodes
                 .iter()
@@ -1465,39 +1526,39 @@ impl LayoutAst {
                     }
                     _ => None,
                 })?;
-        let z_min = sink_z + 1;
-        let z_max = -1;
+        let z_min = if owns_source_row { 0 } else { 1 };
+        let z_max = sink_z - 1;
         if z_min > z_max {
             return None;
         }
         let mut x_min = i32::MAX;
         let mut x_max = i32::MIN;
+        let mut y_min = i32::MAX;
+        let mut y_max = i32::MIN;
         for id in self.layout_nodes.keys() {
             let Some(fp) = self.node_footprint(id) else {
                 continue;
             };
-            if fp.min.x < x_min {
-                x_min = fp.min.x;
-            }
-            if fp.max.x > x_max {
-                x_max = fp.max.x;
-            }
+            x_min = x_min.min(fp.min.x);
+            x_max = x_max.max(fp.max.x);
+            y_min = y_min.min(fp.min.y);
+            y_max = y_max.max(fp.max.y);
         }
         if let Some(sel) = active_selection {
-            if sel.x < x_min {
-                x_min = sel.x;
-            }
-            if sel.x > x_max {
-                x_max = sel.x;
-            }
+            x_min = x_min.min(sel.x);
+            x_max = x_max.max(sel.x);
         }
         if x_min == i32::MAX {
             x_min = 0;
             x_max = 0;
         }
+        if y_min == i32::MAX {
+            y_min = 0;
+            y_max = 0;
+        }
         Some(AstGridBounds {
-            min: IVec3::new(x_min, 0, z_min),
-            max: IVec3::new(x_max, 0, z_max),
+            min: IVec3::new(x_min, y_min, z_min),
+            max: IVec3::new(x_max, y_max, z_max),
         })
     }
 
@@ -1605,15 +1666,65 @@ impl LayoutAst {
         ast
     }
 
-    /// Sum of grid-space owner positions along `path`. Used by crosshair to
-    /// place its anchor for sub-AST-selected nodes when no rendered entity
-    /// is around to read from.
-    pub fn context_offset(&self, path: &[crate::model::node::Id]) -> Vec3 {
-        let mut offset = Vec3::ZERO;
+    /// Resolve a global cell address to the scope that owns it.
+    ///
+    /// Returns the owner path of the **innermost** scope whose volume contains
+    /// `global`, together with the address expressed in that scope's own local
+    /// coordinates. This is the sole answer to "what does editing act on":
+    /// when the caret sits inside a Match branch volume it always resolves to
+    /// that branch scope, never to the enclosing parent.
+    ///
+    /// A scope's volume is its `ast_grid_bounds`, i.e. the whole wall-to-sink
+    /// corridor including the cells that are still empty — otherwise the caret
+    /// could not be placed where a node is about to be inserted.
+    ///
+    /// The root scope claims the source row at Z=0 as part of its grid; a
+    /// sub-scope must not claim its own Z=0, because that cell is the Pattern
+    /// node itself, which lives in — and has to stay selectable from — the
+    /// parent scope. `ast_grid_bounds` encodes that distinction.
+    ///
+    /// `None` when the address lies outside every scope; callers treat that as
+    /// "nothing to edit here".
+    pub fn scope_at(&self, global: IVec3) -> Option<(Vec<crate::model::node::Id>, IVec3)> {
+        let mut best: Option<(Vec<crate::model::node::Id>, IVec3)> = None;
+        for walked in self.walk_all_asts() {
+            let Some(bounds) = walked
+                .layout_ast
+                .ast_grid_bounds(None, walked.context.is_empty())
+            else {
+                continue;
+            };
+            let offset = walked.extra_offset.round().as_ivec3();
+            let local = global - offset;
+            let inside = local.x >= bounds.min.x
+                && local.x <= bounds.max.x
+                && local.y >= bounds.min.y
+                && local.y <= bounds.max.y
+                && local.z >= bounds.min.z
+                && local.z <= bounds.max.z;
+            if !inside {
+                continue;
+            }
+            // Deeper path wins: sub-scopes are nested inside their parent's
+            // volume, and the innermost one is the owner.
+            if best
+                .as_ref()
+                .is_none_or(|(path, _)| walked.context.len() > path.len())
+            {
+                best = Some((walked.context.clone(), local));
+            }
+        }
+        best
+    }
+
+    /// Grid-space origin of the scope named by `path`, i.e. the offset that
+    /// turns a scope-local address into a global one.
+    pub fn scope_offset(&self, path: &[crate::model::node::Id]) -> IVec3 {
+        let mut offset = IVec3::ZERO;
         let mut ast = self;
         for id in path {
             if let Some(ln) = ast.layout_nodes.get(id) {
-                offset += ln.pos;
+                offset += ln.pos.round().as_ivec3();
             }
             let Some(next) = ast.sub_layouts.get(id) else {
                 break;
@@ -1621,6 +1732,18 @@ impl LayoutAst {
             ast = next;
         }
         offset
+    }
+
+    /// Mutable counterpart to `resolve_context`.
+    pub fn resolve_context_mut<'a>(
+        &'a mut self,
+        path: &[crate::model::node::Id],
+    ) -> Option<&'a mut LayoutAst> {
+        let mut ast = self;
+        for id in path {
+            ast = ast.sub_layouts.get_mut(id)?;
+        }
+        Some(ast)
     }
 }
 

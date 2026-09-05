@@ -208,9 +208,8 @@ struct AstNodeEntity {
 /// in the owning LayoutAst.
 #[derive(Component, Clone)]
 struct AstGridEntity {
-    /// Owner path from the root LayoutAst down to this AST's LayoutAst.
-    /// Empty = root (the outer container that owns the Program node).
-    /// Length 1 with the Program's id = the Program-Ast itself.
+    /// Owner path from the Program-Ast down to this AST's LayoutAst.
+    /// Empty = the Program-Ast itself; each further element names a Pattern.
     context: Vec<model::node::Id>,
     /// Accumulated grid-space offset of this AST's origin from the root.
     origin_offset: Vec3,
@@ -219,15 +218,14 @@ struct AstGridEntity {
     max: IVec3,
 }
 
-/// Marker for the Program-Ast's front wall at Z=0. VarDecls attach to this
-/// wall; the wall itself is a pickable vertical plane. Bounds are in the
-/// Program-Ast's local grid X coordinates (inclusive), with half-a-cell of
-/// padding on each side baked into the mesh but *not* into the pick region.
-#[derive(Component, Clone)]
-struct ProgramWallEntity {
-    min_x: i32,
-    max_x: i32,
-}
+/// Height of the Program wall in layout cells. Layout `+Y` maps to world
+/// `-Y`, so the wall spans world Y from 0 down to `-WALL_HEIGHT_CELLS *
+/// LAYOUT_SCALE.y.abs()` — it hangs below the origin row rather than
+/// straddling it, matching the non-negative layout Y range.
+///
+/// The wall is purely decorative: it marks the grid's Z=0 edge, and the
+/// source row it borders is part of the grid and picked like any other cell.
+const WALL_HEIGHT_CELLS: f32 = 2.0;
 
 /// Flag resource that signals the scene needs rebuilding.
 #[derive(Resource, Default)]
@@ -250,7 +248,6 @@ enum EAstActionButton {
     AddFunctionCallButton,
     AddMatchButton,
     AddPatternButton,
-    SelectAstButton,
 }
 
 #[derive(Resource)]
@@ -283,17 +280,22 @@ struct HideDuringStartMenu;
 
 /// Stores the currently selected grid position and hover state.
 ///
-/// Selection is a grid position (always some), not a node. A node is
-/// considered selected iff its layout position rounds to `selected_pos`.
+/// Selection is a **global** grid address (always some), not a node. A node is
+/// considered selected iff its layout position, lifted into global
+/// coordinates, rounds to `selected_pos`.
+///
+/// There is deliberately no editing-context field. The caret address alone
+/// decides what editing acts on: `AstState::scope_of_caret` resolves it to the
+/// innermost scope whose volume contains it. A caret inside a Match branch
+/// volume therefore always refers to that branch, never to the enclosing
+/// parent.
 #[derive(Resource)]
 struct PickState {
-    /// Currently selected grid position (layout coordinates, always set).
+    /// Currently selected grid cell, as a global address. Never negative.
     selected_pos: IVec3,
     /// Node under the cursor (ray-sphere hit), if any.
     hovered_node: Option<model::node::Id>,
-    /// AST grid cell under the cursor (ray hit on an `AstGridEntity`), if
-    /// any. Includes both the local cell coords and the owning AST's
-    /// context path so click routing knows where to write.
+    /// AST grid cell under the cursor (ray hit on an `AstGridEntity`), if any.
     hovered_grid: Option<HoveredGrid>,
     /// Cursor position at the last left-mouse press. Used to distinguish
     /// click vs drag — a release within `CLICK_MOVE_THRESHOLD` of this
@@ -305,29 +307,13 @@ struct PickState {
     /// clicking a dropdown/text-input/checkbox doesn't move the selection
     /// to whatever grid cell the ray passes through behind the panel.
     press_over_ui: bool,
-    /// Path of container ids from the Program-Ast down to the currently
-    /// active editing context. Empty = Program-Ast (top-level user code);
-    /// a non-empty path names Pattern ids in outer-to-inner order. Add/
-    /// delete/move handlers route through `current_ast(_mut)` so the
-    /// change lands in the right sub-ast. Stays empty until Step 5 wires
-    /// the "Select Ast" button.
-    context_path: Vec<model::node::Id>,
-    /// Owner path from the Program-Ast to the LayoutAst that holds the
-    /// currently selected node. Empty = selection lives in the Program-
-    /// Ast. Independent of `context_path`: selection may land in a sub-
-    /// AST while add/delete/move still target the Program (until Step 5
-    /// adds "Select Ast"). `selected_pos` is expressed in the coordinate
-    /// system of the LayoutAst identified by `selected_context`.
-    selected_context: Vec<model::node::Id>,
 }
 
 /// Populated when the cursor is over a per-AST grid mesh.
 #[derive(Clone)]
 struct HoveredGrid {
-    /// Local grid coords inside the hovered AST.
-    local_pos: IVec3,
-    /// Owner path (from Program-Ast) to the hovered AST.
-    context: Vec<model::node::Id>,
+    /// Global grid address of the hovered cell.
+    global_pos: IVec3,
     /// Entity of the `AstGridEntity` mesh that was hit — used so the hover
     /// shader wash flips only on the AST grid actually under the cursor.
     entity: Entity,
@@ -344,42 +330,38 @@ impl Default for PickState {
             hovered_grid: None,
             press_cursor: None,
             press_over_ui: false,
-            context_path: Vec::new(),
-            selected_context: Vec::new(),
         }
     }
 }
 
-impl PickState {
-    fn current_ast<'a>(&self, state: &'a AstState) -> &'a layout::LayoutAst {
-        let mut ast = state.program_ast();
-        for id in &self.context_path {
-            ast = ast.sub_layouts.get(id).unwrap();
-        }
-        ast
+/// Scope the caret currently addresses: the owner path of the innermost scope
+/// containing it, plus the caret expressed in that scope's local coordinates.
+struct CaretScope {
+    path: Vec<model::node::Id>,
+    local: IVec3,
+}
+
+impl AstState {
+    /// Resolve the caret to its owning scope. `None` when the caret sits
+    /// outside every scope volume — editing is then simply unavailable.
+    fn scope_of_caret(&self, pick: &PickState) -> Option<CaretScope> {
+        self.program_ast()
+            .scope_at(pick.selected_pos)
+            .map(|(path, local)| CaretScope { path, local })
     }
 
-    fn current_ast_mut<'a>(&self, state: &'a mut AstState) -> &'a mut layout::LayoutAst {
-        let mut ast = state.program_ast_mut();
-        for id in &self.context_path {
-            ast = ast.sub_layouts.get_mut(id).unwrap();
-        }
-        ast
+    /// The LayoutAst the caret addresses.
+    fn caret_ast(&self, pick: &PickState) -> Option<(&layout::LayoutAst, IVec3)> {
+        let scope = self.scope_of_caret(pick)?;
+        Some((self.program_ast().resolve_context(&scope.path), scope.local))
     }
 
-    /// LayoutAst that owns the currently selected node. Follows
-    /// `selected_context` — distinct from `current_ast`, which follows
-    /// `context_path`.
-    fn selected_ast<'a>(&self, state: &'a AstState) -> &'a layout::LayoutAst {
-        state.program_ast().resolve_context(&self.selected_context)
-    }
-
-    fn selected_ast_mut<'a>(&self, state: &'a mut AstState) -> &'a mut layout::LayoutAst {
-        let mut ast = state.program_ast_mut();
-        for id in &self.selected_context {
-            ast = ast.sub_layouts.get_mut(id).unwrap();
-        }
-        ast
+    /// Mutable counterpart to `caret_ast`. The path is resolved first so the
+    /// immutable and mutable borrows never overlap.
+    fn caret_ast_mut(&mut self, pick: &PickState) -> Option<(&mut layout::LayoutAst, IVec3)> {
+        let scope = self.scope_of_caret(pick)?;
+        let ast = self.program_ast_mut().resolve_context_mut(&scope.path)?;
+        Some((ast, scope.local))
     }
 }
 
@@ -391,7 +373,7 @@ struct SelectionDisplay;
 #[derive(Component)]
 struct FpsDisplay;
 
-/// UI text showing the current editing context (context_path) as breadcrumb.
+/// UI text showing the scope the caret currently addresses, as a breadcrumb.
 #[derive(Component)]
 struct BreadcrumbDisplay;
 
@@ -955,35 +937,44 @@ fn spawn_ast_nodes(
         }
     }
 
+    // The caret's scope is derived, not stored: only that scope's grid grows
+    // to keep the caret cell drawable.
+    let caret_scope = state.scope_of_caret(&pick);
+    let scope_path = caret_scope.as_ref().map(|s| s.path.clone());
+    let scope_local = caret_scope.as_ref().map(|s| s.local);
     for walked_ast in state.program_ast().walk_all_asts() {
-        let active_selection = if walked_ast.context == pick.selected_context {
-            Some(pick.selected_pos)
+        let active_selection = if scope_path.as_deref() == Some(walked_ast.context.as_slice()) {
+            scope_local
         } else {
             None
         };
-        let Some(bounds) = walked_ast.layout_ast.ast_grid_bounds(active_selection) else {
+        let Some(bounds) = walked_ast
+            .layout_ast
+            .ast_grid_bounds(active_selection, walked_ast.context.is_empty())
+        else {
             continue;
         };
         let width_cells = (bounds.max.x - bounds.min.x + 1) as f32;
         let depth_cells = (bounds.max.z - bounds.min.z + 1) as f32;
-        let size_x = width_cells * 3.0;
-        let size_z = depth_cells * 3.0;
+        let size_x = width_cells * render::LAYOUT_SCALE.x.abs();
+        let size_z = depth_cells * render::LAYOUT_SCALE.z.abs();
         let center_local = Vec3::new(
             (bounds.min.x + bounds.max.x) as f32 * 0.5,
             0.0,
             (bounds.min.z + bounds.max.z) as f32 * 0.5,
         );
-        let world_center = (center_local + walked_ast.extra_offset) * Vec3::new(3.0, 3.0, 3.0);
-        let ox = walked_ast.extra_offset.x;
-        let oz = walked_ast.extra_offset.z;
-        let border_min = Vec2::new(
-            (bounds.min.x as f32 + ox - 0.5) * 3.0,
-            (bounds.min.z as f32 + oz - 0.5) * 3.0,
+        let world_center = render::layout_to_world(center_local + walked_ast.extra_offset);
+        let offset = walked_ast.extra_offset;
+        // `layout_range_to_world` re-normalises min/max: LAYOUT_SCALE negates
+        // Z, so scaling the corners individually would yield an inverted rect
+        // and the shader would draw no border at all.
+        let (border_lo, border_hi) = render::layout_range_to_world(
+            bounds.min.as_vec3() + offset,
+            bounds.max.as_vec3() + offset,
+            0.5,
         );
-        let border_max = Vec2::new(
-            (bounds.max.x as f32 + ox + 0.5) * 3.0,
-            (bounds.max.z as f32 + oz + 0.5) * 3.0,
-        );
+        let border_min = Vec2::new(border_lo.x, border_lo.z);
+        let border_max = Vec2::new(border_hi.x, border_hi.z);
         // Collect multi-cell node footprints in this LayoutAst and convert
         // to world-space XZ rects. Fed to the grid shader to suppress
         // interior grid lines inside merged fields.
@@ -1003,15 +994,12 @@ fn spawn_ast_nodes(
                 );
                 break;
             }
-            let min_w = Vec2::new(
-                (fp.min.x as f32 + ox - 0.5) * 3.0,
-                (fp.min.z as f32 + oz - 0.5) * 3.0,
+            let (fp_lo, fp_hi) = render::layout_range_to_world(
+                fp.min.as_vec3() + offset,
+                fp.max.as_vec3() + offset,
+                0.5,
             );
-            let max_w = Vec2::new(
-                (fp.max.x as f32 + ox + 0.5) * 3.0,
-                (fp.max.z as f32 + oz + 0.5) * 3.0,
-            );
-            footprints[footprint_count as usize] = Vec4::new(min_w.x, min_w.y, max_w.x, max_w.y);
+            footprints[footprint_count as usize] = Vec4::new(fp_lo.x, fp_lo.z, fp_hi.x, fp_hi.z);
             footprint_count += 1;
         }
         commands.spawn((
@@ -1045,27 +1033,35 @@ fn spawn_ast_nodes(
             AstSceneEntity,
         ));
 
-        // Program-Ast: front wall at Z=0. Grid-wide plus half a cell of
-        // padding on each side, so VarDecls at the outermost grid X still
-        // have wall to attach to.
+        // Program scope: the front wall is drawn flush against the grid's Z=0
+        // edge, i.e. at layout Z=-0.5 — the source row it borders is part of
+        // the grid now and is picked like any other cell. Grid-wide plus half
+        // a cell of padding on each side, so VarDecls at the outermost grid X
+        // still have wall beside them.
         if walked_ast.context.is_empty() {
             let wall_width_cells = width_cells + 1.0;
-            let wall_size_x = wall_width_cells * 3.0;
-            let wall_center_x =
-                (bounds.min.x + bounds.max.x) as f32 * 0.5 * 3.0 + walked_ast.extra_offset.x * 3.0;
+            let wall_size_x = wall_width_cells * render::LAYOUT_SCALE.x.abs();
+            let wall_center_x = render::layout_to_world(Vec3::new(
+                (bounds.min.x + bounds.max.x) as f32 * 0.5 + walked_ast.extra_offset.x,
+                0.0,
+                0.0,
+            ))
+            .x;
+            // Layout Y >= 0 maps to world Y <= 0, so the wall hangs below the
+            // origin row instead of straddling it.
+            let wall_height_cells = WALL_HEIGHT_CELLS;
+            let wall_size_y = wall_height_cells * render::LAYOUT_SCALE.y.abs();
+            let wall_center_y = -wall_size_y * 0.5;
+            let wall_z = render::layout_to_world(Vec3::new(0.0, 0.0, -0.5)).z;
             commands.spawn((
-                Mesh3d(meshes.add(Cuboid::new(wall_size_x, 6.0, 0.05))),
+                Mesh3d(meshes.add(Cuboid::new(wall_size_x, wall_size_y, 0.05))),
                 MeshMaterial3d(materials.add(StandardMaterial {
                     base_color: Color::srgba(0.5, 0.5, 0.5, 0.5),
                     alpha_mode: AlphaMode::Blend,
                     cull_mode: None,
                     ..default()
                 })),
-                Transform::from_xyz(wall_center_x, 0.0, 0.0),
-                ProgramWallEntity {
-                    min_x: bounds.min.x,
-                    max_x: bounds.max.x,
-                },
+                Transform::from_xyz(wall_center_x, wall_center_y, wall_z),
                 AstSceneEntity,
             ));
         }
@@ -1128,7 +1124,6 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
         ("Add Match", EAstActionButton::AddMatchButton),
         ("Add Pattern", EAstActionButton::AddPatternButton),
         ("Add TypeCast", EAstActionButton::AddTypeCastButton),
-        ("Select Ast", EAstActionButton::SelectAstButton),
     ] {
         y_offset += 36.0;
         spawn_ui_button(
@@ -1266,16 +1261,23 @@ fn handle_delete_node_button(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        if let Some(selected_node_id) = pick.selected_ast(&state).node_at(pick.selected_pos) {
-            let is_sink = matches!(
-                pick.selected_ast(&state).ast.nodes.get(&selected_node_id),
-                Some(model::node::ENode::Sink { .. })
-            );
-            if !is_sink {
-                let updated = pick.selected_ast(&state).minus_node(&selected_node_id);
-                *pick.selected_ast_mut(&mut state) = updated;
-                rebuild.0 = true;
-            }
+        let Some((caret_ast, local)) = state.caret_ast(&pick) else {
+            continue;
+        };
+        let Some(selected_node_id) = caret_ast.node_at(local) else {
+            continue;
+        };
+        let is_sink = matches!(
+            caret_ast.ast.nodes.get(&selected_node_id),
+            Some(model::node::ENode::Sink { .. })
+        );
+        if is_sink {
+            continue;
+        }
+        let updated = caret_ast.minus_node(&selected_node_id);
+        if let Some((caret_ast_mut, _)) = state.caret_ast_mut(&pick) {
+            *caret_ast_mut = updated;
+            rebuild.0 = true;
         }
     }
 }
@@ -1291,14 +1293,13 @@ fn update_add_pattern_button_visuals(
     )>,
     mut text_color_q: Query<&mut TextColor>,
 ) {
-    let context_mismatch = pick.selected_context != pick.context_path;
-    let enabled = !context_mismatch
-        && matches!(
-            pick.current_ast(&state)
-                .node_at(pick.selected_pos)
-                .and_then(|id| pick.current_ast(&state).ast.nodes.get(&id).cloned()),
-            Some(model::node::ENode::Pattern { .. })
-        );
+    let enabled = matches!(
+        state
+            .caret_ast(&pick)
+            .and_then(|(ast, local)| ast.node_at(local).and_then(|id| ast.ast.nodes.get(&id)))
+            .cloned(),
+        Some(model::node::ENode::Pattern { .. })
+    );
     for (interaction, mut bg, children, action) in button_q.iter_mut() {
         if *action != EAstActionButton::AddPatternButton {
             continue;
@@ -1335,23 +1336,27 @@ fn update_add_generic_button_visuals(
     )>,
     mut text_color_q: Query<&mut TextColor>,
 ) {
-    let pos_free = pick
-        .current_ast(&state)
-        .node_at(pick.selected_pos)
-        .is_none();
+    let caret = state.caret_ast(&pick);
+    let pos_free = caret
+        .map(|(ast, local)| ast.node_at(local).is_none())
+        .unwrap_or(false);
+    // Source row = the Program scope's whole Z=0 plane; nothing but a VarDecl
+    // may be created there. A VarDecl additionally needs the Y=0 row.
+    let in_program_scope = state
+        .scope_of_caret(&pick)
+        .map(|s| s.path.is_empty())
+        .unwrap_or(false);
+    let source_row = in_program_scope && caret.map(|(_, local)| local.z == 0).unwrap_or(false);
+    let vardecl_slot = source_row && caret.map(|(_, local)| local.y == 0).unwrap_or(false);
     for (interaction, mut bg, children, action) in button_q.iter_mut() {
-        if *action == EAstActionButton::AddPatternButton
-            || *action == EAstActionButton::SelectAstButton
-        {
+        if *action == EAstActionButton::AddPatternButton {
             continue;
         }
         let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
             continue;
         };
-        let wall_slot =
-            pick.context_path.is_empty() && pick.selected_pos.y == 0 && pick.selected_pos.z == 0;
-        let vardecl_locked = *action == EAstActionButton::AddVarDeclButton && !wall_slot;
-        let wall_slot_locked = wall_slot
+        let vardecl_locked = *action == EAstActionButton::AddVarDeclButton && !vardecl_slot;
+        let source_row_locked = source_row
             && matches!(
                 *action,
                 EAstActionButton::AddConstDeclButton
@@ -1359,48 +1364,7 @@ fn update_add_generic_button_visuals(
                     | EAstActionButton::AddTypeCastButton
                     | EAstActionButton::AddMatchButton
             );
-        let context_mismatch = pick.selected_context != pick.context_path;
-        let enabled = pos_free && !vardecl_locked && !wall_slot_locked && !context_mismatch;
-        if !enabled {
-            bg.0 = Color::srgba(0.10, 0.10, 0.13, 0.9);
-            text_color.0 = Color::srgb(0.35, 0.35, 0.4);
-            continue;
-        }
-        match *interaction {
-            Interaction::Hovered | Interaction::Pressed => {
-                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                text_color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                text_color.0 = Color::srgb(0.6, 0.6, 0.7);
-            }
-        }
-    }
-}
-
-fn update_select_ast_button_visuals(
-    pick: Res<PickState>,
-    state: Res<AstState>,
-    mut button_q: Query<(
-        &Interaction,
-        &mut BackgroundColor,
-        &Children,
-        &EAstActionButton,
-    )>,
-    mut text_color_q: Query<&mut TextColor>,
-) {
-    let enabled = pick
-        .selected_ast(&state)
-        .node_at(pick.selected_pos)
-        .is_some();
-    for (interaction, mut bg, children, action) in button_q.iter_mut() {
-        if *action != EAstActionButton::SelectAstButton {
-            continue;
-        }
-        let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
-            continue;
-        };
+        let enabled = pos_free && !vardecl_locked && !source_row_locked;
         if !enabled {
             bg.0 = Color::srgba(0.10, 0.10, 0.13, 0.9);
             text_color.0 = Color::srgb(0.35, 0.35, 0.4);
@@ -1425,11 +1389,14 @@ fn update_delete_button_visuals(
     mut button_q: Query<(&Interaction, &mut BackgroundColor, &Children), With<DeleteNodeButton>>,
     mut text_color_q: Query<&mut TextColor>,
 ) {
-    let enabled = match pick.selected_ast(&state).node_at(pick.selected_pos) {
-        Some(id) => !matches!(
-            pick.selected_ast(&state).ast.nodes.get(&id),
-            Some(model::node::ENode::Sink { .. })
-        ),
+    let enabled = match state.caret_ast(&pick) {
+        Some((ast, local)) => match ast.node_at(local) {
+            Some(id) => !matches!(
+                ast.ast.nodes.get(&id),
+                Some(model::node::ENode::Sink { .. })
+            ),
+            None => false,
+        },
         None => false,
     };
     for (interaction, mut bg, children) in button_q.iter_mut() {
@@ -1468,7 +1435,7 @@ fn handle_add_node_button(
     mut state: ResMut<AstState>,
     mut orbit: ResMut<camera::OrbitCamera>,
     mut rebuild: ResMut<NeedsRebuild>,
-    mut pick: ResMut<PickState>,
+    pick: Res<PickState>,
     mut commands: Commands,
     scene_entities: Query<Entity, With<AstSceneEntity>>,
     eval: Res<EvalState>,
@@ -1481,28 +1448,27 @@ fn handle_add_node_button(
 
         match *interaction {
             Interaction::Pressed => {
-                if pick.selected_context != pick.context_path {
+                // The caret's scope is the editing target — there is nothing
+                // else to agree with, so no context guard is needed here.
+                let Some(scope) = state.scope_of_caret(&pick) else {
                     continue;
-                }
-                let new_pos = pick.selected_pos.as_vec3();
-                let target_occupied = pick
-                    .current_ast(&state)
-                    .node_at(pick.selected_pos)
-                    .is_some();
+                };
+                let is_program_scope = scope.path.is_empty();
+                let local = scope.local;
+                let new_pos = local.as_vec3();
+                let scope_ast = state.program_ast().resolve_context(&scope.path);
+                let target_occupied = scope_ast.node_at(local).is_some();
                 if target_occupied && *action != EAstActionButton::AddPatternButton {
                     continue;
                 }
-                // Wall row (Program-Ast, Y=0, Z=0) is VarDecl-only. Refuse
-                // every other creation action defensively.
-                let is_wall_slot = pick.context_path.is_empty()
-                    && pick.selected_pos.y == 0
-                    && pick.selected_pos.z == 0;
-                if is_wall_slot
+                // The whole Z=0 plane of the Program scope is the source row:
+                // only VarDecls may live there. Refuse every other creation
+                // action defensively.
+                let is_source_row = is_program_scope && local.z == 0;
+                if is_source_row
                     && !matches!(
                         *action,
-                        EAstActionButton::AddVarDeclButton
-                            | EAstActionButton::SelectAstButton
-                            | EAstActionButton::AddPatternButton
+                        EAstActionButton::AddVarDeclButton | EAstActionButton::AddPatternButton
                     )
                 {
                     continue;
@@ -1510,76 +1476,58 @@ fn handle_add_node_button(
                 let node_id_domain = state.node_id_domain.clone();
                 let anchor_id_domain = state.anchor_id_domain.clone();
                 let (new_layout, new_node_id_domain, new_anchor_id_domain) = match action {
-                    EAstActionButton::SelectAstButton => continue,
-                    EAstActionButton::AddConstDeclButton => {
-                        pick.current_ast(&state).plus_const_decl(
-                            model::r#type::EType::Int { value: None },
-                            new_pos,
-                            node_id_domain,
-                            anchor_id_domain,
-                        )
-                    }
-                    EAstActionButton::AddVarDeclButton => {
-                        // VarDecls live on the Program-Ast's front wall at
-                        // (x, 0, 0) — refuse anything else defensively; the
-                        // enable-check normally greys the button out first.
-                        if !pick.context_path.is_empty()
-                            || pick.selected_pos.y != 0
-                            || pick.selected_pos.z != 0
-                        {
-                            continue;
-                        }
-                        pick.current_ast(&state).plus_var_decl(
-                            new_pos,
-                            node_id_domain,
-                            anchor_id_domain,
-                        )
-                    }
-                    EAstActionButton::AddFunctionCallButton => {
-                        pick.current_ast(&state).plus_function_call(
-                            state
-                                .function_declarations
-                                .iter()
-                                .find(|(_, d)| d.name == "+")
-                                .map(|(id, decl)| (id.clone(), decl))
-                                .unwrap(),
-                            new_pos,
-                            node_id_domain,
-                            anchor_id_domain,
-                        )
-                    }
-                    EAstActionButton::AddTypeCastButton => pick.current_ast(&state).plus_type_cast(
+                    EAstActionButton::AddConstDeclButton => scope_ast.plus_const_decl(
                         model::r#type::EType::Int { value: None },
                         new_pos,
                         node_id_domain,
                         anchor_id_domain,
                     ),
-                    EAstActionButton::AddMatchButton => pick.current_ast(&state).plus_match(
+                    EAstActionButton::AddVarDeclButton => {
+                        // VarDecls occupy the source row at (x, 0, 0) — refuse
+                        // anything else defensively; the enable-check normally
+                        // greys the button out first.
+                        if !is_source_row || local.y != 0 {
+                            continue;
+                        }
+                        scope_ast.plus_var_decl(new_pos, node_id_domain, anchor_id_domain)
+                    }
+                    EAstActionButton::AddFunctionCallButton => scope_ast.plus_function_call(
+                        state
+                            .function_declarations
+                            .iter()
+                            .find(|(_, d)| d.name == "+")
+                            .map(|(id, decl)| (id.clone(), decl))
+                            .unwrap(),
                         new_pos,
                         node_id_domain,
                         anchor_id_domain,
                     ),
-                    EAstActionButton::AddPatternButton => {
-                        match pick.current_ast(&state).node_at(pick.selected_pos) {
-                            Some(id)
-                                if matches!(
-                                    pick.current_ast(&state).ast.nodes.get(&id),
-                                    Some(model::node::ENode::Pattern { .. })
-                                ) =>
-                            {
-                                let updated = pick.current_ast(&state).plus_pattern_above(
-                                    &id,
-                                    node_id_domain,
-                                    anchor_id_domain,
-                                );
-                                pick.selected_pos.y += 1;
-                                updated
-                            }
-                            _ => continue,
-                        }
+                    EAstActionButton::AddTypeCastButton => scope_ast.plus_type_cast(
+                        model::r#type::EType::Int { value: None },
+                        new_pos,
+                        node_id_domain,
+                        anchor_id_domain,
+                    ),
+                    EAstActionButton::AddMatchButton => {
+                        scope_ast.plus_match(new_pos, node_id_domain, anchor_id_domain)
                     }
+                    EAstActionButton::AddPatternButton => match scope_ast.node_at(local) {
+                        Some(id)
+                            if matches!(
+                                scope_ast.ast.nodes.get(&id),
+                                Some(model::node::ENode::Pattern { .. })
+                            ) =>
+                        {
+                            // The selected Pattern keeps its row, so the caret
+                            // stays where it is.
+                            scope_ast.plus_pattern_below(&id, node_id_domain, anchor_id_domain)
+                        }
+                        _ => continue,
+                    },
                 };
-                *pick.current_ast_mut(&mut state) = new_layout;
+                if let Some(target) = state.program_ast_mut().resolve_context_mut(&scope.path) {
+                    *target = new_layout;
+                }
                 state.node_id_domain = new_node_id_domain;
                 state.anchor_id_domain = new_anchor_id_domain;
                 state.layout_ast = state.layout_ast.settle_footprints();
@@ -1594,42 +1542,6 @@ fn handle_add_node_button(
                 color.0 = Color::srgb(0.6, 0.6, 0.7);
             }
         }
-    }
-}
-
-fn handle_select_ast_button(
-    interaction_q: Query<
-        (&Interaction, &EAstActionButton),
-        (Changed<Interaction>, With<EAstActionButton>),
-    >,
-    state: Res<AstState>,
-    mut pick: ResMut<PickState>,
-    mut rebuild: ResMut<NeedsRebuild>,
-    eval: Res<EvalState>,
-) {
-    if is_evaluating(&eval) {
-        return;
-    }
-    for (interaction, action) in interaction_q.iter() {
-        if *action != EAstActionButton::SelectAstButton {
-            continue;
-        }
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
-        let Some(selected_node_id) = pick.selected_ast(&state).node_at(pick.selected_pos) else {
-            continue;
-        };
-        let is_pattern = matches!(
-            pick.selected_ast(&state).ast.nodes.get(&selected_node_id),
-            Some(model::node::ENode::Pattern { .. })
-        );
-        let mut new_context = pick.selected_context.clone();
-        if is_pattern {
-            new_context.push(selected_node_id);
-        }
-        pick.context_path = new_context;
-        rebuild.0 = true;
     }
 }
 
@@ -1678,11 +1590,11 @@ fn sync_node_editor_ui(
     editor_children_q: Query<Entity, With<NodeEditorEntity>>,
     mut cache: Local<NodeEditorFingerprint>,
 ) {
-    let selected_ast = pick.selected_ast(&state);
-    let node_id = selected_ast.node_at(pick.selected_pos);
+    let caret = state.caret_ast(&pick);
+    let node_id = caret.and_then(|(ast, local)| ast.node_at(local));
     let node = node_id
         .as_ref()
-        .and_then(|id| selected_ast.ast.nodes.get(id));
+        .and_then(|id| caret.and_then(|(ast, _)| ast.ast.nodes.get(id)));
     let variant = variant_kind(node);
     let type_choice = node.and_then(|n| match n {
         model::node::ENode::ConstDecl { r#type, .. }
@@ -2979,8 +2891,7 @@ fn handle_start_menu_new_button(
                 *state.program_ast_mut() = fresh;
                 state.node_id_domain = new_node_id_domain;
                 state.anchor_id_domain = new_anchor_id_domain;
-                pick.context_path.clear();
-                pick.selected_context.clear();
+                pick.selected_pos = IVec3::ZERO;
                 rebuild.0 = true;
                 start_menu.showing = false;
                 start_menu.has_cancel = false;
@@ -3469,7 +3380,7 @@ fn sync_value_labels(
         let Some(layout_node) = state.program_ast().layout_nodes.get(id) else {
             continue;
         };
-        let world_pos = layout_node.pos * Vec3::new(3.0, 1.5, 3.0);
+        let world_pos = render::layout_to_world(layout_node.pos);
         commands.spawn((
             Text::new(value.to_string()),
             text_font(&ui_font.0, 28.0),
@@ -3683,13 +3594,18 @@ fn spawn_breadcrumb_display(mut commands: Commands, ui_font: Res<UiFont>) {
 
 fn update_breadcrumb_display(
     pick: Res<PickState>,
+    state: Res<AstState>,
     mut text_q: Query<&mut Text, With<BreadcrumbDisplay>>,
 ) {
     let Ok(mut text) = text_q.single_mut() else {
         return;
     };
+    let Some(scope) = state.scope_of_caret(&pick) else {
+        text.0 = "—".to_string();
+        return;
+    };
     let mut parts = vec!["Program".to_string()];
-    for id in &pick.context_path {
+    for id in &scope.path {
         parts.push(format!("Pattern({})", id));
     }
     text.0 = parts.join(" > ");
@@ -3702,7 +3618,6 @@ fn pick_nodes(
     mut pick: ResMut<PickState>,
     node_q: Query<(&AstNodeEntity, &Transform)>,
     grid_q: Query<(Entity, &AstGridEntity)>,
-    wall_q: Query<(Entity, &ProgramWallEntity)>,
     state: Res<AstState>,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
@@ -3764,71 +3679,42 @@ fn pick_nodes(
     pick.hovered_node = closest.as_ref().map(|(id, _)| id.clone());
 
     // Ray-plane test against each spawned AST grid. Each AST grid sits at
-    // its own Y (Program-Ast Y=0; Pattern sub-AST at Pattern's world Y) and
+    // its own Y (Program scope Y=0; Pattern sub-AST at Pattern's world Y) and
     // spans a rectangle in local grid coords. Pick the closest rect hit.
-    const LAYOUT_SCALE_F: f32 = 3.0;
+    //
+    // Every conversion goes through `render::layout_to_world` /
+    // `world_to_layout` because LAYOUT_SCALE negates Y and Z — dividing by a
+    // bare 3.0 here would mirror the picking against the rendering.
     let mut grid_hit: Option<HoveredGrid> = None;
     let mut best_t = f32::INFINITY;
     if !over_ui && closest.is_none() {
         for (entity, ag) in grid_q.iter() {
-            let plane_y = ag.origin_offset.y * LAYOUT_SCALE_F;
+            let origin_world = render::layout_to_world(ag.origin_offset);
             let denom = ray.direction.y;
             if denom.abs() < 1e-4 {
                 continue;
             }
-            let t = (plane_y - ray.origin.y) / denom;
+            let t = (origin_world.y - ray.origin.y) / denom;
             if t <= 0.0 || t >= best_t {
                 continue;
             }
             let hit = ray.origin + *ray.direction * t;
-            let world_offset_x = ag.origin_offset.x * LAYOUT_SCALE_F;
-            let world_offset_z = ag.origin_offset.z * LAYOUT_SCALE_F;
-            let local_x = ((hit.x - world_offset_x) / LAYOUT_SCALE_F).round() as i32;
-            let local_z = ((hit.z - world_offset_z) / LAYOUT_SCALE_F).round() as i32;
+            let local = render::world_to_layout(hit - origin_world);
+            let local_x = local.x.round() as i32;
+            let local_z = local.z.round() as i32;
             if local_x < ag.min.x || local_x > ag.max.x {
                 continue;
             }
             if local_z < ag.min.z || local_z > ag.max.z {
                 continue;
             }
-            let world_cx = (local_x as f32 + ag.origin_offset.x) * LAYOUT_SCALE_F;
-            let world_cz = (local_z as f32 + ag.origin_offset.z) * LAYOUT_SCALE_F;
+            let cell_local = IVec3::new(local_x, 0, local_z);
+            let center_world = render::layout_to_world(cell_local.as_vec3() + ag.origin_offset);
             best_t = t;
             grid_hit = Some(HoveredGrid {
-                local_pos: IVec3::new(local_x, 0, local_z),
-                context: ag.context.clone(),
+                global_pos: cell_local + ag.origin_offset.round().as_ivec3(),
                 entity,
-                world_center: Vec2::new(world_cx, world_cz),
-            });
-        }
-        // Program-Ast front wall: vertical plane at Z=0. Half-a-cell of
-        // pick padding on each side matches the wall mesh's own padding.
-        for (entity, wall) in wall_q.iter() {
-            let denom = ray.direction.z;
-            if denom.abs() < 1e-4 {
-                continue;
-            }
-            let t = -ray.origin.z / denom;
-            if t <= 0.0 || t >= best_t {
-                continue;
-            }
-            let hit = ray.origin + *ray.direction * t;
-            let min_wx = (wall.min_x as f32 - 0.5) * LAYOUT_SCALE_F;
-            let max_wx = (wall.max_x as f32 + 0.5) * LAYOUT_SCALE_F;
-            if hit.x < min_wx || hit.x > max_wx {
-                continue;
-            }
-            if hit.y < -3.0 || hit.y > 3.0 {
-                continue;
-            }
-            let local_x = (hit.x / LAYOUT_SCALE_F).round() as i32;
-            let world_cx = local_x as f32 * LAYOUT_SCALE_F;
-            best_t = t;
-            grid_hit = Some(HoveredGrid {
-                local_pos: IVec3::new(local_x, 0, 0),
-                context: Vec::new(),
-                entity,
-                world_center: Vec2::new(world_cx, 0.0),
+                world_center: Vec2::new(center_world.x, center_world.z),
             });
         }
     }
@@ -3849,21 +3735,21 @@ fn pick_nodes(
         pick.press_over_ui = false;
         if is_click && !press_over_ui && !over_ui {
             if let Some((node_id, _)) = closest {
+                // Lift the node's scope-local position into a global address.
                 if let Some(ctx) = state.program_ast().context_of_node(&node_id) {
                     let owning_ast = state.program_ast().resolve_context(&ctx);
                     if let Some(ln) = owning_ast.layout_nodes.get(&node_id) {
-                        let new_pos = ln.pos.round().as_ivec3();
-                        if pick.selected_pos != new_pos || pick.selected_context != ctx {
+                        let new_pos =
+                            ln.pos.round().as_ivec3() + state.program_ast().scope_offset(&ctx);
+                        if pick.selected_pos != new_pos {
                             pick.selected_pos = new_pos;
-                            pick.selected_context = ctx;
                             rebuild.0 = true;
                         }
                     }
                 }
             } else if let Some(hit) = grid_hit {
-                if pick.selected_pos != hit.local_pos || pick.selected_context != hit.context {
-                    pick.selected_pos = hit.local_pos;
-                    pick.selected_context = hit.context;
+                if pick.selected_pos != hit.global_pos {
+                    pick.selected_pos = hit.global_pos;
                     rebuild.0 = true;
                 }
             }
@@ -3879,7 +3765,9 @@ fn highlight_hovered(
     node_q: Query<(&AstNodeEntity, &MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let selected_node = pick.selected_ast(&state).node_at(pick.selected_pos);
+    let selected_node = state
+        .caret_ast(&pick)
+        .and_then(|(ast, local)| ast.node_at(local));
     for (node_ent, mat_handle) in node_q.iter() {
         let Some(mat) = materials.get_mut(&mat_handle.0) else {
             continue;
@@ -3914,9 +3802,9 @@ fn update_selection_display(
     let Ok((mut text, mut color)) = display_q.single_mut() else {
         return;
     };
-    let selected_ast = pick.selected_ast(&state);
-    if let Some(id) = selected_ast.node_at(pick.selected_pos) {
-        if let Some(node) = selected_ast.ast.nodes.get(&id) {
+    let caret = state.caret_ast(&pick);
+    if let Some(id) = caret.and_then(|(ast, local)| ast.node_at(local)) {
+        if let Some(node) = caret.and_then(|(ast, _)| ast.ast.nodes.get(&id)) {
             text.0 = format!(
                 "{} : {}",
                 render::label_for_node(node, &state.function_declarations),
@@ -3943,9 +3831,12 @@ fn update_selection_display(
 
 fn update_grid_material(
     pick: Res<PickState>,
+    state: Res<AstState>,
     grid_q: Query<(Entity, &AstGridEntity, &MeshMaterial3d<grid::GridMaterial>)>,
     mut materials: ResMut<Assets<grid::GridMaterial>>,
 ) {
+    // The bordered grid is the one the caret addresses.
+    let caret_path = state.scope_of_caret(&pick).map(|s| s.path);
     let hit_entity = pick.hovered_grid.as_ref().map(|h| h.entity);
     let hit_center = pick
         .hovered_grid
@@ -3962,7 +3853,7 @@ fn update_grid_material(
         } else {
             mat.hover_active = 0.0;
         }
-        mat.border_active = if ast_grid.context == pick.context_path {
+        mat.border_active = if Some(ast_grid.context.as_slice()) == caret_path.as_deref() {
             1.0
         } else {
             0.0
@@ -4152,21 +4043,20 @@ fn text_input_keyboard(
 /// (fresh `Local`) does not trigger, so app startup doesn't jump.
 fn trigger_camera_focus_on_selection_change(
     pick: Res<PickState>,
-    state: Res<AstState>,
     orbit: Res<camera::OrbitCamera>,
     mut tween: ResMut<camera::CameraTween>,
-    mut last_selection: Local<Option<(IVec3, Vec<model::node::Id>)>>,
+    mut last_selection: Local<Option<IVec3>>,
     start_menu: Res<StartMenu>,
 ) {
     if start_menu.showing {
         return;
     }
-    let current = (pick.selected_pos, pick.selected_context.clone());
-    if last_selection.as_ref() != Some(&current) {
+    let current = pick.selected_pos;
+    if *last_selection != Some(current) {
         if last_selection.is_some() {
-            let offset = state.program_ast().context_offset(&pick.selected_context);
-            let world = render::layout_to_world(pick.selected_pos.as_vec3() + offset);
-            tween.focus_on(&orbit, world);
+            // The caret is already a global address, so it converts to world
+            // space directly.
+            tween.focus_on(&orbit, render::layout_to_world(current.as_vec3()));
         }
         *last_selection = Some(current);
     }
@@ -4185,28 +4075,31 @@ fn handle_arrow_keys(
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
 
-    // Direction of each arrow in layout coordinates.
+    // Direction of each arrow in layout coordinates. Layout `+Y` renders
+    // downward and `+Z` runs source-to-sink, so both are inverted relative to
+    // the pre-flip bindings — the keys still move the caret the same way on
+    // screen.
     let delta = if keys.just_pressed(KeyCode::ArrowUp) {
         if shift {
-            Some(IVec3::new(0, 1, 0))
+            Some(IVec3::new(0, -1, 0))
         } else {
             Some(IVec3::new(-1, 0, 0))
         }
     } else if keys.just_pressed(KeyCode::ArrowDown) {
         if shift {
-            Some(IVec3::new(0, -1, 0))
+            Some(IVec3::new(0, 1, 0))
         } else {
             Some(IVec3::new(1, 0, 0))
         }
     } else if keys.just_pressed(KeyCode::ArrowLeft) {
         if !shift {
-            Some(IVec3::new(0, 0, 1))
+            Some(IVec3::new(0, 0, -1))
         } else {
             None
         }
     } else if keys.just_pressed(KeyCode::ArrowRight) {
         if !shift {
-            Some(IVec3::new(0, 0, -1))
+            Some(IVec3::new(0, 0, 1))
         } else {
             None
         }
@@ -4222,20 +4115,27 @@ fn handle_arrow_keys(
         // Move the node under the current selection (if any) and keep
         // the selection anchored to it — the effective position may differ
         // from `selected + delta` when the move jumped over a match.
-        // Route through selected_ast (not current_ast) so a Sub-Ast node
-        // can be moved without first switching context_path via SelectAst.
-        if let Some(node_id) = pick.selected_ast(&state).node_at(pick.selected_pos) {
-            let (new_layout, effective_pos) = pick
-                .selected_ast(&state)
-                .move_node_delta(node_id, delta.as_vec3());
-            *pick.selected_ast_mut(&mut state) = new_layout;
+        // The node lives in whichever scope the caret addresses.
+        let Some(scope) = state.scope_of_caret(&pick) else {
+            return;
+        };
+        let scope_ast = state.program_ast().resolve_context(&scope.path);
+        if let Some(node_id) = scope_ast.node_at(scope.local) {
+            let (new_layout, effective_local) = scope_ast.move_node_delta(node_id, delta.as_vec3());
+            let scope_origin = state.program_ast().scope_offset(&scope.path);
+            if let Some(target) = state.program_ast_mut().resolve_context_mut(&scope.path) {
+                *target = new_layout;
+            }
             state.layout_ast = state.layout_ast.settle_footprints();
-            pick.selected_pos = effective_pos;
+            // `move_node_delta` may report a different cell than
+            // `local + delta` when the move jumped a match footprint.
+            pick.selected_pos = effective_local + scope_origin;
             rebuild.0 = true;
         }
     } else {
-        // Plain arrow: navigate the selection between grid crossings.
-        pick.selected_pos += delta;
+        // Plain arrow: navigate the selection between grid crossings. Layout
+        // space is non-negative, so the caret stops at the origin planes.
+        pick.selected_pos = (pick.selected_pos + delta).max(IVec3::ZERO);
         rebuild.0 = true;
     }
 }
@@ -4454,23 +4354,19 @@ fn update_crosshair(
         return;
     };
 
-    // Anchor world position: use node transform if a node lives at the
-    // selected position (accounts for any drift), otherwise derive from
-    // the layout-scaled selected_pos. When selection lives in a sub-AST,
-    // add the accumulated owner offset — selected_pos is local.
-    let anchor_world = pick
-        .selected_ast(&state)
-        .node_at(pick.selected_pos)
+    // Anchor world position: use the node transform if a node lives at the
+    // caret (accounts for any drift), otherwise convert the caret directly —
+    // it is a global address, so no owner offset is involved.
+    let anchor_world = state
+        .caret_ast(&pick)
+        .and_then(|(ast, local)| ast.node_at(local))
         .and_then(|id| {
             node_q
                 .iter()
                 .find(|(e, _)| e.node_id == id)
                 .map(|(_, tf)| tf.translation())
         })
-        .unwrap_or_else(|| {
-            let offset = state.program_ast().context_offset(&pick.selected_context);
-            render::layout_to_world(pick.selected_pos.as_vec3() + offset)
-        });
+        .unwrap_or_else(|| render::layout_to_world(pick.selected_pos.as_vec3()));
 
     let Ok(screen) = camera.world_to_viewport(cam_tf, anchor_world) else {
         hide_all(&mut crosshair_q);
@@ -4662,7 +4558,6 @@ fn main() {
                     (
                         handle_delete_node_button,
                         handle_add_node_button,
-                        handle_select_ast_button,
                         handle_hamburger_button,
                         handle_start_menu_new_button,
                         handle_start_menu_controls_button,
@@ -4718,7 +4613,6 @@ fn main() {
                 update_delete_button_visuals,
                 update_add_pattern_button_visuals,
                 update_add_generic_button_visuals,
-                update_select_ast_button_visuals,
                 sync_value_labels,
             )
                 .chain(),

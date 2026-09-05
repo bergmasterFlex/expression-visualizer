@@ -1,11 +1,43 @@
 use bevy::prelude::*;
 
 /// Scale factor from layout coordinates to world coordinates.
-pub const LAYOUT_SCALE: Vec3 = Vec3::new(3.0, 3.0, 3.0);
+///
+/// Layout space is the pure non-negative address space: every cell address is
+/// >= 0 on all three axes, and each scope volume has its origin corner at its
+/// own (0,0,0). The axis *orientation* lives here and nowhere else, which is
+/// why Y and Z are negated:
+///
+/// - layout `+X` -> world `+X`, toward the viewer in the default perspective
+/// - layout `+Y` -> world `-Y`, downward on screen
+/// - layout `+Z` -> world `-Z`, the causal direction `source -> sink`
+///
+/// Everything downstream of the conversion (meshes, edge tangents, anchor
+/// offsets, camera, lights, base grid) stays in world space and is unaffected
+/// by the layout-space sign convention.
+pub const LAYOUT_SCALE: Vec3 = Vec3::new(3.0, -3.0, -3.0);
 
 /// Convert a layout position to a world-space position.
 pub fn layout_to_world(pos: Vec3) -> Vec3 {
     pos * LAYOUT_SCALE
+}
+
+/// Inverse of `layout_to_world`. Turns a world-space point (e.g. a grid
+/// raycast hit) back into a cell address.
+pub fn world_to_layout(world: Vec3) -> Vec3 {
+    world / LAYOUT_SCALE
+}
+
+/// World-space AABB of an inclusive layout-space cell range.
+///
+/// `LAYOUT_SCALE` negates Y and Z, so a layout `min` maps to a world `max` on
+/// those axes. Callers needing a world rect (grid borders, the footprint
+/// uniforms the grid shader compares against) must go through this rather than
+/// scaling `min`/`max` individually — otherwise the rect comes out inverted,
+/// i.e. empty. `pad` widens the range by that many cells per side first.
+pub fn layout_range_to_world(min: Vec3, max: Vec3, pad: f32) -> (Vec3, Vec3) {
+    let a = layout_to_world(min - Vec3::splat(pad));
+    let b = layout_to_world(max + Vec3::splat(pad));
+    (a.min(b), a.max(b))
 }
 
 pub struct RenderObject {
@@ -671,10 +703,12 @@ pub fn layoutnode_to_rendernode(
                 .filter_map(|pid| layout_ast.layout_nodes.get(pid).map(|ln| ln.pos.y))
                 .fold(layout_node.pos.y, f32::max);
             let y_diff_grid = max_y_grid - layout_node.pos.y;
+            // LAYOUT_SCALE.y is negative (layout +Y renders downward), so the
+            // signed span is used for the centre but its magnitude for the size.
             let y_diff_world = y_diff_grid * LAYOUT_SCALE.y;
             // Pad by a full anchor-rect height so the top/bottom patterns (now
             // TYPE_MARKER_Y_STEP tall) stay enclosed by the envelope.
-            let height = y_diff_world + TYPE_MARKER_Y_STEP;
+            let height = y_diff_world.abs() + TYPE_MARKER_Y_STEP;
             let center_local = Vec3::new(0.0, y_diff_world / 2.0, 0.0);
             // Envelope hugs the slim patterns with the same 0.05 per-side margin
             // it had around the old 0.45 cubes.
