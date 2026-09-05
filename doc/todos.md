@@ -1,19 +1,8 @@
 # TODOs
 
-- nodes/anchors visualization and anchors one address
-  - Source
-  - TypeCast
-  - Constant
-  - FuncCall
-  - Source
-  - Match
-  - Tunnel
+- Tunnel
 - new positional constraints of the nodes
-
-
 - evaluation step wise -> narrowing to literal types? -> also the match branches? fade away/remove/collapse?
-
-
 - correct relative consumption of band height (0% literals and 50% literals)
 
 

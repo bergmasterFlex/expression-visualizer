@@ -173,7 +173,9 @@ fn orbit_input(
 
     // Ctrl + scroll → zoom
     if scroll_delta != 0.0 {
-        orbit.radius = (orbit.radius - scroll_delta).clamp(2.0, 52.5);
+        // Lower bound tracks the cell size so a single cell can still be filled
+        // on screen; the upper bound stays absolute so bigger graphs fit.
+        orbit.radius = (orbit.radius - scroll_delta).clamp(crate::render::CELL * 0.7, 52.5);
     }
 }
 

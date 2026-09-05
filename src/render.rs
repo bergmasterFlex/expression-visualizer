@@ -1,5 +1,13 @@
 use bevy::prelude::*;
 
+/// Edge length of one grid cell in world units.
+///
+/// Nodes and anchors span several cells each — a function call is as wide as
+/// its inputs and four cells deep — so the cell itself is kept small. Every
+/// size that means "a fraction of a cell" is derived from this rather than
+/// hard-coded, so retuning the density stays a one-line change.
+pub const CELL: f32 = 1.0;
+
 /// Scale factor from layout coordinates to world coordinates.
 ///
 /// Layout space is the pure non-negative address space: every cell address is
@@ -14,7 +22,7 @@ use bevy::prelude::*;
 /// Everything downstream of the conversion (meshes, edge tangents, anchor
 /// offsets, camera, lights, base grid) stays in world space and is unaffected
 /// by the layout-space sign convention.
-pub const LAYOUT_SCALE: Vec3 = Vec3::new(3.0, -3.0, -3.0);
+pub const LAYOUT_SCALE: Vec3 = Vec3::new(CELL, -CELL, -CELL);
 
 /// Convert a layout *address* to its world-space position.
 ///
@@ -54,7 +62,7 @@ pub fn layout_range_to_world(min: Vec3, max: Vec3, pad: f32) -> (Vec3, Vec3) {
 }
 
 /// Edge thickness of the selection caret's cell outline, in world units.
-const CARET_EDGE_THICKNESS: f32 = 0.05;
+const CARET_EDGE_THICKNESS: f32 = CELL / 60.0;
 
 /// Wireframe outline of the cell at `cell`: twelve thin cuboids spanning the
 /// volume from `cell` to `cell + (1,1,1)`. This is the selection caret — it
@@ -156,24 +164,25 @@ pub struct RenderLabel {
 }
 
 const TYPE_MARKER_ALPHA: f32 = 0.6;
-/// Height of one anchor row in world units — exactly one cell, since an
-/// anchor claims one cell per sum-type member. The marker mesh fills the cell
-/// in Y but stays slim in X and Z, so a sum type reads as an unbroken band
-/// while the graph keeps its airy look.
-pub const TYPE_MARKER_Y_STEP: f32 = 3.0;
-const TYPE_MARKER_HALF_DEPTH: f32 = 0.25;
-/// Full Z-depth of an anchor cuboid (half the old 1.0 type-marker depth).
+/// Height of one anchor row: exactly one cell, since an anchor claims one
+/// cell per sum-type member. The marker mesh fills the cell in Y but stays
+/// slim in X and Z, so a sum type reads as an unbroken band while the graph
+/// keeps its airy look.
+pub const TYPE_MARKER_Y_STEP: f32 = CELL;
+const TYPE_MARKER_HALF_DEPTH: f32 = CELL / 12.0;
+/// Full Z-depth of an anchor cuboid.
 const ANCHOR_DEPTH: f32 = 2.0 * TYPE_MARKER_HALF_DEPTH;
-/// X-width of an anchor cuboid (half the old 0.45 node width). Shared with the
-/// three slab nodes so anchor and node line up exactly in X.
-pub const ANCHOR_X: f32 = 0.225;
+/// X-width of an anchor cuboid. Shared with the slab nodes so anchor and node
+/// line up exactly in X.
+pub const ANCHOR_X: f32 = CELL * 0.075;
+/// Margin between a Match envelope and the slim Patterns it encloses.
+pub const ENVELOPE_MARGIN: f32 = CELL / 60.0;
 /// Y-thickness of the gizmo line drawn in the far 2/3 of a value-carrying
-/// type marker. Matches the anchor-sphere radius so lines and spheres read as
-/// one visual family.
-const VALUE_LINE_THICKNESS: f32 = 0.06;
+/// type marker.
+const VALUE_LINE_THICKNESS: f32 = CELL * 0.02;
 /// World-space padding between the tip of the gizmo line and the value
 /// label's projection point.
-const VALUE_LABEL_Z_PADDING: f32 = 0.1;
+const VALUE_LABEL_Z_PADDING: f32 = CELL / 30.0;
 
 /// Sort key that fixes the vertical order of type-marker rectangles.
 /// Returns `None` for variants that should not render a rectangle.
@@ -715,7 +724,10 @@ pub fn layoutnode_to_rendernode(
                 crate::infer::incoming_anchor_type(flat_ast, input_anchor, function_declarations);
             RenderNode {
                 node: Some(RenderObject {
-                    mesh: crate::mesh::square_pyramid_z_mesh(6.0 * sink_scale, 9.0 * sink_scale),
+                    mesh: crate::mesh::square_pyramid_z_mesh(
+                        CELL * 2.0 * sink_scale,
+                        CELL * 3.0 * sink_scale,
+                    ),
                     material: StandardMaterial {
                         base_color: Color::srgba(0.5, 0.5, 0.5, 0.5),
                         alpha_mode: AlphaMode::Blend,
@@ -806,9 +818,8 @@ pub fn layoutnode_to_rendernode(
             // TYPE_MARKER_Y_STEP tall) stay enclosed by the envelope.
             let height = y_diff_world.abs() + TYPE_MARKER_Y_STEP;
             let center_local = Vec3::new(0.0, y_diff_world / 2.0, 0.0);
-            // Envelope hugs the slim patterns with the same 0.05 per-side margin
-            // it had around the old 0.45 cubes.
-            let envelope_xz = ANCHOR_X + 2.0 * 0.05;
+            // Envelope hugs the slim patterns with a margin per side.
+            let envelope_xz = ANCHOR_X + 2.0 * ENVELOPE_MARGIN;
             // Input anchor owns the Match's own cell at local 0|0.
             let input_world = cell(0, 0, 0);
             let incoming =
@@ -833,8 +844,8 @@ pub fn layoutnode_to_rendernode(
             // vertical Y column. Tip world = cell_center_world(sink_local +
             // pattern_grid + extra_offset) + (0, 0, −SINK_TIP_DEPTH). Pattern
             // sub-content always renders at sink_scale 1/3 (see walk_all_into),
-            // so the pyramid depth is 9 · 1/3 = 3.0 world units.
-            const SINK_TIP_DEPTH: f32 = 3.0;
+            // so the pyramid depth is CELL·3 · 1/3 = one cell.
+            const SINK_TIP_DEPTH: f32 = CELL;
             let mut tip_x = node_pos.x;
             let mut tip_z = node_pos.z;
             let mut min_tip_y = f32::MAX;

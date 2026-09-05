@@ -22,10 +22,10 @@ pub struct GridConfig {
 impl Default for GridConfig {
     fn default() -> Self {
         Self {
-            spacing: 3.0,
+            spacing: crate::render::CELL,
             half_extent: 200.0,
-            fade_start: 15.0,
-            fade_end: 100.0,
+            fade_start: crate::render::CELL * 5.0,
+            fade_end: crate::render::CELL * 34.0,
         }
     }
 }

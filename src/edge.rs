@@ -12,14 +12,13 @@ use crate::infer::EType;
 
 /// Height of a solid edge band: one anchor row, so band and type marker line
 /// up exactly.
-pub const RIBBON_HEIGHT: f32 = 3.0;
+pub const RIBBON_HEIGHT: f32 = crate::render::CELL;
 /// Ribbon height used when a source anchor carries an AST literal. The band
 /// itself is invisible in that mode (see `edge_band.wgsl`); the height is
 /// kept as-is so the rasterised marquee glyphs stay readable.
-pub const RIBBON_LINE_HEIGHT: f32 = 0.75;
+pub const RIBBON_LINE_HEIGHT: f32 = crate::render::CELL / 4.0;
 /// Half-thickness of the value-edge hairline in `uv.y` space (i.e. as a
-/// fraction of `RIBBON_LINE_HEIGHT`). 0.1 * 0.25 = 0.025 world units — thin
-/// like a grid line.
+/// fraction of `RIBBON_LINE_HEIGHT`). Thin like a grid line.
 pub const RIBBON_LINE_HALF_THICKNESS_UV: f32 = 0.1;
 pub const RIBBON_SEGMENTS: usize = 40;
 const LABEL_TEX_WIDTH: u32 = 256;
@@ -45,7 +44,8 @@ impl EdgeCurve {
         let dz = to_world.z - from_world.z;
         // Clamp the handle length so same-Z-rank connections still bulge
         // visibly instead of degenerating into a straight line.
-        let mut l = 1.5_f32.max(0.5 * dz.abs() + 0.25 * (to_world - from_world).length());
+        let mut l = (crate::render::CELL * 0.5)
+            .max(0.5 * dz.abs() + 0.25 * (to_world - from_world).length());
         // When the target sits behind the source in −Z (normal flow), cap the
         // handle length at the Z-gap: the cubic's Z-derivative stays ≤ 0 iff
         // l ≤ |dz|, so the curve runs strictly toward −Z and never swings back

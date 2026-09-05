@@ -779,8 +779,8 @@ fn spawn_ast_nodes(
                     MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
                         band_color: band.color.to_linear(),
                         letter_color: LinearRgba::WHITE,
-                        scroll_speed: 1.5,
-                        tile_length: 3.0,
+                        scroll_speed: render::CELL * 0.5,
+                        tile_length: render::CELL,
                         time: 0.0,
                         line_mode: 0.0,
                         line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
@@ -988,8 +988,8 @@ fn spawn_ast_nodes(
                     MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
                         band_color: render::type_marker_color(leaf).to_linear(),
                         letter_color: LinearRgba::WHITE,
-                        scroll_speed: 1.5,
-                        tile_length: 3.0,
+                        scroll_speed: render::CELL * 0.5,
+                        tile_length: render::CELL,
                         time: 0.0,
                         line_mode,
                         line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
@@ -1122,7 +1122,7 @@ fn spawn_ast_nodes(
             let wall_center_y = -wall_size_y * 0.5;
             let wall_z = render::layout_to_world(Vec3::ZERO).z;
             commands.spawn((
-                Mesh3d(meshes.add(Cuboid::new(wall_size_x, wall_size_y, 0.05))),
+                Mesh3d(meshes.add(Cuboid::new(wall_size_x, wall_size_y, render::CELL / 60.0))),
                 MeshMaterial3d(materials.add(StandardMaterial {
                     base_color: Color::srgba(0.5, 0.5, 0.5, 0.5),
                     alpha_mode: AlphaMode::Blend,
@@ -3759,8 +3759,8 @@ fn pick_nodes(
         .iter()
         .any(|i| matches!(*i, Interaction::Hovered | Interaction::Pressed));
 
-    // Ray-sphere test against nodes (radius 0.35).
-    let radius = 0.35_f32;
+    // Ray-sphere test against nodes, at a fraction of a cell.
+    let radius = render::CELL * 0.35;
     let mut closest: Option<(model::node::Id, f32)> = None;
     if !over_ui {
         for (node_ent, transform) in node_q.iter() {
