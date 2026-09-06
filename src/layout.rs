@@ -145,8 +145,9 @@ pub struct WalkedAst<'a> {
 }
 
 /// Bounds of an AST grid in that AST's local grid coordinates. Both corners
-/// are inclusive. X/Z size the drawn grid plane; Y spans the rows the scope
-/// owns and is read only when resolving a caret address to its scope.
+/// are inclusive. X/Z size the drawn grid plane and X/Y its Z faces; the Y
+/// span is the rows the scope owns, which is also what bounds a caret
+/// address to its scope.
 #[derive(Debug, Clone, Copy)]
 pub struct AstGridBounds {
     pub min: IVec3,
@@ -1874,20 +1875,19 @@ impl LayoutAst {
     ///   Both ends are reserved: local Z=0 is the source row (VarDecls in the
     ///   root scope, the BranchSource in a branch) and `sink.z` belongs to the
     ///   Sink alone. Returns `None` if no Sink exists.
-    /// - X range: min/max over every node's footprint X-span, unioned with
-    ///   `active_selection.x` when provided. Multi-cell footprints (matches,
-    ///   ≥3-input function calls) grow the grid so the extra cell is
-    ///   drawable. If the AST has no nodes at all the sink is the only
-    ///   node — X min/max = 0 (sink is at X=0).
+    /// - X range: min/max over every node's footprint X-span. Multi-cell
+    ///   footprints (matches, ≥3-input function calls) grow the grid so the
+    ///   extra cell is drawable. If the AST has no nodes at all the sink is
+    ///   the only node — X min/max = 0 (sink is at X=0).
     /// - Y range: min/max over every node's footprint Y-span. A Match
     ///   contributes its whole Pattern stack, so a scope containing one spans
     ///   every row its patterns occupy. Only `scope_at` reads this — the grid
     ///   mesh is a single plane and uses X/Z alone — but without it a caret on
     ///   any Pattern below the first row would fall outside every scope.
     ///
-    /// `active_selection` is the currently-selected cell in this AST's local
-    /// coords, passed only when this AST is the scope the caret addresses.
-    pub fn ast_grid_bounds(&self, active_selection: Option<IVec3>) -> Option<AstGridBounds> {
+    /// The bounds follow the nodes and nothing else: the caret cannot widen
+    /// them by moving, since `clamp_to_volume` keeps it inside.
+    pub fn ast_grid_bounds(&self) -> Option<AstGridBounds> {
         let sink_z =
             self.layout_nodes
                 .iter()
@@ -1912,10 +1912,6 @@ impl LayoutAst {
             y_min = y_min.min(fp.min.y);
             y_max = y_max.max(fp.max.y);
         }
-        if let Some(sel) = active_selection {
-            x_min = x_min.min(sel.x);
-            x_max = x_max.max(sel.x);
-        }
         if x_min == i32::MAX {
             x_min = 0;
             x_max = 0;
@@ -1928,6 +1924,20 @@ impl LayoutAst {
             min: IVec3::new(x_min, y_min, z_min),
             max: IVec3::new(x_max, y_max, z_max),
         })
+    }
+
+    /// Clamp a global cell address into this AST's volume, i.e. the bounds
+    /// every scope nested in it lives inside.
+    ///
+    /// Caret navigation goes through here: the volume follows the nodes, and
+    /// widening it — adding empty cells to move into — is an explicit action,
+    /// never a side effect of moving. With no Sink there is no volume yet;
+    /// only the non-negative half-space constrains the address then.
+    pub fn clamp_to_volume(&self, global: IVec3) -> IVec3 {
+        match self.ast_grid_bounds() {
+            Some(bounds) => global.clamp(bounds.min, bounds.max),
+            None => global.max(IVec3::ZERO),
+        }
     }
 
     pub fn edges(&self) -> Vec<LayoutEdge> {
@@ -2040,7 +2050,7 @@ impl LayoutAst {
     pub fn scope_at(&self, global: IVec3) -> Option<(Vec<crate::model::node::Id>, IVec3)> {
         let mut best: Option<(Vec<crate::model::node::Id>, IVec3)> = None;
         for walked in self.walk_all_asts() {
-            let Some(bounds) = walked.layout_ast.ast_grid_bounds(None) else {
+            let Some(bounds) = walked.layout_ast.ast_grid_bounds() else {
                 continue;
             };
             let offset = walked.extra_offset.round().as_ivec3();

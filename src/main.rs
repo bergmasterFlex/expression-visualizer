@@ -302,7 +302,8 @@ struct HideDuringStartMenu;
 /// parent.
 #[derive(Resource)]
 struct PickState {
-    /// Currently selected grid cell, as a global address. Never negative.
+    /// Currently selected grid cell, as a global address. Never negative,
+    /// and never outside the graph volume — see `LayoutAst::clamp_to_volume`.
     selected_pos: IVec3,
     /// Node under the cursor (ray-sphere hit), if any.
     hovered_node: Option<model::node::Id>,
@@ -974,18 +975,8 @@ fn spawn_ast_nodes(
         }
     }
 
-    // The caret's scope is derived, not stored: only that scope's grid grows
-    // to keep the caret cell drawable.
-    let caret_scope = state.scope_of_caret(&pick);
-    let scope_path = caret_scope.as_ref().map(|s| s.path.clone());
-    let scope_local = caret_scope.as_ref().map(|s| s.local);
     for walked_ast in state.program_ast().walk_all_asts() {
-        let active_selection = if scope_path.as_deref() == Some(walked_ast.context.as_slice()) {
-            scope_local
-        } else {
-            None
-        };
-        let Some(bounds) = walked_ast.layout_ast.ast_grid_bounds(active_selection) else {
+        let Some(bounds) = walked_ast.layout_ast.ast_grid_bounds() else {
             continue;
         };
         let width_cells = (bounds.max.x - bounds.min.x + 1) as f32;
@@ -4257,10 +4248,17 @@ fn handle_arrow_keys(
             rebuild.0 = true;
         }
     } else {
-        // Plain arrow: navigate the selection between grid crossings. Layout
-        // space is non-negative, so the caret stops at the origin planes.
-        pick.selected_pos = (pick.selected_pos + delta).max(IVec3::ZERO);
-        rebuild.0 = true;
+        // Plain arrow: navigate the selection between grid crossings. The
+        // caret stays inside the graph volume — its faces are where the grid
+        // ends, and only an explicit action may push them outward — so a move
+        // against a face is simply no move at all.
+        let target = state
+            .program_ast()
+            .clamp_to_volume(pick.selected_pos + delta);
+        if target != pick.selected_pos {
+            pick.selected_pos = target;
+            rebuild.0 = true;
+        }
     }
 }
 
