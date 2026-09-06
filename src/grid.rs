@@ -53,7 +53,7 @@ pub struct GridMaterial {
     pub fade_end: f32,
     #[uniform(0)]
     pub line_thickness: f32,
-    /// World-space (x, z) of the hovered cell's center.
+    /// Plane coordinates (see `axis_u`) of the hovered cell's center.
     #[uniform(0)]
     pub hover_pos: Vec2,
     /// 1.0 when a grid cell is hovered, 0.0 otherwise.
@@ -62,10 +62,10 @@ pub struct GridMaterial {
     /// Padding to keep the uniform block 16-byte aligned.
     #[uniform(0)]
     pub _pad: f32,
-    /// World-space (x, z) of the outer boundary min corner.
+    /// Plane coordinates of the outer boundary min corner.
     #[uniform(0)]
     pub border_min: Vec2,
-    /// World-space (x, z) of the outer boundary max corner.
+    /// Plane coordinates of the outer boundary max corner.
     #[uniform(0)]
     pub border_max: Vec2,
     /// Color used when a fragment lies on the outer boundary.
@@ -82,11 +82,52 @@ pub struct GridMaterial {
     pub footprint_count: u32,
     #[uniform(0)]
     pub _pad2: f32,
+    /// World axes the plane's 2D grid coordinates are read along: a fragment
+    /// at world `p` sits at `(dot(p, axis_u), dot(p, axis_v))`. `X`/`Z` for a
+    /// horizontal plane, `X`/`Y` for a plane standing on the Z axis. Every
+    /// other 2D uniform here — hover, border, footprints — is in those same
+    /// coordinates. `w` is unused padding.
+    #[uniform(0)]
+    pub axis_u: Vec4,
+    #[uniform(0)]
+    pub axis_v: Vec4,
     /// World-space footprints of multi-cell nodes: `xy = min.xz`, `zw =
     /// max.xz`. Fragments whose neighbours across the nearest grid line all
     /// lie inside the same footprint suppress that line.
     #[uniform(0)]
     pub footprints: [Vec4; MAX_FOOTPRINTS],
+}
+
+impl GridMaterial {
+    /// The style every AST-scope surface shares: the shaded Y plane a scope
+    /// sits on and the Z faces bounding the graph volume. `axis_u`/`axis_v`
+    /// orient the grid on the plane.
+    ///
+    /// Hover, border and footprints start off — only the interactive Y plane
+    /// fills them in, per frame.
+    pub fn ast_surface(axis_u: Vec3, axis_v: Vec3) -> Self {
+        Self {
+            plane_color: LinearRgba::new(0.07, 0.07, 0.1, 0.55),
+            line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.4),
+            spacing: crate::render::CELL,
+            fade_start: crate::render::CELL * 5.0,
+            fade_end: crate::render::CELL * 34.0,
+            line_thickness: 1.5,
+            hover_pos: Vec2::ZERO,
+            hover_active: 0.0,
+            _pad: 0.0,
+            border_min: Vec2::ZERO,
+            border_max: Vec2::ZERO,
+            border_color: LinearRgba::WHITE,
+            border_active: 0.0,
+            border_thickness: 1.8,
+            footprint_count: 0,
+            _pad2: 0.0,
+            axis_u: axis_u.extend(0.0),
+            axis_v: axis_v.extend(0.0),
+            footprints: [Vec4::ZERO; MAX_FOOTPRINTS],
+        }
+    }
 }
 
 impl Material for GridMaterial {
@@ -158,6 +199,8 @@ fn spawn_grid(
             border_thickness: 1.8,
             footprint_count: 0,
             _pad2: 0.0,
+            axis_u: Vec3::X.extend(0.0),
+            axis_v: Vec3::Z.extend(0.0),
             footprints: [Vec4::ZERO; MAX_FOOTPRINTS],
         })),
         BaseGridEntity,

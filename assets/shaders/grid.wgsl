@@ -14,11 +14,11 @@ struct GridParams {
     fade_start: f32,
     fade_end: f32,
     line_thickness: f32,
-    // World-space (x, z) of the hovered cell's center.
+    // Plane coordinates (see `axis_u`) of the hovered cell's center.
     hover_pos: vec2<f32>,
     hover_active: f32,
     _pad: f32,
-    // World-space (x, z) of the outer boundary.
+    // Plane coordinates of the outer boundary.
     border_min: vec2<f32>,
     border_max: vec2<f32>,
     border_color: vec4<f32>,
@@ -26,6 +26,9 @@ struct GridParams {
     border_thickness: f32,
     footprint_count: u32,
     _pad2: f32,
+    // World axes the plane's 2D grid coordinates are read along.
+    axis_u: vec4<f32>,
+    axis_v: vec4<f32>,
     // World-space footprints of multi-cell nodes: `xy = min.xz`,
     // `zw = max.xz`. Interior grid lines are suppressed inside these.
     footprints: array<vec4<f32>, 16>,
@@ -49,7 +52,12 @@ fn line_between_inside_same_footprint(a: vec2<f32>, b: vec2<f32>) -> f32 {
 
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
-    let world_pos = in.world_position.xz;
+    // The plane picks the two world axes its grid runs along, so the same
+    // material works on the horizontal Y planes and the vertical Z faces.
+    let world_pos = vec2<f32>(
+        dot(in.world_position.xyz, params.axis_u.xyz),
+        dot(in.world_position.xyz, params.axis_v.xyz),
+    );
 
     let coord = world_pos / params.spacing;
     // Cells are corner-anchored: cell N covers [N, N+1), so the lines are the

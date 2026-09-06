@@ -238,15 +238,6 @@ struct AstGridEntity {
     max: IVec3,
 }
 
-/// Height of the Program wall in layout cells. Layout `+Y` maps to world
-/// `-Y`, so the wall spans world Y from 0 down to `-WALL_HEIGHT_CELLS *
-/// LAYOUT_SCALE.y.abs()` — it hangs below the origin row rather than
-/// straddling it, matching the non-negative layout Y range.
-///
-/// The wall is purely decorative: it marks the grid's Z=0 edge, and the
-/// source row it borders is part of the grid and picked like any other cell.
-const WALL_HEIGHT_CELLS: f32 = 2.0;
-
 /// Flag resource that signals the scene needs rebuilding.
 #[derive(Resource, Default)]
 struct NeedsRebuild(bool);
@@ -1051,23 +1042,11 @@ fn spawn_ast_nodes(
         commands.spawn((
             Mesh3d(meshes.add(Plane3d::default().mesh().size(size_x, size_z).build())),
             MeshMaterial3d(materials_grid.add(grid::GridMaterial {
-                plane_color: LinearRgba::new(0.07, 0.07, 0.1, 0.55),
-                line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.4),
-                spacing: 3.0,
-                fade_start: 15.0,
-                fade_end: 100.0,
-                line_thickness: 1.5,
-                hover_pos: Vec2::ZERO,
-                hover_active: 0.0,
-                _pad: 0.0,
                 border_min,
                 border_max,
-                border_color: LinearRgba::WHITE,
-                border_active: 0.0,
-                border_thickness: 1.8,
                 footprint_count,
-                _pad2: 0.0,
                 footprints,
+                ..grid::GridMaterial::ast_surface(Vec3::X, Vec3::Z)
             })),
             Transform::from_translation(world_center),
             AstGridEntity {
@@ -1079,37 +1058,47 @@ fn spawn_ast_nodes(
             AstSceneEntity,
         ));
 
-        // Program scope: the front wall sits on the exact Z=0 plane — the face
-        // of the source row that looks toward the origin. The source row is
-        // part of the grid and is picked like any other cell. Grid-wide plus
-        // half a cell of padding on each side, so VarDecls at the outermost
-        // grid X still have wall beside them.
+        // Program scope: the graph volume's two Z faces, drawn in the same
+        // style as the Y plane the scope sits on. The front face is the Z=0
+        // plane — the face of the source row that looks toward the origin,
+        // where the removed wall used to stand — and the back face is the far
+        // side of the Sink's cell, the volume's last Z edge. Both span the
+        // AST's bounding box in X and Y, so the three surfaces together frame
+        // the volume the graph grows in.
         if walked_ast.context.is_empty() {
-            let wall_width_cells = width_cells + 1.0;
-            let wall_size_x = wall_width_cells * render::LAYOUT_SCALE.x.abs();
-            let wall_center_x = render::layout_to_world(Vec3::new(
-                (bounds.min.x + bounds.max.x + 1) as f32 * 0.5 + walked_ast.extra_offset.x,
-                0.0,
-                0.0,
-            ))
-            .x;
-            // Layout Y >= 0 maps to world Y <= 0, so the wall hangs below the
-            // origin row instead of straddling it.
-            let wall_height_cells = WALL_HEIGHT_CELLS;
-            let wall_size_y = wall_height_cells * render::LAYOUT_SCALE.y.abs();
-            let wall_center_y = -wall_size_y * 0.5;
-            let wall_z = render::layout_to_world(Vec3::ZERO).z;
-            commands.spawn((
-                Mesh3d(meshes.add(Cuboid::new(wall_size_x, wall_size_y, render::CELL / 60.0))),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color: Color::srgba(0.5, 0.5, 0.5, 0.5),
-                    alpha_mode: AlphaMode::Blend,
-                    cull_mode: None,
-                    ..default()
-                })),
-                Transform::from_xyz(wall_center_x, wall_center_y, wall_z),
-                AstSceneEntity,
-            ));
+            let height_cells = (bounds.max.y - bounds.min.y + 1) as f32;
+            let size_y = height_cells * render::LAYOUT_SCALE.y.abs();
+            // Cells are corner-anchored on Y too, so the face is centred on
+            // the inclusive row range [min, max+1] like the X range above.
+            let face_center = render::layout_to_world(
+                Vec3::new(
+                    (bounds.min.x + bounds.max.x + 1) as f32 * 0.5,
+                    (bounds.min.y + bounds.max.y + 1) as f32 * 0.5,
+                    0.0,
+                ) + walked_ast.extra_offset,
+            );
+            // Front at the near corner of the first row, back at the far
+            // corner of the Sink's row — hence `max.z + 1`.
+            for z_cell in [bounds.min.z, bounds.max.z + 1] {
+                let face_z = render::layout_to_world(
+                    Vec3::new(0.0, 0.0, z_cell as f32) + walked_ast.extra_offset,
+                )
+                .z;
+                commands.spawn((
+                    Mesh3d(
+                        meshes.add(
+                            Plane3d::new(Vec3::Z, Vec2::new(size_x * 0.5, size_y * 0.5))
+                                .mesh()
+                                .build(),
+                        ),
+                    ),
+                    MeshMaterial3d(
+                        materials_grid.add(grid::GridMaterial::ast_surface(Vec3::X, Vec3::Y)),
+                    ),
+                    Transform::from_xyz(face_center.x, face_center.y, face_z),
+                    AstSceneEntity,
+                ));
+            }
         }
     }
 
