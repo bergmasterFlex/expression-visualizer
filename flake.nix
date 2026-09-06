@@ -1,5 +1,5 @@
 {
-  description = "3D AST Visualizer — Bevy + WebGPU/WASM";
+  description = "3D expression visualizer — Bevy + WebGPU/WASM";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -109,7 +109,7 @@
 
           shellHook = ''
             echo ""
-            echo "  🌳 AST Visualizer 3D — dev shell"
+            echo "  🌳 Expression Visualizer 3D — dev shell"
             echo ""
             echo "  WASM (browser):  trunk serve --release"
             echo "  Native (desktop): cargo run --release"
@@ -126,7 +126,7 @@
         # therefore won't try to download anything during the build.
         packages.default = craneLib.buildTrunkPackage {
           inherit src;
-          pname = "bevy-ast-3d";
+          pname = "expression-visualizer";
           version = "0.1.0";
 
           # Build cargo against wasm32 — Bevy's native runtime deps are

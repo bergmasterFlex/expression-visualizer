@@ -25,47 +25,9 @@ fixed in the thesis** (`/srv/work/git/bsc-thesis`, chapter 3 + appendix), not a
 feature request. The thesis is the specification; where the two disagree, the
 code moves.
 
-Order is by urgency: (B)-(E) must be done before any screenshot is taken,
-because all of them are visible in the UI. (A), the complete function set, is
-done.
-
-## B. Rename to the thesis' vocabulary — do before any screenshot
-
-The thesis follows a strict one-term-per-concept rule, and **the current names
-are visible in the UI**, so they end up in the screenshots of ch. 4 and ch. 5. A
-screenshot showing `VarDecl` while the text says `Source` reads as a different
-system. All of these are mechanical renames.
-
-| today | must become | where it shows |
-|---|---|---|
-| `ENode::VarDecl` | `ENode::Source` | node editor panel, dropdowns, labels |
-| `ENode::ConstDecl` | `ENode::Constant` | same |
-| `model::ast::Ast` | `model::term_graph::TermGraph` | type names, `flattened_ast()` -> `flattened_graph()` |
-| `LayoutAst` | `LayoutGraph` (or keep, but never render "AST" anywhere) | `AstGridEntity`, `ast_grid_bounds`, `AstSceneEntity`, `AstNodeEntity`, `AstState` |
-| window title `"AST Visualizer 3D — Bevy + WebGPU"` | must not contain "AST" | window title bar — appears in every screenshot |
-| `README.md`, `index.html`, `Cargo.toml` (`name = "bevy-ast-3d"`, description) | same | repository link in the appendix |
-
-**Why `Ast` in particular:** the thesis argues explicitly (3.1.1) that the
-canonical representation is a **term graph** and that calling it an AST would be
-*incorrect* rather than a harmless shorthand, because containment itself is not
-a tree here. Carrying the name `Ast` through the code contradicts the one
-decision the chapter defends hardest.
-
-**Type names in the UI** are wrong too: `EType::to_string` and
-`type_choice_label` produce `int`, `bool`, `string`, `char`, `none`. The defined
-names are `Integer`, `Bool`, `String`, `Char`, `None` (capitalised). Values stay
-lowercase (`true`, `false`, `none`).
-
-**`EType::Exception` is dead and must go.** The language has no exceptions, and
-the thesis explicitly rejects `Exception` as a name for the sad path (it implies
-non-local control flow, the opposite of a value travelling along an edge).
-
-**`ENode::Program` is not a node kind of the language.** The thesis has no such
-kind — it was deliberately deleted from the catalogue. Keep the wrapper if the
-layout needs a root owner, but rename it (`Root`, `ProgramScope`) and comment it
-as an *implementation* object rather than a node kind. Same category as
-`Pattern` (see F below) — and the chapter now says so explicitly, so the comment
-should point at that.
+Order is by urgency: (C)-(E) must be done before any screenshot is taken,
+because all of them are visible in the UI. (A), the complete function set, and
+(B), the vocabulary rename, are done.
 
 ## C. `None` must not carry a payload
 

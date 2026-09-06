@@ -91,7 +91,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let avg_color = mix(params.plane_color, params.line_color, 0.3);
     var color = mix(grid_color, avg_color, density_blend);
 
-    // Outer boundary highlight for the current-context AST grid: paint the
+    // Outer boundary highlight for the current-context graph grid: paint the
     // four mesh-edge grid lines in border_color instead of line_color.
     if params.border_active > 0.5 {
         let d_x = min(

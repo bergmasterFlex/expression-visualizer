@@ -13,7 +13,7 @@ use crate::infer::EType;
 /// Height of a solid edge band: one anchor row, so band and type marker line
 /// up exactly.
 pub const RIBBON_HEIGHT: f32 = crate::render::CELL;
-/// Ribbon height used when a source anchor carries an AST literal. The band
+/// Ribbon height used when a source anchor carries an graph literal. The band
 /// itself is invisible in that mode (see `edge_band.wgsl`); the height is
 /// kept as-is so the rasterised marquee glyphs stay readable.
 pub const RIBBON_LINE_HEIGHT: f32 = crate::render::CELL / 4.0;
@@ -85,11 +85,11 @@ impl LeafKind {
     /// between marquee repetitions once the texture is tiled.
     fn marquee_text(self) -> &'static str {
         match self {
-            LeafKind::Bool => "  bool  ",
-            LeafKind::Char => "  char  ",
-            LeafKind::Int => "  int  ",
-            LeafKind::String => "  string  ",
-            LeafKind::None => "  none  ",
+            LeafKind::Bool => "  Bool  ",
+            LeafKind::Char => "  Char  ",
+            LeafKind::Int => "  Integer  ",
+            LeafKind::String => "  String  ",
+            LeafKind::None => "  None  ",
         }
     }
 
@@ -97,11 +97,11 @@ impl LeafKind {
     /// alternating "value + type" marquee on value-carrying edges.
     pub fn type_name(self) -> &'static str {
         match self {
-            LeafKind::Bool => "bool",
-            LeafKind::Char => "char",
-            LeafKind::Int => "int",
-            LeafKind::String => "string",
-            LeafKind::None => "none",
+            LeafKind::Bool => "Bool",
+            LeafKind::Char => "Char",
+            LeafKind::Int => "Integer",
+            LeafKind::String => "String",
+            LeafKind::None => "None",
         }
     }
 

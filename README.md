@@ -1,8 +1,9 @@
-# AST Visualizer 3D — Bevy
+# Expression Visualizer 3D — Bevy
 
-A 3D Abstract Syntax Tree visualizer for a
-operator support, built with **Rust** and **Bevy**, compiled to **Native**
-or **WebAssembly** with **WebGPU**.
+A 3D editor for expression term graphs: nodes are placed on a grid whose axes
+carry meaning — evaluation order, conjunction, disjunction — and edges show the
+types travelling along them. Built with **Rust** and **Bevy**, compiled to
+**Native** or **WebAssembly** with **WebGPU**.
 
 ## Features
 Todo

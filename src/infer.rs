@@ -11,7 +11,6 @@ pub enum EType {
     /// output anchor resolves to a concrete type.
     Pending,
     None,
-    Exception,
     SumType(Vec<EType>),
 }
 
@@ -22,33 +21,32 @@ impl ToString for EType {
                 if let Some(value) = value {
                     value.to_string()
                 } else {
-                    "int".to_string()
+                    "Integer".to_string()
                 }
             }
             EType::Bool(value) => {
                 if let Some(value) = value {
                     value.to_string()
                 } else {
-                    "bool".to_string()
+                    "Bool".to_string()
                 }
             }
             EType::String(value) => {
                 if let Some(value) = value {
                     value.to_string()
                 } else {
-                    "string".to_string()
+                    "String".to_string()
                 }
             }
             EType::Char(value) => {
                 if let Some(value) = value {
                     value.to_string()
                 } else {
-                    "char".to_string()
+                    "Char".to_string()
                 }
             }
             EType::Pending => "pending".to_string(),
-            EType::None => "none".to_string(),
-            EType::Exception => "exception".to_string(),
+            EType::None => "None".to_string(),
             EType::SumType(sub_types) => sub_types
                 .iter()
                 .map(|sub_type| sub_type.to_string())
@@ -58,9 +56,9 @@ impl ToString for EType {
     }
 }
 
-/// Convert the AST-level type descriptor into the evaluation-level type,
+/// Convert the graph-level type descriptor into the evaluation-level type,
 /// discarding any user-typed value literal.
-pub fn ast_type_to_eval_type(t: &crate::model::r#type::EType) -> EType {
+pub fn graph_type_to_eval_type(t: &crate::model::r#type::EType) -> EType {
     match t {
         crate::model::r#type::EType::Bool { .. } => EType::Bool(None),
         crate::model::r#type::EType::Int { .. } => EType::Int(None),
@@ -80,8 +78,8 @@ pub fn flatten_type(t: &EType) -> Vec<EType> {
 }
 
 /// Leaves of `t` that each claim their own row: the four concrete value types
-/// plus `none`. Sum types are expanded first; `Pending` and `Exception` claim
-/// no row of their own.
+/// plus `none`. Sum types are expanded first; `Pending` claims no row of its
+/// own.
 ///
 /// This lives here rather than in the renderer because the row count is an
 /// *addressing* fact — it decides how many cells an anchor occupies — which
@@ -106,16 +104,16 @@ pub fn row_leaves(t: &EType) -> Vec<EType> {
 /// — which means connecting or disconnecting an edge changes the node's
 /// footprint and has to be followed by a re-settle.
 pub fn anchor_rows(
-    ast: &crate::model::ast::Ast,
+    graph: &crate::model::term_graph::TermGraph,
     anchor_id: &crate::model::anchor::Id,
     function_declarations: &FunctionDeclarations,
 ) -> usize {
-    let declared = anchor_type(ast, anchor_id, function_declarations);
+    let declared = anchor_type(graph, anchor_id, function_declarations);
     let rows = match declared {
         Some(t) => row_leaves(&t).len(),
-        None => match ast.anchors.get(anchor_id) {
+        None => match graph.anchors.get(anchor_id) {
             Some(crate::model::anchor::EAnchor::Input(_)) => {
-                incoming_anchor_type(ast, anchor_id, function_declarations)
+                incoming_anchor_type(graph, anchor_id, function_declarations)
                     .map(|t| row_leaves(&t).len())
                     .unwrap_or(0)
             }
@@ -127,24 +125,26 @@ pub fn anchor_rows(
 
 /// Type flowing into `input` from its connected source anchor, if any.
 pub fn incoming_anchor_type(
-    ast: &crate::model::ast::Ast,
+    graph: &crate::model::term_graph::TermGraph,
     input: &crate::model::anchor::Id,
     function_declarations: &FunctionDeclarations,
 ) -> Option<EType> {
     incoming_type(
-        ast,
+        graph,
         input,
         function_declarations,
         &mut std::collections::HashSet::new(),
     )
 }
-/// Collect every VarDecl in the AST as (node_id, name).
-pub fn collect_var_decls(ast: &crate::model::ast::Ast) -> Vec<(crate::model::node::Id, String)> {
-    let mut out: Vec<_> = ast
+/// Collect every Source in the graph as (node_id, name).
+pub fn collect_sources(
+    graph: &crate::model::term_graph::TermGraph,
+) -> Vec<(crate::model::node::Id, String)> {
+    let mut out: Vec<_> = graph
         .nodes
         .iter()
         .filter_map(|(id, node)| match node {
-            crate::model::node::ENode::VarDecl { name, .. } => Some((id.clone(), name.clone())),
+            crate::model::node::ENode::Source { name, .. } => Some((id.clone(), name.clone())),
             _ => None,
         })
         .collect();
@@ -156,13 +156,13 @@ pub fn collect_var_decls(ast: &crate::model::ast::Ast) -> Vec<(crate::model::nod
 /// edge with `anchor`, regardless of which end the edge was recorded from.
 /// Drag-to-connect lets the user start from either anchor, so we accept both.
 fn neighbours_of_anchor(
-    ast: &crate::model::ast::Ast,
+    graph: &crate::model::term_graph::TermGraph,
     anchor: &crate::model::anchor::Id,
 ) -> Vec<crate::model::node::Id> {
-    let mut out: Vec<crate::model::node::Id> = ast.get_connected_nodes_to_anchor(anchor.clone());
-    if let Some(edges) = ast.edges.get(anchor) {
+    let mut out: Vec<crate::model::node::Id> = graph.get_connected_nodes_to_anchor(anchor.clone());
+    if let Some(edges) = graph.edges.get(anchor) {
         for e in edges {
-            if let Some(n) = ast.anchor_to_node.get(&e.to) {
+            if let Some(n) = graph.anchor_to_node.get(&e.to) {
                 out.push(n.clone());
             }
         }
@@ -171,10 +171,10 @@ fn neighbours_of_anchor(
 }
 
 /// True if any Sink has at least one edge on its input anchor.
-pub fn sink_has_input(ast: &crate::model::ast::Ast) -> bool {
-    ast.nodes.values().any(|node| match node {
+pub fn sink_has_input(graph: &crate::model::term_graph::TermGraph) -> bool {
+    graph.nodes.values().any(|node| match node {
         crate::model::node::ENode::Sink { input_anchor } => {
-            !neighbours_of_anchor(ast, input_anchor).is_empty()
+            !neighbours_of_anchor(graph, input_anchor).is_empty()
         }
         _ => false,
     })
@@ -194,16 +194,16 @@ type FunctionDeclarations = std::collections::HashMap<
 /// TypeCast inputs accept any value. There is no supertype: `None` is the
 /// absence of a constraint, not a type that subsumes the others.
 ///
-/// `ast` must be the flattened AST (`LayoutAst::flattened_ast`): every edge —
+/// `graph` must be the flattened graph (`LayoutGraph::flattened_graph`): every edge —
 /// including those inside Pattern branches — lives in the program-level edge
-/// table, so inference on a bare sub-AST would see no edges at all.
+/// table, so inference on a bare sub-graph would see no edges at all.
 pub fn anchor_type(
-    ast: &crate::model::ast::Ast,
+    graph: &crate::model::term_graph::TermGraph,
     anchor_id: &crate::model::anchor::Id,
     function_declarations: &FunctionDeclarations,
 ) -> Option<EType> {
     anchor_type_guarded(
-        ast,
+        graph,
         anchor_id,
         function_declarations,
         &mut std::collections::HashSet::new(),
@@ -216,7 +216,7 @@ pub fn anchor_type(
 /// recursion never terminates. A cycle is by definition undecidable, so it
 /// resolves to `Pending`.
 fn anchor_type_guarded(
-    ast: &crate::model::ast::Ast,
+    graph: &crate::model::term_graph::TermGraph,
     anchor_id: &crate::model::anchor::Id,
     function_declarations: &FunctionDeclarations,
     visiting: &mut std::collections::HashSet<crate::model::anchor::Id>,
@@ -224,29 +224,29 @@ fn anchor_type_guarded(
     if !visiting.insert(anchor_id.clone()) {
         return Some(EType::Pending);
     }
-    let result = anchor_type_uncycled(ast, anchor_id, function_declarations, visiting);
+    let result = anchor_type_uncycled(graph, anchor_id, function_declarations, visiting);
     visiting.remove(anchor_id);
     result
 }
 
 fn anchor_type_uncycled(
-    ast: &crate::model::ast::Ast,
+    graph: &crate::model::term_graph::TermGraph,
     anchor_id: &crate::model::anchor::Id,
     function_declarations: &FunctionDeclarations,
     visiting: &mut std::collections::HashSet<crate::model::anchor::Id>,
 ) -> Option<EType> {
-    let node_id = ast.anchor_to_node.get(anchor_id)?;
-    match ast.nodes.get(node_id)? {
+    let node_id = graph.anchor_to_node.get(anchor_id)?;
+    match graph.nodes.get(node_id)? {
         // Declared types are fixed: they never depend on what flows in.
-        crate::model::node::ENode::ConstDecl {
+        crate::model::node::ENode::Constant {
             r#type,
             output_anchor,
         }
-        | crate::model::node::ENode::VarDecl {
+        | crate::model::node::ENode::Source {
             r#type,
             output_anchor,
             ..
-        } => (anchor_id == output_anchor).then(|| ast_type_to_eval_type(r#type)),
+        } => (anchor_id == output_anchor).then(|| graph_type_to_eval_type(r#type)),
         // A branch source hands the matched value into its branch, so it
         // carries its Pattern's declared type — the narrowing the Match
         // performs. It has no type of its own to declare.
@@ -257,9 +257,9 @@ fn anchor_type_uncycled(
             if anchor_id != output_anchor {
                 return None;
             }
-            match ast.nodes.get(pattern)? {
+            match graph.nodes.get(pattern)? {
                 crate::model::node::ENode::Pattern { r#type, .. } => {
-                    Some(ast_type_to_eval_type(r#type))
+                    Some(graph_type_to_eval_type(r#type))
                 }
                 _ => None,
             }
@@ -283,19 +283,25 @@ fn anchor_type_uncycled(
             input_anchor,
             output_anchor,
         } => (anchor_id == output_anchor).then(|| {
-            type_cast_output_type(ast, r#type, input_anchor, function_declarations, visiting)
+            type_cast_output_type(graph, r#type, input_anchor, function_declarations, visiting)
         }),
         crate::model::node::ENode::Match {
             patterns,
             input_anchor,
             output_anchor,
         } => (anchor_id == output_anchor).then(|| {
-            match_output_type(ast, patterns, input_anchor, function_declarations, visiting)
+            match_output_type(
+                graph,
+                patterns,
+                input_anchor,
+                function_declarations,
+                visiting,
+            )
         }),
-        // Sink input takes anything; Pattern and Program have no anchors.
+        // Sink input takes anything; Pattern and Root have no anchors.
         crate::model::node::ENode::Sink { .. }
         | crate::model::node::ENode::Pattern { .. }
-        | crate::model::node::ENode::Program {} => None,
+        | crate::model::node::ENode::Root {} => None,
     }
 }
 
@@ -305,14 +311,14 @@ fn anchor_type_uncycled(
 /// incoming type is known, so an unconnected (or itself pending) input makes
 /// the output `Pending`.
 fn type_cast_output_type(
-    ast: &crate::model::ast::Ast,
+    graph: &crate::model::term_graph::TermGraph,
     target: &crate::model::r#type::EType,
     input_anchor: &crate::model::anchor::Id,
     function_declarations: &FunctionDeclarations,
     visiting: &mut std::collections::HashSet<crate::model::anchor::Id>,
 ) -> EType {
-    let target = ast_type_to_eval_type(target);
-    match incoming_type(ast, input_anchor, function_declarations, visiting) {
+    let target = graph_type_to_eval_type(target);
+    match incoming_type(graph, input_anchor, function_declarations, visiting) {
         None | Some(EType::Pending) => EType::Pending,
         Some(incoming) if !types_match(&incoming, &target) => {
             EType::SumType(vec![target, EType::None])
@@ -327,7 +333,7 @@ fn type_cast_output_type(
 /// leaves the union undecided. The Match input matters too — without it the
 /// pattern set cannot be checked against what actually flows in.
 fn match_output_type(
-    ast: &crate::model::ast::Ast,
+    graph: &crate::model::term_graph::TermGraph,
     patterns: &[crate::model::node::Id],
     input_anchor: &crate::model::anchor::Id,
     function_declarations: &FunctionDeclarations,
@@ -336,13 +342,13 @@ fn match_output_type(
     if patterns.is_empty() {
         return EType::Pending;
     }
-    match incoming_type(ast, input_anchor, function_declarations, visiting) {
+    match incoming_type(graph, input_anchor, function_declarations, visiting) {
         None | Some(EType::Pending) => return EType::Pending,
         Some(_) => {}
     }
     let mut leaves: Vec<EType> = Vec::new();
     for pattern_id in patterns {
-        let branch = match branch_type(ast, pattern_id, function_declarations, visiting) {
+        let branch = match branch_type(graph, pattern_id, function_declarations, visiting) {
             None | Some(EType::Pending) => return EType::Pending,
             Some(t) => t,
         };
@@ -361,87 +367,90 @@ fn match_output_type(
 
 /// Type a Pattern's branch produces: whatever reaches the branch's own Sink.
 fn branch_type(
-    ast: &crate::model::ast::Ast,
+    graph: &crate::model::term_graph::TermGraph,
     pattern_id: &crate::model::node::Id,
     function_declarations: &FunctionDeclarations,
     visiting: &mut std::collections::HashSet<crate::model::anchor::Id>,
 ) -> Option<EType> {
-    let crate::model::node::ENode::Pattern { sink_node_id, .. } = ast.nodes.get(pattern_id)? else {
+    let crate::model::node::ENode::Pattern { sink_node_id, .. } = graph.nodes.get(pattern_id)?
+    else {
         return None;
     };
-    let crate::model::node::ENode::Sink { input_anchor } = ast.nodes.get(sink_node_id)? else {
+    let crate::model::node::ENode::Sink { input_anchor } = graph.nodes.get(sink_node_id)? else {
         return None;
     };
-    incoming_type(ast, input_anchor, function_declarations, visiting)
+    incoming_type(graph, input_anchor, function_declarations, visiting)
 }
 
 /// Type flowing into `input` from the connected source anchor. `None` when the
 /// input is unconnected or the source carries no type.
 fn incoming_type(
-    ast: &crate::model::ast::Ast,
+    graph: &crate::model::term_graph::TermGraph,
     input: &crate::model::anchor::Id,
     function_declarations: &FunctionDeclarations,
     visiting: &mut std::collections::HashSet<crate::model::anchor::Id>,
 ) -> Option<EType> {
-    let source = source_anchor_for_input(ast, input)?;
-    anchor_type_guarded(ast, &source, function_declarations, visiting)
+    let source = source_anchor_for_input(graph, input)?;
+    anchor_type_guarded(graph, &source, function_declarations, visiting)
 }
 
 /// Source anchor feeding into `input`, if connected. Drag-to-connect records
 /// an edge from either end, so both directions are checked.
 pub fn source_anchor_for_input(
-    ast: &crate::model::ast::Ast,
+    graph: &crate::model::term_graph::TermGraph,
     input: &crate::model::anchor::Id,
 ) -> Option<crate::model::anchor::Id> {
-    for (from, edges) in &ast.edges {
+    for (from, edges) in &graph.edges {
         if edges.iter().any(|e| &e.to == input) {
             return Some(from.clone());
         }
     }
-    ast.edges
+    graph
+        .edges
         .get(input)
         .and_then(|edges| edges.first())
         .map(|e| e.to.clone())
 }
 
 /// Type a node produces, i.e. the type of its output anchor. `None` for nodes
-/// that have no output at all (Sink, Program). Used for the selection display.
+/// that have no output at all (Sink, Root). Used for the selection display.
 pub fn node_output_type(
-    ast: &crate::model::ast::Ast,
+    graph: &crate::model::term_graph::TermGraph,
     node_id: &crate::model::node::Id,
     function_declarations: &FunctionDeclarations,
 ) -> Option<EType> {
     let output_anchor =
-        ast.nodes
+        graph
+            .nodes
             .get(node_id)?
             .anchors()
             .into_iter()
             .find_map(|(id, anchor)| {
                 matches!(anchor, crate::model::anchor::EAnchor::Output).then_some(id)
             })?;
-    anchor_type(ast, &output_anchor, function_declarations)
+    anchor_type(graph, &output_anchor, function_declarations)
 }
 
-/// AST-level literal an anchor's type is pinned to, if any.
+/// graph-level literal an anchor's type is pinned to, if any.
 ///
 /// A BranchSource borrows its Pattern's whole declaration, literal included:
 /// inside the branch the matched value is known to be exactly that literal, so
 /// the source shows it rather than the bare type.
 ///
-/// Lives here rather than on `LayoutAst` because resolving a BranchSource
+/// Lives here rather than on `LayoutGraph` because resolving a BranchSource
 /// means reaching its Pattern, which sits in the *parent* scope — only the
-/// flattened AST has both.
+/// flattened graph has both.
 pub fn anchor_literal(
-    ast: &crate::model::ast::Ast,
+    graph: &crate::model::term_graph::TermGraph,
     anchor_id: &crate::model::anchor::Id,
 ) -> Option<String> {
-    let node_id = ast.anchor_to_node.get(anchor_id)?;
-    match ast.nodes.get(node_id)? {
-        crate::model::node::ENode::ConstDecl {
+    let node_id = graph.anchor_to_node.get(anchor_id)?;
+    match graph.nodes.get(node_id)? {
+        crate::model::node::ENode::Constant {
             r#type,
             output_anchor,
         }
-        | crate::model::node::ENode::VarDecl {
+        | crate::model::node::ENode::Source {
             r#type,
             output_anchor,
             ..
@@ -462,7 +471,7 @@ pub fn anchor_literal(
             if anchor_id != output_anchor {
                 return None;
             }
-            match ast.nodes.get(pattern)? {
+            match graph.nodes.get(pattern)? {
                 crate::model::node::ENode::Pattern { r#type, .. } => {
                     crate::layout::value_of_etype(r#type)
                 }
@@ -470,7 +479,7 @@ pub fn anchor_literal(
             }
         }
         // FunctionCall anchors bind to declaration types, which carry no
-        // AST-level literal; Match, Pattern, Sink and Program carry no
+        // graph-level literal; Match, Pattern, Sink and Root carry no
         // anchored type at all.
         _ => None,
     }
@@ -484,8 +493,7 @@ pub fn types_match(a: &EType, b: &EType) -> bool {
         | (EType::String(_), EType::String(_))
         | (EType::Char(_), EType::Char(_))
         | (EType::None, EType::None)
-        | (EType::Pending, EType::Pending)
-        | (EType::Exception, EType::Exception) => true,
+        | (EType::Pending, EType::Pending) => true,
         (EType::SumType(x), EType::SumType(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| types_match(p, q))
         }

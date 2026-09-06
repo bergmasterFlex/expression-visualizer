@@ -1,8 +1,8 @@
 [package]
-name = "bevy-ast-3d"
+name = "expression-visualizer"
 version = "0.1.0"
 edition = "2021"
-description = "3D AST visualizer with evaluation-order layout, built with Bevy + WebGPU (OIT)"
+description = "3D term-graph editor with evaluation-order layout, built with Bevy + WebGPU (OIT)"
 
 [dependencies]
 bevy = { version = "0.18", features = ["webgpu"] }

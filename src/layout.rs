@@ -24,7 +24,7 @@ pub enum CellRole {
 
 /// Node-local cell layout: every cell a node claims, and what each one means.
 ///
-/// Built by `LayoutAst::with_shapes` from the node kind plus its anchor types,
+/// Built by `LayoutGraph::with_shapes` from the node kind plus its anchor types,
 /// and cached on the `LayoutNode`. It never depends on positions, only on
 /// types and wiring — which is why it stays valid across a whole
 /// `settle_footprints` pass.
@@ -74,7 +74,7 @@ impl NodeShape {
 pub struct LayoutNode {
     pub node_id: crate::model::node::Id,
     pub pos: Vec3,
-    /// Cell layout, refreshed by `LayoutAst::with_shapes` whenever types or
+    /// Cell layout, refreshed by `LayoutGraph::with_shapes` whenever types or
     /// wiring change. Independent of `pos`, so it survives the settle pass.
     pub shape: NodeShape,
 }
@@ -93,19 +93,19 @@ impl LayoutNode {
 
 /// Match-local Z of the Pattern row. The Match's own input anchor owns local
 /// Z=0, so the arms start one cell behind it and their branch volumes one
-/// further still (see `LayoutAst::sub_layout_origin`).
+/// further still (see `LayoutGraph::sub_layout_origin`).
 pub const PATTERN_LOCAL_Z: f32 = 1.0;
 /// Cells an anchor claims: `infer::anchor_rows` of them, growing along +Y from
 /// row 0, all in column `x` at depth `z`.
 fn anchor_cells(
-    flat_ast: &crate::model::ast::Ast,
+    flat_graph: &crate::model::term_graph::TermGraph,
     function_declarations: &FunctionDeclarations,
     anchor: &crate::model::anchor::Id,
     x: i32,
     z: i32,
     role: impl Fn(usize) -> CellRole,
 ) -> Vec<(IVec3, CellRole)> {
-    (0..crate::infer::anchor_rows(flat_ast, anchor, function_declarations))
+    (0..crate::infer::anchor_rows(flat_graph, anchor, function_declarations))
         .map(|leaf| (IVec3::new(x, leaf as i32, z), role(leaf)))
         .collect()
 }
@@ -123,33 +123,33 @@ pub struct LayoutAnchor {
     pub pos: Vec3,
 }
 
-/// A single entry produced by `LayoutAst::walk_all`. Groups a LayoutNode with
-/// enough context (its owning LayoutAst for anchor lookups and the accumulated
-/// grid-space offset) so the render layer can place pattern sub-AST nodes
+/// A single entry produced by `LayoutGraph::walk_all`. Groups a LayoutNode with
+/// enough context (its owning LayoutGraph for anchor lookups and the accumulated
+/// grid-space offset) so the render layer can place pattern sub-graph nodes
 /// correctly without re-doing the traversal.
 pub struct WalkedNode<'a> {
-    pub layout_ast: &'a LayoutAst,
+    pub layout_graph: &'a LayoutGraph,
     pub layout_node: &'a LayoutNode,
     pub extra_offset: Vec3,
 }
 
-/// One entry per LayoutAst reached from a root. Used by the per-AST grid
-/// renderer to place a dedicated grid mesh per Program/Pattern sub-AST.
-pub struct WalkedAst<'a> {
-    pub layout_ast: &'a LayoutAst,
-    /// Owner path from the walk root to this AST. Empty at the outermost
-    /// LayoutAst (the one `walk_all_asts` was called on).
+/// One entry per LayoutGraph reached from a root. Used by the per-graph grid
+/// renderer to place a dedicated grid mesh per Root/Pattern sub-graph.
+pub struct WalkedGraph<'a> {
+    pub layout_graph: &'a LayoutGraph,
+    /// Owner path from the walk root to this graph. Empty at the outermost
+    /// LayoutGraph (the one `walk_all_graphs` was called on).
     pub context: Vec<crate::model::node::Id>,
-    /// Accumulated grid-space offset from the root to this AST's origin.
+    /// Accumulated grid-space offset from the root to this graph's origin.
     pub extra_offset: Vec3,
 }
 
-/// Bounds of an AST grid in that AST's local grid coordinates. Both corners
+/// Bounds of an graph grid in that graph's local grid coordinates. Both corners
 /// are inclusive. X/Z size the drawn grid plane and X/Y its Z faces; the Y
 /// span is the rows the scope owns, which is also what bounds a caret
 /// address to its scope.
 #[derive(Debug, Clone, Copy)]
-pub struct AstGridBounds {
+pub struct GridBounds {
     pub min: IVec3,
     pub max: IVec3,
 }
@@ -257,14 +257,14 @@ impl AABB {
 }
 
 #[derive(Clone)]
-pub struct LayoutAst {
-    pub ast: crate::model::ast::Ast,
+pub struct LayoutGraph {
+    pub graph: crate::model::term_graph::TermGraph,
     pub layout_nodes: std::collections::HashMap<crate::model::node::Id, LayoutNode>,
-    /// Per-owner nested layouts. Keyed by the container node id (Program in
-    /// Step 1; Pattern in later steps). The `sub_layouts[program_id]` LayoutAst
-    /// is the source of truth for the top-level context — the ENode::Program's
-    /// own `ast` field is unused in Step 1 and stays empty.
-    pub sub_layouts: std::collections::HashMap<crate::model::node::Id, LayoutAst>,
+    /// Per-owner nested layouts. Keyed by the container node id (Root in
+    /// Step 1; Pattern in later steps). The `sub_layouts[root_id]` LayoutGraph
+    /// is the source of truth for the top-level context — the ENode::Root's
+    /// own `graph` field is unused in Step 1 and stays empty.
+    pub sub_layouts: std::collections::HashMap<crate::model::node::Id, LayoutGraph>,
     /// Volume this scope claims beyond what its nodes occupy: the inclusive
     /// maximum cell address on X and Y. Whitespace is a first-class part of a
     /// scope, so the room an INSERT-mode row or column opened stays open even
@@ -276,19 +276,19 @@ pub struct LayoutAst {
     pub reserved_max: IVec2,
 }
 
-impl LayoutAst {
-    /// A LayoutAst whose AST already holds its terminating `Sink` (via
-    /// `Ast::new`), with a matching LayoutNode placed at the sink's default
+impl LayoutGraph {
+    /// A LayoutGraph whose graph already holds its terminating `Sink` (via
+    /// `TermGraph::new`), with a matching LayoutNode placed at the sink's default
     /// grid position. Replaces the former `empty()` + `plus_sink()` pairing.
     pub fn new(
         node_id_domain: NodeIdDomain,
         anchor_id_domain: AnchorIdDomain,
     ) -> (Self, NodeIdDomain, AnchorIdDomain) {
-        let (ast, node_id_domain, anchor_id_domain) =
-            crate::model::ast::Ast::new(node_id_domain, anchor_id_domain);
-        let sink_node_id = ast.sink_node_id.clone();
+        let (graph, node_id_domain, anchor_id_domain) =
+            crate::model::term_graph::TermGraph::new(node_id_domain, anchor_id_domain);
+        let sink_node_id = graph.sink_node_id.clone();
         let layout = Self {
-            ast,
+            graph,
             layout_nodes: std::collections::HashMap::new(),
             reserved_max: IVec2::ZERO,
             sub_layouts: std::collections::HashMap::new(),
@@ -297,43 +297,44 @@ impl LayoutAst {
         (layout, node_id_domain, anchor_id_domain)
     }
 
-    /// Build a root LayoutAst that holds a single Program node plus a
-    /// `sub_layouts` entry keyed by the Program's id. The inner LayoutAst is
+    /// Build a root LayoutGraph that holds a single Root node plus a
+    /// `sub_layouts` entry keyed by the Root's id. The inner LayoutGraph is
     /// where user-visible nodes live, and starts with its own terminating sink.
-    pub fn empty_with_program() -> (Self, crate::model::node::Id, NodeIdDomain, AnchorIdDomain) {
+    pub fn empty_with_root() -> (Self, crate::model::node::Id, NodeIdDomain, AnchorIdDomain) {
         let node_id_domain = NodeIdDomain::new();
         let anchor_id_domain = AnchorIdDomain::new();
-        let (node_id_domain, program_id) = node_id_domain.next_id();
-        // The outer wrapper only carries the Program node; the sink `Ast::new`
-        // mandates goes unused here (this AST is never rendered or evaluated —
-        // rendering and eval both operate on `sub_layouts[program_id]`).
-        let (outer_ast, node_id_domain, anchor_id_domain) =
-            crate::model::ast::Ast::new(node_id_domain, anchor_id_domain);
-        let outer_ast =
-            outer_ast.plus_node(program_id.clone(), crate::model::node::ENode::Program {});
-        let (program_sub, node_id_domain, anchor_id_domain) =
+        let (node_id_domain, root_id) = node_id_domain.next_id();
+        // The outer wrapper only carries the Root node; the sink `TermGraph::new`
+        // mandates goes unused here (this graph is never rendered or evaluated —
+        // rendering and eval both operate on `sub_layouts[root_id]`).
+        let (outer_graph, node_id_domain, anchor_id_domain) =
+            crate::model::term_graph::TermGraph::new(node_id_domain, anchor_id_domain);
+        let outer_graph =
+            outer_graph.plus_node(root_id.clone(), crate::model::node::ENode::Root {});
+        let (root_sub, node_id_domain, anchor_id_domain) =
             Self::new(node_id_domain, anchor_id_domain);
         let outer = Self {
-            ast: outer_ast,
+            graph: outer_graph,
             layout_nodes: std::collections::HashMap::new(),
             reserved_max: IVec2::ZERO,
-            sub_layouts: std::collections::HashMap::from([(program_id.clone(), program_sub)]),
+            sub_layouts: std::collections::HashMap::from([(root_id.clone(), root_sub)]),
         };
-        (outer, program_id, node_id_domain, anchor_id_domain)
+        (outer, root_id, node_id_domain, anchor_id_domain)
     }
 
     pub fn minus_node(&self, node_id: &crate::model::node::Id) -> Self {
-        match self.ast.nodes.get(node_id) {
+        match self.graph.nodes.get(node_id) {
             Some(crate::model::node::ENode::Pattern { parent_match, .. }) => {
                 let parent_id = parent_match.clone();
-                let remaining: Vec<crate::model::node::Id> = match self.ast.nodes.get(&parent_id) {
+                let remaining: Vec<crate::model::node::Id> = match self.graph.nodes.get(&parent_id)
+                {
                     Some(crate::model::node::ENode::Match { patterns, .. }) => {
                         patterns.iter().filter(|p| *p != node_id).cloned().collect()
                     }
                     _ => vec![],
                 };
                 let after_pattern = Self {
-                    ast: self.ast.minus_node(node_id),
+                    graph: self.graph.minus_node(node_id),
                     layout_nodes: self
                         .layout_nodes
                         .clone()
@@ -350,7 +351,7 @@ impl LayoutAst {
                 };
                 if remaining.is_empty() {
                     Self {
-                        ast: after_pattern.ast.minus_node(&parent_id),
+                        graph: after_pattern.graph.minus_node(&parent_id),
                         layout_nodes: after_pattern
                             .layout_nodes
                             .into_iter()
@@ -369,13 +370,13 @@ impl LayoutAst {
                 let child_ids: Vec<_> = patterns.clone();
                 let after_children = child_ids.iter().fold(
                     Self {
-                        ast: self.ast.clone(),
+                        graph: self.graph.clone(),
                         layout_nodes: self.layout_nodes.clone(),
                         reserved_max: self.reserved_max,
                         sub_layouts: self.sub_layouts.clone(),
                     },
                     |acc, pid| Self {
-                        ast: acc.ast.minus_node(pid),
+                        graph: acc.graph.minus_node(pid),
                         layout_nodes: acc
                             .layout_nodes
                             .into_iter()
@@ -390,7 +391,7 @@ impl LayoutAst {
                     },
                 );
                 Self {
-                    ast: after_children.ast.minus_node(node_id),
+                    graph: after_children.graph.minus_node(node_id),
                     layout_nodes: after_children
                         .layout_nodes
                         .into_iter()
@@ -401,7 +402,7 @@ impl LayoutAst {
                 }
             }
             _ => Self {
-                ast: self.ast.minus_node(node_id),
+                graph: self.graph.minus_node(node_id),
                 layout_nodes: self
                     .layout_nodes
                     .clone()
@@ -423,7 +424,7 @@ impl LayoutAst {
     pub fn node_at(&self, pos: IVec3) -> Option<crate::model::node::Id> {
         self.layout_nodes.keys().find_map(|id| {
             if matches!(
-                self.ast.nodes.get(id),
+                self.graph.nodes.get(id),
                 Some(crate::model::node::ENode::Match { .. })
             ) {
                 return None;
@@ -437,7 +438,7 @@ impl LayoutAst {
         })
     }
 
-    /// AABB (in this LayoutAst's local grid coords) that a node claims: the
+    /// AABB (in this LayoutGraph's local grid coords) that a node claims: the
     /// bounding box of its `NodeShape`, translated to its position.
     ///
     /// A Match delegates to `match_footprint` instead, because its extent also
@@ -445,7 +446,7 @@ impl LayoutAst {
     /// sub-layouts that its own shape knows nothing about.
     pub fn node_footprint(&self, id: &crate::model::node::Id) -> Option<AABB> {
         if matches!(
-            self.ast.nodes.get(id),
+            self.graph.nodes.get(id),
             Some(crate::model::node::ENode::Match { .. })
         ) {
             return self.match_footprint(id);
@@ -490,13 +491,13 @@ impl LayoutAst {
 
     fn is_pattern(&self, id: &crate::model::node::Id) -> bool {
         matches!(
-            self.ast.nodes.get(id),
+            self.graph.nodes.get(id),
             Some(crate::model::node::ENode::Pattern { .. })
         )
     }
 
     fn parent_match_of(&self, id: &crate::model::node::Id) -> Option<crate::model::node::Id> {
-        match self.ast.nodes.get(id) {
+        match self.graph.nodes.get(id) {
             Some(crate::model::node::ENode::Pattern { parent_match, .. }) => {
                 Some(parent_match.clone())
             }
@@ -506,7 +507,7 @@ impl LayoutAst {
 
     /// Return the sibling Pattern ids of a `Match`.
     fn match_pattern_ids(&self, match_id: &crate::model::node::Id) -> Vec<crate::model::node::Id> {
-        match self.ast.nodes.get(match_id) {
+        match self.graph.nodes.get(match_id) {
             Some(crate::model::node::ENode::Match { patterns, .. }) => patterns.clone(),
             _ => vec![],
         }
@@ -514,14 +515,14 @@ impl LayoutAst {
 
     fn is_match(&self, id: &crate::model::node::Id) -> bool {
         matches!(
-            self.ast.nodes.get(id),
+            self.graph.nodes.get(id),
             Some(crate::model::node::ENode::Match { .. })
         )
     }
 
     /// Recompute every node's `NodeShape` from the current types and wiring.
     ///
-    /// `flat_ast` must be the flattened AST — anchor heights depend on edges,
+    /// `flat_graph` must be the flattened graph — anchor heights depend on edges,
     /// and only the program-level table holds them. Sub-layouts are shaped
     /// first, because a Match places its output behind its deepest branch and
     /// needs those branches measured already.
@@ -530,27 +531,27 @@ impl LayoutAst {
     /// footprints, and footprints decide displacement.
     pub fn with_shapes(
         &self,
-        flat_ast: &crate::model::ast::Ast,
+        flat_graph: &crate::model::term_graph::TermGraph,
         function_declarations: &FunctionDeclarations,
     ) -> Self {
         let staged = Self {
-            ast: self.ast.clone(),
+            graph: self.graph.clone(),
             layout_nodes: self.layout_nodes.clone(),
             reserved_max: self.reserved_max,
             sub_layouts: self
                 .sub_layouts
                 .iter()
-                .map(|(k, v)| (k.clone(), v.with_shapes(flat_ast, function_declarations)))
+                .map(|(k, v)| (k.clone(), v.with_shapes(flat_graph, function_declarations)))
                 .collect(),
         };
         let layout_nodes = staged
             .layout_nodes
             .iter()
             .map(|(id, ln)| {
-                let shape = flat_ast
+                let shape = flat_graph
                     .nodes
                     .get(id)
-                    .map(|node| staged.node_shape(node, flat_ast, function_declarations))
+                    .map(|node| staged.node_shape(node, flat_graph, function_declarations))
                     .unwrap_or_else(NodeShape::placeholder);
                 (
                     id.clone(),
@@ -563,7 +564,7 @@ impl LayoutAst {
             })
             .collect();
         Self {
-            ast: staged.ast,
+            graph: staged.graph,
             layout_nodes,
             reserved_max: staged.reserved_max,
             sub_layouts: staged.sub_layouts,
@@ -576,7 +577,7 @@ impl LayoutAst {
     /// | node | cells (`x|z`) |
     /// |---|---|
     /// | Sink | `0\|0` input |
-    /// | VarDecl / ConstDecl | `0\|0` body, `0\|1` output |
+    /// | Source / Constant | `0\|0` body, `0\|1` output |
     /// | TypeCast | `0\|0` input, `0\|1` body, `0\|2` output |
     /// | FunctionCall (n inputs) | `i\|0` input i, `(0..n)\|1..2` body, `0\|3` output |
     /// | Match | `0\|0` input, output directly behind the deepest branch |
@@ -590,27 +591,27 @@ impl LayoutAst {
     fn node_shape(
         &self,
         node: &crate::model::node::ENode,
-        flat_ast: &crate::model::ast::Ast,
+        flat_graph: &crate::model::term_graph::TermGraph,
         fds: &FunctionDeclarations,
     ) -> NodeShape {
         let mut cells: Vec<(IVec3, CellRole)> = Vec::new();
         match node {
             crate::model::node::ENode::Sink { input_anchor } => {
-                cells.extend(anchor_cells(flat_ast, fds, input_anchor, 0, 0, |leaf| {
+                cells.extend(anchor_cells(flat_graph, fds, input_anchor, 0, 0, |leaf| {
                     CellRole::Input { index: 0, leaf }
                 }));
             }
-            crate::model::node::ENode::VarDecl { output_anchor, .. }
-            | crate::model::node::ENode::ConstDecl { output_anchor, .. } => {
+            crate::model::node::ENode::Source { output_anchor, .. }
+            | crate::model::node::ENode::Constant { output_anchor, .. } => {
                 cells.push((IVec3::ZERO, CellRole::Body));
-                cells.extend(anchor_cells(flat_ast, fds, output_anchor, 0, 1, |leaf| {
+                cells.extend(anchor_cells(flat_graph, fds, output_anchor, 0, 1, |leaf| {
                     CellRole::Output { leaf }
                 }));
             }
             // Mirror of the Sink: one anchor and nothing else. It declares no
             // type of its own — that comes from its Pattern — so no body cell.
             crate::model::node::ENode::BranchSource { output_anchor, .. } => {
-                cells.extend(anchor_cells(flat_ast, fds, output_anchor, 0, 0, |leaf| {
+                cells.extend(anchor_cells(flat_graph, fds, output_anchor, 0, 0, |leaf| {
                     CellRole::Output { leaf }
                 }));
             }
@@ -619,11 +620,11 @@ impl LayoutAst {
                 output_anchor,
                 ..
             } => {
-                cells.extend(anchor_cells(flat_ast, fds, input_anchor, 0, 0, |leaf| {
+                cells.extend(anchor_cells(flat_graph, fds, input_anchor, 0, 0, |leaf| {
                     CellRole::Input { index: 0, leaf }
                 }));
                 cells.push((IVec3::new(0, 0, 1), CellRole::Body));
-                cells.extend(anchor_cells(flat_ast, fds, output_anchor, 0, 2, |leaf| {
+                cells.extend(anchor_cells(flat_graph, fds, output_anchor, 0, 2, |leaf| {
                     CellRole::Output { leaf }
                 }));
             }
@@ -634,7 +635,7 @@ impl LayoutAst {
             } => {
                 for (index, anchor) in input_anchors.iter().enumerate() {
                     cells.extend(anchor_cells(
-                        flat_ast,
+                        flat_graph,
                         fds,
                         anchor,
                         index as i32,
@@ -651,7 +652,7 @@ impl LayoutAst {
                 }
                 // Output stays in column 0 so its address does not move when
                 // the call is swapped for a function of different arity.
-                cells.extend(anchor_cells(flat_ast, fds, output_anchor, 0, 3, |leaf| {
+                cells.extend(anchor_cells(flat_graph, fds, output_anchor, 0, 3, |leaf| {
                     CellRole::Output { leaf }
                 }));
             }
@@ -660,11 +661,11 @@ impl LayoutAst {
                 output_anchor,
                 patterns,
             } => {
-                cells.extend(anchor_cells(flat_ast, fds, input_anchor, 0, 0, |leaf| {
+                cells.extend(anchor_cells(flat_graph, fds, input_anchor, 0, 0, |leaf| {
                     CellRole::Input { index: 0, leaf }
                 }));
                 cells.extend(anchor_cells(
-                    flat_ast,
+                    flat_graph,
                     fds,
                     output_anchor,
                     0,
@@ -673,8 +674,8 @@ impl LayoutAst {
                 ));
             }
             // A Pattern owns no anchor: one cell declaring the arm's type.
-            // Program is never laid out.
-            crate::model::node::ENode::Pattern { .. } | crate::model::node::ENode::Program {} => {
+            // Root is never laid out.
+            crate::model::node::ENode::Pattern { .. } | crate::model::node::ENode::Root {} => {
                 cells.push((IVec3::ZERO, CellRole::Body));
             }
         }
@@ -699,9 +700,9 @@ impl LayoutAst {
         2 + deepest_sink + 2
     }
 
-    /// Union of all visible grid cells in this LayoutAst's local coords.
+    /// Union of all visible grid cells in this LayoutGraph's local coords.
     /// Match nodes contribute their `match_footprint` (recursive over
-    /// nested sub-ASTs); every other node contributes its rounded cell.
+    /// nested sub-graphs); every other node contributes its rounded cell.
     /// Sub-layouts contribute their own inner_footprint offset by the owner
     /// node's grid position.
     pub fn inner_footprint(&self) -> Option<AABB> {
@@ -770,24 +771,24 @@ impl LayoutAst {
             row += self.branch_row_height(pid) as f32;
         }
         Self {
-            ast: self.ast.clone(),
+            graph: self.graph.clone(),
             layout_nodes,
             reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         }
     }
 
-    /// Grid-space AABB (in this LayoutAst's local coords) that a Match
+    /// Grid-space AABB (in this LayoutGraph's local coords) that a Match
     /// container claims. Aggregates all Pattern arms:
-    ///   - Y: `sum over patterns of max(1, subast_y_extent)` stacked at the
+    ///   - Y: `sum over patterns of max(1, subgraph_y_extent)` stacked at the
     ///     Pattern's own y (patterns are assumed to occupy consecutive rows).
-    ///   - X: union of every Pattern's sub-AST X extent, translated by the
+    ///   - X: union of every Pattern's sub-graph X extent, translated by the
     ///     Pattern's outer position.
     ///   - Z: from the Pattern's own Z (the parent-facing side) out to its
     ///     branch: the branch origin sits one cell behind the Pattern, so the
-    ///     sub-AST Z range is offset by 1, plus one further cell of padding.
+    ///     sub-graph Z range is offset by 1, plus one further cell of padding.
     /// Recursion via `inner_footprint` — inner matches inflate their host
-    /// Pattern's sub-AST bbox and thus the outer footprint too.
+    /// Pattern's sub-graph bbox and thus the outer footprint too.
     pub fn match_footprint(&self, match_id: &crate::model::node::Id) -> Option<AABB> {
         if !self.is_match(match_id) {
             return None;
@@ -835,13 +836,13 @@ impl LayoutAst {
             return (self.clone_shape(), IVec3::ZERO);
         };
         let primary_origin = primary_ln.pos;
-        // VarDecls are pinned to the source row (Y=0, Z=0) and may only be
+        // Sources are pinned to the source row (Y=0, Z=0) and may only be
         // reordered along X. A BranchSource is pinned outright: it must stay
         // at branch-local (0,0,0). Every other node type has to stay beyond
         // the source row (Z >= 1). Layout space is non-negative, so X and Y
         // are clamped at 0 as well.
-        let delta_pos = match self.ast.nodes.get(&node_id) {
-            Some(crate::model::node::ENode::VarDecl { .. }) => Vec3::new(delta_pos.x, 0.0, 0.0),
+        let delta_pos = match self.graph.nodes.get(&node_id) {
+            Some(crate::model::node::ENode::Source { .. }) => Vec3::new(delta_pos.x, 0.0, 0.0),
             Some(crate::model::node::ENode::BranchSource { .. }) => Vec3::ZERO,
             _ => {
                 // Z=0 is the source row and the sink's Z is the sink's alone,
@@ -939,7 +940,7 @@ impl LayoutAst {
         }
 
         let moved = Self {
-            ast: self.ast.clone(),
+            graph: self.graph.clone(),
             layout_nodes: self
                 .layout_nodes
                 .iter()
@@ -986,7 +987,7 @@ impl LayoutAst {
 
     fn clone_shape(&self) -> Self {
         Self {
-            ast: self.ast.clone(),
+            graph: self.graph.clone(),
             layout_nodes: self.layout_nodes.clone(),
             reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
@@ -1012,13 +1013,13 @@ impl LayoutAst {
     /// below have settled, so their heights are final — that ordering is what
     /// carries growth out of nested Matches into their enclosing ones.
     pub fn settle_footprints(&self) -> Self {
-        let settled_subs: std::collections::HashMap<crate::model::node::Id, LayoutAst> = self
+        let settled_subs: std::collections::HashMap<crate::model::node::Id, LayoutGraph> = self
             .sub_layouts
             .iter()
             .map(|(k, v)| (k.clone(), v.settle_footprints()))
             .collect();
         let layout = Self {
-            ast: self.ast.clone(),
+            graph: self.graph.clone(),
             layout_nodes: self.layout_nodes.clone(),
             reserved_max: self.reserved_max,
             sub_layouts: settled_subs,
@@ -1065,7 +1066,7 @@ impl LayoutAst {
                     // branch origin — so never pick one as the intruder, or the
                     // settle loop would spin until its iteration cap.
                     if matches!(
-                        layout.ast.nodes.get(id),
+                        layout.graph.nodes.get(id),
                         Some(crate::model::node::ENode::BranchSource { .. })
                     ) {
                         return None;
@@ -1090,15 +1091,15 @@ impl LayoutAst {
                 };
                 let push_y = bbox.max.y + 1 - ipos.y;
                 let push_z = bbox.max.z + 1 - ipos.z;
-                // VarDecls are pinned to Y=0, Z=0 → only X-push can succeed.
-                let is_var_decl = matches!(
-                    layout.ast.nodes.get(&intruder_id),
-                    Some(crate::model::node::ENode::VarDecl { .. })
+                // Sources are pinned to Y=0, Z=0 → only X-push can succeed.
+                let is_source = matches!(
+                    layout.graph.nodes.get(&intruder_id),
+                    Some(crate::model::node::ENode::Source { .. })
                 );
                 // Priority: Z (deeper) → X (sideways) → Y (downward). Y is a
                 // last resort because it crosses row boundaries; XZ keeps
                 // the intruder on the same floor.
-                let (best_axis, best_dist) = if is_var_decl {
+                let (best_axis, best_dist) = if is_source {
                     (0u8, push_x)
                 } else if push_z != 0 {
                     (2u8, push_z)
@@ -1178,13 +1179,13 @@ impl LayoutAst {
             .get(&sink_id)
             .map(|ln| ln.pos.round().as_ivec3().z)
     }
-    /// The single Sink node id of this LayoutAst, if present.
+    /// The single Sink node id of this LayoutGraph, if present.
     pub fn sink_id(&self) -> Option<crate::model::node::Id> {
         self.layout_nodes
             .keys()
             .find(|id| {
                 matches!(
-                    self.ast.nodes.get(*id),
+                    self.graph.nodes.get(*id),
                     Some(crate::model::node::ENode::Sink { .. })
                 )
             })
@@ -1342,27 +1343,27 @@ impl LayoutAst {
 
     pub fn plus_edge(&self, from: crate::model::anchor::Id, to: crate::model::anchor::Id) -> Self {
         Self {
-            ast: self.ast.plus_edge(from, to),
+            graph: self.graph.plus_edge(from, to),
             layout_nodes: self.layout_nodes.clone(),
             reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         }
     }
 
-    /// Merge this scene's AST with every nested sub-layout's AST (recursively)
-    /// into one flat `Ast`. Pattern sub-scenes keep their nodes in `sub_layouts`
-    /// — invisible to this scene's own `ast` — so evaluation, which walks a
-    /// single `Ast`, needs this combined view. The result's `sink_node_id` stays
-    /// this scene's root sink (folding starts from `self.ast`).
-    pub fn flattened_ast(&self) -> crate::model::ast::Ast {
+    /// Merge this scene's graph with every nested sub-layout's graph (recursively)
+    /// into one flat `TermGraph`. Pattern sub-scenes keep their nodes in `sub_layouts`
+    /// — invisible to this scene's own `graph` — so evaluation, which walks a
+    /// single `TermGraph`, needs this combined view. The result's `sink_node_id` stays
+    /// this scene's root sink (folding starts from `self.graph`).
+    pub fn flattened_graph(&self) -> crate::model::term_graph::TermGraph {
         self.sub_layouts
             .values()
-            .fold(self.ast.clone(), |acc, sub| {
-                acc.merged_with(sub.flattened_ast())
+            .fold(self.graph.clone(), |acc, sub| {
+                acc.merged_with(sub.flattened_graph())
             })
     }
 
-    pub fn plus_const_decl(
+    pub fn plus_constant(
         &self,
         r#type: crate::model::r#type::EType,
         pos: Vec3,
@@ -1371,15 +1372,15 @@ impl LayoutAst {
     ) -> (Self, NodeIdDomain, AnchorIdDomain) {
         let (anchor_id_domain, output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, node_id) = node_id_domain.next_id();
-        let ast = self.ast.plus_node(
+        let graph = self.graph.plus_node(
             node_id.clone(),
-            crate::model::node::ENode::ConstDecl {
+            crate::model::node::ENode::Constant {
                 r#type,
                 output_anchor: output_anchor_id,
             },
         );
         let layout = Self {
-            ast,
+            graph,
             layout_nodes: self.layout_nodes.clone(),
             reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
@@ -1398,7 +1399,7 @@ impl LayoutAst {
         let (anchor_id_domain, input_anchor_id) = anchor_id_domain.next_id();
         let (anchor_id_domain, output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, node_id) = node_id_domain.next_id();
-        let ast = self.ast.plus_node(
+        let graph = self.graph.plus_node(
             node_id.clone(),
             crate::model::node::ENode::TypeCast {
                 r#type,
@@ -1407,7 +1408,7 @@ impl LayoutAst {
             },
         );
         let layout = Self {
-            ast,
+            graph,
             layout_nodes: self.layout_nodes.clone(),
             reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
@@ -1446,7 +1447,7 @@ impl LayoutAst {
                 );
         let (anchor_id_domain, output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, node_id) = node_id_domain.next_id();
-        let ast = self.ast.plus_node(
+        let graph = self.graph.plus_node(
             node_id.clone(),
             crate::model::node::ENode::FunctionCall {
                 function_declaration_id: function_declaration.0,
@@ -1455,7 +1456,7 @@ impl LayoutAst {
             },
         );
         let layout = Self {
-            ast,
+            graph,
             layout_nodes: self.layout_nodes.clone(),
             reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
@@ -1482,7 +1483,7 @@ impl LayoutAst {
     /// Create a `Match` container plus its initial `Pattern` child at `pos`.
     /// The Match's synthetic LayoutNode mirrors the lowest Pattern's pos so
     /// rendering can iterate `layout_nodes` uniformly. The Pattern is created
-    /// with a fresh sub-AST (BranchSource + Sink) and a matching entry in
+    /// with a fresh sub-graph (BranchSource + Sink) and a matching entry in
     /// `sub_layouts[pattern_id]`. The branch volume starts one cell behind the
     /// Pattern, so branch-local (0,0,0) — the BranchSource — is the cell
     /// adjoining the Pattern in +Z.
@@ -1495,7 +1496,7 @@ impl LayoutAst {
         let (anchor_id_domain, match_input_anchor_id) = anchor_id_domain.next_id();
         let (anchor_id_domain, match_output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, match_node_id) = node_id_domain.next_id();
-        let ast = self.ast.plus_node(
+        let graph = self.graph.plus_node(
             match_node_id.clone(),
             crate::model::node::ENode::Match {
                 patterns: vec![],
@@ -1504,15 +1505,15 @@ impl LayoutAst {
             },
         );
         let (node_id_domain, pattern_node_id) = node_id_domain.next_id();
-        // The sub-AST draws its sink node and anchor ids from the same shared
+        // The sub-graph draws its sink node and anchor ids from the same shared
         // id domains, so every id in the tree stays globally unique.
-        let (node_id_domain, anchor_id_domain, pattern_sub_ast, sub_sink_id, branch_source_id) =
-            crate::model::ast::Ast::new_pattern_sub_ast(
+        let (node_id_domain, anchor_id_domain, pattern_sub_graph, sub_sink_id, branch_source_id) =
+            crate::model::term_graph::TermGraph::new_pattern_sub_graph(
                 node_id_domain,
                 anchor_id_domain,
                 pattern_node_id.clone(),
             );
-        let ast = ast.plus_node(
+        let graph = graph.plus_node(
             pattern_node_id.clone(),
             crate::model::node::ENode::Pattern {
                 parent_match: match_node_id.clone(),
@@ -1521,8 +1522,8 @@ impl LayoutAst {
             },
         );
         let pattern_sub_layout =
-            Self::initial_pattern_sub_layout(&pattern_sub_ast, &sub_sink_id, &branch_source_id);
-        let ast = ast.with_node_replaced(
+            Self::initial_pattern_sub_layout(&pattern_sub_graph, &sub_sink_id, &branch_source_id);
+        let graph = graph.with_node_replaced(
             &match_node_id,
             crate::model::node::ENode::Match {
                 patterns: vec![pattern_node_id.clone()],
@@ -1531,7 +1532,7 @@ impl LayoutAst {
             },
         );
         let layout = Self {
-            ast,
+            graph,
             layout_nodes: self.layout_nodes.clone(),
             reserved_max: self.reserved_max,
             sub_layouts: self
@@ -1548,7 +1549,7 @@ impl LayoutAst {
         (layout, node_id_domain, anchor_id_domain)
     }
 
-    /// LayoutAst for a fresh Pattern's sub-AST: the branch's `BranchSource` at
+    /// LayoutGraph for a fresh Pattern's sub-graph: the branch's `BranchSource` at
     /// branch-local (0,0,0) and its Sink at (0,0,2).
     ///
     /// Branch-local (0,0,0) is the Pattern's cell + Z1 (see
@@ -1556,12 +1557,12 @@ impl LayoutAst {
     /// The Sink at Z=2 leaves exactly one free working cell at Z=1 from birth;
     /// `settle_sink` pushes it further back as the branch fills up.
     fn initial_pattern_sub_layout(
-        sub_ast: &crate::model::ast::Ast,
+        sub_graph: &crate::model::term_graph::TermGraph,
         sub_sink_id: &crate::model::node::Id,
         branch_source_id: &crate::model::node::Id,
     ) -> Self {
         Self {
-            ast: sub_ast.clone(),
+            graph: sub_graph.clone(),
             layout_nodes: std::collections::HashMap::from([
                 (
                     branch_source_id.clone(),
@@ -1594,7 +1595,7 @@ impl LayoutAst {
         node_id_domain: NodeIdDomain,
         anchor_id_domain: AnchorIdDomain,
     ) -> (Self, NodeIdDomain, AnchorIdDomain) {
-        let (parent_id, selected_pos) = match self.ast.nodes.get(selected_pattern_id) {
+        let (parent_id, selected_pos) = match self.graph.nodes.get(selected_pattern_id) {
             Some(crate::model::node::ENode::Pattern { parent_match, .. }) => {
                 let ln = self.layout_nodes.get(selected_pattern_id).unwrap();
                 (parent_match.clone(), ln.pos)
@@ -1602,7 +1603,7 @@ impl LayoutAst {
             _ => {
                 return (
                     Self {
-                        ast: self.ast.clone(),
+                        graph: self.graph.clone(),
                         layout_nodes: self.layout_nodes.clone(),
                         reserved_max: self.reserved_max,
                         sub_layouts: self.sub_layouts.clone(),
@@ -1643,30 +1644,30 @@ impl LayoutAst {
             })
             .collect();
         let shifted = Self {
-            ast: self.ast.clone(),
+            graph: self.graph.clone(),
             layout_nodes: shifted_layout_nodes,
             reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         };
-        let sibling_ids: Vec<crate::model::node::Id> = match shifted.ast.nodes.get(&parent_id) {
+        let sibling_ids: Vec<crate::model::node::Id> = match shifted.graph.nodes.get(&parent_id) {
             Some(crate::model::node::ENode::Match { patterns, .. }) => patterns.clone(),
             _ => vec![],
         };
         let (node_id_domain, new_pattern_id) = node_id_domain.next_id();
-        // The sub-AST draws its ids from the same shared domains, keeping every
+        // The sub-graph draws its ids from the same shared domains, keeping every
         // id in the tree globally unique (see plus_match).
         let (
             node_id_domain,
             anchor_id_domain,
-            new_pattern_sub_ast,
+            new_pattern_sub_graph,
             new_sub_sink_id,
             new_branch_source_id,
-        ) = crate::model::ast::Ast::new_pattern_sub_ast(
+        ) = crate::model::term_graph::TermGraph::new_pattern_sub_graph(
             node_id_domain,
             anchor_id_domain,
             new_pattern_id.clone(),
         );
-        let ast = shifted.ast.plus_node(
+        let graph = shifted.graph.plus_node(
             new_pattern_id.clone(),
             crate::model::node::ENode::Pattern {
                 parent_match: parent_id.clone(),
@@ -1675,7 +1676,7 @@ impl LayoutAst {
             },
         );
         let new_pattern_sub_layout = Self::initial_pattern_sub_layout(
-            &new_pattern_sub_ast,
+            &new_pattern_sub_graph,
             &new_sub_sink_id,
             &new_branch_source_id,
         );
@@ -1684,7 +1685,7 @@ impl LayoutAst {
             .cloned()
             .chain([new_pattern_id.clone()])
             .collect();
-        let (match_input_anchor, match_output_anchor) = match ast.nodes.get(&parent_id) {
+        let (match_input_anchor, match_output_anchor) = match graph.nodes.get(&parent_id) {
             Some(crate::model::node::ENode::Match {
                 input_anchor,
                 output_anchor,
@@ -1692,7 +1693,7 @@ impl LayoutAst {
             }) => (input_anchor.clone(), output_anchor.clone()),
             _ => return (shifted, node_id_domain, anchor_id_domain),
         };
-        let ast = ast.with_node_replaced(
+        let graph = graph.with_node_replaced(
             &parent_id,
             crate::model::node::ENode::Match {
                 patterns: new_patterns,
@@ -1701,7 +1702,7 @@ impl LayoutAst {
             },
         );
         let with_new = Self {
-            ast,
+            graph,
             layout_nodes: shifted.layout_nodes,
             reserved_max: shifted.reserved_max,
             sub_layouts: shifted
@@ -1715,7 +1716,7 @@ impl LayoutAst {
             Vec3::new(column_x, selected_y + 1.0, column_z),
         );
         let match_ids: Vec<crate::model::node::Id> = with_new
-            .ast
+            .graph
             .nodes
             .iter()
             .filter_map(|(id, n)| {
@@ -1738,11 +1739,11 @@ impl LayoutAst {
     /// add/remove/shift of Patterns so the render pass finds the container at
     /// the correct origin.
     pub fn recompute_match_pos(&self, match_id: &crate::model::node::Id) -> Self {
-        let pattern_ids: Vec<crate::model::node::Id> = match self.ast.nodes.get(match_id) {
+        let pattern_ids: Vec<crate::model::node::Id> = match self.graph.nodes.get(match_id) {
             Some(crate::model::node::ENode::Match { patterns, .. }) => patterns.clone(),
             _ => {
                 return Self {
-                    ast: self.ast.clone(),
+                    graph: self.graph.clone(),
                     layout_nodes: self.layout_nodes.clone(),
                     reserved_max: self.reserved_max,
                     sub_layouts: self.sub_layouts.clone(),
@@ -1755,7 +1756,7 @@ impl LayoutAst {
             .min_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
         let Some(lowest_pos) = lowest_pos else {
             return Self {
-                ast: self.ast.clone(),
+                graph: self.graph.clone(),
                 layout_nodes: self.layout_nodes.clone(),
                 reserved_max: self.reserved_max,
                 sub_layouts: self.sub_layouts.clone(),
@@ -1763,7 +1764,7 @@ impl LayoutAst {
         };
         let new_pos = lowest_pos - Vec3::new(0.0, 0.0, PATTERN_LOCAL_Z);
         Self {
-            ast: self.ast.clone(),
+            graph: self.graph.clone(),
             layout_nodes: self
                 .layout_nodes
                 .iter()
@@ -1792,7 +1793,7 @@ impl LayoutAst {
         match_id: &crate::model::node::Id,
         new_patterns: Vec<crate::model::node::Id>,
     ) -> Self {
-        let (input_anchor, output_anchor) = match self.ast.nodes.get(match_id) {
+        let (input_anchor, output_anchor) = match self.graph.nodes.get(match_id) {
             Some(crate::model::node::ENode::Match {
                 input_anchor,
                 output_anchor,
@@ -1800,7 +1801,7 @@ impl LayoutAst {
             }) => (input_anchor.clone(), output_anchor.clone()),
             _ => {
                 return Self {
-                    ast: self.ast.clone(),
+                    graph: self.graph.clone(),
                     layout_nodes: self.layout_nodes.clone(),
                     reserved_max: self.reserved_max,
                     sub_layouts: self.sub_layouts.clone(),
@@ -1808,7 +1809,7 @@ impl LayoutAst {
             }
         };
         Self {
-            ast: self.ast.with_node_replaced(
+            graph: self.graph.with_node_replaced(
                 match_id,
                 crate::model::node::ENode::Match {
                     patterns: new_patterns,
@@ -1822,26 +1823,26 @@ impl LayoutAst {
         }
     }
 
-    pub fn plus_var_decl(
+    pub fn plus_source(
         &self,
         pos: Vec3,
         node_id_domain: NodeIdDomain,
         anchor_id_domain: AnchorIdDomain,
     ) -> (Self, NodeIdDomain, AnchorIdDomain) {
-        // VarDecls live only on the Program wall (Y=0, Z=0). Snap defensively.
+        // Sources live only on the root scope's wall (Y=0, Z=0). Snap defensively.
         let pos = Vec3::new(pos.x, 0.0, 0.0);
         let (anchor_id_domain, output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, node_id) = node_id_domain.next_id();
-        let ast = self.ast.plus_node(
+        let graph = self.graph.plus_node(
             node_id.clone(),
-            crate::model::node::ENode::VarDecl {
+            crate::model::node::ENode::Source {
                 name: "v".to_string(),
                 r#type: crate::model::r#type::EType::Int { value: None },
                 output_anchor: output_anchor_id,
             },
         );
         let layout = Self {
-            ast,
+            graph,
             layout_nodes: self.layout_nodes.clone(),
             reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
@@ -1850,13 +1851,13 @@ impl LayoutAst {
         (layout, node_id_domain, anchor_id_domain)
     }
 
-    /// Grid-space origin of `owner_id`'s sub-layout, in this LayoutAst's own
+    /// Grid-space origin of `owner_id`'s sub-layout, in this LayoutGraph's own
     /// coordinates.
     ///
     /// A Pattern's branch volume starts one cell *behind* the Pattern (+Z):
     /// the Pattern itself belongs to the Match volume, not to the branch, so
     /// branch-local (0,0,0) — where the `BranchSource` sits — lands at the
-    /// Pattern's Z+1. Every other owner (the Program wrapper) contributes no
+    /// Pattern's Z+1. Every other owner (the Root wrapper) contributes no
     /// shift.
     fn sub_layout_origin(&self, owner_id: &crate::model::node::Id) -> Vec3 {
         let base = self
@@ -1865,7 +1866,7 @@ impl LayoutAst {
             .map(|ln| ln.pos)
             .unwrap_or(Vec3::ZERO);
         if matches!(
-            self.ast.nodes.get(owner_id),
+            self.graph.nodes.get(owner_id),
             Some(crate::model::node::ENode::Pattern { .. })
         ) {
             base + Vec3::new(0.0, 0.0, 1.0)
@@ -1876,7 +1877,7 @@ impl LayoutAst {
 
     fn _plus_layout_node(&self, node_id: &crate::model::node::Id, pos: Vec3) -> Self {
         Self {
-            ast: self.ast.clone(),
+            graph: self.graph.clone(),
             layout_nodes: self
                 .layout_nodes
                 .clone()
@@ -1888,13 +1889,13 @@ impl LayoutAst {
         }
     }
 
-    /// Recursively walk every node in this LayoutAst and its `sub_layouts`.
-    /// Each entry carries the containing LayoutAst (for anchor lookups), the
+    /// Recursively walk every node in this LayoutGraph and its `sub_layouts`.
+    /// Each entry carries the containing LayoutGraph (for anchor lookups), the
     /// LayoutNode, and the accumulated grid-space offset from the outer root.
     ///
     /// Descent into a sub-layout uses the owner node's grid position as the
     /// additional offset. The outer root's `layout_nodes` is expected to be
-    /// empty (Program has no LayoutNode) so `sub_layouts[program_id]` is
+    /// empty (Root has no LayoutNode) so `sub_layouts[root_id]` is
     /// entered with offset (0,0,0).
     pub fn walk_all(&self) -> Vec<WalkedNode> {
         let mut out = Vec::new();
@@ -1905,7 +1906,7 @@ impl LayoutAst {
     fn walk_all_into<'a>(&'a self, offset: Vec3, out: &mut Vec<WalkedNode<'a>>) {
         for layout_node in self.layout_nodes.values() {
             out.push(WalkedNode {
-                layout_ast: self,
+                layout_graph: self,
                 layout_node,
                 extra_offset: offset,
             });
@@ -1916,23 +1917,23 @@ impl LayoutAst {
         }
     }
 
-    /// Yield every LayoutAst reachable from `self`, including `self` itself.
-    /// Each entry carries the owner path from `self` down to the yielded AST
+    /// Yield every LayoutGraph reachable from `self`, including `self` itself.
+    /// Each entry carries the owner path from `self` down to the yielded graph
     /// (empty at `self`) and the accumulated grid-space offset.
-    pub fn walk_all_asts(&self) -> Vec<WalkedAst> {
+    pub fn walk_all_graphs(&self) -> Vec<WalkedGraph> {
         let mut out = Vec::new();
-        self.walk_all_asts_into(Vec::new(), Vec3::ZERO, &mut out);
+        self.walk_all_graphs_into(Vec::new(), Vec3::ZERO, &mut out);
         out
     }
 
-    fn walk_all_asts_into<'a>(
+    fn walk_all_graphs_into<'a>(
         &'a self,
         context: Vec<crate::model::node::Id>,
         offset: Vec3,
-        out: &mut Vec<WalkedAst<'a>>,
+        out: &mut Vec<WalkedGraph<'a>>,
     ) {
-        out.push(WalkedAst {
-            layout_ast: self,
+        out.push(WalkedGraph {
+            layout_graph: self,
             context: context.clone(),
             extra_offset: offset,
         });
@@ -1940,11 +1941,11 @@ impl LayoutAst {
             let sub_origin = self.sub_layout_origin(owner_id);
             let mut sub_context = context.clone();
             sub_context.push(owner_id.clone());
-            sub_layout.walk_all_asts_into(sub_context, offset + sub_origin, out);
+            sub_layout.walk_all_graphs_into(sub_context, offset + sub_origin, out);
         }
     }
 
-    /// Compute the grid bounds for this AST in its own local coordinates.
+    /// Compute the grid bounds for this graph in its own local coordinates.
     ///
     /// The volume is anchored at the scope origin — `min` is always (0,0,0),
     /// the corner every scope owns. Nodes are what push the far corner out;
@@ -1952,7 +1953,7 @@ impl LayoutAst {
     /// origin leaves whitespace behind instead of dragging its volume with it.
     ///
     /// - Z: `[0, sink.z]` where `sink.z` is the single Sink's layout-Z. Both
-    ///   ends are reserved: local Z=0 is the source row (VarDecls in the root
+    ///   ends are reserved: local Z=0 is the source row (Sources in the root
     ///   scope, the BranchSource in a branch) and `sink.z` belongs to the Sink
     ///   alone. Returns `None` if no Sink exists.
     /// - X / Y: `[0, max]` over every node's footprint, unioned with
@@ -1967,11 +1968,11 @@ impl LayoutAst {
     ///
     /// Only nodes and `reserved_max` decide this: the caret cannot widen the
     /// volume by moving, since `clamp_to_volume` keeps it inside.
-    pub fn ast_grid_bounds(&self) -> Option<AstGridBounds> {
+    pub fn grid_bounds(&self) -> Option<GridBounds> {
         let sink_z =
             self.layout_nodes
                 .iter()
-                .find_map(|(id, ln)| match self.ast.nodes.get(id) {
+                .find_map(|(id, ln)| match self.graph.nodes.get(id) {
                     Some(crate::model::node::ENode::Sink { .. }) => {
                         Some(ln.pos.round().as_ivec3().z)
                     }
@@ -1985,13 +1986,13 @@ impl LayoutAst {
             max.x = max.x.max(fp.max.x);
             max.y = max.y.max(fp.max.y);
         }
-        Some(AstGridBounds {
+        Some(GridBounds {
             min: IVec3::ZERO,
             max,
         })
     }
 
-    /// Clamp a global cell address into this AST's volume, i.e. the bounds
+    /// Clamp a global cell address into this graph's volume, i.e. the bounds
     /// every scope nested in it lives inside.
     ///
     /// Caret navigation goes through here: the volume follows the nodes, and
@@ -1999,7 +2000,7 @@ impl LayoutAst {
     /// never a side effect of moving. With no Sink there is no volume yet;
     /// only the non-negative half-space constrains the address then.
     pub fn clamp_to_volume(&self, global: IVec3) -> IVec3 {
-        match self.ast_grid_bounds() {
+        match self.grid_bounds() {
             Some(bounds) => global.clamp(bounds.min, bounds.max),
             None => global.max(IVec3::ZERO),
         }
@@ -2009,8 +2010,8 @@ impl LayoutAst {
     /// it is.
     ///
     /// Three node kinds are scope furniture rather than content in it. The
-    /// BranchSource marks its branch origin and never moves at all; a VarDecl
-    /// marks the program wall, free to slide along X with the other
+    /// BranchSource marks its branch origin and never moves at all; a Source
+    /// marks the root scope's wall, free to slide along X with the other
     /// declarations but never off Y=0 or Z=0. The Sink is the mirror image at
     /// the far end: it rides every depth insert, so the volume gains the cell
     /// that was opened, and holds X=0 for the rest.
@@ -2018,10 +2019,10 @@ impl LayoutAst {
     /// None of them refuses an insert — the layer simply opens around them,
     /// which is what keeps the source row and the terminal where they belong.
     fn shifts_with(&self, id: &crate::model::node::Id, axis: Axis) -> bool {
-        match self.ast.nodes.get(id) {
+        match self.graph.nodes.get(id) {
             Some(crate::model::node::ENode::Sink { .. }) => axis == Axis::Z,
             Some(crate::model::node::ENode::BranchSource { .. }) => false,
-            Some(crate::model::node::ENode::VarDecl { .. }) => axis == Axis::X,
+            Some(crate::model::node::ENode::Source { .. }) => axis == Axis::X,
             _ => true,
         }
     }
@@ -2061,7 +2062,7 @@ impl LayoutAst {
     /// cannot be stretched around a gap.
     ///
     /// Patterns are never tested on their own: their positions live in this
-    /// AST, but the owning Match's footprint already covers them, and a
+    /// graph, but the owning Match's footprint already covers them, and a
     /// Pattern moving alone would tear its branch off the arm it belongs to.
     /// They ride along with the Match instead.
     ///
@@ -2107,7 +2108,7 @@ impl LayoutAst {
         // Room made is room kept. The bounds are otherwise re-derived from the
         // node positions alone, so the freed layer would collapse as soon as
         // the graph normalises and the scope would read as shifted, not wider.
-        if let Some(prev) = self.ast_grid_bounds() {
+        if let Some(prev) = self.grid_bounds() {
             let claim = axis.of(prev.max) + 1;
             match axis {
                 Axis::X => layout.reserved_max.x = layout.reserved_max.x.max(claim),
@@ -2133,7 +2134,7 @@ impl LayoutAst {
     }
 
     pub fn edges(&self) -> Vec<LayoutEdge> {
-        self.ast
+        self.graph
             .edges
             .iter()
             .flat_map(|(from_anchor_id, edges)| {
@@ -2148,15 +2149,15 @@ impl LayoutAst {
     pub fn layout_anchor(&self, anchor_id: crate::model::anchor::Id) -> LayoutAnchor {
         self.try_layout_anchor(&anchor_id).unwrap_or_else(|| {
             panic!(
-                "layout_anchor: anchor {:?} not found in any (sub-)ast",
+                "layout_anchor: anchor {:?} not found in any (sub-)graph",
                 anchor_id
             )
         })
     }
 
     fn try_layout_anchor(&self, anchor_id: &crate::model::anchor::Id) -> Option<LayoutAnchor> {
-        if let Some(anchor) = self.ast.anchors.get(anchor_id) {
-            let node_id = self.ast.anchor_to_node.get(anchor_id).unwrap().clone();
+        if let Some(anchor) = self.graph.anchors.get(anchor_id) {
+            let node_id = self.graph.anchor_to_node.get(anchor_id).unwrap().clone();
             return Some(LayoutAnchor {
                 anchor_id: anchor_id.clone(),
                 anchor: anchor.clone(),
@@ -2172,7 +2173,7 @@ impl LayoutAst {
         None
     }
 
-    /// Owner path from this LayoutAst down to the LayoutAst whose
+    /// Owner path from this LayoutGraph down to the LayoutGraph whose
     /// `layout_nodes` contains `target`. `Some(vec![])` = target lives in
     /// `self`; `Some(vec![a, b])` = target lives in `self.sub_layouts[a]
     /// .sub_layouts[b]`. `None` = not found.
@@ -2193,15 +2194,18 @@ impl LayoutAst {
         None
     }
 
-    /// Return the LayoutAst that holds `target` in its `ast.nodes` map.
+    /// Return the LayoutGraph that holds `target` in its `graph.nodes` map.
     /// Used by editor handlers to mutate node fields without needing to
     /// know which sub-layout the node lives in.
-    pub fn find_node_ast_mut(&mut self, target: &crate::model::node::Id) -> Option<&mut LayoutAst> {
-        if self.ast.nodes.contains_key(target) {
+    pub fn find_node_graph_mut(
+        &mut self,
+        target: &crate::model::node::Id,
+    ) -> Option<&mut LayoutGraph> {
+        if self.graph.nodes.contains_key(target) {
             return Some(self);
         }
         for sub in self.sub_layouts.values_mut() {
-            if let Some(found) = sub.find_node_ast_mut(target) {
+            if let Some(found) = sub.find_node_graph_mut(target) {
                 return Some(found);
             }
         }
@@ -2209,15 +2213,15 @@ impl LayoutAst {
     }
 
     /// Resolve an owner path (as produced by `context_of_node`) to the
-    /// corresponding sub-LayoutAst reference. Panics if the path names a
+    /// corresponding sub-LayoutGraph reference. Panics if the path names a
     /// key that no longer exists — callers are expected to have obtained
     /// the path from a fresh lookup in the same frame.
-    pub fn resolve_context<'a>(&'a self, path: &[crate::model::node::Id]) -> &'a LayoutAst {
-        let mut ast = self;
+    pub fn resolve_context<'a>(&'a self, path: &[crate::model::node::Id]) -> &'a LayoutGraph {
+        let mut graph = self;
         for id in path {
-            ast = ast.sub_layouts.get(id).unwrap();
+            graph = graph.sub_layouts.get(id).unwrap();
         }
-        ast
+        graph
     }
 
     /// Resolve a global cell address to the scope that owns it.
@@ -2228,7 +2232,7 @@ impl LayoutAst {
     /// when the caret sits inside a Match branch volume it always resolves to
     /// that branch scope, never to the enclosing parent.
     ///
-    /// A scope's volume is its `ast_grid_bounds`, i.e. the whole wall-to-sink
+    /// A scope's volume is its `grid_bounds`, i.e. the whole wall-to-sink
     /// corridor including the cells that are still empty — otherwise the caret
     /// could not be placed where a node is about to be inserted.
     ///
@@ -2241,8 +2245,8 @@ impl LayoutAst {
     /// "nothing to edit here".
     pub fn scope_at(&self, global: IVec3) -> Option<(Vec<crate::model::node::Id>, IVec3)> {
         let mut best: Option<(Vec<crate::model::node::Id>, IVec3)> = None;
-        for walked in self.walk_all_asts() {
-            let Some(bounds) = walked.layout_ast.ast_grid_bounds() else {
+        for walked in self.walk_all_graphs() {
+            let Some(bounds) = walked.layout_graph.grid_bounds() else {
                 continue;
             };
             let offset = walked.extra_offset.round().as_ivec3();
@@ -2272,13 +2276,13 @@ impl LayoutAst {
     /// turns a scope-local address into a global one.
     pub fn scope_offset(&self, path: &[crate::model::node::Id]) -> IVec3 {
         let mut offset = IVec3::ZERO;
-        let mut ast = self;
+        let mut graph = self;
         for id in path {
-            offset += ast.sub_layout_origin(id).round().as_ivec3();
-            let Some(next) = ast.sub_layouts.get(id) else {
+            offset += graph.sub_layout_origin(id).round().as_ivec3();
+            let Some(next) = graph.sub_layouts.get(id) else {
                 break;
             };
-            ast = next;
+            graph = next;
         }
         offset
     }
@@ -2287,12 +2291,12 @@ impl LayoutAst {
     pub fn resolve_context_mut<'a>(
         &'a mut self,
         path: &[crate::model::node::Id],
-    ) -> Option<&'a mut LayoutAst> {
-        let mut ast = self;
+    ) -> Option<&'a mut LayoutGraph> {
+        let mut graph = self;
         for id in path {
-            ast = ast.sub_layouts.get_mut(id)?;
+            graph = graph.sub_layouts.get_mut(id)?;
         }
-        Some(ast)
+        Some(graph)
     }
 }
 

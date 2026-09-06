@@ -210,7 +210,7 @@ pub struct RenderTypeMarker {
     /// value-carrying edge drops its band for a hairline.
     pub rect: Option<RenderObject>,
     pub label: Option<RenderLabel>,
-    /// Present iff this leaf's anchor carries an AST-level literal. A thin
+    /// Present iff this leaf's anchor carries an graph-level literal. A thin
     /// coloured segment spanning the anchor's full depth, at its Y-middle.
     pub value_line: Option<RenderObject>,
     /// Present alongside `value_line`. Text is the literal itself, projected
@@ -294,7 +294,7 @@ pub fn type_marker_color(t: &crate::infer::EType) -> Color {
 /// first row.
 ///
 /// Both the marker stack (`build_type_markers`) and the edge ribbons
-/// (`spawn_ast_nodes`) go through this, so they cannot drift apart.
+/// (`spawn_graph_nodes`) go through this, so they cannot drift apart.
 pub fn leaf_row_offset(index: usize) -> f32 {
     index as f32 * LAYOUT_SCALE.y.signum() * TYPE_MARKER_Y_STEP
 }
@@ -340,14 +340,14 @@ pub fn source_body_curve(cell_center: Vec3) -> crate::edge::EdgeCurve {
 /// half for an input, the near half for an output — so the stack hangs off the
 /// node rather than floating mid-cell. `is_input` picks the side.
 ///
-/// `ast_value` is the AST-level literal on the anchor's type, if any. When
+/// `graph_value` is the graph-level literal on the anchor's type, if any. When
 /// present the band is dropped entirely and the leaf is drawn as a single
 /// thin line plus the literal — a value is shown as the value, not as its
 /// type. In practice value-carrying nodes have a single leaf, so this only
 /// fires on one marker per anchor.
 fn build_type_markers(
     t: &crate::infer::EType,
-    ast_value: Option<&str>,
+    graph_value: Option<&str>,
     anchor_world_pos: Vec3,
     is_input: bool,
 ) -> Vec<RenderTypeMarker> {
@@ -373,7 +373,7 @@ fn build_type_markers(
             let letter = type_marker_letter(&leaf).to_string();
             let center = Vec3::new(anchor_world_pos.x, y_center, full_rect_z_center);
 
-            if let Some(value) = ast_value {
+            if let Some(value) = graph_value {
                 // A leaf pinned to a literal is drawn as that literal and
                 // nothing else: one thin line across the anchor's full depth,
                 // its colour carrying the type. No band, no type letter — the
@@ -443,11 +443,11 @@ fn build_type_markers(
 /// like the typeless (unconstrained) inputs.
 fn typed_anchor(
     t: &crate::infer::EType,
-    ast_value: Option<&str>,
+    graph_value: Option<&str>,
     cell_center: Vec3,
     is_input: bool,
 ) -> RenderAnchor {
-    let type_markers = build_type_markers(t, ast_value, cell_center, is_input);
+    let type_markers = build_type_markers(t, graph_value, cell_center, is_input);
     RenderAnchor {
         // The cell centre is the anchor's outward face, so edges meet it there
         // no matter how many rows the anchor spans.
@@ -483,27 +483,27 @@ fn plain_anchor_body(cell_center: Vec3, is_input: bool) -> RenderObject {
     }
 }
 
-/// Spawn the AST node meshes.
+/// Spawn the graph node meshes.
 ///
 /// `extra_offset` (grid units) is added to `layout_node.pos` before the
-/// grid→world conversion; used for pattern sub-AST nodes whose positions are
+/// grid→world conversion; used for pattern sub-graph nodes whose positions are
 /// relative to the containing pattern.
 ///
-/// `flat_ast` is the program's flattened AST. Type inference needs it because
+/// `flat_graph` is the program's flattened graph. Type inference needs it because
 /// every edge — including those inside Pattern branches — lives in the
-/// program-level edge table, while `layout_ast` may be a sub-layout that holds
+/// program-level edge table, while `layout_graph` may be a sub-layout that holds
 /// only nodes.
 pub fn layoutnode_to_rendernode(
     layout_node: &crate::layout::LayoutNode,
-    layout_ast: &crate::layout::LayoutAst,
-    flat_ast: &crate::model::ast::Ast,
+    layout_graph: &crate::layout::LayoutGraph,
+    flat_graph: &crate::model::term_graph::TermGraph,
     function_declarations: &std::collections::HashMap<
         crate::model::function_declaration::FunctionDeclarationId,
         crate::model::function_declaration::FunctionDeclaration,
     >,
     extra_offset: Vec3,
 ) -> RenderNode {
-    let ast = &layout_ast.ast;
+    let graph = &layout_graph.graph;
     let node_pos = cell_center_world(layout_node.pos + extra_offset);
     // World centre of a node-local cell. Every part of a node — each anchor
     // row, the body — lives in its own cell, so placement goes through this
@@ -511,22 +511,22 @@ pub fn layoutnode_to_rendernode(
     let cell = |x: i32, y: i32, z: i32| {
         cell_center_world(layout_node.pos + extra_offset + Vec3::new(x as f32, y as f32, z as f32))
     };
-    let node = ast.nodes.get(&layout_node.node_id).unwrap();
+    let node = graph.nodes.get(&layout_node.node_id).unwrap();
     match node {
         // Source nodes (a declared constant, a named variable): body band at
         // `0|0` naming the type, output anchor at `0|1`.
-        crate::model::node::ENode::ConstDecl {
+        crate::model::node::ENode::Constant {
             r#type,
             output_anchor,
         }
-        | crate::model::node::ENode::VarDecl {
+        | crate::model::node::ENode::Source {
             r#type,
             output_anchor,
             ..
         } => {
             let body_world = cell(0, 0, 0);
             let output_world = cell(0, 0, 1);
-            let output_eval_type = crate::infer::ast_type_to_eval_type(r#type);
+            let output_eval_type = crate::infer::graph_type_to_eval_type(r#type);
             let output_value = crate::layout::value_of_etype(r#type);
             let bands = crate::edge::leaf_kind_of(&output_eval_type)
                 .map(|kind| RenderBand {
@@ -559,7 +559,7 @@ pub fn layoutnode_to_rendernode(
                 markers: vec![],
                 bands,
                 labels: match node {
-                    crate::model::node::ENode::VarDecl { .. } => vec![RenderLabel {
+                    crate::model::node::ENode::Source { .. } => vec![RenderLabel {
                         text: label_for_node(node, function_declarations),
                         color: Color::WHITE,
                         font_size: 18.0,
@@ -585,10 +585,10 @@ pub fn layoutnode_to_rendernode(
             // when a mismatched type flows in, and stays `Pending` while
             // nothing flows in at all; that logic lives in `infer::anchor_type`.
             let output_eval_type =
-                crate::infer::anchor_type(flat_ast, output_anchor, function_declarations)
-                    .unwrap_or_else(|| crate::infer::ast_type_to_eval_type(r#type));
+                crate::infer::anchor_type(flat_graph, output_anchor, function_declarations)
+                    .unwrap_or_else(|| crate::infer::graph_type_to_eval_type(r#type));
             let input_eval_type =
-                crate::infer::incoming_anchor_type(flat_ast, input_anchor, function_declarations);
+                crate::infer::incoming_anchor_type(flat_graph, input_anchor, function_declarations);
             let elim_value = crate::layout::value_of_etype(r#type);
             RenderNode {
                 node: Some(RenderObject {
@@ -654,11 +654,11 @@ pub fn layoutnode_to_rendernode(
             // another — which is why this builds explicit corners.
             let input_rows = input_anchors
                 .iter()
-                .map(|a| crate::infer::anchor_rows(flat_ast, a, function_declarations))
+                .map(|a| crate::infer::anchor_rows(flat_graph, a, function_declarations))
                 .max()
                 .unwrap_or(1);
             let output_rows =
-                crate::infer::anchor_rows(flat_ast, output_anchor, function_declarations);
+                crate::infer::anchor_rows(flat_graph, output_anchor, function_declarations);
             let first_col = cell(0, 0, 0);
             let last_col = cell(width - 1, 0, 0);
             // Upper edge of row 0, shared by both faces.
@@ -721,7 +721,7 @@ pub fn layoutnode_to_rendernode(
                             .and_then(|param| param.r#type.clone());
                         let shown = declared.or_else(|| {
                             crate::infer::incoming_anchor_type(
-                                flat_ast,
+                                flat_graph,
                                 anchor_id,
                                 function_declarations,
                             )
@@ -779,7 +779,7 @@ pub fn layoutnode_to_rendernode(
         crate::model::node::ENode::Sink { input_anchor } => {
             let input_world = cell(0, 0, 0);
             let incoming =
-                crate::infer::incoming_anchor_type(flat_ast, input_anchor, function_declarations);
+                crate::infer::incoming_anchor_type(flat_graph, input_anchor, function_declarations);
             RenderNode {
                 node: None,
                 anchors: std::collections::HashMap::from([(
@@ -807,7 +807,7 @@ pub fn layoutnode_to_rendernode(
             node: None,
             anchors: std::collections::HashMap::new(),
             markers: build_type_markers(
-                &crate::infer::ast_type_to_eval_type(r#type),
+                &crate::infer::graph_type_to_eval_type(r#type),
                 crate::layout::value_of_etype(r#type).as_deref(),
                 node_pos,
                 true,
@@ -822,9 +822,9 @@ pub fn layoutnode_to_rendernode(
             // Both type and literal come from the owning Pattern, so the
             // source shows exactly what its arm matched.
             let output_eval_type =
-                crate::infer::anchor_type(flat_ast, output_anchor, function_declarations)
+                crate::infer::anchor_type(flat_graph, output_anchor, function_declarations)
                     .unwrap_or(crate::infer::EType::Pending);
-            let output_value = crate::infer::anchor_literal(flat_ast, output_anchor);
+            let output_value = crate::infer::anchor_literal(flat_graph, output_anchor);
             RenderNode {
                 node: None,
                 anchors: std::collections::HashMap::from([(
@@ -853,13 +853,13 @@ pub fn layoutnode_to_rendernode(
             // Input anchor owns the Match's own cell at local 0|0.
             let input_world = cell(0, 0, 0);
             let incoming =
-                crate::infer::incoming_anchor_type(flat_ast, input_anchor, function_declarations);
+                crate::infer::incoming_anchor_type(flat_graph, input_anchor, function_declarations);
             // The output owns its own cell directly behind the deepest branch;
             // `match_output_z` decides which one. Its type is the union of the
             // branch types, or `Pending` while the inferer cannot decide it.
-            let out_world = cell(0, 0, layout_ast.match_output_z(patterns));
+            let out_world = cell(0, 0, layout_graph.match_output_z(patterns));
             let output_eval_type =
-                crate::infer::anchor_type(flat_ast, output_anchor, function_declarations)
+                crate::infer::anchor_type(flat_graph, output_anchor, function_declarations)
                     .unwrap_or(crate::infer::EType::Pending);
             RenderNode {
                 node: None,
@@ -885,8 +885,8 @@ pub fn layoutnode_to_rendernode(
                 labels: vec![],
             }
         }
-        crate::model::node::ENode::Program { .. } => {
-            unreachable!("Program node has no layout position and is never rendered directly")
+        crate::model::node::ENode::Root { .. } => {
+            unreachable!("Root node has no layout position and is never rendered directly")
         }
     }
 }
@@ -913,14 +913,14 @@ pub fn label_for_node(
             .unwrap()
             .name
             .to_string(),
-        crate::model::node::ENode::ConstDecl { r#type, .. }
+        crate::model::node::ENode::Constant { r#type, .. }
         | crate::model::node::ENode::TypeCast { r#type, .. } => r#type.to_string(),
-        crate::model::node::ENode::VarDecl { name, r#type, .. } => {
+        crate::model::node::ENode::Source { name, r#type, .. } => {
             format!("{}: {}", name, r#type.to_string())
         }
         crate::model::node::ENode::Match { .. } => "match".to_string(),
         crate::model::node::ENode::Pattern { r#type, .. } => r#type.to_string(),
         crate::model::node::ENode::BranchSource { .. } => "branch source".to_string(),
-        crate::model::node::ENode::Program { .. } => "program".to_string(),
+        crate::model::node::ENode::Root { .. } => "root".to_string(),
     }
 }

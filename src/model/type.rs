@@ -10,23 +10,23 @@ pub enum EType {
 impl std::fmt::Display for EType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = match self.clone() {
-            EType::Bool { value } => value.unwrap_or("bool".to_string()),
-            EType::Int { value } => value.unwrap_or("int".to_string()),
+            EType::Bool { value } => value.unwrap_or("Bool".to_string()),
+            EType::Int { value } => value.unwrap_or("Integer".to_string()),
             EType::String { value } => {
                 if let Some(value) = value {
                     format!("\"{}\"", value)
                 } else {
-                    "string".to_string()
+                    "String".to_string()
                 }
             }
             EType::Char { value } => {
                 if let Some(value) = value {
                     format!("'{}'", value)
                 } else {
-                    "char".to_string()
+                    "Char".to_string()
                 }
             }
-            EType::None { message } => message.unwrap_or("none".to_string()),
+            EType::None { message } => message.unwrap_or("None".to_string()),
         };
         write!(f, "{}", text)
     }

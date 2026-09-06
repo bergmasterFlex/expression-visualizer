@@ -1,16 +1,16 @@
 #[derive(Clone, Debug)]
-pub struct Ast {
+pub struct TermGraph {
     pub nodes: std::collections::HashMap<super::node::Id, super::node::ENode>,
     pub anchors: std::collections::HashMap<super::anchor::Id, super::anchor::EAnchor>,
     pub anchor_to_node: std::collections::HashMap<super::anchor::Id, super::node::Id>,
     pub edges: std::collections::HashMap<super::anchor::Id, Vec<super::edge::Edge>>,
-    /// The Sink node that terminates this AST. Always present: an `Ast` is born
+    /// The Sink node that terminates this graph. Always present: an `TermGraph` is born
     /// with its sink in `new`, and every builder carries it forward unchanged.
     pub sink_node_id: super::node::Id,
 }
 
-impl Ast {
-    /// Create an AST that already contains its terminating `Sink` node (with a
+impl TermGraph {
+    /// Create an graph that already contains its terminating `Sink` node (with a
     /// fresh input anchor), pointed to by `sink_node_id`. The id domains are
     /// threaded through so every id stays globally unique.
     pub fn new(
@@ -23,7 +23,7 @@ impl Ast {
     ) {
         let (node_id_domain, sink_node_id) = node_id_domain.next_id();
         let (anchor_id_domain, sink_input_anchor_id) = anchor_id_domain.next_id();
-        let ast = Self {
+        let graph = Self {
             nodes: std::collections::HashMap::new(),
             anchors: std::collections::HashMap::new(),
             anchor_to_node: std::collections::HashMap::new(),
@@ -36,14 +36,14 @@ impl Ast {
                 input_anchor: sink_input_anchor_id,
             },
         );
-        (ast, node_id_domain, anchor_id_domain)
+        (graph, node_id_domain, anchor_id_domain)
     }
 
-    /// Sub-AST for a Match branch: the terminating Sink plus the branch's
+    /// Sub-graph for a Match branch: the terminating Sink plus the branch's
     /// single `BranchSource`, which belongs to `pattern`. Both are
     /// constitutive — a branch is never without them — so they are created
     /// here rather than by any user action.
-    pub fn new_pattern_sub_ast(
+    pub fn new_pattern_sub_graph(
         node_id_domain: crate::common::IdDomain<super::node::Id>,
         anchor_id_domain: crate::common::IdDomain<super::anchor::Id>,
         pattern: super::node::Id,
@@ -54,12 +54,12 @@ impl Ast {
         super::node::Id,
         super::node::Id,
     ) {
-        let (sub_ast, node_id_domain, anchor_id_domain) =
+        let (sub_graph, node_id_domain, anchor_id_domain) =
             Self::new(node_id_domain, anchor_id_domain);
-        let sink_node_id = sub_ast.sink_node_id.clone();
+        let sink_node_id = sub_graph.sink_node_id.clone();
         let (node_id_domain, branch_source_id) = node_id_domain.next_id();
         let (anchor_id_domain, branch_source_anchor_id) = anchor_id_domain.next_id();
-        let sub_ast = sub_ast.plus_node(
+        let sub_graph = sub_graph.plus_node(
             branch_source_id.clone(),
             super::node::ENode::BranchSource {
                 pattern,
@@ -69,15 +69,15 @@ impl Ast {
         (
             node_id_domain,
             anchor_id_domain,
-            sub_ast,
+            sub_graph,
             sink_node_id,
             branch_source_id,
         )
     }
 
-    /// Union another AST's nodes/anchors/edges into this one, keeping this AST's
+    /// Union another graph's nodes/anchors/edges into this one, keeping this graph's
     /// `sink_node_id` as the root. Node/anchor ids are globally unique across a
-    /// (sub-)AST tree, so those maps never collide; edge lists that share a
+    /// (sub-)graph tree, so those maps never collide; edge lists that share a
     /// `from` anchor are concatenated defensively.
     pub fn merged_with(self, other: Self) -> Self {
         let mut edges = self.edges;

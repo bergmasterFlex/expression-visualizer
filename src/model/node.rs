@@ -19,7 +19,11 @@ impl std::fmt::Display for Id {
 
 #[derive(Debug, Clone)]
 pub enum ENode {
-    Program {},
+    /// The root owner of the layout tree. Not a node kind of the language —
+    /// the abstract syntax has no such thing — but the layout needs one object
+    /// that owns the outermost scope, and what has to be addressable needs an
+    /// entry in the layout. Same category as `Pattern` below.
+    Root {},
     Sink {
         input_anchor: super::anchor::Id,
     },
@@ -28,7 +32,7 @@ pub enum ENode {
         input_anchors: Vec<super::anchor::Id>,
         output_anchor: super::anchor::Id,
     },
-    ConstDecl {
+    Constant {
         r#type: super::r#type::EType,
         output_anchor: super::anchor::Id,
     },
@@ -37,7 +41,7 @@ pub enum ENode {
         input_anchor: super::anchor::Id,
         output_anchor: super::anchor::Id,
     },
-    VarDecl {
+    Source {
         name: String,
         r#type: super::r#type::EType,
         output_anchor: super::anchor::Id,
@@ -59,8 +63,8 @@ pub enum ENode {
     /// The single entry point of a Match branch, at branch-local (0,0,0) —
     /// directly behind its Pattern. Exactly one exists per branch and it is
     /// created with the branch, never by the user. Its output carries the
-    /// matched value, typed by `pattern`'s declared type; it is the branch's
-    /// equivalent of a top-level VarDecl source.
+    /// matched value, typed by `pattern`'s declared type; it is what a
+    /// top-level `Source` is to the root scope.
     BranchSource {
         pattern: super::node::Id,
         output_anchor: super::anchor::Id,
@@ -99,7 +103,7 @@ impl ENode {
                     name: None,
                 }),
             )],
-            ENode::ConstDecl { output_anchor, .. } => {
+            ENode::Constant { output_anchor, .. } => {
                 vec![(output_anchor.clone(), super::anchor::EAnchor::Output)]
             }
             ENode::TypeCast {
@@ -116,7 +120,7 @@ impl ENode {
                 ),
                 (output_anchor.clone(), super::anchor::EAnchor::Output),
             ],
-            ENode::VarDecl { output_anchor, .. } => {
+            ENode::Source { output_anchor, .. } => {
                 vec![(output_anchor.clone(), super::anchor::EAnchor::Output)]
             }
             ENode::Match {
@@ -138,7 +142,7 @@ impl ENode {
             }
             // A Pattern carries no anchor: the branch reads its value from
             // the branch's own BranchSource.
-            ENode::Pattern { .. } | ENode::Program { .. } => vec![],
+            ENode::Pattern { .. } | ENode::Root { .. } => vec![],
         }
     }
 

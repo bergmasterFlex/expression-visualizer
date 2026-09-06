@@ -17,13 +17,13 @@ use bevy::{input::keyboard::KeyboardInput, math::VectorSpace, prelude::*};
 // ── Resources ───────────────────────────────────────────────
 
 #[derive(Resource)]
-struct AstState {
-    /// Root LayoutAst. Contains exactly one Program node; the user-visible
-    /// scene lives in `layout_ast.sub_layouts[program_id]`. Reads/writes go
-    /// through `program_ast()` / `program_ast_mut()`.
-    layout_ast: layout::LayoutAst,
-    program_id: model::node::Id,
-    /// Shared id domains for the whole LayoutAst tree. Threaded through every
+struct GraphState {
+    /// Root LayoutGraph. Contains exactly one Root node; the user-visible
+    /// scene lives in `layout_graph.sub_layouts[root_id]`. Reads/writes go
+    /// through `root_graph()` / `root_graph_mut()`.
+    layout_graph: layout::LayoutGraph,
+    root_id: model::node::Id,
+    /// Shared id domains for the whole LayoutGraph tree. Threaded through every
     /// `plus_*` builder so node and anchor ids stay globally unique across the
     /// root, the program sub-layout, and all pattern sub-layouts.
     node_id_domain: common::IdDomain<model::node::Id>,
@@ -34,15 +34,15 @@ struct AstState {
     >,
 }
 
-impl AstState {
-    fn program_ast(&self) -> &layout::LayoutAst {
-        self.layout_ast.sub_layouts.get(&self.program_id).unwrap()
+impl GraphState {
+    fn root_graph(&self) -> &layout::LayoutGraph {
+        self.layout_graph.sub_layouts.get(&self.root_id).unwrap()
     }
 
-    fn program_ast_mut(&mut self) -> &mut layout::LayoutAst {
-        self.layout_ast
+    fn root_graph_mut(&mut self) -> &mut layout::LayoutGraph {
+        self.layout_graph
             .sub_layouts
-            .get_mut(&self.program_id)
+            .get_mut(&self.root_id)
             .unwrap()
     }
 
@@ -55,21 +55,21 @@ impl AstState {
     /// wired into it — which is why connecting, disconnecting and deleting all
     /// have to come through here, not just moving and adding.
     fn resettle(&mut self) {
-        let flat = self.program_ast().flattened_ast();
-        self.layout_ast = self
-            .layout_ast
+        let flat = self.root_graph().flattened_graph();
+        self.layout_graph = self
+            .layout_graph
             .with_shapes(&flat, &self.function_declarations)
             .settle_footprints();
     }
 }
 
-impl Default for AstState {
+impl Default for GraphState {
     fn default() -> Self {
-        let (layout_ast, program_id, node_id_domain, anchor_id_domain) =
-            layout::LayoutAst::empty_with_program();
+        let (layout_graph, root_id, node_id_domain, anchor_id_domain) =
+            layout::LayoutGraph::empty_with_root();
         let mut state = Self {
-            layout_ast,
-            program_id,
+            layout_graph,
+            root_id,
             node_id_domain,
             anchor_id_domain,
             function_declarations: model::function_declaration::catalogue(),
@@ -108,14 +108,14 @@ pub struct Edge {
 /// In-flight drag-to-connect state.
 ///
 /// Deliberately holds no `Entity`: `clear_scene` despawns and respawns every
-/// `AstSceneEntity` on each rebuild, so an entity captured at drag start is
+/// `SceneEntity` on each rebuild, so an entity captured at drag start is
 /// stale the moment anything sets `NeedsRebuild` mid-drag. Anchor identity is
 /// tracked by `AnchorId`, which survives rebuilds.
 pub struct DragInfo {
     pub source_anchor_id: model::anchor::Id,
     /// `true` if the drag started on an `EAnchor::Output`. Lets the target
     /// check reject same-kind pairs and lets drag-end store the edge in the
-    /// canonical output → input direction without an AST lookup.
+    /// canonical output → input direction without an graph lookup.
     pub source_is_output: bool,
     pub source_pos: Vec3,
     pub current_end: Vec3,
@@ -127,21 +127,21 @@ pub struct DragState {
     pub active: Option<DragInfo>,
 }
 
-/// Marker for AST node mesh entities (so we can despawn them on rebuild).
+/// Marker for graph node mesh entities (so we can despawn them on rebuild).
 #[derive(Component)]
-struct AstNodeEntity {
+struct NodeEntity {
     node_id: model::node::Id,
 }
 
-/// Marker for a per-AST grid mesh (one per Program-Ast / Pattern sub-AST).
+/// Marker for a per-graph grid mesh (one per root graph / Pattern sub-graph).
 /// Carries just enough info to map a raycast hit back to a local grid cell
-/// in the owning LayoutAst.
+/// in the owning LayoutGraph.
 #[derive(Component, Clone)]
-struct AstGridEntity {
-    /// Owner path from the Program-Ast down to this AST's LayoutAst.
-    /// Empty = the Program-Ast itself; each further element names a Pattern.
+struct ScopeGridEntity {
+    /// Owner path from the root graph down to this graph's LayoutGraph.
+    /// Empty = the root graph itself; each further element names a Pattern.
     context: Vec<model::node::Id>,
-    /// Accumulated grid-space offset of this AST's origin from the root.
+    /// Accumulated grid-space offset of this graph's origin from the root.
     origin_offset: Vec3,
     /// Local grid-space bounds this grid currently spans (inclusive).
     min: IVec3,
@@ -164,7 +164,7 @@ enum EditorMode {
 
 /// Marker for any spawned scene entity (cleaned on rebuild).
 #[derive(Component)]
-struct AstSceneEntity;
+struct SceneEntity;
 
 //Buttons
 #[derive(Component)]
@@ -172,9 +172,9 @@ struct DeleteNodeButton;
 #[derive(Component)]
 struct HamburgerButton;
 #[derive(Component, Clone, PartialEq, Eq)]
-enum EAstActionButton {
-    AddConstDeclButton,
-    AddVarDeclButton,
+enum EGraphActionButton {
+    AddConstantButton,
+    AddSourceButton,
     AddTypeCastButton,
     AddFunctionCallButton,
     AddMatchButton,
@@ -216,18 +216,18 @@ struct HideDuringStartMenu;
 /// coordinates, rounds to `selected_pos`.
 ///
 /// There is deliberately no editing-context field. The caret address alone
-/// decides what editing acts on: `AstState::scope_of_caret` resolves it to the
+/// decides what editing acts on: `GraphState::scope_of_caret` resolves it to the
 /// innermost scope whose volume contains it. A caret inside a Match branch
 /// volume therefore always refers to that branch, never to the enclosing
 /// parent.
 #[derive(Resource)]
 struct PickState {
     /// Currently selected grid cell, as a global address. Never negative,
-    /// and never outside the graph volume — see `LayoutAst::clamp_to_volume`.
+    /// and never outside the graph volume — see `LayoutGraph::clamp_to_volume`.
     selected_pos: IVec3,
     /// Node under the cursor (ray-sphere hit), if any.
     hovered_node: Option<model::node::Id>,
-    /// AST grid cell under the cursor (ray hit on an `AstGridEntity`), if any.
+    /// graph grid cell under the cursor (ray hit on an `ScopeGridEntity`), if any.
     hovered_grid: Option<HoveredGrid>,
     /// Cursor position at the last left-mouse press. Used to distinguish
     /// click vs drag — a release within `CLICK_MOVE_THRESHOLD` of this
@@ -241,13 +241,13 @@ struct PickState {
     press_over_ui: bool,
 }
 
-/// Populated when the cursor is over a per-AST grid mesh.
+/// Populated when the cursor is over a per-graph grid mesh.
 #[derive(Clone)]
 struct HoveredGrid {
     /// Global grid address of the hovered cell.
     global_pos: IVec3,
-    /// Entity of the `AstGridEntity` mesh that was hit — used so the hover
-    /// shader wash flips only on the AST grid actually under the cursor.
+    /// Entity of the `ScopeGridEntity` mesh that was hit — used so the hover
+    /// shader wash flips only on the graph grid actually under the cursor.
     entity: Entity,
     /// World XZ of the hovered cell's center. Fed to the grid shader's
     /// `hover_pos` uniform.
@@ -273,27 +273,27 @@ struct CaretScope {
     local: IVec3,
 }
 
-impl AstState {
+impl GraphState {
     /// Resolve the caret to its owning scope. `None` when the caret sits
     /// outside every scope volume — editing is then simply unavailable.
     fn scope_of_caret(&self, pick: &PickState) -> Option<CaretScope> {
-        self.program_ast()
+        self.root_graph()
             .scope_at(pick.selected_pos)
             .map(|(path, local)| CaretScope { path, local })
     }
 
-    /// The LayoutAst the caret addresses.
-    fn caret_ast(&self, pick: &PickState) -> Option<(&layout::LayoutAst, IVec3)> {
+    /// The LayoutGraph the caret addresses.
+    fn caret_graph(&self, pick: &PickState) -> Option<(&layout::LayoutGraph, IVec3)> {
         let scope = self.scope_of_caret(pick)?;
-        Some((self.program_ast().resolve_context(&scope.path), scope.local))
+        Some((self.root_graph().resolve_context(&scope.path), scope.local))
     }
 
-    /// Mutable counterpart to `caret_ast`. The path is resolved first so the
+    /// Mutable counterpart to `caret_graph`. The path is resolved first so the
     /// immutable and mutable borrows never overlap.
-    fn caret_ast_mut(&mut self, pick: &PickState) -> Option<(&mut layout::LayoutAst, IVec3)> {
+    fn caret_graph_mut(&mut self, pick: &PickState) -> Option<(&mut layout::LayoutGraph, IVec3)> {
         let scope = self.scope_of_caret(pick)?;
-        let ast = self.program_ast_mut().resolve_context_mut(&scope.path)?;
-        Some((ast, scope.local))
+        let graph = self.root_graph_mut().resolve_context_mut(&scope.path)?;
+        Some((graph, scope.local))
     }
 }
 
@@ -343,7 +343,7 @@ enum EvalPhase {
     Idle,
     ErrorModal(String),
     ControlsModal,
-    VarDeclPrompt {
+    SourcePrompt {
         /// Stable node_id order; values mirror what the user has typed so far.
         inputs: Vec<(model::node::Id, String)>,
     },
@@ -352,8 +352,8 @@ enum EvalPhase {
         /// `Next` computes one more `eval_next_step`, `Prev` rewinds.
         states: Vec<eval::State>,
         current: usize,
-        /// VarDecl values from the prompt modal, needed to keep stepping.
-        user_vardecl_values: std::collections::HashMap<model::node::Id, eval::EValue>,
+        /// Source values from the prompt modal, needed to keep stepping.
+        user_source_values: std::collections::HashMap<model::node::Id, eval::EValue>,
     },
 }
 
@@ -377,7 +377,7 @@ fn is_evaluating(eval: &EvalState) -> bool {
 fn modal_is_open(eval: &EvalState) -> bool {
     matches!(
         eval.phase,
-        EvalPhase::ErrorModal(_) | EvalPhase::ControlsModal | EvalPhase::VarDeclPrompt { .. }
+        EvalPhase::ErrorModal(_) | EvalPhase::ControlsModal | EvalPhase::SourcePrompt { .. }
     )
 }
 
@@ -398,10 +398,10 @@ struct ModalEvaluateButton;
 #[derive(Component)]
 struct ControlsModalOkButton;
 
-/// Marker on a TextInputBox inside the VarDecl modal so we can collect
-/// typed values per VarDecl when the user confirms.
+/// Marker on a TextInputBox inside the Source modal so we can collect
+/// typed values per Source when the user confirms.
 #[derive(Component)]
-struct ModalVarDeclInput {
+struct ModalSourceInput {
     node_id: model::node::Id,
 }
 
@@ -434,7 +434,7 @@ struct NodeEditorEntity;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NodeEditorField {
-    VarDeclName,
+    SourceName,
     Value,
 }
 
@@ -504,9 +504,9 @@ struct DropdownState {
 enum NodeVariantKind {
     #[default]
     None,
-    ConstDecl,
+    Constant,
     TypeCast,
-    VarDecl,
+    Source,
     FunctionCall,
     Pattern,
     Other,
@@ -515,9 +515,9 @@ enum NodeVariantKind {
 fn variant_kind(node: Option<&model::node::ENode>) -> NodeVariantKind {
     match node {
         None => NodeVariantKind::None,
-        Some(model::node::ENode::ConstDecl { .. }) => NodeVariantKind::ConstDecl,
+        Some(model::node::ENode::Constant { .. }) => NodeVariantKind::Constant,
         Some(model::node::ENode::TypeCast { .. }) => NodeVariantKind::TypeCast,
-        Some(model::node::ENode::VarDecl { .. }) => NodeVariantKind::VarDecl,
+        Some(model::node::ENode::Source { .. }) => NodeVariantKind::Source,
         Some(model::node::ENode::FunctionCall { .. }) => NodeVariantKind::FunctionCall,
         Some(model::node::ENode::Pattern { .. }) => NodeVariantKind::Pattern,
         Some(_) => NodeVariantKind::Other,
@@ -536,11 +536,11 @@ fn type_choice_of(t: &model::r#type::EType) -> TypeChoice {
 
 fn type_choice_label(t: TypeChoice) -> &'static str {
     match t {
-        TypeChoice::String => "string",
-        TypeChoice::Char => "char",
-        TypeChoice::Bool => "bool",
-        TypeChoice::Int => "int",
-        TypeChoice::None => "none",
+        TypeChoice::String => "String",
+        TypeChoice::Char => "Char",
+        TypeChoice::Bool => "Bool",
+        TypeChoice::Int => "Integer",
+        TypeChoice::None => "None",
     }
 }
 
@@ -641,8 +641,8 @@ fn setup_scene(mut commands: Commands) {
     ));
 }
 
-/// Spawn the AST node meshes.
-fn spawn_ast_nodes(
+/// Spawn the graph node meshes.
+fn spawn_graph_nodes(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -650,7 +650,7 @@ fn spawn_ast_nodes(
     mut materials_edge: ResMut<Assets<edge::EdgeMaterial>>,
     mut images: ResMut<Assets<Image>>,
     edge_labels: Option<Res<edge::EdgeLabelTextures>>,
-    state: Res<AstState>,
+    state: Res<GraphState>,
     ui_font: Res<UiFont>,
     pick: Res<PickState>,
     editor_mode: Res<EditorMode>,
@@ -661,15 +661,15 @@ fn spawn_ast_nodes(
     // Type inference resolves edges, and every edge (pattern branches included)
     // lives in the program-level edge table — so flatten once here instead of
     // per anchor, and hand the same view to the renderer and the edge pass.
-    let flat_ast = state.program_ast().flattened_ast();
-    for walked in state.layout_ast.walk_all() {
+    let flat_graph = state.root_graph().flattened_graph();
+    for walked in state.layout_graph.walk_all() {
         let layout_node = walked.layout_node;
         let node_id = &layout_node.node_id;
-        let node = walked.layout_ast.ast.nodes.get(node_id).unwrap();
+        let node = walked.layout_graph.graph.nodes.get(node_id).unwrap();
         let render_node = render::layoutnode_to_rendernode(
             layout_node,
-            walked.layout_ast,
-            &flat_ast,
+            walked.layout_graph,
+            &flat_graph,
             &state.function_declarations,
             walked.extra_offset,
         );
@@ -681,10 +681,10 @@ fn spawn_ast_nodes(
                     Mesh3d(meshes.add(obj.mesh)),
                     MeshMaterial3d(materials.add(obj.material)),
                     obj.transform,
-                    AstNodeEntity {
+                    NodeEntity {
                         node_id: node_id.clone(),
                     },
-                    AstSceneEntity,
+                    SceneEntity,
                 ))
                 .id(),
             None => commands
@@ -692,10 +692,10 @@ fn spawn_ast_nodes(
                     Transform::from_translation(render::cell_center_world(
                         layout_node.pos + walked.extra_offset,
                     )),
-                    AstNodeEntity {
+                    NodeEntity {
                         node_id: node_id.clone(),
                     },
-                    AstSceneEntity,
+                    SceneEntity,
                 ))
                 .id(),
         };
@@ -721,7 +721,7 @@ fn spawn_ast_nodes(
                     })),
                     Transform::IDENTITY,
                     Visibility::Inherited,
-                    AstSceneEntity,
+                    SceneEntity,
                 ));
             }
         }
@@ -760,13 +760,13 @@ fn spawn_ast_nodes(
                         Mesh3d(meshes.add(body.mesh)),
                         MeshMaterial3d(materials.add(body.material)),
                         body.transform,
-                        AstSceneEntity,
+                        SceneEntity,
                     ));
                 }
 
                 // The anchor itself is now mesh-less: screen-space hover picking
                 // only needs its GlobalTransform, positioned at the cuboid centre.
-                let layout_anchor = walked.layout_ast.layout_anchor(anchor_id.clone());
+                let layout_anchor = walked.layout_graph.layout_anchor(anchor_id.clone());
                 let spawned = commands
                     .spawn((
                         Transform::from_translation(pick_center),
@@ -778,7 +778,7 @@ fn spawn_ast_nodes(
                                 id: anchor_id.clone(),
                             },
                         },
-                        AstSceneEntity,
+                        SceneEntity,
                     ))
                     .id();
                 anchor_entities.insert(anchor_id.clone(), spawned);
@@ -788,7 +788,7 @@ fn spawn_ast_nodes(
         node_entites.insert(node_id.clone(), node_entity.clone());
 
         render_node.labels.into_iter().for_each(|l| {
-            spawn_world_label(&mut commands, &ui_font.0, l, AstSceneEntity);
+            spawn_world_label(&mut commands, &ui_font.0, l, SceneEntity);
         });
     }
 
@@ -803,7 +803,7 @@ fn spawn_ast_nodes(
         let value_font =
             ab_glyph::FontRef::try_from_slice(edge::FONT_BYTES).expect("bundled font is valid");
 
-        for e in state.program_ast().edges() {
+        for e in state.root_graph().edges() {
             let src_id = &e.from_anchor.anchor_id;
             let tgt_id = &e.to_anchor.anchor_id;
 
@@ -814,7 +814,7 @@ fn spawn_ast_nodes(
                 continue;
             };
 
-            let src_type = infer::anchor_type(&flat_ast, src_id, &state.function_declarations)
+            let src_type = infer::anchor_type(&flat_graph, src_id, &state.function_declarations)
                 .unwrap_or(infer::EType::Pending);
             let source_leaves = render::ordered_supported_leaves(&src_type);
             if source_leaves.is_empty() {
@@ -824,19 +824,19 @@ fn spawn_ast_nodes(
             // A target that constrains nothing renders as tall as what arrives,
             // so the ribbons must use that same type — otherwise every leaf
             // would collapse onto the anchor's first row.
-            let tgt_type = infer::anchor_type(&flat_ast, tgt_id, &state.function_declarations)
+            let tgt_type = infer::anchor_type(&flat_graph, tgt_id, &state.function_declarations)
                 .or_else(|| {
-                    infer::incoming_anchor_type(&flat_ast, tgt_id, &state.function_declarations)
+                    infer::incoming_anchor_type(&flat_graph, tgt_id, &state.function_declarations)
                 });
             let target_leaves = tgt_type
                 .as_ref()
                 .map(|t| render::ordered_supported_leaves(t))
                 .unwrap_or_default();
 
-            // AST-level literal on the source anchor. When present, the sole
+            // graph-level literal on the source anchor. When present, the sole
             // rendered leaf swaps to the thin "value line" style — same rule
             // the anchor markers follow, via the same lookup.
-            let src_ast_value = infer::anchor_literal(&flat_ast, src_id);
+            let src_graph_value = infer::anchor_literal(&flat_graph, src_id);
 
             let curve = edge::EdgeCurve::from_endpoints(from_world, to_world);
 
@@ -849,7 +849,7 @@ fn spawn_ast_nodes(
                     },
                     Transform::IDENTITY,
                     Visibility::Inherited,
-                    AstSceneEntity,
+                    SceneEntity,
                 ))
                 .id();
 
@@ -870,7 +870,7 @@ fn spawn_ast_nodes(
                 let Some(kind) = edge::leaf_kind_of(leaf) else {
                     continue;
                 };
-                let (height, label, line_mode) = if let Some(value) = src_ast_value.as_deref() {
+                let (height, label, line_mode) = if let Some(value) = src_graph_value.as_deref() {
                     let text = format!("  {}  {}  ", value, kind.type_name());
                     let handle = value_marquee_cache
                         .entry((kind, text.clone()))
@@ -908,14 +908,14 @@ fn spawn_ast_nodes(
                         label,
                     })),
                     ChildOf(edge_root),
-                    AstSceneEntity,
+                    SceneEntity,
                 ));
             }
         }
     }
 
-    for walked_ast in state.program_ast().walk_all_asts() {
-        let Some(bounds) = walked_ast.layout_ast.ast_grid_bounds() else {
+    for walked_graph in state.root_graph().walk_all_graphs() {
+        let Some(bounds) = walked_graph.layout_graph.grid_bounds() else {
             continue;
         };
         let width_cells = (bounds.max.x - bounds.min.x + 1) as f32;
@@ -930,8 +930,8 @@ fn spawn_ast_nodes(
             0.0,
             (bounds.min.z + bounds.max.z + 1) as f32 * 0.5,
         );
-        let world_center = render::layout_to_world(center_local + walked_ast.extra_offset);
-        let offset = walked_ast.extra_offset;
+        let world_center = render::layout_to_world(center_local + walked_graph.extra_offset);
+        let offset = walked_graph.extra_offset;
         // `layout_range_to_world` re-normalises min/max: LAYOUT_SCALE negates
         // Z, so scaling the corners individually would yield an inverted rect
         // and the shader would draw no border at all.
@@ -942,13 +942,13 @@ fn spawn_ast_nodes(
         );
         let border_min = Vec2::new(border_lo.x, border_lo.z);
         let border_max = Vec2::new(border_hi.x, border_hi.z);
-        // Collect multi-cell node footprints in this LayoutAst and convert
+        // Collect multi-cell node footprints in this LayoutGraph and convert
         // to world-space XZ rects. Fed to the grid shader to suppress
         // interior grid lines inside merged fields.
         let mut footprints = [Vec4::ZERO; grid::MAX_FOOTPRINTS];
         let mut footprint_count: u32 = 0;
-        for id in walked_ast.layout_ast.layout_nodes.keys() {
-            let Some(fp) = walked_ast.layout_ast.node_footprint(id) else {
+        for id in walked_graph.layout_graph.layout_nodes.keys() {
+            let Some(fp) = walked_graph.layout_graph.node_footprint(id) else {
                 continue;
             };
             if (fp.max.x - fp.min.x) == 0 && (fp.max.z - fp.min.z) == 0 {
@@ -956,7 +956,7 @@ fn spawn_ast_nodes(
             }
             if (footprint_count as usize) >= grid::MAX_FOOTPRINTS {
                 warn!(
-                    "grid: more than {} footprints in one AST; truncating",
+                    "grid: more than {} footprints in one graph; truncating",
                     grid::MAX_FOOTPRINTS
                 );
                 break;
@@ -976,26 +976,26 @@ fn spawn_ast_nodes(
                 border_max,
                 footprint_count,
                 footprints,
-                ..grid::GridMaterial::ast_surface(Vec3::X, Vec3::Z)
+                ..grid::GridMaterial::scope_surface(Vec3::X, Vec3::Z)
             })),
             Transform::from_translation(world_center),
-            AstGridEntity {
-                context: walked_ast.context.clone(),
-                origin_offset: walked_ast.extra_offset,
+            ScopeGridEntity {
+                context: walked_graph.context.clone(),
+                origin_offset: walked_graph.extra_offset,
                 min: bounds.min,
                 max: bounds.max,
             },
-            AstSceneEntity,
+            SceneEntity,
         ));
 
-        // Program scope: the graph volume's two Z faces, drawn in the same
+        // root scope: the graph volume's two Z faces, drawn in the same
         // style as the Y plane the scope sits on. The front face is the Z=0
         // plane — the face of the source row that looks toward the origin,
         // where the removed wall used to stand — and the back face is the far
         // side of the Sink's cell, the volume's last Z edge. Both span the
-        // AST's bounding box in X and Y, so the three surfaces together frame
+        // graph's bounding box in X and Y, so the three surfaces together frame
         // the volume the graph grows in.
-        if walked_ast.context.is_empty() {
+        if walked_graph.context.is_empty() {
             let height_cells = (bounds.max.y - bounds.min.y + 1) as f32;
             let size_y = height_cells * render::LAYOUT_SCALE.y.abs();
             // Cells are corner-anchored on Y too, so the face is centred on
@@ -1005,13 +1005,13 @@ fn spawn_ast_nodes(
                     (bounds.min.x + bounds.max.x + 1) as f32 * 0.5,
                     (bounds.min.y + bounds.max.y + 1) as f32 * 0.5,
                     0.0,
-                ) + walked_ast.extra_offset,
+                ) + walked_graph.extra_offset,
             );
             // Front at the near corner of the first row, back at the far
             // corner of the Sink's row — hence `max.z + 1`.
             for z_cell in [bounds.min.z, bounds.max.z + 1] {
                 let face_z = render::layout_to_world(
-                    Vec3::new(0.0, 0.0, z_cell as f32) + walked_ast.extra_offset,
+                    Vec3::new(0.0, 0.0, z_cell as f32) + walked_graph.extra_offset,
                 )
                 .z;
                 commands.spawn((
@@ -1023,10 +1023,10 @@ fn spawn_ast_nodes(
                         ),
                     ),
                     MeshMaterial3d(
-                        materials_grid.add(grid::GridMaterial::ast_surface(Vec3::X, Vec3::Y)),
+                        materials_grid.add(grid::GridMaterial::scope_surface(Vec3::X, Vec3::Y)),
                     ),
                     Transform::from_xyz(face_center.x, face_center.y, face_z),
-                    AstSceneEntity,
+                    SceneEntity,
                 ));
             }
         }
@@ -1045,7 +1045,7 @@ fn spawn_ast_nodes(
                     Mesh3d(meshes.add(edge.mesh)),
                     MeshMaterial3d(materials.add(edge.material)),
                     edge.transform,
-                    AstSceneEntity,
+                    SceneEntity,
                 ));
             }
         }
@@ -1056,7 +1056,7 @@ fn spawn_ast_nodes(
                     MeshMaterial3d(materials.add(face.material)),
                     face.transform,
                     CaretBlink,
-                    AstSceneEntity,
+                    SceneEntity,
                 ));
             }
         }
@@ -1093,7 +1093,7 @@ fn spawn_ast_nodes(
                 transform: Transform::from_xyz(0.0, 0.0, z),
                 ..default()
             },
-            AstSceneEntity,
+            SceneEntity,
         ));
     }
     */
@@ -1113,12 +1113,15 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
         Display::Flex,
     );
     for (label, action) in [
-        ("Add ConstDecl", EAstActionButton::AddConstDeclButton),
-        ("Add VarDecl", EAstActionButton::AddVarDeclButton),
-        ("Add FunctionCall", EAstActionButton::AddFunctionCallButton),
-        ("Add Match", EAstActionButton::AddMatchButton),
-        ("Add Pattern", EAstActionButton::AddPatternButton),
-        ("Add TypeCast", EAstActionButton::AddTypeCastButton),
+        ("Add Constant", EGraphActionButton::AddConstantButton),
+        ("Add Source", EGraphActionButton::AddSourceButton),
+        (
+            "Add FunctionCall",
+            EGraphActionButton::AddFunctionCallButton,
+        ),
+        ("Add Match", EGraphActionButton::AddMatchButton),
+        ("Add Pattern", EGraphActionButton::AddPatternButton),
+        ("Add TypeCast", EGraphActionButton::AddTypeCastButton),
     ] {
         y_offset += 36.0;
         spawn_ui_button(
@@ -1245,7 +1248,7 @@ fn spawn_hamburger_button(commands: &mut Commands, pos: Vec2) {
 
 fn handle_delete_node_button(
     interaction_q: Query<&Interaction, (Changed<Interaction>, With<DeleteNodeButton>)>,
-    mut state: ResMut<AstState>,
+    mut state: ResMut<GraphState>,
     mut rebuild: ResMut<NeedsRebuild>,
     pick: Res<PickState>,
     eval: Res<EvalState>,
@@ -1257,24 +1260,24 @@ fn handle_delete_node_button(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        let Some((caret_ast, local)) = state.caret_ast(&pick) else {
+        let Some((caret_graph, local)) = state.caret_graph(&pick) else {
             continue;
         };
-        let Some(selected_node_id) = caret_ast.node_at(local) else {
+        let Some(selected_node_id) = caret_graph.node_at(local) else {
             continue;
         };
         // Sink and BranchSource are constitutive parts of their scope, not
         // user-placed nodes — neither can be deleted.
         let is_fixture = matches!(
-            caret_ast.ast.nodes.get(&selected_node_id),
+            caret_graph.graph.nodes.get(&selected_node_id),
             Some(model::node::ENode::Sink { .. } | model::node::ENode::BranchSource { .. })
         );
         if is_fixture {
             continue;
         }
-        let updated = caret_ast.minus_node(&selected_node_id);
-        if let Some((caret_ast_mut, _)) = state.caret_ast_mut(&pick) {
-            *caret_ast_mut = updated;
+        let updated = caret_graph.minus_node(&selected_node_id);
+        if let Some((caret_graph_mut, _)) = state.caret_graph_mut(&pick) {
+            *caret_graph_mut = updated;
             // Removing a node can shrink a constraint-less input that fed off
             // it, so shapes have to be recomputed, not just the layout.
             state.resettle();
@@ -1285,24 +1288,28 @@ fn handle_delete_node_button(
 
 fn update_add_pattern_button_visuals(
     pick: Res<PickState>,
-    state: Res<AstState>,
+    state: Res<GraphState>,
     mut button_q: Query<(
         &Interaction,
         &mut BackgroundColor,
         &Children,
-        &EAstActionButton,
+        &EGraphActionButton,
     )>,
     mut text_color_q: Query<&mut TextColor>,
 ) {
     let enabled = matches!(
         state
-            .caret_ast(&pick)
-            .and_then(|(ast, local)| ast.node_at(local).and_then(|id| ast.ast.nodes.get(&id)))
+            .caret_graph(&pick)
+            .and_then(|(layout, local)| {
+                layout
+                    .node_at(local)
+                    .and_then(|id| layout.graph.nodes.get(&id))
+            })
             .cloned(),
         Some(model::node::ENode::Pattern { .. })
     );
     for (interaction, mut bg, children, action) in button_q.iter_mut() {
-        if *action != EAstActionButton::AddPatternButton {
+        if *action != EGraphActionButton::AddPatternButton {
             continue;
         }
         let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
@@ -1328,48 +1335,48 @@ fn update_add_pattern_button_visuals(
 
 fn update_add_generic_button_visuals(
     pick: Res<PickState>,
-    state: Res<AstState>,
+    state: Res<GraphState>,
     mut button_q: Query<(
         &Interaction,
         &mut BackgroundColor,
         &Children,
-        &EAstActionButton,
+        &EGraphActionButton,
     )>,
     mut text_color_q: Query<&mut TextColor>,
 ) {
-    let caret = state.caret_ast(&pick);
+    let caret = state.caret_graph(&pick);
     let pos_free = caret
-        .map(|(ast, local)| ast.node_at(local).is_none())
+        .map(|(layout, local)| layout.node_at(local).is_none())
         .unwrap_or(false);
-    // Source row = the Program scope's whole Z=0 plane; nothing but a VarDecl
-    // may be created there. A VarDecl additionally needs the Y=0 row.
-    let in_program_scope = state
+    // Source row = the root scope's whole Z=0 plane; nothing but a Source
+    // may be created there. A Source additionally needs the Y=0 row.
+    let in_root_scope = state
         .scope_of_caret(&pick)
         .map(|s| s.path.is_empty())
         .unwrap_or(false);
-    let source_row = in_program_scope && caret.map(|(_, local)| local.z == 0).unwrap_or(false);
-    let vardecl_slot = source_row && caret.map(|(_, local)| local.y == 0).unwrap_or(false);
+    let source_row = in_root_scope && caret.map(|(_, local)| local.z == 0).unwrap_or(false);
+    let source_slot = source_row && caret.map(|(_, local)| local.y == 0).unwrap_or(false);
     // The scope's last Z row belongs to its Sink alone.
     let sink_row = caret
-        .map(|(ast, local)| ast.sink_z().is_some_and(|z| local.z >= z))
+        .map(|(layout, local)| layout.sink_z().is_some_and(|z| local.z >= z))
         .unwrap_or(false);
     for (interaction, mut bg, children, action) in button_q.iter_mut() {
-        if *action == EAstActionButton::AddPatternButton {
+        if *action == EGraphActionButton::AddPatternButton {
             continue;
         }
         let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
             continue;
         };
-        let vardecl_locked = *action == EAstActionButton::AddVarDeclButton && !vardecl_slot;
+        let source_locked = *action == EGraphActionButton::AddSourceButton && !source_slot;
         let source_row_locked = source_row
             && matches!(
                 *action,
-                EAstActionButton::AddConstDeclButton
-                    | EAstActionButton::AddFunctionCallButton
-                    | EAstActionButton::AddTypeCastButton
-                    | EAstActionButton::AddMatchButton
+                EGraphActionButton::AddConstantButton
+                    | EGraphActionButton::AddFunctionCallButton
+                    | EGraphActionButton::AddTypeCastButton
+                    | EGraphActionButton::AddMatchButton
             );
-        let enabled = pos_free && !vardecl_locked && !source_row_locked && !sink_row;
+        let enabled = pos_free && !source_locked && !source_row_locked && !sink_row;
         if !enabled {
             bg.0 = Color::srgba(0.10, 0.10, 0.13, 0.9);
             text_color.0 = Color::srgb(0.35, 0.35, 0.4);
@@ -1390,14 +1397,14 @@ fn update_add_generic_button_visuals(
 
 fn update_delete_button_visuals(
     pick: Res<PickState>,
-    state: Res<AstState>,
+    state: Res<GraphState>,
     mut button_q: Query<(&Interaction, &mut BackgroundColor, &Children), With<DeleteNodeButton>>,
     mut text_color_q: Query<&mut TextColor>,
 ) {
-    let enabled = match state.caret_ast(&pick) {
-        Some((ast, local)) => match ast.node_at(local) {
+    let enabled = match state.caret_graph(&pick) {
+        Some((layout, local)) => match layout.node_at(local) {
             Some(id) => !matches!(
-                ast.ast.nodes.get(&id),
+                layout.graph.nodes.get(&id),
                 Some(model::node::ENode::Sink { .. } | model::node::ENode::BranchSource { .. })
             ),
             None => false,
@@ -1432,17 +1439,17 @@ fn handle_add_node_button(
             &Interaction,
             &mut BackgroundColor,
             &Children,
-            &EAstActionButton,
+            &EGraphActionButton,
         ),
-        (Changed<Interaction>, With<EAstActionButton>),
+        (Changed<Interaction>, With<EGraphActionButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
-    mut state: ResMut<AstState>,
+    mut state: ResMut<GraphState>,
     mut orbit: ResMut<camera::OrbitCamera>,
     mut rebuild: ResMut<NeedsRebuild>,
     pick: Res<PickState>,
     mut commands: Commands,
-    scene_entities: Query<Entity, With<AstSceneEntity>>,
+    scene_entities: Query<Entity, With<SceneEntity>>,
     eval: Res<EvalState>,
 ) {
     if is_evaluating(&eval) {
@@ -1458,49 +1465,49 @@ fn handle_add_node_button(
                 let Some(scope) = state.scope_of_caret(&pick) else {
                     continue;
                 };
-                let is_program_scope = scope.path.is_empty();
+                let is_root_scope = scope.path.is_empty();
                 let local = scope.local;
                 let new_pos = local.as_vec3();
-                let scope_ast = state.program_ast().resolve_context(&scope.path);
-                let target_occupied = scope_ast.node_at(local).is_some();
-                if target_occupied && *action != EAstActionButton::AddPatternButton {
+                let scope_graph = state.root_graph().resolve_context(&scope.path);
+                let target_occupied = scope_graph.node_at(local).is_some();
+                if target_occupied && *action != EGraphActionButton::AddPatternButton {
                     continue;
                 }
                 // Every scope reserves its Z=0 plane as the source row. Only a
-                // VarDecl may be created there, and only in the Program scope
+                // Source may be created there, and only in the root scope
                 // — a branch's Z=0 already holds its BranchSource. Refuse
                 // every other creation action defensively.
                 let is_source_row = local.z == 0;
-                let vardecl_allowed = is_source_row && is_program_scope && local.y == 0;
+                let source_allowed = is_source_row && is_root_scope && local.y == 0;
                 // The scope's last Z row belongs to its Sink alone.
-                if scope_ast.sink_z().is_some_and(|z| local.z >= z) {
+                if scope_graph.sink_z().is_some_and(|z| local.z >= z) {
                     continue;
                 }
                 if is_source_row
-                    && !matches!(*action, EAstActionButton::AddPatternButton)
-                    && !(vardecl_allowed && *action == EAstActionButton::AddVarDeclButton)
+                    && !matches!(*action, EGraphActionButton::AddPatternButton)
+                    && !(source_allowed && *action == EGraphActionButton::AddSourceButton)
                 {
                     continue;
                 }
                 let node_id_domain = state.node_id_domain.clone();
                 let anchor_id_domain = state.anchor_id_domain.clone();
                 let (new_layout, new_node_id_domain, new_anchor_id_domain) = match action {
-                    EAstActionButton::AddConstDeclButton => scope_ast.plus_const_decl(
+                    EGraphActionButton::AddConstantButton => scope_graph.plus_constant(
                         model::r#type::EType::Int { value: None },
                         new_pos,
                         node_id_domain,
                         anchor_id_domain,
                     ),
-                    EAstActionButton::AddVarDeclButton => {
-                        // VarDecls occupy the Program scope's source row at
+                    EGraphActionButton::AddSourceButton => {
+                        // Sources occupy the root scope's source row at
                         // (x, 0, 0) — refuse anything else defensively; the
                         // enable-check normally greys the button out first.
-                        if !vardecl_allowed {
+                        if !source_allowed {
                             continue;
                         }
-                        scope_ast.plus_var_decl(new_pos, node_id_domain, anchor_id_domain)
+                        scope_graph.plus_source(new_pos, node_id_domain, anchor_id_domain)
                     }
-                    EAstActionButton::AddFunctionCallButton => scope_ast.plus_function_call(
+                    EGraphActionButton::AddFunctionCallButton => scope_graph.plus_function_call(
                         state
                             .function_declarations
                             .iter()
@@ -1511,30 +1518,30 @@ fn handle_add_node_button(
                         node_id_domain,
                         anchor_id_domain,
                     ),
-                    EAstActionButton::AddTypeCastButton => scope_ast.plus_type_cast(
+                    EGraphActionButton::AddTypeCastButton => scope_graph.plus_type_cast(
                         model::r#type::EType::Int { value: None },
                         new_pos,
                         node_id_domain,
                         anchor_id_domain,
                     ),
-                    EAstActionButton::AddMatchButton => {
-                        scope_ast.plus_match(new_pos, node_id_domain, anchor_id_domain)
+                    EGraphActionButton::AddMatchButton => {
+                        scope_graph.plus_match(new_pos, node_id_domain, anchor_id_domain)
                     }
-                    EAstActionButton::AddPatternButton => match scope_ast.node_at(local) {
+                    EGraphActionButton::AddPatternButton => match scope_graph.node_at(local) {
                         Some(id)
                             if matches!(
-                                scope_ast.ast.nodes.get(&id),
+                                scope_graph.graph.nodes.get(&id),
                                 Some(model::node::ENode::Pattern { .. })
                             ) =>
                         {
                             // The selected Pattern keeps its row, so the caret
                             // stays where it is.
-                            scope_ast.plus_pattern_below(&id, node_id_domain, anchor_id_domain)
+                            scope_graph.plus_pattern_below(&id, node_id_domain, anchor_id_domain)
                         }
                         _ => continue,
                     },
                 };
-                if let Some(target) = state.program_ast_mut().resolve_context_mut(&scope.path) {
+                if let Some(target) = state.root_graph_mut().resolve_context_mut(&scope.path) {
                     *target = new_layout;
                 }
                 state.node_id_domain = new_node_id_domain;
@@ -1589,7 +1596,7 @@ struct NodeEditorFingerprint {
 
 fn sync_node_editor_ui(
     mut commands: Commands,
-    state: Res<AstState>,
+    state: Res<GraphState>,
     pick: Res<PickState>,
     dropdown_state: Res<DropdownState>,
     start_menu: Res<StartMenu>,
@@ -1599,21 +1606,21 @@ fn sync_node_editor_ui(
     editor_children_q: Query<Entity, With<NodeEditorEntity>>,
     mut cache: Local<NodeEditorFingerprint>,
 ) {
-    let caret = state.caret_ast(&pick);
+    let caret = state.caret_graph(&pick);
     // The panel edits the property this address stands for, so it only opens
     // on a node's body cell — never on one of its anchor rows.
-    let node_id = caret.and_then(|(ast, local)| {
-        let id = ast.node_at(local)?;
-        let ln = ast.layout_nodes.get(&id)?;
+    let node_id = caret.and_then(|(layout, local)| {
+        let id = layout.node_at(local)?;
+        let ln = layout.layout_nodes.get(&id)?;
         let node_local = local - ln.pos.round().as_ivec3();
         matches!(ln.shape.role_at(node_local), Some(layout::CellRole::Body)).then_some(id)
     });
     let node = node_id
         .as_ref()
-        .and_then(|id| caret.and_then(|(ast, _)| ast.ast.nodes.get(id)));
+        .and_then(|id| caret.and_then(|(layout, _)| layout.graph.nodes.get(id)));
     let variant = variant_kind(node);
     let type_choice = node.and_then(|n| match n {
-        model::node::ENode::ConstDecl { r#type, .. }
+        model::node::ENode::Constant { r#type, .. }
         | model::node::ENode::TypeCast { r#type, .. }
         | model::node::ENode::Pattern { r#type, .. } => Some(type_choice_of(r#type)),
         _ => None,
@@ -1633,9 +1640,9 @@ fn sync_node_editor_ui(
 
     let editable = matches!(
         variant,
-        NodeVariantKind::ConstDecl
+        NodeVariantKind::Constant
             | NodeVariantKind::TypeCast
-            | NodeVariantKind::VarDecl
+            | NodeVariantKind::Source
             | NodeVariantKind::FunctionCall
             | NodeVariantKind::Pattern
     );
@@ -1679,8 +1686,8 @@ fn sync_node_editor_ui(
     commands
         .entity(panel_entity)
         .with_children(|panel| match node {
-            model::node::ENode::ConstDecl { r#type, .. } => {
-                spawn_editor_label(panel, font, "ConstDecl");
+            model::node::ENode::Constant { r#type, .. } => {
+                spawn_editor_label(panel, font, "Constant");
                 spawn_labeled_row(panel, font, "Type", |slot| {
                     spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
                 });
@@ -1697,7 +1704,7 @@ fn sync_node_editor_ui(
                     });
                 }
             }
-            model::node::ENode::VarDecl { name, r#type, .. } => {
+            model::node::ENode::Source { name, r#type, .. } => {
                 spawn_labeled_row(panel, font, "Name", |slot| {
                     spawn_name_input(slot, font, &node_id, name);
                 });
@@ -1829,7 +1836,7 @@ fn spawn_name_input(
             },
             NodeEditorTextInput {
                 node_id: node_id.clone(),
-                field: NodeEditorField::VarDeclName,
+                field: NodeEditorField::SourceName,
             },
             NodeEditorEntity,
         ))
@@ -1935,7 +1942,7 @@ fn spawn_value_widget(
         model::r#type::EType::None { .. } => {}
         model::r#type::EType::Bool { value } => {
             let current_bool = value.as_deref() == Some("true");
-            let label = value.as_deref().unwrap_or("bool");
+            let label = value.as_deref().unwrap_or("Bool");
             spawn_dropdown_root(
                 panel,
                 font,
@@ -2181,7 +2188,7 @@ fn handle_dropdown_click(
 
 fn handle_dropdown_option_click(
     interaction_q: Query<(&Interaction, &DropdownOption), Changed<Interaction>>,
-    mut state: ResMut<AstState>,
+    mut state: ResMut<GraphState>,
     mut dropdown_state: ResMut<DropdownState>,
     mut rebuild: ResMut<NeedsRebuild>,
 ) {
@@ -2192,13 +2199,13 @@ fn handle_dropdown_option_click(
         match &option.choice {
             DropdownChoice::Type(new_choice) => {
                 let node = state
-                    .layout_ast
-                    .find_node_ast_mut(&option.node_id)
-                    .and_then(|a| a.ast.nodes.get_mut(&option.node_id));
+                    .layout_graph
+                    .find_node_graph_mut(&option.node_id)
+                    .and_then(|a| a.graph.nodes.get_mut(&option.node_id));
                 match node {
-                    Some(model::node::ENode::ConstDecl { r#type, .. })
+                    Some(model::node::ENode::Constant { r#type, .. })
                     | Some(model::node::ENode::TypeCast { r#type, .. })
-                    | Some(model::node::ENode::VarDecl { r#type, .. })
+                    | Some(model::node::ENode::Source { r#type, .. })
                     | Some(model::node::ENode::Pattern { r#type, .. }) => {
                         let value = value_of_etype(r#type);
                         *r#type = make_etype(*new_choice, value);
@@ -2212,13 +2219,13 @@ fn handle_dropdown_option_click(
             }
             DropdownChoice::BoolValue(v) => {
                 let node = state
-                    .layout_ast
-                    .find_node_ast_mut(&option.node_id)
-                    .and_then(|a| a.ast.nodes.get_mut(&option.node_id));
+                    .layout_graph
+                    .find_node_graph_mut(&option.node_id)
+                    .and_then(|a| a.graph.nodes.get_mut(&option.node_id));
                 match node {
-                    Some(model::node::ENode::ConstDecl { r#type, .. })
+                    Some(model::node::ENode::Constant { r#type, .. })
                     | Some(model::node::ENode::TypeCast { r#type, .. })
-                    | Some(model::node::ENode::VarDecl { r#type, .. })
+                    | Some(model::node::ENode::Source { r#type, .. })
                     | Some(model::node::ENode::Pattern { r#type, .. }) => {
                         if let model::r#type::EType::Bool { value } = r#type {
                             *value = Some(if *v { "true" } else { "false" }.to_string());
@@ -2234,15 +2241,17 @@ fn handle_dropdown_option_click(
                 if let Some(new_decl) = decl {
                     let node_id_domain = state.node_id_domain.clone();
                     let anchor_id_domain = state.anchor_id_domain.clone();
-                    if let Some(owning_ast) = state.layout_ast.find_node_ast_mut(&option.node_id) {
-                        let (new_layout, new_node_id_domain, new_anchor_id_domain) = owning_ast
+                    if let Some(owning_graph) =
+                        state.layout_graph.find_node_graph_mut(&option.node_id)
+                    {
+                        let (new_layout, new_node_id_domain, new_anchor_id_domain) = owning_graph
                             .with_function_call_replaced(
                                 &option.node_id,
                                 (new_fn_id.clone(), &new_decl),
                                 node_id_domain,
                                 anchor_id_domain,
                             );
-                        *owning_ast = new_layout;
+                        *owning_graph = new_layout;
                         state.node_id_domain = new_node_id_domain;
                         state.anchor_id_domain = new_anchor_id_domain;
                         state.resettle();
@@ -2257,7 +2266,7 @@ fn handle_dropdown_option_click(
 
 fn handle_value_enable_checkbox(
     interaction_q: Query<(&Interaction, &ValueEnableCheckbox), Changed<Interaction>>,
-    mut state: ResMut<AstState>,
+    mut state: ResMut<GraphState>,
     mut rebuild: ResMut<NeedsRebuild>,
 ) {
     for (interaction, cb) in interaction_q.iter() {
@@ -2265,9 +2274,9 @@ fn handle_value_enable_checkbox(
             continue;
         }
         let r#type = match state
-            .layout_ast
-            .find_node_ast_mut(&cb.node_id)
-            .and_then(|a| a.ast.nodes.get_mut(&cb.node_id))
+            .layout_graph
+            .find_node_graph_mut(&cb.node_id)
+            .and_then(|a| a.graph.nodes.get_mut(&cb.node_id))
         {
             Some(model::node::ENode::TypeCast { r#type, .. })
             | Some(model::node::ENode::Pattern { r#type, .. }) => r#type,
@@ -2289,20 +2298,20 @@ fn handle_value_enable_checkbox(
 
 fn handle_node_editor_text_input(
     input_q: Query<(&NodeEditorTextInput, &TextInput), Changed<TextInput>>,
-    mut state: ResMut<AstState>,
+    mut state: ResMut<GraphState>,
     mut rebuild: ResMut<NeedsRebuild>,
 ) {
     for (editor_input, input) in input_q.iter() {
         let Some(node) = state
-            .layout_ast
-            .find_node_ast_mut(&editor_input.node_id)
-            .and_then(|a| a.ast.nodes.get_mut(&editor_input.node_id))
+            .layout_graph
+            .find_node_graph_mut(&editor_input.node_id)
+            .and_then(|a| a.graph.nodes.get_mut(&editor_input.node_id))
         else {
             continue;
         };
         match editor_input.field {
-            NodeEditorField::VarDeclName => {
-                if let model::node::ENode::VarDecl { name, .. } = node {
+            NodeEditorField::SourceName => {
+                if let model::node::ENode::Source { name, .. } = node {
                     if *name != input.value {
                         *name = input.value.clone();
                         rebuild.0 = true;
@@ -2311,9 +2320,9 @@ fn handle_node_editor_text_input(
             }
             NodeEditorField::Value => {
                 let r#type = match node {
-                    model::node::ENode::ConstDecl { r#type, .. }
+                    model::node::ENode::Constant { r#type, .. }
                     | model::node::ENode::TypeCast { r#type, .. }
-                    | model::node::ENode::VarDecl { r#type, .. }
+                    | model::node::ENode::Source { r#type, .. }
                     | model::node::ENode::Pattern { r#type, .. } => r#type,
                     _ => continue,
                 };
@@ -2343,7 +2352,7 @@ fn handle_evaluate_button(
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut eval: ResMut<EvalState>,
-    state: Res<AstState>,
+    state: Res<GraphState>,
 ) {
     for (interaction, mut bg, children) in interaction_q.iter_mut() {
         let mut color = text_color_q.get_mut(children[0]).unwrap();
@@ -2353,7 +2362,7 @@ fn handle_evaluate_button(
                     // Already showing a modal or running — ignore.
                     continue;
                 }
-                if !infer::sink_has_input(&state.program_ast().ast) {
+                if !infer::sink_has_input(&state.root_graph().graph) {
                     eval.phase = EvalPhase::ErrorModal(
                         "Cannot evaluate, because no node is connected to the sink".to_string(),
                     );
@@ -2361,24 +2370,27 @@ fn handle_evaluate_button(
                 }
                 // Flatten pattern sub-scenes in so eval and var-decl collection
                 // see every node, not just the program-level ones.
-                let ast = state.program_ast().flattened_ast();
-                let var_decls = infer::collect_var_decls(&ast);
-                if !var_decls.is_empty() {
-                    eval.phase = EvalPhase::VarDeclPrompt {
-                        inputs: var_decls
+                let graph = state.root_graph().flattened_graph();
+                let sources = infer::collect_sources(&graph);
+                if !sources.is_empty() {
+                    eval.phase = EvalPhase::SourcePrompt {
+                        inputs: sources
                             .into_iter()
                             .map(|(id, _name)| (id, String::new()))
                             .collect(),
                     };
                 } else {
-                    let user_vardecl_values = std::collections::HashMap::new();
-                    match eval::State::new(&ast, &user_vardecl_values, &state.function_declarations)
-                    {
+                    let user_source_values = std::collections::HashMap::new();
+                    match eval::State::new(
+                        &graph,
+                        &user_source_values,
+                        &state.function_declarations,
+                    ) {
                         Ok(initial) => {
                             eval.phase = EvalPhase::Running {
                                 states: vec![initial],
                                 current: 0,
-                                user_vardecl_values,
+                                user_source_values,
                             };
                         }
                         Err(errors) => {
@@ -2407,14 +2419,14 @@ enum ModalKind {
     None,
     Error,
     Controls,
-    VarDeclPrompt,
+    SourcePrompt,
 }
 
 fn modal_kind(phase: &EvalPhase) -> ModalKind {
     match phase {
         EvalPhase::ErrorModal(_) => ModalKind::Error,
         EvalPhase::ControlsModal => ModalKind::Controls,
-        EvalPhase::VarDeclPrompt { .. } => ModalKind::VarDeclPrompt,
+        EvalPhase::SourcePrompt { .. } => ModalKind::SourcePrompt,
         _ => ModalKind::None,
     }
 }
@@ -2422,7 +2434,7 @@ fn modal_kind(phase: &EvalPhase) -> ModalKind {
 fn sync_modal_ui(
     mut commands: Commands,
     eval: Res<EvalState>,
-    state: Res<AstState>,
+    state: Res<GraphState>,
     ui_font: Res<UiFont>,
     modal_q: Query<Entity, With<ModalEntity>>,
     mut last_kind: Local<ModalKind>,
@@ -2444,19 +2456,19 @@ fn sync_modal_ui(
         EvalPhase::ControlsModal => {
             spawn_controls_modal(&mut commands, &ui_font.0);
         }
-        EvalPhase::VarDeclPrompt { inputs } => {
-            let ast = state.program_ast().flattened_ast();
+        EvalPhase::SourcePrompt { inputs } => {
+            let graph = state.root_graph().flattened_graph();
             let rows: Vec<(model::node::Id, String)> = inputs
                 .iter()
                 .map(|(id, _)| {
-                    let name = match ast.nodes.get(id) {
-                        Some(model::node::ENode::VarDecl { name, .. }) => name.clone(),
+                    let name = match graph.nodes.get(id) {
+                        Some(model::node::ENode::Source { name, .. }) => name.clone(),
                         _ => "?".to_string(),
                     };
                     (id.clone(), name)
                 })
                 .collect();
-            spawn_vardecl_modal(&mut commands, &ui_font.0, rows);
+            spawn_source_modal(&mut commands, &ui_font.0, rows);
         }
         _ => {}
     }
@@ -2644,7 +2656,7 @@ fn spawn_controls_section(
     }
 }
 
-fn spawn_vardecl_modal(
+fn spawn_source_modal(
     commands: &mut Commands,
     font: &Handle<Font>,
     rows: Vec<(model::node::Id, String)>,
@@ -2665,7 +2677,7 @@ fn spawn_vardecl_modal(
             ))
             .with_children(|panel| {
                 panel.spawn((
-                    Text::new("Enter values for the variable declarations:"),
+                    Text::new("Enter values for the sources:"),
                     text_font(font, 16.0),
                     TextColor(Color::srgb(0.95, 0.95, 1.0)),
                     Node {
@@ -2713,7 +2725,7 @@ fn spawn_vardecl_modal(
                                     focused: false,
                                     cursor: 0,
                                 },
-                                ModalVarDeclInput { node_id },
+                                ModalSourceInput { node_id },
                                 ModalEntity,
                             ))
                             .with_children(|input| {
@@ -2905,7 +2917,7 @@ fn handle_start_menu_new_button(
         (Changed<Interaction>, With<StartMenuNewButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
-    mut state: ResMut<AstState>,
+    mut state: ResMut<GraphState>,
     mut rebuild: ResMut<NeedsRebuild>,
     mut start_menu: ResMut<StartMenu>,
     mut pick: ResMut<PickState>,
@@ -2917,8 +2929,8 @@ fn handle_start_menu_new_button(
                 let node_id_domain = state.node_id_domain.clone();
                 let anchor_id_domain = state.anchor_id_domain.clone();
                 let (fresh, new_node_id_domain, new_anchor_id_domain) =
-                    layout::LayoutAst::new(node_id_domain, anchor_id_domain);
-                *state.program_ast_mut() = fresh;
+                    layout::LayoutGraph::new(node_id_domain, anchor_id_domain);
+                *state.root_graph_mut() = fresh;
                 state.node_id_domain = new_node_id_domain;
                 state.anchor_id_domain = new_anchor_id_domain;
                 pick.selected_pos = IVec3::ZERO;
@@ -3146,26 +3158,26 @@ fn handle_modal_evaluate_button(
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut eval: ResMut<EvalState>,
-    state: Res<AstState>,
-    input_q: Query<(&ModalVarDeclInput, &TextInput)>,
+    state: Res<GraphState>,
+    input_q: Query<(&ModalSourceInput, &TextInput)>,
 ) {
     for (interaction, mut bg, children) in interaction_q.iter_mut() {
         let mut color = text_color_q.get_mut(children[0]).unwrap();
         match *interaction {
             Interaction::Pressed => {
-                let ast = state.program_ast().flattened_ast();
-                let mut user_vardecl_values: std::collections::HashMap<
+                let graph = state.root_graph().flattened_graph();
+                let mut user_source_values: std::collections::HashMap<
                     model::node::Id,
                     eval::EValue,
                 > = std::collections::HashMap::new();
                 let mut parse_errors: Vec<String> = Vec::new();
                 for (m, input) in input_q.iter() {
-                    if let Some(model::node::ENode::VarDecl { r#type, name, .. }) =
-                        ast.nodes.get(&m.node_id)
+                    if let Some(model::node::ENode::Source { r#type, name, .. }) =
+                        graph.nodes.get(&m.node_id)
                     {
                         match eval::EValue::parse(r#type, &input.value) {
                             Ok(value) => {
-                                user_vardecl_values.insert(m.node_id.clone(), value);
+                                user_source_values.insert(m.node_id.clone(), value);
                             }
                             Err(error) => parse_errors.push(format!("{}: {}", name, error)),
                         }
@@ -3174,13 +3186,16 @@ fn handle_modal_evaluate_button(
                 if !parse_errors.is_empty() {
                     eval.phase = EvalPhase::ErrorModal(parse_errors.join("\n"));
                 } else {
-                    match eval::State::new(&ast, &user_vardecl_values, &state.function_declarations)
-                    {
+                    match eval::State::new(
+                        &graph,
+                        &user_source_values,
+                        &state.function_declarations,
+                    ) {
                         Ok(initial) => {
                             eval.phase = EvalPhase::Running {
                                 states: vec![initial],
                                 current: 0,
-                                user_vardecl_values,
+                                user_source_values,
                             };
                         }
                         Err(errors) => {
@@ -3251,7 +3266,7 @@ fn handle_eval_step_buttons(
     next_q: Query<&Interaction, (With<NextStepButton>, Changed<Interaction>)>,
     exit_q: Query<&Interaction, (With<ExitEvaluationButton>, Changed<Interaction>)>,
     mut eval: ResMut<EvalState>,
-    state: Res<AstState>,
+    state: Res<GraphState>,
 ) {
     if exit_q.iter().any(|i| *i == Interaction::Pressed) {
         eval.phase = EvalPhase::Idle;
@@ -3265,23 +3280,27 @@ fn handle_eval_step_buttons(
         }
     }
     if next_q.iter().any(|i| *i == Interaction::Pressed) {
-        let ast = state.program_ast().flattened_ast();
+        let graph = state.root_graph().flattened_graph();
         // Compute the next step first (immutable borrow of `eval.phase`), then
         // apply it — `Err` reassigns `eval.phase`, which the borrow would block.
         let step_result = if let EvalPhase::Running {
             states,
             current,
-            user_vardecl_values,
+            user_source_values,
         } = &eval.phase
         {
-            ast.nodes.get(&ast.sink_node_id).cloned().map(|sink_node| {
-                states[*current].eval_next_step(
-                    &ast,
-                    user_vardecl_values,
-                    (ast.sink_node_id.clone(), sink_node),
-                    &state.function_declarations,
-                )
-            })
+            graph
+                .nodes
+                .get(&graph.sink_node_id)
+                .cloned()
+                .map(|sink_node| {
+                    states[*current].eval_next_step(
+                        &graph,
+                        user_source_values,
+                        (graph.sink_node_id.clone(), sink_node),
+                        &state.function_declarations,
+                    )
+                })
         } else {
             None
         };
@@ -3312,7 +3331,7 @@ fn handle_eval_step_buttons(
 
 fn update_step_button_visuals(
     eval: Res<EvalState>,
-    state: Res<AstState>,
+    state: Res<GraphState>,
     mut prev_q: Query<
         (&mut BackgroundColor, &Children),
         (With<PrevStepButton>, Without<NextStepButton>),
@@ -3327,7 +3346,7 @@ fn update_step_button_visuals(
         EvalPhase::Running {
             states, current, ..
         } => {
-            let next_possible = !states[*current].is_evaluated(&state.program_ast().ast);
+            let next_possible = !states[*current].is_evaluated(&state.root_graph().graph);
             (*current > 0, next_possible)
         }
         _ => (false, false),
@@ -3374,7 +3393,7 @@ fn sync_evaluate_button_visibility(
 fn sync_value_labels(
     mut commands: Commands,
     eval: Res<EvalState>,
-    state: Res<AstState>,
+    state: Res<GraphState>,
     ui_font: Res<UiFont>,
     mut existing_q: Query<(Entity, &ValueLabel, &mut Text)>,
 ) {
@@ -3408,7 +3427,7 @@ fn sync_value_labels(
         if kept.contains(id) {
             continue;
         }
-        let Some(layout_node) = state.program_ast().layout_nodes.get(id) else {
+        let Some(layout_node) = state.root_graph().layout_nodes.get(id) else {
             continue;
         };
         let world_pos = render::cell_center_world(layout_node.pos);
@@ -3433,7 +3452,7 @@ fn sync_value_labels(
 }
 
 /// Gentle pulsing animation for nodes.
-fn animate_nodes(time: Res<Time>, mut query: Query<(&AstNodeEntity, &mut Transform)>) {
+fn animate_nodes(time: Res<Time>, mut query: Query<(&NodeEntity, &mut Transform)>) {
     /*
     let t = time.elapsed_seconds();
     for (node_ent, mut transform) in query.iter_mut() {
@@ -3447,9 +3466,9 @@ fn clear_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    state: Res<AstState>,
+    state: Res<GraphState>,
     rebuild: ResMut<NeedsRebuild>,
-    query_ast_entities: Query<Entity, With<AstSceneEntity>>,
+    query_ast_entities: Query<Entity, With<SceneEntity>>,
 ) {
     if rebuild.0 {
         for entity in query_ast_entities.iter() {
@@ -3475,15 +3494,15 @@ fn rebuild_scene(
     materials_edge: ResMut<Assets<edge::EdgeMaterial>>,
     images: ResMut<Assets<Image>>,
     edge_labels: Option<Res<edge::EdgeLabelTextures>>,
-    state: Res<AstState>,
+    state: Res<GraphState>,
     ui_font: Res<UiFont>,
     pick: Res<PickState>,
     editor_mode: Res<EditorMode>,
     mut rebuild: ResMut<NeedsRebuild>,
-    _query_ast_entities: Query<Entity, With<AstSceneEntity>>,
+    _query_scene_entities: Query<Entity, With<SceneEntity>>,
 ) {
     if rebuild.0 {
-        spawn_ast_nodes(
+        spawn_graph_nodes(
             commands,
             meshes,
             materials,
@@ -3532,22 +3551,22 @@ fn spawn_type_markers(
                 Mesh3d(meshes.add(rect.mesh)),
                 MeshMaterial3d(materials.add(rect.material)),
                 rect.transform,
-                AstSceneEntity,
+                SceneEntity,
             ));
         }
         if let Some(label) = label {
-            spawn_world_label(commands, font, label, AstSceneEntity);
+            spawn_world_label(commands, font, label, SceneEntity);
         }
         if let Some(line) = value_line {
             commands.spawn((
                 Mesh3d(meshes.add(line.mesh)),
                 MeshMaterial3d(materials.add(line.material)),
                 line.transform,
-                AstSceneEntity,
+                SceneEntity,
             ));
         }
         if let Some(vlabel) = value_label {
-            spawn_world_label(commands, font, vlabel, AstSceneEntity);
+            spawn_world_label(commands, font, vlabel, SceneEntity);
         }
     }
 }
@@ -3705,7 +3724,7 @@ fn update_mode_display(
 
 fn spawn_breadcrumb_display(mut commands: Commands, ui_font: Res<UiFont>) {
     commands.spawn((
-        Text::new("Program"),
+        Text::new("Root"),
         text_font(&ui_font.0, 12.0),
         TextColor(Color::srgba(0.55, 0.55, 0.65, 0.9)),
         Node {
@@ -3723,7 +3742,7 @@ fn spawn_breadcrumb_display(mut commands: Commands, ui_font: Res<UiFont>) {
 
 fn update_breadcrumb_display(
     pick: Res<PickState>,
-    state: Res<AstState>,
+    state: Res<GraphState>,
     mut text_q: Query<&mut Text, With<BreadcrumbDisplay>>,
 ) {
     let Ok(mut text) = text_q.single_mut() else {
@@ -3733,7 +3752,7 @@ fn update_breadcrumb_display(
         text.0 = "—".to_string();
         return;
     };
-    let mut parts = vec!["Program".to_string()];
+    let mut parts = vec!["Root".to_string()];
     for id in &scope.path {
         parts.push(format!("Pattern({})", id));
     }
@@ -3745,9 +3764,9 @@ fn pick_nodes(
     windows: Query<&Window>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut pick: ResMut<PickState>,
-    node_q: Query<(&AstNodeEntity, &Transform)>,
-    grid_q: Query<(Entity, &AstGridEntity)>,
-    state: Res<AstState>,
+    node_q: Query<(&NodeEntity, &Transform)>,
+    grid_q: Query<(Entity, &ScopeGridEntity)>,
+    state: Res<GraphState>,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
     ui_interactions: Query<&Interaction, With<Button>>,
@@ -3807,8 +3826,8 @@ fn pick_nodes(
     }
     pick.hovered_node = closest.as_ref().map(|(id, _)| id.clone());
 
-    // Ray-plane test against each spawned AST grid. Each AST grid sits at
-    // its own Y (Program scope Y=0; Pattern sub-AST at Pattern's world Y) and
+    // Ray-plane test against each spawned graph grid. Each graph grid sits at
+    // its own Y (root scope Y=0; Pattern sub-graph at Pattern's world Y) and
     // spans a rectangle in local grid coords. Pick the closest rect hit.
     //
     // Every conversion goes through `render::layout_to_world` /
@@ -3867,11 +3886,11 @@ fn pick_nodes(
         if is_click && !press_over_ui && !over_ui {
             if let Some((node_id, _)) = closest {
                 // Lift the node's scope-local position into a global address.
-                if let Some(ctx) = state.program_ast().context_of_node(&node_id) {
-                    let owning_ast = state.program_ast().resolve_context(&ctx);
-                    if let Some(ln) = owning_ast.layout_nodes.get(&node_id) {
+                if let Some(ctx) = state.root_graph().context_of_node(&node_id) {
+                    let owning_graph = state.root_graph().resolve_context(&ctx);
+                    if let Some(ln) = owning_graph.layout_nodes.get(&node_id) {
                         let new_pos =
-                            ln.pos.round().as_ivec3() + state.program_ast().scope_offset(&ctx);
+                            ln.pos.round().as_ivec3() + state.root_graph().scope_offset(&ctx);
                         if pick.selected_pos != new_pos {
                             pick.selected_pos = new_pos;
                             rebuild.0 = true;
@@ -3884,7 +3903,7 @@ fn pick_nodes(
                     rebuild.0 = true;
                 }
             }
-            // Click into truly empty space (no AST grid hit) leaves the
+            // Click into truly empty space (no graph grid hit) leaves the
             // selection unchanged.
         }
     }
@@ -3892,13 +3911,13 @@ fn pick_nodes(
 
 fn highlight_hovered(
     pick: Res<PickState>,
-    state: Res<AstState>,
-    node_q: Query<(&AstNodeEntity, &MeshMaterial3d<StandardMaterial>)>,
+    state: Res<GraphState>,
+    node_q: Query<(&NodeEntity, &MeshMaterial3d<StandardMaterial>)>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
     let selected_node = state
-        .caret_ast(&pick)
-        .and_then(|(ast, local)| ast.node_at(local));
+        .caret_graph(&pick)
+        .and_then(|(layout, local)| layout.node_at(local));
     for (node_ent, mat_handle) in node_q.iter() {
         let Some(mat) = materials.get_mut(&mat_handle.0) else {
             continue;
@@ -3927,25 +3946,25 @@ fn highlight_hovered(
 
 fn update_selection_display(
     pick: Res<PickState>,
-    state: Res<AstState>,
+    state: Res<GraphState>,
     mut display_q: Query<(&mut Text, &mut TextColor), With<SelectionDisplay>>,
 ) {
     let Ok((mut text, mut color)) = display_q.single_mut() else {
         return;
     };
-    let caret = state.caret_ast(&pick);
-    if let Some(id) = caret.and_then(|(ast, local)| ast.node_at(local)) {
-        if let Some(node) = caret.and_then(|(ast, _)| ast.ast.nodes.get(&id)) {
+    let caret = state.caret_graph(&pick);
+    if let Some(id) = caret.and_then(|(layout, local)| layout.node_at(local)) {
+        if let Some(node) = caret.and_then(|(layout, _)| layout.graph.nodes.get(&id)) {
             text.0 = format!(
                 "{} : {}",
                 render::label_for_node(node, &state.function_declarations),
                 match infer::node_output_type(
-                    &state.program_ast().flattened_ast(),
+                    &state.root_graph().flattened_graph(),
                     &id,
                     &state.function_declarations,
                 ) {
                     Some(r#type) => r#type.to_string(),
-                    // Sink and Program produce nothing at all.
+                    // Sink and Root produce nothing at all.
                     None => "-".to_string(),
                 }
             );
@@ -3962,8 +3981,12 @@ fn update_selection_display(
 
 fn update_grid_material(
     pick: Res<PickState>,
-    state: Res<AstState>,
-    grid_q: Query<(Entity, &AstGridEntity, &MeshMaterial3d<grid::GridMaterial>)>,
+    state: Res<GraphState>,
+    grid_q: Query<(
+        Entity,
+        &ScopeGridEntity,
+        &MeshMaterial3d<grid::GridMaterial>,
+    )>,
     mut materials: ResMut<Assets<grid::GridMaterial>>,
 ) {
     // The bordered grid is the one the caret addresses.
@@ -3974,7 +3997,7 @@ fn update_grid_material(
         .as_ref()
         .map(|h| h.world_center)
         .unwrap_or(Vec2::ZERO);
-    for (entity, ast_grid, mat_handle) in grid_q.iter() {
+    for (entity, scope_grid, mat_handle) in grid_q.iter() {
         let Some(mat) = materials.get_mut(&mat_handle.0) else {
             continue;
         };
@@ -3984,7 +4007,7 @@ fn update_grid_material(
         } else {
             mat.hover_active = 0.0;
         }
-        mat.border_active = if Some(ast_grid.context.as_slice()) == caret_path.as_deref() {
+        mat.border_active = if Some(scope_grid.context.as_slice()) == caret_path.as_deref() {
             1.0
         } else {
             0.0
@@ -4064,11 +4087,11 @@ fn text_input_keyboard(
     mut input_q: Query<(&mut TextInput, &Children), With<TextInputBox>>,
     mut text_q: Query<&mut Text, With<TextInputDisplay>>,
     mut key_events: MessageReader<KeyboardInput>,
-    //mut state: ResMut<AstState>,
+    //mut state: ResMut<GraphState>,
     mut orbit: ResMut<camera::OrbitCamera>,
     //    mut rebuild: ResMut<NeedsRebuild>,
     mut commands: Commands,
-    scene_entities: Query<Entity, With<AstSceneEntity>>,
+    scene_entities: Query<Entity, With<SceneEntity>>,
 ) {
     for (mut input, children) in input_q.iter_mut() {
         if !input.focused {
@@ -4154,19 +4177,8 @@ fn text_input_keyboard(
             };
         }
 
-        // Rebuild AST on change
+        // Rebuild graph on change
         if changed && !input.value.is_empty() {
-            /*
-            let tree = crate::ast::parse(&input.value);
-            let (nodes, edges) = crate::layout::compute_layout(&tree);
-            state.expression = input.value.clone();
-            state.nodes = nodes;
-            state.edges = edges;
-
-            for entity in scene_entities.iter() {
-                commands.entity(entity).despawn();
-            }
-            */
             //orbit.auto_rotate = true;
             //rebuild.0 = true;
             //orbit.theta = 0.6;
@@ -4268,7 +4280,7 @@ fn handle_insert_keys(
     text_inputs: Query<&TextInput>,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
-    mut state: ResMut<AstState>,
+    mut state: ResMut<GraphState>,
     mut pick: ResMut<PickState>,
     mut rebuild: ResMut<NeedsRebuild>,
 ) {
@@ -4279,21 +4291,21 @@ fn handle_insert_keys(
     let Some(scope) = state.scope_of_caret(&pick) else {
         return;
     };
-    let scope_ast = state.program_ast().resolve_context(&scope.path);
+    let scope_graph = state.root_graph().resolve_context(&scope.path);
     // The direction the insert pushes, which is also the direction the caret
     // follows it in.
     let (delta, inserted) = if keys.just_pressed(KeyCode::Space) {
-        (IVec3::Z, scope_ast.plus_empty_cell(scope.local))
+        (IVec3::Z, scope_graph.plus_empty_cell(scope.local))
     } else if keys.just_pressed(KeyCode::Enter) {
         if shift {
             (
                 IVec3::Y,
-                scope_ast.plus_empty_slab(layout::Axis::Y, scope.local.y),
+                scope_graph.plus_empty_slab(layout::Axis::Y, scope.local.y),
             )
         } else {
             (
                 IVec3::X,
-                scope_ast.plus_empty_slab(layout::Axis::X, scope.local.x),
+                scope_graph.plus_empty_slab(layout::Axis::X, scope.local.x),
             )
         }
     } else {
@@ -4302,19 +4314,19 @@ fn handle_insert_keys(
     let Some(new_layout) = inserted else {
         return;
     };
-    if let Some(target) = state.program_ast_mut().resolve_context_mut(&scope.path) {
+    if let Some(target) = state.root_graph_mut().resolve_context_mut(&scope.path) {
         *target = new_layout;
     }
     state.resettle();
     pick.selected_pos = state
-        .program_ast()
+        .root_graph()
         .clamp_to_volume(pick.selected_pos + delta);
     rebuild.0 = true;
 }
 
 fn handle_arrow_keys(
     keys: Res<ButtonInput<KeyCode>>,
-    mut state: ResMut<AstState>,
+    mut state: ResMut<GraphState>,
     mut pick: ResMut<PickState>,
     mut rebuild: ResMut<NeedsRebuild>,
     eval: Res<EvalState>,
@@ -4372,11 +4384,12 @@ fn handle_arrow_keys(
         let Some(scope) = state.scope_of_caret(&pick) else {
             return;
         };
-        let scope_ast = state.program_ast().resolve_context(&scope.path);
-        if let Some(node_id) = scope_ast.node_at(scope.local) {
-            let (new_layout, effective_local) = scope_ast.move_node_delta(node_id, delta.as_vec3());
-            let scope_origin = state.program_ast().scope_offset(&scope.path);
-            if let Some(target) = state.program_ast_mut().resolve_context_mut(&scope.path) {
+        let scope_graph = state.root_graph().resolve_context(&scope.path);
+        if let Some(node_id) = scope_graph.node_at(scope.local) {
+            let (new_layout, effective_local) =
+                scope_graph.move_node_delta(node_id, delta.as_vec3());
+            let scope_origin = state.root_graph().scope_offset(&scope.path);
+            if let Some(target) = state.root_graph_mut().resolve_context_mut(&scope.path) {
                 *target = new_layout;
             }
             state.resettle();
@@ -4391,7 +4404,7 @@ fn handle_arrow_keys(
         // ends, and only an explicit action may push them outward — so a move
         // against a face is simply no move at all.
         let target = state
-            .program_ast()
+            .root_graph()
             .clamp_to_volume(pick.selected_pos + delta);
         if target != pick.selected_pos {
             pick.selected_pos = target;
@@ -4494,7 +4507,7 @@ fn drag_update_system(
     hovered: Query<(&GlobalTransform, &EAnchor), With<AnchorHovered>>,
     mut drag: ResMut<DragState>,
     eval: Res<EvalState>,
-    state: Res<AstState>,
+    state: Res<GraphState>,
 ) {
     if is_evaluating(&eval) {
         return;
@@ -4545,7 +4558,7 @@ fn drag_update_system(
         // gelb bleibt statt eine Verbindung zu versprechen, die drag_end
         // ohnehin als Duplikat verwirft.
         let is_duplicate =
-            anchors_already_connected(state.program_ast(), &info.source_anchor_id, &target_id);
+            anchors_already_connected(state.root_graph(), &info.source_anchor_id, &target_id);
         if !is_self && is_opposite_kind && !is_duplicate {
             info.target_anchor_id = Some(target_id);
             info.current_end = tf.translation();
@@ -4556,20 +4569,20 @@ fn drag_update_system(
 /// True if `a` and `b` are already joined by an edge, in either stored
 /// direction.
 ///
-/// `Ast::plus_edge` appends unconditionally, so without this guard reconnecting
+/// `TermGraph::plus_edge` appends unconditionally, so without this guard reconnecting
 /// the same pair stacks a second, perfectly coincident ribbon on the first —
 /// invisible until one of them is deleted. The reverse direction is checked too
 /// because edges recorded before drag-end started normalising to output → input
 /// may still sit the other way around, and `eval::neighbours_of_anchor` treats
 /// both orientations as connected.
 fn anchors_already_connected(
-    layout_ast: &layout::LayoutAst,
+    layout_graph: &layout::LayoutGraph,
     a: &model::anchor::Id,
     b: &model::anchor::Id,
 ) -> bool {
     let joined = |from: &model::anchor::Id, to: &model::anchor::Id| {
-        layout_ast
-            .ast
+        layout_graph
+            .graph
             .edges
             .get(from)
             .is_some_and(|edges| edges.iter().any(|e| e.to == *to))
@@ -4582,7 +4595,7 @@ fn drag_end_system(
     mut drag: ResMut<DragState>,
     mut commands: Commands,
     mut rebuild: ResMut<NeedsRebuild>,
-    mut state: ResMut<AstState>,
+    mut state: ResMut<GraphState>,
     eval: Res<EvalState>,
 ) {
     if is_evaluating(&eval) {
@@ -4603,9 +4616,9 @@ fn drag_end_system(
                 // Defensiv: eine Self-Edge kollabiert die Kurve zu einer
                 // Schlaufe am Anchor. drag_update lässt das nicht zu, aber die
                 // Invariante hier nochmal festnageln.
-                if from != to && !anchors_already_connected(state.program_ast(), &from, &to) {
-                    let updated = state.program_ast().plus_edge(from, to);
-                    *state.program_ast_mut() = updated;
+                if from != to && !anchors_already_connected(state.root_graph(), &from, &to) {
+                    let updated = state.root_graph().plus_edge(from, to);
+                    *state.root_graph_mut() = updated;
                     // A new edge can grow the target's anchor, which changes
                     // its footprint.
                     state.resettle();
@@ -4624,7 +4637,7 @@ fn main() {
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: "AST Visualizer 3D — Bevy + WebGPU".into(),
+                    title: "Expression Visualizer 3D".into(),
                     canvas: Some("#bevy-canvas".into()),
                     fit_canvas_to_parent: true,
                     prevent_default_event_handling: true,
@@ -4638,7 +4651,7 @@ fn main() {
         ))
         .add_plugins(grid::GridPlugin)
         .add_plugins(edge::EdgePlugin)
-        .init_resource::<AstState>()
+        .init_resource::<GraphState>()
         .init_resource::<NeedsRebuild>()
         .init_resource::<PickState>()
         .init_resource::<DragState>()
@@ -4651,7 +4664,7 @@ fn main() {
             (
                 load_ui_font,
                 setup_scene,
-                spawn_ast_nodes,
+                spawn_graph_nodes,
                 spawn_ui,
                 spawn_selection_display,
                 spawn_node_editor_panel,

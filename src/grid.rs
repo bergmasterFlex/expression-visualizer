@@ -99,13 +99,13 @@ pub struct GridMaterial {
 }
 
 impl GridMaterial {
-    /// The style every AST-scope surface shares: the shaded Y plane a scope
+    /// The style every scope surface shares: the shaded Y plane a scope
     /// sits on and the Z faces bounding the graph volume. `axis_u`/`axis_v`
     /// orient the grid on the plane.
     ///
     /// Hover, border and footprints start off — only the interactive Y plane
     /// fills them in, per frame.
-    pub fn ast_surface(axis_u: Vec3, axis_v: Vec3) -> Self {
+    pub fn scope_surface(axis_u: Vec3, axis_v: Vec3) -> Self {
         Self {
             plane_color: LinearRgba::new(0.07, 0.07, 0.1, 0.55),
             line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.4),
