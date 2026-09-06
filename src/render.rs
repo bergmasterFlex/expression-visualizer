@@ -61,8 +61,68 @@ pub fn layout_range_to_world(min: Vec3, max: Vec3, pad: f32) -> (Vec3, Vec3) {
     (a.min(b), a.max(b))
 }
 
-/// Edge thickness of the selection caret's cell outline, in world units.
+/// Edge thickness of the NORMAL-mode caret's cell outline, in world units.
 const CARET_EDGE_THICKNESS: f32 = CELL / 60.0;
+
+/// Alpha of the INSERT-mode caret faces. Nearly solid: the blink is what
+/// keeps the cell behind the caret readable, not the paint.
+const CARET_FACE_ALPHA: f32 = 0.8;
+
+/// Linear brightness the caret faces are painted with, well past white.
+///
+/// The camera tonemaps (TonyMcMapface), which maps a linear 1.0 to roughly
+/// 0.8 on screen — plain white comes out grey. Overdriving the colour puts the
+/// caret back at #FFFFFF after the curve. It only works because the camera
+/// renders HDR; an 8-bit target would clamp this back to 1.0 first.
+const CARET_FACE_GAIN: f32 = 8.0;
+
+/// The INSERT-mode caret: the two faces of the addressed cell that look back
+/// toward the scope origin — the YZ face at the cell's lower X, the XY face at
+/// its lower Z. Those are the planes a `Return` resp. `Space` insert opens
+/// along, so the caret shows the corner the new layer would appear at.
+///
+/// `cell` is a layout address, and layout Y and Z are negated on the way to
+/// world space — which is why the origin-facing side is the world *maximum* on
+/// Z and only X reads the way it looks.
+pub fn cell_caret_faces(cell: Vec3) -> Vec<RenderObject> {
+    let a = layout_to_world(cell);
+    let b = layout_to_world(cell + Vec3::ONE);
+    let (lo, hi) = (a.min(b), a.max(b));
+    let center = (lo + hi) * 0.5;
+    let span = hi - lo;
+    let material = || StandardMaterial {
+        base_color: Color::LinearRgba(LinearRgba::new(
+            CARET_FACE_GAIN,
+            CARET_FACE_GAIN,
+            CARET_FACE_GAIN,
+            CARET_FACE_ALPHA,
+        )),
+        alpha_mode: AlphaMode::Blend,
+        cull_mode: None,
+        unlit: true,
+        // The camera's distance fog reaches unlit materials too, and would
+        // mix a quarter of the background's dark blue into a caret ten cells
+        // out. The caret marks an address, not a place in the scene, so it is
+        // exempt from depth cues.
+        fog_enabled: false,
+        ..default()
+    };
+    vec![
+        // A Rectangle is built in the XY plane, so the YZ face is that quad
+        // turned a quarter turn about Y: its width lands on world Z.
+        RenderObject {
+            mesh: Rectangle::new(span.z, span.y).mesh().build(),
+            material: material(),
+            transform: Transform::from_translation(Vec3::new(lo.x, center.y, center.z))
+                .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
+        },
+        RenderObject {
+            mesh: Rectangle::new(span.x, span.y).mesh().build(),
+            material: material(),
+            transform: Transform::from_translation(Vec3::new(center.x, center.y, hi.z)),
+        },
+    ]
+}
 
 /// Wireframe outline of the cell at `cell`: twelve thin cuboids spanning the
 /// volume from `cell` to `cell + (1,1,1)`. This is the selection caret — it

@@ -403,6 +403,15 @@ struct BreadcrumbDisplay;
 #[derive(Component)]
 struct ModeDisplay;
 
+/// Marker for the INSERT-mode caret faces, which blink instead of standing
+/// still like the NORMAL-mode outline.
+#[derive(Component)]
+struct CaretBlink;
+
+/// Half-period of the caret blink. 530 ms is what text carets have used
+/// forever: calm enough not to nag, quick enough to read as "here".
+const CARET_BLINK_SECONDS: f32 = 0.53;
+
 #[derive(Component)]
 struct TextInput {
     value: String,
@@ -670,6 +679,11 @@ fn setup_scene(mut commands: Commands) {
             clear_color: ClearColorConfig::Custom(Color::srgb(0.031, 0.031, 0.102)),
             ..default()
         },
+        // Render through an HDR texture so colours brighter than white survive
+        // the main pass instead of clamping at 1.0. The INSERT caret is painted
+        // past white on purpose, to land on #FFFFFF once the tonemapper has had
+        // its say.
+        bevy::render::view::Hdr,
         Transform::from_xyz(0.0, 5.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
         OrderIndependentTransparencySettings::default(),
         Msaa::Off,
@@ -729,6 +743,7 @@ fn spawn_ast_nodes(
     state: Res<AstState>,
     ui_font: Res<UiFont>,
     pick: Res<PickState>,
+    editor_mode: Res<EditorMode>,
 ) {
     let mut node_entites = std::collections::HashMap::<model::node::Id, Entity>::new();
     let mut anchor_entities = std::collections::HashMap::<model::anchor::Id, Entity>::new();
@@ -1107,16 +1122,34 @@ fn spawn_ast_nodes(
         }
     }
 
-    // Selection caret: a wireframe box enclosing the addressed cell volume,
-    // from the caret address to address + (1,1,1). Rebuild-driven, like every
-    // other scene entity — caret moves already flag a rebuild.
-    for edge in render::cell_caret_edges(pick.selected_pos.as_vec3()) {
-        commands.spawn((
-            Mesh3d(meshes.add(edge.mesh)),
-            MeshMaterial3d(materials.add(edge.material)),
-            edge.transform,
-            AstSceneEntity,
-        ));
+    // Selection caret, enclosing the addressed cell volume from the caret
+    // address to address + (1,1,1). Rebuild-driven, like every other scene
+    // entity — caret moves and mode switches already flag a rebuild.
+    //
+    // It shows which mode it is in: NORMAL outlines the cell, INSERT fills the
+    // two faces the next insert would open along and blinks like a text caret.
+    match *editor_mode {
+        EditorMode::Normal => {
+            for edge in render::cell_caret_edges(pick.selected_pos.as_vec3()) {
+                commands.spawn((
+                    Mesh3d(meshes.add(edge.mesh)),
+                    MeshMaterial3d(materials.add(edge.material)),
+                    edge.transform,
+                    AstSceneEntity,
+                ));
+            }
+        }
+        EditorMode::Insert => {
+            for face in render::cell_caret_faces(pick.selected_pos.as_vec3()) {
+                commands.spawn((
+                    Mesh3d(meshes.add(face.mesh)),
+                    MeshMaterial3d(materials.add(face.material)),
+                    face.transform,
+                    CaretBlink,
+                    AstSceneEntity,
+                ));
+            }
+        }
     }
 
     /*
@@ -3535,6 +3568,7 @@ fn rebuild_scene(
     state: Res<AstState>,
     ui_font: Res<UiFont>,
     pick: Res<PickState>,
+    editor_mode: Res<EditorMode>,
     mut rebuild: ResMut<NeedsRebuild>,
     _query_ast_entities: Query<Entity, With<AstSceneEntity>>,
 ) {
@@ -3550,6 +3584,7 @@ fn rebuild_scene(
             state,
             ui_font,
             pick,
+            editor_mode,
         );
         rebuild.0 = false;
     }
@@ -3720,6 +3755,22 @@ fn spawn_mode_display(mut commands: Commands, ui_font: Res<UiFont>) {
         ModeDisplay,
         HideDuringStartMenu,
     ));
+}
+
+/// Blink the INSERT-mode caret on a fixed wall-clock cycle, so it keeps its
+/// rhythm across scene rebuilds instead of restarting on every caret move.
+fn blink_caret(time: Res<Time>, mut caret_q: Query<&mut Visibility, With<CaretBlink>>) {
+    let lit = (time.elapsed_secs() / CARET_BLINK_SECONDS) as i64 % 2 == 0;
+    let desired = if lit {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    for mut visibility in caret_q.iter_mut() {
+        if *visibility != desired {
+            *visibility = desired;
+        }
+    }
 }
 
 fn update_mode_display(
@@ -4270,6 +4321,7 @@ fn handle_mode_keys(
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
     mut mode: ResMut<EditorMode>,
+    mut rebuild: ResMut<NeedsRebuild>,
 ) {
     if keyboard_captured(&text_inputs, &start_menu, &eval) {
         return;
@@ -4278,12 +4330,15 @@ fn handle_mode_keys(
         if ev.state != bevy::input::ButtonState::Pressed {
             continue;
         }
-        match &ev.logical_key {
-            bevy::input::keyboard::Key::Escape => *mode = EditorMode::Normal,
-            bevy::input::keyboard::Key::Character(s) if s.as_str() == "i" => {
-                *mode = EditorMode::Insert
-            }
-            _ => {}
+        let next = match &ev.logical_key {
+            bevy::input::keyboard::Key::Escape => EditorMode::Normal,
+            bevy::input::keyboard::Key::Character(s) if s.as_str() == "i" => EditorMode::Insert,
+            _ => continue,
+        };
+        if *mode != next {
+            *mode = next;
+            // The caret is drawn per mode, and it is a scene entity.
+            rebuild.0 = true;
         }
     }
 }
@@ -4746,6 +4801,7 @@ fn main() {
                 update_fps_display,
                 update_breadcrumb_display,
                 update_mode_display,
+                blink_caret,
             ),
         )
         .add_systems(
