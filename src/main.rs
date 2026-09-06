@@ -4061,11 +4061,17 @@ fn text_input_focus(
         With<TextInputBox>,
     >,
     mouse: Res<ButtonInput<MouseButton>>,
-    keys: Res<ButtonInput<KeyCode>>,
+    mut key_events: MessageReader<KeyboardInput>,
     eval: Res<EvalState>,
 ) {
     let clicked_outside = mouse.just_pressed(MouseButton::Left);
     let evaluating = is_evaluating(&eval);
+    // By the layout's reckoning, not the key's position — see
+    // `handle_mode_keys`.
+    let escaped = key_events.read().any(|ev| {
+        ev.state == bevy::input::ButtonState::Pressed
+            && matches!(ev.logical_key, bevy::input::keyboard::Key::Escape)
+    });
 
     for (interaction, mut input, mut border, modal_tag) in input_q.iter_mut() {
         // During evaluation only modal inputs may take focus.
@@ -4080,7 +4086,7 @@ fn text_input_focus(
             input.focused = false;
         }
 
-        if keys.just_pressed(KeyCode::Escape) {
+        if escaped {
             input.focused = false;
         }
 
@@ -4252,8 +4258,14 @@ fn keyboard_captured(
 /// `Esc` also unfocuses a text field, and that case is claimed by
 /// `text_input_focus` — while a field has focus the mode stays put, so the
 /// first `Esc` leaves the field and the second leaves INSERT.
+///
+/// Both are read from `logical_key`, the key the layout produced, not from
+/// `KeyCode`, which names the physical position. A CapsLock remapped to Escape
+/// still reports the CapsLock position, so a `KeyCode::Escape` binding would
+/// never fire for it — and a command letter like `i` would sit wherever QWERTY
+/// puts it, whatever the user actually types.
 fn handle_mode_keys(
-    keys: Res<ButtonInput<KeyCode>>,
+    mut key_events: MessageReader<KeyboardInput>,
     text_inputs: Query<&TextInput>,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
@@ -4262,10 +4274,17 @@ fn handle_mode_keys(
     if keyboard_captured(&text_inputs, &start_menu, &eval) {
         return;
     }
-    if keys.just_pressed(KeyCode::KeyI) {
-        *mode = EditorMode::Insert;
-    } else if keys.just_pressed(KeyCode::Escape) {
-        *mode = EditorMode::Normal;
+    for ev in key_events.read() {
+        if ev.state != bevy::input::ButtonState::Pressed {
+            continue;
+        }
+        match &ev.logical_key {
+            bevy::input::keyboard::Key::Escape => *mode = EditorMode::Normal,
+            bevy::input::keyboard::Key::Character(s) if s.as_str() == "i" => {
+                *mode = EditorMode::Insert
+            }
+            _ => {}
+        }
     }
 }
 
@@ -4699,9 +4718,10 @@ fn main() {
                     update_selection_display,
                     update_grid_material,
                     update_cursor,
-                    text_input_focus,
-                    text_input_keyboard,
-                    handle_mode_keys,
+                    // Mode keys before the text field: while a field has
+                    // focus, Escape belongs to it, and `text_input_focus`
+                    // clears that focus in the same frame.
+                    (handle_mode_keys, text_input_focus, text_input_keyboard).chain(),
                     handle_insert_keys,
                     handle_arrow_keys,
                     trigger_camera_focus_on_selection_change,
