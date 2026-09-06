@@ -242,6 +242,16 @@ struct AstGridEntity {
 #[derive(Resource, Default)]
 struct NeedsRebuild(bool);
 
+/// Editor mode, vim style. NORMAL navigates the caret through the volume the
+/// graph already occupies; INSERT freezes the caret and turns `Space`,
+/// `Return` and `Shift+Return` into the inserts that make room inside it.
+#[derive(Resource, Default, Clone, Copy, PartialEq, Eq)]
+enum EditorMode {
+    #[default]
+    Normal,
+    Insert,
+}
+
 /// Marker for any spawned scene entity (cleaned on rebuild).
 #[derive(Component)]
 struct AstSceneEntity;
@@ -388,6 +398,10 @@ struct FpsDisplay;
 /// UI text showing the scope the caret currently addresses, as a breadcrumb.
 #[derive(Component)]
 struct BreadcrumbDisplay;
+
+/// UI text showing the current `EditorMode`, in the bottom-right corner.
+#[derive(Component)]
+struct ModeDisplay;
 
 #[derive(Component)]
 struct TextInput {
@@ -1174,6 +1188,7 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
         );
     }
 
+    // Bottom-left, opposite the mode indicator in the bottom-right corner.
     spawn_corner_button(
         &mut commands,
         &ui_font.0,
@@ -1189,7 +1204,7 @@ fn spawn_corner_button<C: Bundle>(
     font: &Handle<Font>,
     label: &str,
     component: C,
-    right: Val,
+    left: Val,
     bottom: Val,
 ) {
     commands
@@ -1198,8 +1213,8 @@ fn spawn_corner_button<C: Bundle>(
             Node {
                 position_type: PositionType::Absolute,
                 top: Val::Auto,
-                left: Val::Auto,
-                right,
+                right: Val::Auto,
+                left,
                 bottom,
                 padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
                 border_radius: BorderRadius::all(Val::Px(6.0)),
@@ -2558,14 +2573,18 @@ fn spawn_controls_modal(commands: &mut Commands, font: &Handle<Font>) {
         ("Ctrl + Scroll", "Zoom"),
     ];
     let key_bindings: &[(&str, &str)] = &[
-        ("Arrow keys", "Move selection along the grid"),
-        ("Shift + Up/Down", "Move selection vertically"),
-        ("Ctrl + Arrow", "Move the selected node"),
+        ("Arrow keys", "NORMAL: move selection along the grid"),
+        ("Shift + Up/Down", "NORMAL: move selection vertically"),
+        ("Ctrl + Arrow", "NORMAL: move the selected node"),
         (
             "Ctrl + Shift + Up/Down",
-            "Move the selected node vertically",
+            "NORMAL: move the selected node vertically",
         ),
-        ("Escape", "Unfocus text input"),
+        ("i", "Enter INSERT mode"),
+        ("Space", "INSERT: open a cell behind the caret"),
+        ("Return", "INSERT: open a column (X)"),
+        ("Shift + Return", "INSERT: open a row (Y)"),
+        ("Escape", "Unfocus text input, then leave INSERT"),
     ];
 
     commands
@@ -3687,6 +3706,42 @@ fn update_fps_display(
     };
 }
 
+fn spawn_mode_display(mut commands: Commands, ui_font: Res<UiFont>) {
+    commands.spawn((
+        Text::new("NORMAL"),
+        text_font(&ui_font.0, 14.0),
+        TextColor(Color::srgb(0.6, 0.6, 0.7)),
+        Node {
+            position_type: PositionType::Absolute,
+            bottom: Val::Px(16.0),
+            right: Val::Px(14.0),
+            ..default()
+        },
+        ModeDisplay,
+        HideDuringStartMenu,
+    ));
+}
+
+fn update_mode_display(
+    mode: Res<EditorMode>,
+    mut text_q: Query<(&mut Text, &mut TextColor), With<ModeDisplay>>,
+) {
+    if !mode.is_changed() {
+        return;
+    }
+    let Ok((mut text, mut color)) = text_q.single_mut() else {
+        return;
+    };
+    let (label, tint) = match *mode {
+        EditorMode::Normal => ("NORMAL", Color::srgb(0.6, 0.6, 0.7)),
+        // Green, and brighter than NORMAL: INSERT is the state that changes
+        // the graph, so it should be the one that catches the eye.
+        EditorMode::Insert => ("INSERT", Color::srgb(0.35, 0.85, 0.55)),
+    };
+    text.0 = label.to_string();
+    *color = TextColor(tint);
+}
+
 fn spawn_breadcrumb_display(mut commands: Commands, ui_font: Res<UiFont>) {
     commands.spawn((
         Text::new("Program"),
@@ -4177,14 +4232,113 @@ fn trigger_camera_focus_on_selection_change(
     }
 }
 
+/// True while something other than the graph owns the keyboard: a focused
+/// text field, a modal, the start menu, or a running evaluation. Mode
+/// switching and the INSERT-mode inserts stay out of the way then — otherwise
+/// `i` would both type an `i` and change the mode.
+fn keyboard_captured(
+    text_inputs: &Query<&TextInput>,
+    start_menu: &StartMenu,
+    eval: &EvalState,
+) -> bool {
+    start_menu.showing
+        || modal_is_open(eval)
+        || is_evaluating(eval)
+        || text_inputs.iter().any(|input| input.focused)
+}
+
+/// NORMAL ⇄ INSERT, vim style: `i` enters INSERT, `Esc` returns to NORMAL.
+///
+/// `Esc` also unfocuses a text field, and that case is claimed by
+/// `text_input_focus` — while a field has focus the mode stays put, so the
+/// first `Esc` leaves the field and the second leaves INSERT.
+fn handle_mode_keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    text_inputs: Query<&TextInput>,
+    start_menu: Res<StartMenu>,
+    eval: Res<EvalState>,
+    mut mode: ResMut<EditorMode>,
+) {
+    if keyboard_captured(&text_inputs, &start_menu, &eval) {
+        return;
+    }
+    if keys.just_pressed(KeyCode::KeyI) {
+        *mode = EditorMode::Insert;
+    } else if keys.just_pressed(KeyCode::Escape) {
+        *mode = EditorMode::Normal;
+    }
+}
+
+/// INSERT mode's three room-makers, all acting on the scope the caret
+/// addresses and in that scope's local coordinates: `Space` opens a single
+/// cell in the caret's column, `Return` a whole X column, `Shift+Return` a
+/// whole Y row. Everything at or beyond the caret is pushed one cell outward
+/// and the usual settling cascade grows the scope around it.
+///
+/// The caret rides the insert instead of staying behind in the freed cell,
+/// so it keeps addressing whatever it pointed at. An insert the layout
+/// refuses — it would have to cut a node in half — leaves the graph untouched.
+fn handle_insert_keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    mode: Res<EditorMode>,
+    text_inputs: Query<&TextInput>,
+    start_menu: Res<StartMenu>,
+    eval: Res<EvalState>,
+    mut state: ResMut<AstState>,
+    mut pick: ResMut<PickState>,
+    mut rebuild: ResMut<NeedsRebuild>,
+) {
+    if *mode != EditorMode::Insert || keyboard_captured(&text_inputs, &start_menu, &eval) {
+        return;
+    }
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let Some(scope) = state.scope_of_caret(&pick) else {
+        return;
+    };
+    let scope_ast = state.program_ast().resolve_context(&scope.path);
+    // The direction the insert pushes, which is also the direction the caret
+    // follows it in.
+    let (delta, inserted) = if keys.just_pressed(KeyCode::Space) {
+        (IVec3::Z, scope_ast.plus_empty_cell(scope.local))
+    } else if keys.just_pressed(KeyCode::Enter) {
+        if shift {
+            (
+                IVec3::Y,
+                scope_ast.plus_empty_slab(layout::Axis::Y, scope.local.y),
+            )
+        } else {
+            (
+                IVec3::X,
+                scope_ast.plus_empty_slab(layout::Axis::X, scope.local.x),
+            )
+        }
+    } else {
+        return;
+    };
+    let Some(new_layout) = inserted else {
+        return;
+    };
+    if let Some(target) = state.program_ast_mut().resolve_context_mut(&scope.path) {
+        *target = new_layout;
+    }
+    state.resettle();
+    pick.selected_pos = state
+        .program_ast()
+        .clamp_to_volume(pick.selected_pos + delta);
+    rebuild.0 = true;
+}
+
 fn handle_arrow_keys(
     keys: Res<ButtonInput<KeyCode>>,
     mut state: ResMut<AstState>,
     mut pick: ResMut<PickState>,
     mut rebuild: ResMut<NeedsRebuild>,
     eval: Res<EvalState>,
+    mode: Res<EditorMode>,
 ) {
-    if is_evaluating(&eval) {
+    // INSERT mode freezes the caret: the arrows belong to NORMAL, and moving
+    // a node (Ctrl+arrow) is a NORMAL operation too.
+    if is_evaluating(&eval) || *mode == EditorMode::Insert {
         return;
     }
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
@@ -4507,6 +4661,7 @@ fn main() {
         .init_resource::<EvalState>()
         .init_resource::<StartMenu>()
         .init_resource::<DropdownState>()
+        .init_resource::<EditorMode>()
         .add_systems(
             Startup,
             (
@@ -4518,6 +4673,7 @@ fn main() {
                 spawn_node_editor_panel,
                 spawn_fps_display,
                 spawn_breadcrumb_display,
+                spawn_mode_display,
                 spawn_start_menu,
             )
                 .chain(),
@@ -4545,6 +4701,8 @@ fn main() {
                     update_cursor,
                     text_input_focus,
                     text_input_keyboard,
+                    handle_mode_keys,
+                    handle_insert_keys,
                     handle_arrow_keys,
                     trigger_camera_focus_on_selection_change,
                 ),
@@ -4567,6 +4725,7 @@ fn main() {
                 update_world_labels,
                 update_fps_display,
                 update_breadcrumb_display,
+                update_mode_display,
             ),
         )
         .add_systems(

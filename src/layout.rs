@@ -154,6 +154,35 @@ pub struct AstGridBounds {
     pub max: IVec3,
 }
 
+/// One of the three grid axes, as a value. Lets the INSERT-mode inserts
+/// share one implementation instead of one copy per axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    X,
+    Y,
+    Z,
+}
+
+impl Axis {
+    /// This axis' component of `v`.
+    fn of(self, v: IVec3) -> i32 {
+        match self {
+            Axis::X => v.x,
+            Axis::Y => v.y,
+            Axis::Z => v.z,
+        }
+    }
+
+    /// One cell along this axis, in layout space.
+    fn unit(self) -> Vec3 {
+        match self {
+            Axis::X => Vec3::X,
+            Axis::Y => Vec3::Y,
+            Axis::Z => Vec3::Z,
+        }
+    }
+}
+
 /// Inclusive 3D bounding box in grid cells. Used for match footprint math.
 #[derive(Debug, Clone, Copy)]
 pub struct AABB {
@@ -236,6 +265,15 @@ pub struct LayoutAst {
     /// is the source of truth for the top-level context — the ENode::Program's
     /// own `ast` field is unused in Step 1 and stays empty.
     pub sub_layouts: std::collections::HashMap<crate::model::node::Id, LayoutAst>,
+    /// Volume this scope claims beyond what its nodes occupy: the inclusive
+    /// maximum cell address on X and Y. Whitespace is a first-class part of a
+    /// scope, so the room an INSERT-mode row or column opened stays open even
+    /// while nothing stands in it — bounds derived from the nodes alone would
+    /// renormalise and the graph would merely look shifted.
+    ///
+    /// Z needs no counterpart: the Sink is a node, sits on the scope's last
+    /// row, and only ever moves outward, so it holds the depth open itself.
+    pub reserved_max: IVec2,
 }
 
 impl LayoutAst {
@@ -252,6 +290,7 @@ impl LayoutAst {
         let layout = Self {
             ast,
             layout_nodes: std::collections::HashMap::new(),
+            reserved_max: IVec2::ZERO,
             sub_layouts: std::collections::HashMap::new(),
         }
         ._plus_layout_node(&sink_node_id, Vec3::new(0.0, 0.0, 4.0));
@@ -277,6 +316,7 @@ impl LayoutAst {
         let outer = Self {
             ast: outer_ast,
             layout_nodes: std::collections::HashMap::new(),
+            reserved_max: IVec2::ZERO,
             sub_layouts: std::collections::HashMap::from([(program_id.clone(), program_sub)]),
         };
         (outer, program_id, node_id_domain, anchor_id_domain)
@@ -300,6 +340,7 @@ impl LayoutAst {
                         .into_iter()
                         .filter(|(id, _)| id != node_id)
                         .collect(),
+                    reserved_max: self.reserved_max,
                     sub_layouts: self
                         .sub_layouts
                         .clone()
@@ -315,6 +356,7 @@ impl LayoutAst {
                             .into_iter()
                             .filter(|(id, _)| id != &parent_id)
                             .collect(),
+                        reserved_max: after_pattern.reserved_max,
                         sub_layouts: after_pattern.sub_layouts,
                     }
                 } else {
@@ -329,6 +371,7 @@ impl LayoutAst {
                     Self {
                         ast: self.ast.clone(),
                         layout_nodes: self.layout_nodes.clone(),
+                        reserved_max: self.reserved_max,
                         sub_layouts: self.sub_layouts.clone(),
                     },
                     |acc, pid| Self {
@@ -338,6 +381,7 @@ impl LayoutAst {
                             .into_iter()
                             .filter(|(id, _)| id != pid)
                             .collect(),
+                        reserved_max: acc.reserved_max,
                         sub_layouts: acc
                             .sub_layouts
                             .into_iter()
@@ -352,6 +396,7 @@ impl LayoutAst {
                         .into_iter()
                         .filter(|(id, _)| id != node_id)
                         .collect(),
+                    reserved_max: after_children.reserved_max,
                     sub_layouts: after_children.sub_layouts,
                 }
             }
@@ -363,6 +408,7 @@ impl LayoutAst {
                     .into_iter()
                     .filter(|(id, _)| id != node_id)
                     .collect(),
+                reserved_max: self.reserved_max,
                 sub_layouts: self.sub_layouts.clone(),
             },
         }
@@ -490,6 +536,7 @@ impl LayoutAst {
         let staged = Self {
             ast: self.ast.clone(),
             layout_nodes: self.layout_nodes.clone(),
+            reserved_max: self.reserved_max,
             sub_layouts: self
                 .sub_layouts
                 .iter()
@@ -518,6 +565,7 @@ impl LayoutAst {
         Self {
             ast: staged.ast,
             layout_nodes,
+            reserved_max: staged.reserved_max,
             sub_layouts: staged.sub_layouts,
         }
     }
@@ -657,7 +705,12 @@ impl LayoutAst {
     /// Sub-layouts contribute their own inner_footprint offset by the owner
     /// node's grid position.
     pub fn inner_footprint(&self) -> Option<AABB> {
-        let mut bbox: Option<AABB> = None;
+        // Whitespace the scope reserved is part of it: a branch that opened a
+        // column is that much wider, and the arm around it has to make room.
+        let mut bbox: Option<AABB> = (self.reserved_max != IVec2::ZERO).then(|| AABB {
+            min: IVec3::ZERO,
+            max: self.reserved_max.extend(0),
+        });
         for (id, ln) in &self.layout_nodes {
             let node_bbox = if self.is_match(id) {
                 self.match_footprint(id)
@@ -719,6 +772,7 @@ impl LayoutAst {
         Self {
             ast: self.ast.clone(),
             layout_nodes,
+            reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         }
     }
@@ -901,6 +955,7 @@ impl LayoutAst {
                     )
                 })
                 .collect(),
+            reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         };
 
@@ -933,6 +988,7 @@ impl LayoutAst {
         Self {
             ast: self.ast.clone(),
             layout_nodes: self.layout_nodes.clone(),
+            reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         }
     }
@@ -964,6 +1020,7 @@ impl LayoutAst {
         let layout = Self {
             ast: self.ast.clone(),
             layout_nodes: self.layout_nodes.clone(),
+            reserved_max: self.reserved_max,
             sub_layouts: settled_subs,
         };
         // Branch heights are final now, so pack every arm stack before any
@@ -1065,14 +1122,19 @@ impl LayoutAst {
         layout.settle_sink().harmonize_match_sinks()
     }
 
-    /// Push the Sink back (+Z, away from the wall) so the grid encapsulates
-    /// the deepest node, regardless of where on X/Y it sits. `deepest_z` is
-    /// the maximum over every non-sink node's `node_footprint` max.z (so
-    /// multi-cell owners — function calls, Match footprints extending into
-    /// +Z — are contained too). The sink lands one cell beyond that
-    /// (`deepest_z + 1`), matching the convention the swap constraint already
-    /// produces. Expand-only: the sink never moves back toward the wall,
-    /// preserving the initial roomy corridor.
+    /// Pin the Sink to the scope's terminal corner: X=0 always, and Z far
+    /// enough back that the volume encapsulates the deepest node.
+    ///
+    /// `deepest_z` is the maximum over every non-sink node's `node_footprint`
+    /// max.z (so multi-cell owners — function calls, Match footprints
+    /// extending into +Z — are contained too). The sink lands one cell beyond
+    /// that (`deepest_z + 1`), matching the convention the swap constraint
+    /// already produces. Expand-only on Z: the sink never moves back toward
+    /// the wall, preserving the room already opened behind the graph.
+    ///
+    /// X is not a position the sink owns — it marks where the scope ends, not
+    /// a column in it — so anything that drifted it sideways (a settle push, a
+    /// node move) is undone here.
     fn settle_sink(&self) -> Self {
         let Some(sink_id) = self.sink_id() else {
             return self.clone_shape();
@@ -1080,8 +1142,7 @@ impl LayoutAst {
         let Some(sink_ln) = self.layout_nodes.get(&sink_id) else {
             return self.clone_shape();
         };
-        let sink_pos = sink_ln.pos;
-        let current_sink_z = sink_pos.round().as_ivec3().z;
+        let current_sink_z = sink_ln.pos.round().as_ivec3().z;
 
         let mut deepest_z = i32::MIN;
         for id in self.layout_nodes.keys() {
@@ -1095,17 +1156,15 @@ impl LayoutAst {
                 deepest_z = fp.max.z;
             }
         }
-        if deepest_z == i32::MIN {
-            return self.clone_shape();
-        }
-
-        let new_sink_z = current_sink_z.max(deepest_z + 1);
-        if new_sink_z == current_sink_z {
-            return self.clone_shape();
-        }
+        let new_sink_z = if deepest_z == i32::MIN {
+            current_sink_z
+        } else {
+            current_sink_z.max(deepest_z + 1)
+        };
 
         let mut layout = self.clone_shape();
         if let Some(ln) = layout.layout_nodes.get_mut(&sink_id) {
+            ln.pos.x = 0.0;
             ln.pos.z = new_sink_z as f32;
         }
         layout
@@ -1285,6 +1344,7 @@ impl LayoutAst {
         Self {
             ast: self.ast.plus_edge(from, to),
             layout_nodes: self.layout_nodes.clone(),
+            reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         }
     }
@@ -1321,6 +1381,7 @@ impl LayoutAst {
         let layout = Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&node_id, pos);
@@ -1348,6 +1409,7 @@ impl LayoutAst {
         let layout = Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&node_id, pos);
@@ -1395,6 +1457,7 @@ impl LayoutAst {
         let layout = Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&node_id, pos);
@@ -1470,6 +1533,7 @@ impl LayoutAst {
         let layout = Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            reserved_max: self.reserved_max,
             sub_layouts: self
                 .sub_layouts
                 .clone()
@@ -1508,6 +1572,7 @@ impl LayoutAst {
                     LayoutNode::unshaped(sub_sink_id.clone(), Vec3::new(0.0, 0.0, 2.0)),
                 ),
             ]),
+            reserved_max: IVec2::ZERO,
             sub_layouts: std::collections::HashMap::new(),
         }
     }
@@ -1539,6 +1604,7 @@ impl LayoutAst {
                     Self {
                         ast: self.ast.clone(),
                         layout_nodes: self.layout_nodes.clone(),
+                        reserved_max: self.reserved_max,
                         sub_layouts: self.sub_layouts.clone(),
                     },
                     node_id_domain,
@@ -1579,6 +1645,7 @@ impl LayoutAst {
         let shifted = Self {
             ast: self.ast.clone(),
             layout_nodes: shifted_layout_nodes,
+            reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         };
         let sibling_ids: Vec<crate::model::node::Id> = match shifted.ast.nodes.get(&parent_id) {
@@ -1636,6 +1703,7 @@ impl LayoutAst {
         let with_new = Self {
             ast,
             layout_nodes: shifted.layout_nodes,
+            reserved_max: shifted.reserved_max,
             sub_layouts: shifted
                 .sub_layouts
                 .into_iter()
@@ -1676,6 +1744,7 @@ impl LayoutAst {
                 return Self {
                     ast: self.ast.clone(),
                     layout_nodes: self.layout_nodes.clone(),
+                    reserved_max: self.reserved_max,
                     sub_layouts: self.sub_layouts.clone(),
                 }
             }
@@ -1688,6 +1757,7 @@ impl LayoutAst {
             return Self {
                 ast: self.ast.clone(),
                 layout_nodes: self.layout_nodes.clone(),
+                reserved_max: self.reserved_max,
                 sub_layouts: self.sub_layouts.clone(),
             };
         };
@@ -1712,6 +1782,7 @@ impl LayoutAst {
                     }
                 })
                 .collect(),
+            reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         }
     }
@@ -1731,6 +1802,7 @@ impl LayoutAst {
                 return Self {
                     ast: self.ast.clone(),
                     layout_nodes: self.layout_nodes.clone(),
+                    reserved_max: self.reserved_max,
                     sub_layouts: self.sub_layouts.clone(),
                 }
             }
@@ -1745,6 +1817,7 @@ impl LayoutAst {
                 },
             ),
             layout_nodes: self.layout_nodes.clone(),
+            reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         }
     }
@@ -1770,6 +1843,7 @@ impl LayoutAst {
         let layout = Self {
             ast,
             layout_nodes: self.layout_nodes.clone(),
+            reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&node_id, pos);
@@ -1809,6 +1883,7 @@ impl LayoutAst {
                 .into_iter()
                 .chain([(node_id.clone(), LayoutNode::unshaped(node_id.clone(), pos))])
                 .collect(),
+            reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         }
     }
@@ -1871,22 +1946,27 @@ impl LayoutAst {
 
     /// Compute the grid bounds for this AST in its own local coordinates.
     ///
-    /// - Z range: `[0, sink.z]` where `sink.z` is the single Sink's layout-Z.
-    ///   Both ends are reserved: local Z=0 is the source row (VarDecls in the
-    ///   root scope, the BranchSource in a branch) and `sink.z` belongs to the
-    ///   Sink alone. Returns `None` if no Sink exists.
-    /// - X range: min/max over every node's footprint X-span. Multi-cell
-    ///   footprints (matches, ≥3-input function calls) grow the grid so the
-    ///   extra cell is drawable. If the AST has no nodes at all the sink is
-    ///   the only node — X min/max = 0 (sink is at X=0).
-    /// - Y range: min/max over every node's footprint Y-span. A Match
-    ///   contributes its whole Pattern stack, so a scope containing one spans
-    ///   every row its patterns occupy. Only `scope_at` reads this — the grid
-    ///   mesh is a single plane and uses X/Z alone — but without it a caret on
-    ///   any Pattern below the first row would fall outside every scope.
+    /// The volume is anchored at the scope origin — `min` is always (0,0,0),
+    /// the corner every scope owns. Nodes are what push the far corner out;
+    /// they never pull the near one along, so a graph that moved off the
+    /// origin leaves whitespace behind instead of dragging its volume with it.
     ///
-    /// The bounds follow the nodes and nothing else: the caret cannot widen
-    /// them by moving, since `clamp_to_volume` keeps it inside.
+    /// - Z: `[0, sink.z]` where `sink.z` is the single Sink's layout-Z. Both
+    ///   ends are reserved: local Z=0 is the source row (VarDecls in the root
+    ///   scope, the BranchSource in a branch) and `sink.z` belongs to the Sink
+    ///   alone. Returns `None` if no Sink exists.
+    /// - X / Y: `[0, max]` over every node's footprint, unioned with
+    ///   `reserved_max` — the width and height the scope claims explicitly.
+    ///   Multi-cell footprints (matches, ≥3-input function calls) push the far
+    ///   corner out so their extra cells are drawable; a Match contributes its
+    ///   whole Pattern stack on Y, so a scope containing one spans every row
+    ///   its patterns occupy. That Y span is also what `scope_at` needs — the
+    ///   grid mesh itself is a single plane and uses X/Z alone, but without it
+    ///   a caret on any Pattern below the first row would fall outside every
+    ///   scope.
+    ///
+    /// Only nodes and `reserved_max` decide this: the caret cannot widen the
+    /// volume by moving, since `clamp_to_volume` keeps it inside.
     pub fn ast_grid_bounds(&self) -> Option<AstGridBounds> {
         let sink_z =
             self.layout_nodes
@@ -1897,32 +1977,17 @@ impl LayoutAst {
                     }
                     _ => None,
                 })?;
-        let z_min = 0;
-        let z_max = sink_z;
-        let mut x_min = i32::MAX;
-        let mut x_max = i32::MIN;
-        let mut y_min = i32::MAX;
-        let mut y_max = i32::MIN;
+        let mut max = IVec3::new(self.reserved_max.x, self.reserved_max.y, sink_z);
         for id in self.layout_nodes.keys() {
             let Some(fp) = self.node_footprint(id) else {
                 continue;
             };
-            x_min = x_min.min(fp.min.x);
-            x_max = x_max.max(fp.max.x);
-            y_min = y_min.min(fp.min.y);
-            y_max = y_max.max(fp.max.y);
-        }
-        if x_min == i32::MAX {
-            x_min = 0;
-            x_max = 0;
-        }
-        if y_min == i32::MAX {
-            y_min = 0;
-            y_max = 0;
+            max.x = max.x.max(fp.max.x);
+            max.y = max.y.max(fp.max.y);
         }
         Some(AstGridBounds {
-            min: IVec3::new(x_min, y_min, z_min),
-            max: IVec3::new(x_max, y_max, z_max),
+            min: IVec3::ZERO,
+            max,
         })
     }
 
@@ -1938,6 +2003,133 @@ impl LayoutAst {
             Some(bounds) => global.clamp(bounds.min, bounds.max),
             None => global.max(IVec3::ZERO),
         }
+    }
+
+    /// Whether an insert along `axis` carries `id` along, or leaves it where
+    /// it is.
+    ///
+    /// Three node kinds are scope furniture rather than content in it. The
+    /// BranchSource marks its branch origin and never moves at all; a VarDecl
+    /// marks the program wall, free to slide along X with the other
+    /// declarations but never off Y=0 or Z=0. The Sink is the mirror image at
+    /// the far end: it rides every depth insert, so the volume gains the cell
+    /// that was opened, and holds X=0 for the rest.
+    ///
+    /// None of them refuses an insert — the layer simply opens around them,
+    /// which is what keeps the source row and the terminal where they belong.
+    fn shifts_with(&self, id: &crate::model::node::Id, axis: Axis) -> bool {
+        match self.ast.nodes.get(id) {
+            Some(crate::model::node::ENode::Sink { .. }) => axis == Axis::Z,
+            Some(crate::model::node::ENode::BranchSource { .. }) => false,
+            Some(crate::model::node::ENode::VarDecl { .. }) => axis == Axis::X,
+            _ => true,
+        }
+    }
+
+    /// Open one empty cell at `at`, pushing every node in the same `(x, y)`
+    /// column that starts at or behind it one cell deeper. This is INSERT
+    /// mode's `Space`: room for a node between two others.
+    ///
+    /// Only the caret's own column moves — neighbouring columns keep what
+    /// stands in them — while the Sink rides along, so the scope is one cell
+    /// deeper afterwards even if the column was empty.
+    pub fn plus_empty_cell(&self, at: IVec3) -> Option<Self> {
+        self.plus_empty_layer(Axis::Z, at.z, |fp| {
+            fp.min.x <= at.x && at.x <= fp.max.x && fp.min.y <= at.y && at.y <= fp.max.y
+        })
+    }
+
+    /// Open an empty layer across the whole scope at `cut` on `axis`, pushing
+    /// everything at or beyond it one cell outward. This is INSERT mode's
+    /// `Return` (X) and `Shift+Return` (Y): a whole new column resp. row, so
+    /// the scope volume grows by one cell on that axis.
+    pub fn plus_empty_slab(&self, axis: Axis, cut: i32) -> Option<Self> {
+        self.plus_empty_layer(axis, cut, |_| true)
+    }
+
+    /// Shared body of the INSERT-mode room-makers. Every node the `lane`
+    /// predicate selects and whose footprint starts at or beyond `cut` on
+    /// `axis` moves one cell outward, leaving an empty layer at `cut`.
+    ///
+    /// The volume grows by exactly the layer that was opened, whether or not
+    /// a node had to move for it: a slab insert claims one more cell on
+    /// `reserved_max`, a depth insert takes the Sink along. So a layer opens
+    /// in whitespace just as well as in front of a node.
+    ///
+    /// `None` refuses the insert rather than approximating it when a selected
+    /// footprint straddles `cut`: a node occupies its cells as one piece and
+    /// cannot be stretched around a gap.
+    ///
+    /// Patterns are never tested on their own: their positions live in this
+    /// AST, but the owning Match's footprint already covers them, and a
+    /// Pattern moving alone would tear its branch off the arm it belongs to.
+    /// They ride along with the Match instead.
+    ///
+    /// The nodes that mark the scope itself — the source row, the Sink — stay
+    /// put instead of riding along; `shifts_with` has the rules.
+    fn plus_empty_layer(&self, axis: Axis, cut: i32, lane: impl Fn(&AABB) -> bool) -> Option<Self> {
+        let mut moved: Vec<crate::model::node::Id> = Vec::new();
+        for id in self.layout_nodes.keys() {
+            if self.is_pattern(id) {
+                continue;
+            }
+            let Some(fp) = self.node_footprint(id) else {
+                continue;
+            };
+            if !lane(&fp) {
+                continue;
+            }
+            if axis.of(fp.min) >= cut {
+                if self.shifts_with(id, axis) {
+                    moved.push(id.clone());
+                }
+            } else if axis.of(fp.max) >= cut {
+                return None;
+            }
+        }
+        if axis == Axis::Z {
+            // The Sink is the scope's back wall, not content, so a depth
+            // insert takes it along even when it stands in another column —
+            // that is what makes the opened cell real in an empty column,
+            // where there is nothing else to push.
+            if let Some(sink_id) = self.sink_id() {
+                if !moved.contains(&sink_id) {
+                    moved.push(sink_id);
+                }
+            }
+        }
+        if moved.is_empty() && axis == Axis::Z {
+            // Without a Sink a scope has no depth to open. A slab insert has
+            // nothing to prove: its claim on `reserved_max` is the insert.
+            return None;
+        }
+        let mut layout = self.clone_shape();
+        // Room made is room kept. The bounds are otherwise re-derived from the
+        // node positions alone, so the freed layer would collapse as soon as
+        // the graph normalises and the scope would read as shifted, not wider.
+        if let Some(prev) = self.ast_grid_bounds() {
+            let claim = axis.of(prev.max) + 1;
+            match axis {
+                Axis::X => layout.reserved_max.x = layout.reserved_max.x.max(claim),
+                Axis::Y => layout.reserved_max.y = layout.reserved_max.y.max(claim),
+                // Depth needs no claim of its own: the Sink moved with the
+                // insert and holds the scope open that far.
+                Axis::Z => {}
+            }
+        }
+        for id in &moved {
+            let group = std::iter::once(id.clone()).chain(if self.is_match(id) {
+                self.match_pattern_ids(id)
+            } else {
+                vec![]
+            });
+            for member in group {
+                if let Some(ln) = layout.layout_nodes.get_mut(&member) {
+                    ln.pos += axis.unit();
+                }
+            }
+        }
+        Some(layout)
     }
 
     pub fn edges(&self) -> Vec<LayoutEdge> {
