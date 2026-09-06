@@ -1,6 +1,19 @@
 #[derive(Clone)]
 pub struct State {
     pub node_ids_to_values: std::collections::HashMap<crate::model::node::Id, EValue>,
+    /// Why a node produced `none`. `None` says only *that* no value was
+    /// produced, never *why*, so the why lives beside the value rather than
+    /// inside it: session-only, unreadable by the evaluated program, gone with
+    /// the run — the relation a program has to a stack trace.
+    ///
+    /// Invariant: only ever written by `with_produced`, and only together with
+    /// a value. `main.rs` measures a step's progress by the value map alone
+    /// and relies on that.
+    ///
+    /// An entry exists iff the node itself produced the `none`. A node that
+    /// merely passes one on carries no entry — the reason belongs to the
+    /// operation that failed, and the edges already show the way back to it.
+    pub trace: std::collections::HashMap<crate::model::node::Id, String>,
 }
 
 #[derive(Clone)]
@@ -9,13 +22,42 @@ pub enum EValue {
     Int(i32),
     String(String),
     Char(char),
-    None(String),
+    None,
+}
+
+/// A produced value and, when that value is `none`, the reason for it.
+///
+/// The reason travels beside the value and never inside it. `reason` is
+/// private and `none_because` is the only way to set it, so a reason cannot
+/// be attached to anything but a `none`.
+pub struct Produced {
+    value: EValue,
+    reason: Option<String>,
+}
+
+impl From<EValue> for Produced {
+    fn from(value: EValue) -> Self {
+        Self {
+            value,
+            reason: None,
+        }
+    }
+}
+
+impl Produced {
+    fn none_because(reason: String) -> Self {
+        Self {
+            value: EValue::None,
+            reason: Some(reason),
+        }
+    }
 }
 
 impl State {
     fn empty() -> Self {
         Self {
             node_ids_to_values: std::collections::HashMap::new(),
+            trace: std::collections::HashMap::new(),
         }
     }
 
@@ -105,15 +147,30 @@ impl State {
         }
     }
 
-    fn with_value(&self, node_id: &crate::model::node::Id, value: EValue) -> Self {
+    /// Record what `node_id` produced: the value always, the reason only when
+    /// the node itself could not produce one. `Option` is an iterator of zero
+    /// or one, so the trace entry needs no branch of its own.
+    fn with_produced(&self, node_id: &crate::model::node::Id, produced: Produced) -> Self {
         Self {
             node_ids_to_values: self
                 .node_ids_to_values
                 .clone()
                 .into_iter()
-                .chain(vec![(node_id.clone(), value)])
+                .chain(vec![(node_id.clone(), produced.value)])
+                .collect(),
+            trace: self
+                .trace
+                .clone()
+                .into_iter()
+                .chain(produced.reason.map(|reason| (node_id.clone(), reason)))
                 .collect(),
         }
+    }
+
+    /// Record a value that this node did not compute itself — it was passed on
+    /// from somewhere else, so there is nothing to explain here.
+    fn with_value(&self, node_id: &crate::model::node::Id, value: EValue) -> Self {
+        self.with_produced(node_id, value.into())
     }
 
     fn merged_with(self, other: Self) -> Self {
@@ -123,6 +180,7 @@ impl State {
                 .into_iter()
                 .chain(other.node_ids_to_values)
                 .collect(),
+            trace: self.trace.into_iter().chain(other.trace).collect(),
         }
     }
 
@@ -179,11 +237,11 @@ impl State {
                                 Self::eval_value_for_function_call(function_declaration, arguments)
                             })
                     })
-                    .map(|value| self.with_value(node_id, value))
+                    .map(|produced| self.with_produced(node_id, produced))
                     .map_err(|error| vec![error])
             }
             crate::model::node::ENode::Constant { r#type, .. } => Self::eval_value_for_type(r#type)
-                .map(|value| self.with_value(node_id, value))
+                .map(|produced| self.with_produced(node_id, produced))
                 .map_err(|error| vec![error]),
             crate::model::node::ENode::TypeCast {
                 r#type,
@@ -193,7 +251,7 @@ impl State {
                 .get(&input_anchor)
                 .ok_or_else(|| vec!["no value found for input anchor for type cast".to_string()])
                 .map(|value| {
-                    self.with_value(
+                    self.with_produced(
                         node_id,
                         Self::eval_value_for_type_cast(value.clone(), r#type),
                     )
@@ -315,56 +373,55 @@ impl State {
             (crate::model::r#type::EType::Char { value }, EValue::Char(c)) => value
                 .as_ref()
                 .is_none_or(|v| v.parse::<char>().ok() == Some(*c)),
-            (crate::model::r#type::EType::None { .. }, EValue::None(_)) => true,
+            (crate::model::r#type::EType::None { .. }, EValue::None) => true,
             _ => false,
         }
     }
 
-    fn eval_value_for_type(r#type: crate::model::r#type::EType) -> Result<EValue, String> {
+    fn eval_value_for_type(r#type: crate::model::r#type::EType) -> Result<Produced, String> {
         match r#type {
             crate::model::r#type::EType::Bool { value } => value
                 .ok_or("bool type did not have a specific value!".to_string())
                 .and_then(|v| {
                     v.parse::<bool>()
-                        .map(EValue::Bool)
+                        .map(|v| EValue::Bool(v).into())
                         .map_err(|_| format!("could not parse \"{}\" as Bool", v))
                 }),
             crate::model::r#type::EType::Int { value } => value
                 .ok_or("int type did not have a specific value!".to_string())
                 .and_then(|v| {
                     v.parse::<i32>()
-                        .map(EValue::Int)
+                        .map(|v| EValue::Int(v).into())
                         .map_err(|_| format!("could not parse \"{}\" as Integer", v))
                 }),
             crate::model::r#type::EType::String { value } => value
-                .map(EValue::String)
+                .map(|v| EValue::String(v).into())
                 .ok_or("string type did not have a specific value!".to_string()),
             crate::model::r#type::EType::Char { value } => value
                 .ok_or("char type did not have a specific value!".to_string())
                 .and_then(|v| {
                     v.parse::<char>()
-                        .map(EValue::Char)
+                        .map(|v| EValue::Char(v).into())
                         .map_err(|_| format!("could not parse \"{}\" as Char", v))
                 }),
-            crate::model::r#type::EType::None { message } => message
-                .map(EValue::None)
-                .ok_or("none type did not have a specific value!".to_string()),
+            // `none` is a single-symbol type: the value is the type, so there
+            // is nothing left to read off and nothing that can be missing.
+            crate::model::r#type::EType::None {} => Ok(EValue::None.into()),
         }
     }
 
     /// Value equality, as `=` and `!=` see it.
     ///
-    /// Two `none`s are equal whatever diagnostic they happen to carry: `none`
-    /// says only *that* no value was produced, so a message must never make
-    /// one `none` distinguishable from another. Values of different kinds are
-    /// simply unequal — the comparison is total and never fails.
+    /// There is exactly one `none`, so two of them are always equal. Values of
+    /// different kinds are simply unequal — the comparison is total and never
+    /// fails.
     fn values_equal(a: &EValue, b: &EValue) -> bool {
         match (a, b) {
             (EValue::Bool(a), EValue::Bool(b)) => a == b,
             (EValue::Int(a), EValue::Int(b)) => a == b,
             (EValue::String(a), EValue::String(b)) => a == b,
             (EValue::Char(a), EValue::Char(b)) => a == b,
-            (EValue::None(_), EValue::None(_)) => true,
+            (EValue::None, EValue::None) => true,
             _ => false,
         }
     }
@@ -382,44 +439,44 @@ impl State {
     fn eval_value_for_function_call(
         function_declaration: &crate::model::function_declaration::FunctionDeclaration,
         arguments: Vec<EValue>,
-    ) -> Result<EValue, String> {
+    ) -> Result<Produced, String> {
         match (function_declaration.name.as_str(), arguments.as_slice()) {
             // Arithmetic. Integer overflow wraps rather than trapping: the
             // language has no exceptions, and none is reserved for the failures
             // the output type actually declares.
-            ("+", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(a.wrapping_add(*b))),
-            ("-", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(a.wrapping_sub(*b))),
-            ("*", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(a.wrapping_mul(*b))),
+            ("+", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(a.wrapping_add(*b)).into()),
+            ("-", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(a.wrapping_sub(*b)).into()),
+            ("*", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(a.wrapping_mul(*b)).into()),
             ("/", [EValue::Int(a), EValue::Int(b)]) => Ok(if *b == 0 {
-                EValue::None("division by zero".to_string())
+                Produced::none_because("division by zero".to_string())
             } else {
-                EValue::Int(a.wrapping_div(*b))
+                EValue::Int(a.wrapping_div(*b)).into()
             }),
             ("mod", [EValue::Int(a), EValue::Int(b)]) => Ok(if *b == 0 {
-                EValue::None("division by zero".to_string())
+                Produced::none_because("division by zero".to_string())
             } else {
-                EValue::Int(a.wrapping_rem(*b))
+                EValue::Int(a.wrapping_rem(*b)).into()
             }),
-            ("neg", [EValue::Int(a)]) => Ok(EValue::Int(a.wrapping_neg())),
+            ("neg", [EValue::Int(a)]) => Ok(EValue::Int(a.wrapping_neg()).into()),
             // Comparison
-            ("=", [a, b]) => Ok(EValue::Bool(Self::values_equal(a, b))),
-            ("!=", [a, b]) => Ok(EValue::Bool(!Self::values_equal(a, b))),
-            ("<", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Bool(a < b)),
-            (">", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Bool(a > b)),
-            ("<=", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Bool(a <= b)),
-            (">=", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Bool(a >= b)),
+            ("=", [a, b]) => Ok(EValue::Bool(Self::values_equal(a, b)).into()),
+            ("!=", [a, b]) => Ok(EValue::Bool(!Self::values_equal(a, b)).into()),
+            ("<", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Bool(a < b).into()),
+            (">", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Bool(a > b).into()),
+            ("<=", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Bool(a <= b).into()),
+            (">=", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Bool(a >= b).into()),
             // Logic. Both operands are already evaluated by the time we get
             // here — a function call asks for every argument, so `&&` and `||`
             // do not short-circuit.
-            ("&&", [EValue::Bool(a), EValue::Bool(b)]) => Ok(EValue::Bool(*a && *b)),
-            ("||", [EValue::Bool(a), EValue::Bool(b)]) => Ok(EValue::Bool(*a || *b)),
-            ("!", [EValue::Bool(a)]) => Ok(EValue::Bool(!a)),
+            ("&&", [EValue::Bool(a), EValue::Bool(b)]) => Ok(EValue::Bool(*a && *b).into()),
+            ("||", [EValue::Bool(a), EValue::Bool(b)]) => Ok(EValue::Bool(*a || *b).into()),
+            ("!", [EValue::Bool(a)]) => Ok(EValue::Bool(!a).into()),
             // String. Indices count characters, not bytes.
-            ("len", [EValue::String(s)]) => Ok(EValue::Int(s.chars().count() as i32)),
+            ("len", [EValue::String(s)]) => Ok(EValue::Int(s.chars().count() as i32).into()),
             ("charAt", [EValue::String(s), EValue::Int(i)]) => {
                 match usize::try_from(*i).ok().and_then(|i| s.chars().nth(i)) {
-                    Some(c) => Ok(EValue::Char(c)),
-                    None => Ok(EValue::None(format!(
+                    Some(c) => Ok(EValue::Char(c).into()),
+                    None => Ok(Produced::none_because(format!(
                         "charAt: index {} out of bounds for string of length {}",
                         i,
                         s.chars().count()
@@ -427,7 +484,7 @@ impl State {
                 }
             }
             ("concat", [left, right]) => match (Self::text_of(left), Self::text_of(right)) {
-                (Some(left), Some(right)) => Ok(EValue::String(left + &right)),
+                (Some(left), Some(right)) => Ok(EValue::String(left + &right).into()),
                 _ => Err(Self::argument_error(function_declaration, &arguments)),
             },
             ("substr", [EValue::String(s), EValue::Int(begin), EValue::Int(length)]) => {
@@ -440,8 +497,8 @@ impl State {
                     (end <= chars.len()).then_some(start..end)
                 });
                 match range {
-                    Some(range) => Ok(EValue::String(chars[range].iter().collect())),
-                    None => Ok(EValue::None(format!(
+                    Some(range) => Ok(EValue::String(chars[range].iter().collect()).into()),
+                    None => Ok(Produced::none_because(format!(
                         "substr: {}..{} out of bounds for string of length {}",
                         begin,
                         begin.saturating_add(*length),
@@ -450,9 +507,9 @@ impl State {
                 }
             }
             // Math
-            ("min", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(*a.min(b))),
-            ("max", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(*a.max(b))),
-            ("abs", [EValue::Int(a)]) => Ok(EValue::Int(a.wrapping_abs())),
+            ("min", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(*a.min(b)).into()),
+            ("max", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(*a.max(b)).into()),
+            ("abs", [EValue::Int(a)]) => Ok(EValue::Int(a.wrapping_abs()).into()),
             // Either the arguments do not fit the signature, or the name is
             // not one of the defined functions at all. Both mean the same
             // thing to the caller: this call cannot be evaluated.
@@ -478,62 +535,81 @@ impl State {
     fn eval_value_for_type_cast(
         input_value: EValue,
         target_type: crate::model::r#type::EType,
-    ) -> EValue {
+    ) -> Produced {
         match &target_type {
             crate::model::r#type::EType::Bool { value: Some(_) }
             | crate::model::r#type::EType::Int { value: Some(_) }
             | crate::model::r#type::EType::String { value: Some(_) }
             | crate::model::r#type::EType::Char { value: Some(_) } => {
-                return Self::eval_value_for_type(target_type).unwrap_or_else(EValue::None);
+                // A literal target type: the cast node authors the value
+                // itself, so a value that does not parse is this node's own
+                // failure and belongs in its trace entry.
+                return Self::eval_value_for_type(target_type)
+                    .unwrap_or_else(Produced::none_because);
             }
             _ => {}
         }
 
-        if let EValue::None(message) = input_value {
-            return EValue::None(message);
+        // `none` passes through every cast, String included: the sad path is
+        // handed on, never turned into an ordinary value that a match would no
+        // longer have to open. The reason stays where it was produced — this
+        // node did not fail, it forwarded.
+        if matches!(input_value, EValue::None) {
+            return EValue::None.into();
         }
 
         let input_type = input_value.type_name();
         match target_type {
             crate::model::r#type::EType::Bool { .. } => match input_value {
-                EValue::Bool(b) => EValue::Bool(b),
-                EValue::Int(i) => EValue::Bool(i != 0),
-                EValue::String(s) => s.parse::<bool>().map(EValue::Bool).unwrap_or_else(|_| {
-                    EValue::None(format!("cannot cast String \"{}\" to Bool", s))
-                }),
-                _ => EValue::None(format!("cannot cast {} to Bool", input_type)),
+                EValue::Bool(b) => EValue::Bool(b).into(),
+                EValue::Int(i) => EValue::Bool(i != 0).into(),
+                EValue::String(s) => s
+                    .parse::<bool>()
+                    .map(|b| EValue::Bool(b).into())
+                    .unwrap_or_else(|_| {
+                        Produced::none_because(format!("cannot cast String \"{}\" to Bool", s))
+                    }),
+                _ => Produced::none_because(format!("cannot cast {} to Bool", input_type)),
             },
             crate::model::r#type::EType::Int { .. } => match input_value {
-                EValue::Bool(b) => EValue::Int(if b { 1 } else { 0 }),
-                EValue::Int(i) => EValue::Int(i),
-                EValue::Char(c) => EValue::Int(c as i32),
-                EValue::String(s) => s.parse::<i32>().map(EValue::Int).unwrap_or_else(|_| {
-                    EValue::None(format!("cannot cast String \"{}\" to Integer", s))
-                }),
-                _ => EValue::None(format!("cannot cast {} to Integer", input_type)),
+                EValue::Bool(b) => EValue::Int(if b { 1 } else { 0 }).into(),
+                EValue::Int(i) => EValue::Int(i).into(),
+                EValue::Char(c) => EValue::Int(c as i32).into(),
+                EValue::String(s) => s
+                    .parse::<i32>()
+                    .map(|i| EValue::Int(i).into())
+                    .unwrap_or_else(|_| {
+                        Produced::none_because(format!("cannot cast String \"{}\" to Integer", s))
+                    }),
+                _ => Produced::none_because(format!("cannot cast {} to Integer", input_type)),
             },
+            // Every remaining kind has a text form, so this cast is total.
             crate::model::r#type::EType::String { .. } => EValue::String(match input_value {
                 EValue::Bool(b) => b.to_string(),
                 EValue::Int(i) => i.to_string(),
                 EValue::String(s) => s,
                 EValue::Char(c) => c.to_string(),
-                EValue::None(message) => message,
-            }),
+                EValue::None => "none".to_string(),
+            })
+            .into(),
             crate::model::r#type::EType::Char { .. } => match input_value {
-                EValue::Char(c) => EValue::Char(c),
+                EValue::Char(c) => EValue::Char(c).into(),
                 EValue::Int(i) => u32::try_from(i)
                     .ok()
                     .and_then(char::from_u32)
-                    .map(EValue::Char)
-                    .unwrap_or_else(|| EValue::None(format!("cannot cast Integer {} to Char", i))),
-                EValue::String(s) => s.parse::<char>().map(EValue::Char).unwrap_or_else(|_| {
-                    EValue::None(format!("cannot cast String \"{}\" to Char", s))
-                }),
-                _ => EValue::None(format!("cannot cast {} to Char", input_type)),
+                    .map(|c| EValue::Char(c).into())
+                    .unwrap_or_else(|| {
+                        Produced::none_because(format!("cannot cast Integer {} to Char", i))
+                    }),
+                EValue::String(s) => s
+                    .parse::<char>()
+                    .map(|c| EValue::Char(c).into())
+                    .unwrap_or_else(|_| {
+                        Produced::none_because(format!("cannot cast String \"{}\" to Char", s))
+                    }),
+                _ => Produced::none_because(format!("cannot cast {} to Char", input_type)),
             },
-            crate::model::r#type::EType::None { message } => {
-                EValue::None(message.unwrap_or_else(|| "none".to_string()))
-            }
+            crate::model::r#type::EType::None {} => EValue::None.into(),
         }
     }
 
@@ -552,7 +628,7 @@ impl std::fmt::Display for EValue {
             EValue::Int(value) => write!(f, "{}", value),
             EValue::String(value) => write!(f, "{}", value),
             EValue::Char(value) => write!(f, "{}", value),
-            EValue::None(_) => write!(f, "none"),
+            EValue::None => write!(f, "none"),
         }
     }
 }
@@ -577,7 +653,9 @@ impl EValue {
                 .parse::<char>()
                 .map(EValue::Char)
                 .map_err(|_| format!("could not parse \"{}\" as Char", raw)),
-            crate::model::r#type::EType::None { .. } => Ok(EValue::None(raw.to_string())),
+            // A Source declared `none` has exactly one possible value, so
+            // whatever was typed there says nothing and is dropped.
+            crate::model::r#type::EType::None { .. } => Ok(EValue::None),
         }
     }
 
@@ -587,7 +665,7 @@ impl EValue {
             EValue::Int(_) => "Integer",
             EValue::String(_) => "String",
             EValue::Char(_) => "Char",
-            EValue::None(_) => "None",
+            EValue::None => "None",
         }
     }
 }

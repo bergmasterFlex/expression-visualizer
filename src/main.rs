@@ -552,7 +552,7 @@ fn make_etype(choice: TypeChoice, value: Option<String>) -> model::r#type::EType
         TypeChoice::Int => model::r#type::EType::Int { value },
         TypeChoice::String => model::r#type::EType::String { value },
         TypeChoice::Char => model::r#type::EType::Char { value },
-        TypeChoice::None => model::r#type::EType::None { message: None },
+        TypeChoice::None => model::r#type::EType::None {},
     }
 }
 
@@ -3947,6 +3947,7 @@ fn highlight_hovered(
 fn update_selection_display(
     pick: Res<PickState>,
     state: Res<GraphState>,
+    eval: Res<EvalState>,
     mut display_q: Query<(&mut Text, &mut TextColor), With<SelectionDisplay>>,
 ) {
     let Ok((mut text, mut color)) = display_q.single_mut() else {
@@ -3955,8 +3956,18 @@ fn update_selection_display(
     let caret = state.caret_graph(&pick);
     if let Some(id) = caret.and_then(|(layout, local)| layout.node_at(local)) {
         if let Some(node) = caret.and_then(|(layout, _)| layout.graph.nodes.get(&id)) {
+            // A `none` says only that no value was produced; the why lives in
+            // the run's trace, and this is where the addressed node gets to
+            // tell it. It is read from the snapshot on screen, so stepping
+            // back drops the line again.
+            let reason = match &eval.phase {
+                EvalPhase::Running {
+                    states, current, ..
+                } => states[*current].trace.get(&id),
+                _ => None,
+            };
             text.0 = format!(
-                "{} : {}",
+                "{} : {}{}",
                 render::label_for_node(node, &state.function_declarations),
                 match infer::node_output_type(
                     &state.root_graph().flattened_graph(),
@@ -3966,7 +3977,10 @@ fn update_selection_display(
                     Some(r#type) => r#type.to_string(),
                     // Sink and Root produce nothing at all.
                     None => "-".to_string(),
-                }
+                },
+                reason
+                    .map(|reason| format!("\n{}", reason))
+                    .unwrap_or_default()
             );
             color.0 = Color::WHITE;
         }

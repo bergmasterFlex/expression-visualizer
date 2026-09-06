@@ -25,27 +25,9 @@ fixed in the thesis** (`/srv/work/git/bsc-thesis`, chapter 3 + appendix), not a
 feature request. The thesis is the specification; where the two disagree, the
 code moves.
 
-Order is by urgency: (C)-(E) must be done before any screenshot is taken,
-because all of them are visible in the UI. (A), the complete function set, and
-(B), the vocabulary rename, are done.
-
-## C. `None` must not carry a payload
-
-`EValue::None(String)` and `model::r#type::EType::None { message }` carry a
-diagnostic message, and `eval_value_for_type_cast` returns that message when
-casting `none` to `String`. **The thesis forbids exactly this** (3.1.2 and the
-rationale *A payload-free None instead of one carrying a message*):
-
-- `None` says *that* no value was produced, never *why*.
-- `none -> String` must yield the string `"none"`, **not** the message text.
-- A readable message would make one `none` distinguishable from another, which
-  breaks the single-symbol type set and makes `=` unsound.
-
-**Where the "why" goes instead:** into an *evaluation trace* the editor records —
-which node produced what, from which input; session-only, not readable by the
-program, not serialised (3.3.5). So: drop the payload from the value, and if the
-diagnostic is worth keeping, move it into a side table keyed by node id that the
-evaluator fills while stepping.
+Order is by urgency: (D) and (E) must be done before any screenshot is taken,
+because both are visible in the UI. (A), the complete function set, (B), the
+vocabulary rename, and (C), the payload-free None, are done.
 
 ## D. Camera: bring it in line with 3.3.2
 
