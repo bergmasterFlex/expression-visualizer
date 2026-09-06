@@ -712,14 +712,30 @@ pub fn layoutnode_to_rendernode(
                     .enumerate()
                     .map(|(i_anchor, anchor_id)| {
                         let input_world = cell(i_anchor as i32, 0, 0);
-                        let input_type = function_declaration
+                        // A parameter that constrains nothing — `=` and `!=`
+                        // take any two values — reads like a TypeCast input:
+                        // whatever arrives, and a neutral body when idle.
+                        let declared = function_declaration
                             .inputs
                             .get(i_anchor)
-                            .map(|param| param.r#type.clone())
-                            .unwrap_or(crate::infer::EType::None);
+                            .and_then(|param| param.r#type.clone());
+                        let shown = declared.or_else(|| {
+                            crate::infer::incoming_anchor_type(
+                                flat_ast,
+                                anchor_id,
+                                function_declarations,
+                            )
+                        });
                         (
                             anchor_id.clone(),
-                            typed_anchor(&input_type, None, input_world, true),
+                            match shown {
+                                Some(t) => typed_anchor(&t, None, input_world, true),
+                                None => RenderAnchor {
+                                    pick_center: input_world,
+                                    type_markers: vec![],
+                                    plain_body: Some(plain_anchor_body(input_world, true)),
+                                },
+                            },
                         )
                     })
                     .chain([(

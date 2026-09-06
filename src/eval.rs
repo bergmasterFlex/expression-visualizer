@@ -353,19 +353,70 @@ impl State {
         }
     }
 
+    /// Value equality, as `=` and `!=` see it.
+    ///
+    /// Two `none`s are equal whatever diagnostic they happen to carry: `none`
+    /// says only *that* no value was produced, so a message must never make
+    /// one `none` distinguishable from another. Values of different kinds are
+    /// simply unequal — the comparison is total and never fails.
+    fn values_equal(a: &EValue, b: &EValue) -> bool {
+        match (a, b) {
+            (EValue::Bool(a), EValue::Bool(b)) => a == b,
+            (EValue::Int(a), EValue::Int(b)) => a == b,
+            (EValue::String(a), EValue::String(b)) => a == b,
+            (EValue::Char(a), EValue::Char(b)) => a == b,
+            (EValue::None(_), EValue::None(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// The text a `Char | String` argument stands for, `None` for any other
+    /// kind. `concat` accepts either on both sides.
+    fn text_of(value: &EValue) -> Option<String> {
+        match value {
+            EValue::String(s) => Some(s.clone()),
+            EValue::Char(c) => Some(c.to_string()),
+            _ => None,
+        }
+    }
+
     fn eval_value_for_function_call(
         function_declaration: &crate::model::function_declaration::FunctionDeclaration,
         arguments: Vec<EValue>,
     ) -> Result<EValue, String> {
         match (function_declaration.name.as_str(), arguments.as_slice()) {
+            // Arithmetic. Integer overflow wraps rather than trapping: the
+            // language has no exceptions, and none is reserved for the failures
+            // the output type actually declares.
             ("+", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(a.wrapping_add(*b))),
-            ("/", [EValue::Int(a), EValue::Int(b)]) => {
-                if *b == 0 {
-                    Ok(EValue::None("division by zero".to_string()))
-                } else {
-                    Ok(EValue::Int(a.wrapping_div(*b)))
-                }
-            }
+            ("-", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(a.wrapping_sub(*b))),
+            ("*", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(a.wrapping_mul(*b))),
+            ("/", [EValue::Int(a), EValue::Int(b)]) => Ok(if *b == 0 {
+                EValue::None("division by zero".to_string())
+            } else {
+                EValue::Int(a.wrapping_div(*b))
+            }),
+            ("mod", [EValue::Int(a), EValue::Int(b)]) => Ok(if *b == 0 {
+                EValue::None("division by zero".to_string())
+            } else {
+                EValue::Int(a.wrapping_rem(*b))
+            }),
+            ("neg", [EValue::Int(a)]) => Ok(EValue::Int(a.wrapping_neg())),
+            // Comparison
+            ("=", [a, b]) => Ok(EValue::Bool(Self::values_equal(a, b))),
+            ("!=", [a, b]) => Ok(EValue::Bool(!Self::values_equal(a, b))),
+            ("<", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Bool(a < b)),
+            (">", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Bool(a > b)),
+            ("<=", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Bool(a <= b)),
+            (">=", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Bool(a >= b)),
+            // Logic. Both operands are already evaluated by the time we get
+            // here — a function call asks for every argument, so `&&` and `||`
+            // do not short-circuit.
+            ("&&", [EValue::Bool(a), EValue::Bool(b)]) => Ok(EValue::Bool(*a && *b)),
+            ("||", [EValue::Bool(a), EValue::Bool(b)]) => Ok(EValue::Bool(*a || *b)),
+            ("!", [EValue::Bool(a)]) => Ok(EValue::Bool(!a)),
+            // String. Indices count characters, not bytes.
+            ("len", [EValue::String(s)]) => Ok(EValue::Int(s.chars().count() as i32)),
             ("charAt", [EValue::String(s), EValue::Int(i)]) => {
                 match usize::try_from(*i).ok().and_then(|i| s.chars().nth(i)) {
                     Some(c) => Ok(EValue::Char(c)),
@@ -376,25 +427,53 @@ impl State {
                     ))),
                 }
             }
-            ("*(-1)", [EValue::Int(a)]) => Ok(EValue::Int(a.wrapping_neg())),
+            ("concat", [left, right]) => match (Self::text_of(left), Self::text_of(right)) {
+                (Some(left), Some(right)) => Ok(EValue::String(left + &right)),
+                _ => Err(Self::argument_error(function_declaration, &arguments)),
+            },
             ("substr", [EValue::String(s), EValue::Int(begin), EValue::Int(length)]) => {
                 let chars = s.chars().collect::<Vec<char>>();
-                let start = usize::try_from(*begin).unwrap_or(0).min(chars.len());
-                let end = start
-                    .saturating_add(usize::try_from(*length).unwrap_or(0))
-                    .min(chars.len());
-                Ok(EValue::String(chars[start..end].iter().collect()))
+                // Out of range is a none, not a clamped substring: a shorter
+                // string than asked for would be a wrong answer, not a missing
+                // one.
+                let range = usize::try_from(*begin).ok().and_then(|start| {
+                    let end = start.checked_add(usize::try_from(*length).ok()?)?;
+                    (end <= chars.len()).then_some(start..end)
+                });
+                match range {
+                    Some(range) => Ok(EValue::String(chars[range].iter().collect())),
+                    None => Ok(EValue::None(format!(
+                        "substr: {}..{} out of bounds for string of length {}",
+                        begin,
+                        begin.saturating_add(*length),
+                        chars.len()
+                    ))),
+                }
             }
-            (name @ ("+" | "/" | "charAt" | "*(-1)" | "substr"), args) => Err(format!(
-                "function {} called with unexpected argument types ({})",
-                name,
-                args.iter()
-                    .map(EValue::type_name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-            (name, _) => Err(format!("unknown function declaration {}", name)),
+            // Math
+            ("min", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(*a.min(b))),
+            ("max", [EValue::Int(a), EValue::Int(b)]) => Ok(EValue::Int(*a.max(b))),
+            ("abs", [EValue::Int(a)]) => Ok(EValue::Int(a.wrapping_abs())),
+            // Either the arguments do not fit the signature, or the name is
+            // not one of the defined functions at all. Both mean the same
+            // thing to the caller: this call cannot be evaluated.
+            _ => Err(Self::argument_error(function_declaration, &arguments)),
         }
+    }
+
+    fn argument_error(
+        function_declaration: &crate::model::function_declaration::FunctionDeclaration,
+        arguments: &[EValue],
+    ) -> String {
+        format!(
+            "function {} cannot be applied to ({})",
+            function_declaration.name,
+            arguments
+                .iter()
+                .map(EValue::type_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     }
 
     fn eval_value_for_type_cast(

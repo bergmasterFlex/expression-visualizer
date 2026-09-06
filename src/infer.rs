@@ -274,7 +274,9 @@ fn anchor_type_uncycled(
                 return Some(declaration.output_type.clone());
             }
             let index = input_anchors.iter().position(|a| a == anchor_id)?;
-            declaration.inputs.get(index).map(|p| p.r#type.clone())
+            // A parameter with no declared type constrains nothing, and
+            // `None` already says exactly that here.
+            declaration.inputs.get(index).and_then(|p| p.r#type.clone())
         }
         crate::model::node::ENode::TypeCast {
             r#type,
