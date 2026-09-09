@@ -594,6 +594,9 @@ fn setup_scene(mut commands: Commands) {
         // past white on purpose, to land on #FFFFFF once the tonemapper has had
         // its say.
         bevy::render::view::Hdr,
+        // The bound mode is the default, so the camera starts orthographic. The
+        // mode switch replaces this component; nothing else touches it.
+        camera::bound_projection(camera::DEFAULT_CELL_PIXELS, camera::RESET_RADIUS, 0.0),
         Transform::from_xyz(0.0, 5.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
         OrderIndependentTransparencySettings::default(),
         Msaa::Off,
@@ -1143,6 +1146,133 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
         Val::Px(12.0),
         Val::Px(12.0),
     );
+    // Directly above it: leaving the bound camera has to be an explicit act,
+    // so it gets a control of its own rather than happening by dragging.
+    spawn_corner_button(
+        &mut commands,
+        &ui_font.0,
+        camera_mode_label(camera::CameraMode::Bound),
+        CameraModeButton,
+        Val::Px(12.0),
+        Val::Px(52.0),
+    );
+    // Beside it, clear of the widest camera label.
+    spawn_corner_checkbox(
+        &mut commands,
+        &ui_font.0,
+        "semi ortho",
+        SemiOrthoCheckbox,
+        Val::Px(150.0),
+        Val::Px(52.0),
+    );
+}
+
+/// Marker for the checkbox that turns the bound mode's convergence on.
+#[derive(Component)]
+struct SemiOrthoCheckbox;
+
+/// Marker on that checkbox's 16×16 swatch, which is what carries the state.
+#[derive(Component)]
+struct SemiOrthoCheckboxBox;
+
+/// A labelled checkbox pinned to a screen corner.
+///
+/// The node editor's checkbox (`spawn_typecast_checkbox_and_value`) is a bare
+/// swatch that gets respawned on every panel rebuild; a corner widget stands
+/// still instead, so this one carries a label, makes the whole row clickable,
+/// and leaves the swatch to a sync system. Colours and size are the panel's, so
+/// the two read as the same control.
+fn spawn_corner_checkbox<C: Bundle>(
+    commands: &mut Commands,
+    font: &Handle<Font>,
+    label: &str,
+    component: C,
+    left: Val,
+    bottom: Val,
+) {
+    commands
+        .spawn((
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Auto,
+                right: Val::Auto,
+                left,
+                bottom,
+                padding: UiRect::axes(Val::Px(10.0), Val::Px(8.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(8.0),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+            component,
+            HideDuringStartMenu,
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Node {
+                    width: Val::Px(16.0),
+                    height: Val::Px(16.0),
+                    border: UiRect::all(Val::Px(1.5)),
+                    border_radius: BorderRadius::all(Val::Px(3.0)),
+                    flex_shrink: 0.0,
+                    ..default()
+                },
+                BackgroundColor(UNCHECKED_COLOR),
+                BorderColor::all(Color::srgb(0.35, 0.35, 0.5)),
+                SemiOrthoCheckboxBox,
+            ));
+            parent.spawn((
+                Text::new(label),
+                text_font(font, 14.0),
+                TextColor(Color::srgb(0.6, 0.6, 0.7)),
+            ));
+        });
+}
+
+const CHECKED_COLOR: Color = Color::srgb(0.133, 0.827, 0.933);
+const UNCHECKED_COLOR: Color = Color::srgba(0.06, 0.06, 0.12, 0.95);
+
+/// Toggle the bound mode's convergence. The projection eases across on its own
+/// clock, so this only flips the intent.
+fn handle_semi_ortho_checkbox(
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<SemiOrthoCheckbox>)>,
+    mut orbit: ResMut<camera::OrbitCamera>,
+) {
+    for interaction in interaction_q.iter() {
+        if *interaction == Interaction::Pressed {
+            orbit.semi_ortho = !orbit.semi_ortho;
+        }
+    }
+}
+
+fn sync_semi_ortho_checkbox(
+    orbit: Res<camera::OrbitCamera>,
+    mut box_q: Query<&mut BackgroundColor, With<SemiOrthoCheckboxBox>>,
+) {
+    let wanted = if orbit.semi_ortho {
+        CHECKED_COLOR
+    } else {
+        UNCHECKED_COLOR
+    };
+    for mut color in box_q.iter_mut() {
+        if color.0 != wanted {
+            color.0 = wanted;
+        }
+    }
+}
+
+/// Marker for the button that switches the camera between its two modes.
+#[derive(Component)]
+struct CameraModeButton;
+
+fn camera_mode_label(mode: camera::CameraMode) -> &'static str {
+    match mode {
+        camera::CameraMode::Bound => "Camera: bound",
+        camera::CameraMode::Free => "Camera: free",
+    }
 }
 
 fn spawn_corner_button<C: Bundle>(
@@ -1445,7 +1575,6 @@ fn handle_add_node_button(
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut state: ResMut<GraphState>,
-    mut orbit: ResMut<camera::OrbitCamera>,
     mut rebuild: ResMut<NeedsRebuild>,
     pick: Res<PickState>,
     mut commands: Commands,
@@ -2345,6 +2474,91 @@ fn handle_node_editor_text_input(
     }
 }
 
+/// Switch the camera between bound and free.
+///
+/// Bound → free matches the free camera's distance to the scale the user was
+/// looking at, so the caret's own plane keeps its size across the change and
+/// what happens visually is the depth of the picture opening up rather than a
+/// jump. Free → bound is a journey back to the default view; the scale setting
+/// is the user's and is left alone.
+fn handle_camera_mode_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (Changed<Interaction>, With<CameraModeButton>),
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+    windows: Query<&Window>,
+    pick: Res<PickState>,
+    mut orbit: ResMut<camera::OrbitCamera>,
+    mut tween: ResMut<camera::CameraTween>,
+) {
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
+        match *interaction {
+            Interaction::Pressed => {
+                let height = windows
+                    .single()
+                    .map(|window| window.height())
+                    .unwrap_or(1080.0);
+                match orbit.mode {
+                    camera::CameraMode::Bound => {
+                        // Hand the free camera the view it is taking over:
+                        // the same distance, the angles the oblique projection
+                        // implies a viewer would stand at, and the field of
+                        // view that keeps the caret's plane the size it
+                        // already is. What is left to notice on the switch is
+                        // then only the real difference — that the axes stop
+                        // being exactly aligned — instead of a new viewpoint
+                        // burying it.
+                        let (theta, phi) = camera::oblique_view_angles();
+                        let visible_world = height / orbit.cell_pixels;
+                        orbit.free_fov =
+                            2.0 * (visible_world * 0.5 / orbit.radius).atan();
+                        orbit.mode = camera::CameraMode::Free;
+                        tween.to_view(&orbit, theta, phi, orbit.radius, orbit.target);
+                    }
+                    camera::CameraMode::Free => {
+                        let radius = camera::bound_radius(&orbit, height);
+                        orbit.mode = camera::CameraMode::Bound;
+                        tween.to_view(
+                            &orbit,
+                            camera::RESET_THETA,
+                            camera::RESET_PHI,
+                            radius,
+                            render::cell_center_world(pick.selected_pos.as_vec3()),
+                        );
+                    }
+                }
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
+                color.0 = Color::srgb(0.6, 0.6, 0.7);
+            }
+        }
+    }
+}
+
+/// Keep the mode button's caption on the mode it will show, not the one it
+/// switches to.
+fn sync_camera_mode_button(
+    orbit: Res<camera::OrbitCamera>,
+    button_q: Query<&Children, With<CameraModeButton>>,
+    mut text_q: Query<&mut Text>,
+) {
+    let label = camera_mode_label(orbit.mode);
+    for children in button_q.iter() {
+        if let Ok(mut text) = text_q.get_mut(children[0]) {
+            if text.0 != label {
+                text.0 = label.to_string();
+            }
+        }
+    }
+}
+
 fn handle_evaluate_button(
     mut interaction_q: Query<
         (&Interaction, &mut BackgroundColor, &Children),
@@ -2523,9 +2737,9 @@ fn spawn_controls_modal(commands: &mut Commands, font: &Handle<Font>) {
     let mouse_bindings: &[(&str, &str)] = &[
         ("Left click", "Select node / grid position"),
         ("Left drag on anchor", "Connect nodes"),
-        ("Ctrl + Left drag", "Orbit camera"),
-        ("Ctrl + Right drag", "Pan camera"),
-        ("Ctrl + Scroll", "Zoom"),
+        ("Ctrl + Left drag", "Free camera: orbit"),
+        ("Ctrl + Right drag", "Free camera: pan"),
+        ("Ctrl + Scroll", "Zoom (bound: cell size, free: distance)"),
     ];
     let key_bindings: &[(&str, &str)] = &[
         ("Arrow keys", "NORMAL: move selection along the grid"),
@@ -3605,13 +3819,19 @@ fn update_world_labels(
     };
 
     for (label, mut node, mut vis, computed) in label_q.iter_mut() {
-        if let Ok(screen_pos) = camera.world_to_viewport(cam_gt, label.world_pos) {
+        // The orthographic view box reaches behind the camera on purpose (see
+        // `camera::bound_projection`), so a point behind it still projects to a
+        // perfectly plausible screen position instead of being rejected. Ask
+        // which side of the camera it is on directly.
+        let offset = label.world_pos - cam_gt.translation();
+        let in_front = cam_gt.forward().dot(offset) > 0.0;
+        let screen = camera.world_to_viewport(cam_gt, label.world_pos);
+        if let (true, Ok(screen_pos)) = (in_front, screen) {
             let size = computed.size();
             node.left = Val::Px(screen_pos.x - size.x / 2.0 + label.offset.x);
             node.top = Val::Px(screen_pos.y - size.y / 2.0 + label.offset.y);
             *vis = Visibility::Visible;
         } else {
-            // Behind camera
             *vis = Visibility::Hidden;
         }
     }
@@ -3704,11 +3924,9 @@ fn blink_caret(time: Res<Time>, mut caret_q: Query<&mut Visibility, With<CaretBl
 
 fn update_mode_display(
     mode: Res<EditorMode>,
+    orbit: Res<camera::OrbitCamera>,
     mut text_q: Query<(&mut Text, &mut TextColor), With<ModeDisplay>>,
 ) {
-    if !mode.is_changed() {
-        return;
-    }
     let Ok((mut text, mut color)) = text_q.single_mut() else {
         return;
     };
@@ -3718,7 +3936,15 @@ fn update_mode_display(
         // the graph, so it should be the one that catches the eye.
         EditorMode::Insert => ("INSERT", Color::srgb(0.35, 0.85, 0.55)),
     };
-    text.0 = label.to_string();
+    // The free camera suspends the guarantees the bound one gives, so it is
+    // worth saying out loud next to the editing mode.
+    let label = match orbit.mode {
+        camera::CameraMode::Bound => label.to_string(),
+        camera::CameraMode::Free => format!("{} · FREE", label),
+    };
+    if text.0 != label {
+        text.0 = label;
+    }
     *color = TextColor(tint);
 }
 
@@ -4101,11 +4327,6 @@ fn text_input_keyboard(
     mut input_q: Query<(&mut TextInput, &Children), With<TextInputBox>>,
     mut text_q: Query<&mut Text, With<TextInputDisplay>>,
     mut key_events: MessageReader<KeyboardInput>,
-    //mut state: ResMut<GraphState>,
-    mut orbit: ResMut<camera::OrbitCamera>,
-    //    mut rebuild: ResMut<NeedsRebuild>,
-    mut commands: Commands,
-    scene_entities: Query<Entity, With<SceneEntity>>,
 ) {
     for (mut input, children) in input_q.iter_mut() {
         if !input.focused {
@@ -4189,14 +4410,6 @@ fn text_input_keyboard(
             } else {
                 input.value.clone()
             };
-        }
-
-        // Rebuild graph on change
-        if changed && !input.value.is_empty() {
-            //orbit.auto_rotate = true;
-            //rebuild.0 = true;
-            //orbit.theta = 0.6;
-            //orbit.phi = 1.0;
         }
     }
 }
@@ -4465,6 +4678,12 @@ fn anchor_hover_system(
     let mut closest: Option<(Entity, f32)> = None;
 
     for (entity, global_tf) in &anchors {
+        // Same reason as in `update_world_labels`: under the orthographic
+        // projection a point behind the camera still projects, so it would
+        // otherwise become a hover target.
+        if cam_tf.forward().dot(global_tf.translation() - cam_tf.translation()) <= 0.0 {
+            continue;
+        }
         let Ok(screen_pos) = camera.world_to_viewport(cam_tf, global_tf.translation()) else {
             continue;
         };
@@ -4745,6 +4964,10 @@ fn main() {
             Update,
             (
                 handle_evaluate_button,
+                handle_camera_mode_button,
+                sync_camera_mode_button,
+                handle_semi_ortho_checkbox,
+                sync_semi_ortho_checkbox,
                 handle_modal_ok_button,
                 handle_controls_modal_ok_button,
                 handle_modal_cancel_button,
