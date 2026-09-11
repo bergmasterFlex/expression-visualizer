@@ -164,12 +164,18 @@ enum EditorMode {
 }
 
 /// What has been typed in INSERT so far, and which suggestion it stands on.
+/// One resource for both prompts — the one that creates and the one that
+/// declares a type — because the caret decides which of them is live, so the
+/// two can never be live at once and a second resource would only add the
+/// question of which one to believe.
 ///
 /// Deliberately **not** a `TextInput`: a focused text field makes
 /// `keyboard_captured` true, and that is what gives `Space`, `Return` and
 /// `Escape` their INSERT meanings. A field here would turn `Space` into a
 /// blank and `Escape` into a mere unfocus — the three behaviours that have to
-/// survive. `selected` indexes the *candidate* list — not the window of it
+/// survive. (The Source *name* is the one place where a real field is right,
+/// and there that is the whole point: it takes the keyboard, and `Escape`
+/// hands it back.) `selected` indexes the *candidate* list — not the window of it
 /// that fits on screen, which is derived from `selected` rather than the other
 /// way round — and is re-clamped on every rebuild rather than trusted.
 #[derive(Resource, Default)]
@@ -248,17 +254,29 @@ const LITERAL_KEYWORDS: [(&str, TypeChoice, Option<&str>); 3] = [
     ("none", TypeChoice::None, None),
 ];
 
-/// One row of the INSERT prompt: what it would build, what it is called, and
-/// the muted right column that tells `charAt` from `concat` before the node
+/// What committing a prompt row does. The prompt is one widget with two jobs,
+/// because INSERT means whatever the caret's cell is: on a free cell it builds
+/// a node, on a Source's output anchor it declares that Source's type.
+///
+/// One type rather than two prompts is what keeps the rest small — the typing,
+/// the highlight, the window and the click path never learn which job is on.
+#[derive(Clone, PartialEq, Eq)]
+enum PromptAction {
+    Create(AddKind),
+    SetType(TypeChoice),
+}
+
+/// One row of the INSERT prompt: what it would do, what it is called, and the
+/// muted right column that tells `charAt` from `concat` before the node
 /// exists.
 ///
 /// It owns its strings instead of borrowing the catalogue on purpose: the list
-/// is built from a `&GraphState` and the picked kind then goes to
-/// `insert_node_kind(&mut state, …)`, which a borrowed declaration in here
+/// is built from a `&GraphState` and the picked row then goes to
+/// `apply_prompt_action(&mut state, …)`, which a borrowed declaration in here
 /// would keep from compiling.
 #[derive(Clone, PartialEq, Eq)]
 struct Suggestion {
-    kind: AddKind,
+    action: PromptAction,
     /// Typed to reach the row, and shown in its left column.
     label: String,
     /// The parameter types, empty for a kind that takes none.
@@ -293,7 +311,7 @@ struct InsertPromptEntity;
 /// A clickable suggestion row, so the mouse path the "Add" button opens does
 /// not dead-end at a keyboard-only list.
 #[derive(Component)]
-struct InsertPromptOption(AddKind);
+struct InsertPromptOption(PromptAction);
 
 #[derive(Resource)]
 struct StartMenu {
@@ -408,6 +426,67 @@ impl GraphState {
         let scope = self.scope_of_caret(pick)?;
         let graph = self.root_graph_mut().resolve_context_mut(&scope.path)?;
         Some((graph, scope.local))
+    }
+}
+
+/// The node the caret addresses and which of its cells — but only for the
+/// cells that stand for an editable property, which is what both the panel and
+/// INSERT mode ask about.
+///
+/// A body cell is the node's own property. A Source answers on its output
+/// anchor as well: that cell is where its declared type lives, while its body
+/// is where its name is, printed on it.
+fn addressed_cell(
+    state: &GraphState,
+    pick: &PickState,
+) -> Option<(model::node::Id, layout::CellRole)> {
+    let (layout, local) = state.caret_graph(pick)?;
+    let id = layout.node_at(local)?;
+    let ln = layout.layout_nodes.get(&id)?;
+    let role = ln.shape.role_at(local - ln.pos.round().as_ivec3())?.clone();
+    let opens = match (&role, layout.graph.nodes.get(&id)?) {
+        (layout::CellRole::Body, _) => true,
+        (layout::CellRole::Output { .. }, model::node::ENode::Source { .. }) => true,
+        _ => false,
+    };
+    opens.then_some((id, role))
+}
+
+/// What INSERT mode does at the caret. The mode is one key, but it means
+/// whatever the addressed cell is.
+///
+/// `Create` is the default for everything — including an occupied cell of some
+/// other node kind — so that only the two Source cases change and nothing else
+/// has to be re-decided.
+#[derive(Clone, PartialEq, Eq)]
+enum InsertTarget {
+    /// Build something: the prompt offers node kinds, functions and literals.
+    Create,
+    /// A Source's name, typed into the panel's own field rather than a prompt.
+    Name(model::node::Id),
+    /// A Source's declared type, through the prompt in the panel.
+    Type(model::node::Id),
+}
+
+fn insert_target(state: &GraphState, pick: &PickState) -> InsertTarget {
+    let Some((id, role)) = addressed_cell(state, pick) else {
+        return InsertTarget::Create;
+    };
+    let Some((layout, _)) = state.caret_graph(pick) else {
+        return InsertTarget::Create;
+    };
+    // Only a Source has the two cells this distinction is about. A body cell of
+    // anything else names a property the panel already edits its own way.
+    if !matches!(
+        layout.graph.nodes.get(&id),
+        Some(model::node::ENode::Source { .. })
+    ) {
+        return InsertTarget::Create;
+    }
+    match role {
+        layout::CellRole::Body => InsertTarget::Name(id),
+        layout::CellRole::Output { .. } => InsertTarget::Type(id),
+        layout::CellRole::Input { .. } => InsertTarget::Create,
     }
 }
 
@@ -1707,6 +1786,51 @@ fn insert_node_kind(state: &mut GraphState, pick: &PickState, kind: &AddKind) ->
     true
 }
 
+/// Declare a new type on whichever node carries one. Returns whether the graph
+/// changed, so the caller knows whether to flag a rebuild.
+///
+/// The existing literal is carried across unchanged — `make_etype` drops it for
+/// `None`, which is the one type that has no value to keep.
+fn set_node_type(
+    state: &mut GraphState,
+    node_id: &model::node::Id,
+    choice: TypeChoice,
+) -> bool {
+    let node = state
+        .layout_graph
+        .find_node_graph_mut(node_id)
+        .and_then(|a| a.graph.nodes.get_mut(node_id));
+    match node {
+        Some(model::node::ENode::Constant { r#type, .. })
+        | Some(model::node::ENode::TypeCast { r#type, .. })
+        | Some(model::node::ENode::Source { r#type, .. })
+        | Some(model::node::ENode::Pattern { r#type, .. }) => {
+            let value = value_of_etype(r#type);
+            *r#type = make_etype(choice, value);
+            // Anchor heights follow declared types, so a type change reshapes
+            // the node and its neighbours.
+            state.resettle();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Commit a prompt row. Returns whether the graph changed.
+///
+/// `SetType` takes the node from the **caret**, not from the row, for the same
+/// reason `Create` does: the caret is what the prompt is about, so a row can
+/// never point at something that has moved on since it was drawn.
+fn apply_prompt_action(state: &mut GraphState, pick: &PickState, action: &PromptAction) -> bool {
+    match action {
+        PromptAction::Create(kind) => insert_node_kind(state, pick, kind),
+        PromptAction::SetType(choice) => match insert_target(state, pick) {
+            InsertTarget::Type(id) => set_node_type(state, &id, *choice),
+            _ => false,
+        },
+    }
+}
+
 fn update_delete_button_visuals(
     pick: Res<PickState>,
     state: Res<GraphState>,
@@ -1820,6 +1944,7 @@ fn handle_insert_prompt_click(
     // Read-only: the caret keeps addressing the cell the node now fills.
     pick: Res<PickState>,
     mut prompt: ResMut<InsertPrompt>,
+    mut mode: ResMut<EditorMode>,
     mut rebuild: ResMut<NeedsRebuild>,
 ) {
     if is_evaluating(&eval) {
@@ -1829,16 +1954,24 @@ fn handle_insert_prompt_click(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        if insert_node_kind(&mut state, &pick, &option.0) {
+        if apply_prompt_action(&mut state, &pick, &option.0) {
             prompt.clear();
             rebuild.0 = true;
+            // Creating leaves INSERT on, so the next node can be typed
+            // straight away. Declaring a type is one answer to one question —
+            // it is finished, and staying would only offer to answer it again.
+            if matches!(option.0, PromptAction::SetType(_)) {
+                *mode = EditorMode::Normal;
+            }
         }
     }
 }
 
-/// The suggestions the prompt currently offers: the node kinds and every
-/// declared function whose name carries the typed prefix, each with whether it
-/// may be created at the caret.
+/// The suggestions the prompt currently offers — which is a question about the
+/// caret's cell, not only about the typed text. On a Source's output anchor
+/// that is the five base types; everywhere else it is the node kinds, the
+/// literals and every declared function whose name carries the prefix, each
+/// with whether it may be created there.
 ///
 /// The prefix filters, the legality only greys — those are two different
 /// questions, and typing must not make a row silently disappear because the
@@ -1849,6 +1982,24 @@ fn prompt_candidates(state: &GraphState, pick: &PickState, text: &str) -> Vec<Su
     // Shift reports the uppercase character and the labels are CamelCase, so
     // the comparison has to ignore case in both directions.
     let prefix = text.to_ascii_lowercase();
+    // A declared type is a closed set of five, all of them always legal — the
+    // node already stands there, so nothing about the caret can forbid one.
+    if let InsertTarget::Type(_) = insert_target(state, pick) {
+        return TYPE_CHOICES
+            .iter()
+            .filter(|choice| {
+                type_choice_label(**choice)
+                    .to_ascii_lowercase()
+                    .starts_with(&prefix)
+            })
+            .map(|choice| Suggestion {
+                action: PromptAction::SetType(*choice),
+                label: type_choice_label(*choice).to_string(),
+                detail: String::new(),
+                allowed: true,
+            })
+            .collect();
+    }
     let scope = state.scope_of_caret(pick);
     let resolved = scope.as_ref().map(|s| {
         (
@@ -1883,7 +2034,7 @@ fn prompt_candidates(state: &GraphState, pick: &PickState, text: &str) -> Vec<Su
         let kind = AddKind::Constant(choice, Some(raw));
         let allowed = parses && caret_allows(&kind);
         candidates.push(Suggestion {
-            kind,
+            action: PromptAction::Create(kind),
             // Through the type's own rendering while it parses, which puts the
             // quotes back on: `'a` is offered as `'a'`, so the closing quote
             // reads as implied rather than as missing. What does not parse
@@ -1921,7 +2072,7 @@ fn prompt_candidates(state: &GraphState, pick: &PickState, text: &str) -> Vec<Su
             .map(|(kind, label, detail)| {
                 let allowed = caret_allows(&kind);
                 Suggestion {
-                    kind,
+                    action: PromptAction::Create(kind),
                     label,
                     detail,
                     allowed,
@@ -2098,6 +2249,10 @@ fn sync_insert_prompt_ui(
     mut cache: Local<InsertPromptFingerprint>,
 ) {
     let visible = *mode == EditorMode::Insert
+        // Only where INSERT means "build something". Editing a Source's name
+        // or type happens in the node editor's panel, and an empty create
+        // prompt standing beside it would claim a choice that is not on offer.
+        && insert_target(&state, &pick) == InsertTarget::Create
         && !start_menu.showing
         && !modal_is_open(&eval)
         && !is_evaluating(&eval);
@@ -2175,86 +2330,96 @@ fn sync_insert_prompt_ui(
                 InsertPromptEntity,
             ))
             .with_children(|options| {
-                let window = prompt_window(candidates.len(), selected);
-                // What the window hides is said, not swallowed: the list is
-                // long enough that a silent cut would read as "that is all
-                // there is".
-                if window.start > 0 {
-                    spawn_prompt_hint(options, font, format!("… {} more above", window.start));
-                }
-                for (index, suggestion) in candidates
-                    .iter()
-                    .enumerate()
-                    .take(window.end)
-                    .skip(window.start)
-                {
-                    // Only a committable row can hold the highlight, so a
-                    // greyed one never looks like the answer to `Enter`.
-                    let highlighted = index == selected && suggestion.allowed;
-                    let label_color = if suggestion.allowed {
-                        Color::srgb(0.85, 0.85, 0.9)
-                    } else {
-                        Color::srgb(0.35, 0.35, 0.4)
-                    };
-                    options
-                        .spawn((
-                            Button,
-                            Node {
-                                padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
-                                border_radius: BorderRadius::all(Val::Px(3.0)),
-                                flex_direction: FlexDirection::Row,
-                                justify_content: JustifyContent::SpaceBetween,
-                                align_items: AlignItems::Center,
-                                column_gap: Val::Px(12.0),
-                                ..default()
-                            },
-                            BackgroundColor(if highlighted {
-                                Color::srgba(0.2, 0.2, 0.3, 0.95)
-                            } else {
-                                Color::srgba(0.0, 0.0, 0.0, 0.0)
-                            }),
-                            InsertPromptOption(suggestion.kind.clone()),
-                        ))
-                        .with_children(|row| {
-                            row.spawn((
-                                Text::new(suggestion.label.clone()),
-                                text_font(font, 14.0),
-                                TextColor(label_color),
-                            ));
-                            // Spawned only when it says something —
-                            // `SpaceBetween` already puts a lone child at the
-                            // start, so a node kind needs no empty placeholder
-                            // to stay left-aligned.
-                            if !suggestion.detail.is_empty() {
-                                row.spawn((
-                                    Text::new(suggestion.detail.clone()),
-                                    text_font(font, 12.0),
-                                    TextColor(if suggestion.allowed {
-                                        Color::srgb(0.6, 0.6, 0.7)
-                                    } else {
-                                        label_color
-                                    }),
-                                    // The signature is the row's width, not
-                                    // its slack: shrinking it would wrap
-                                    // `Char|String,Char|String` onto a second
-                                    // line and make the rows uneven.
-                                    Node {
-                                        flex_shrink: 0.0,
-                                        ..default()
-                                    },
-                                ));
-                            }
-                        });
-                }
-                if window.end < candidates.len() {
-                    spawn_prompt_hint(
-                        options,
-                        font,
-                        format!("… {} more below", candidates.len() - window.end),
-                    );
-                }
+                spawn_prompt_rows(options, font, &candidates, selected);
             });
     });
+}
+
+/// The prompt's suggestion rows, windowed around the highlight. Shared by the
+/// prompt that creates nodes and the one that declares a Source's type: the
+/// rows are the same rows, only the container differs — which is why this
+/// takes no marker of its own and the caller tags its own container.
+fn spawn_prompt_rows(
+    options: &mut ChildSpawnerCommands,
+    font: &Handle<Font>,
+    candidates: &[Suggestion],
+    selected: usize,
+) {
+    let window = prompt_window(candidates.len(), selected);
+    // What the window hides is said, not swallowed: the list can be long
+    // enough that a silent cut would read as "that is all there is".
+    if window.start > 0 {
+        spawn_prompt_hint(options, font, format!("… {} more above", window.start));
+    }
+    for (index, suggestion) in candidates
+        .iter()
+        .enumerate()
+        .take(window.end)
+        .skip(window.start)
+    {
+        // Only a committable row can hold the highlight, so a greyed one never
+        // looks like the answer to `Enter`.
+        let highlighted = index == selected && suggestion.allowed;
+        let label_color = if suggestion.allowed {
+            Color::srgb(0.85, 0.85, 0.9)
+        } else {
+            Color::srgb(0.35, 0.35, 0.4)
+        };
+        options
+            .spawn((
+                Button,
+                Node {
+                    padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                    border_radius: BorderRadius::all(Val::Px(3.0)),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(12.0),
+                    ..default()
+                },
+                BackgroundColor(if highlighted {
+                    Color::srgba(0.2, 0.2, 0.3, 0.95)
+                } else {
+                    Color::srgba(0.0, 0.0, 0.0, 0.0)
+                }),
+                InsertPromptOption(suggestion.action.clone()),
+            ))
+            .with_children(|row| {
+                row.spawn((
+                    Text::new(suggestion.label.clone()),
+                    text_font(font, 14.0),
+                    TextColor(label_color),
+                ));
+                // Spawned only when it says something — `SpaceBetween` already
+                // puts a lone child at the start, so a row without a detail
+                // needs no empty placeholder to stay left-aligned.
+                if !suggestion.detail.is_empty() {
+                    row.spawn((
+                        Text::new(suggestion.detail.clone()),
+                        text_font(font, 12.0),
+                        TextColor(if suggestion.allowed {
+                            Color::srgb(0.6, 0.6, 0.7)
+                        } else {
+                            label_color
+                        }),
+                        // The signature is the row's width, not its slack:
+                        // shrinking it would wrap `Char|String,Char|String`
+                        // onto a second line and make the rows uneven.
+                        Node {
+                            flex_shrink: 0.0,
+                            ..default()
+                        },
+                    ));
+                }
+            });
+    }
+    if window.end < candidates.len() {
+        spawn_prompt_hint(
+            options,
+            font,
+            format!("… {} more below", candidates.len() - window.end),
+        );
+    }
 }
 
 /// A row that counts what the window leaves off. It carries neither `Button`
@@ -2308,6 +2473,11 @@ struct NodeEditorFingerprint {
     /// property that cell stands for, so moving between two cells of the *same*
     /// node has to rebuild it — node and variant are unchanged then.
     role: Option<layout::CellRole>,
+    /// The prompt's text and highlight, but only while the panel is the one
+    /// drawing it. That is also the bit that catches the NORMAL→INSERT switch
+    /// on an output anchor, where the role stays `Output` and nothing else in
+    /// here moves.
+    insert_prompt: Option<(String, usize)>,
     visible: bool,
 }
 
@@ -2318,6 +2488,8 @@ fn sync_node_editor_ui(
     dropdown_state: Res<DropdownState>,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
+    mode: Res<EditorMode>,
+    prompt: Res<InsertPrompt>,
     ui_font: Res<UiFont>,
     mut panel_q: Query<(Entity, &mut Node), With<NodeEditorPanel>>,
     editor_children_q: Query<Entity, With<NodeEditorEntity>>,
@@ -2325,21 +2497,8 @@ fn sync_node_editor_ui(
 ) {
     let caret = state.caret_graph(&pick);
     // The panel edits the property this address stands for, so *which* of the
-    // node's cells is addressed decides what it shows, not only which node. A
-    // body cell is the node's own property. A Source answers on its output
-    // anchor too: that cell is where its declared type lives, while its body is
-    // where its name is — printed on it.
-    let addressed = caret.and_then(|(layout, local)| {
-        let id = layout.node_at(local)?;
-        let ln = layout.layout_nodes.get(&id)?;
-        let role = ln.shape.role_at(local - ln.pos.round().as_ivec3())?.clone();
-        let opens = match (&role, layout.graph.nodes.get(&id)?) {
-            (layout::CellRole::Body, _) => true,
-            (layout::CellRole::Output { .. }, model::node::ENode::Source { .. }) => true,
-            _ => false,
-        };
-        opens.then_some((id, role))
-    });
+    // node's cells is addressed decides what it shows, not only which node.
+    let addressed = addressed_cell(&state, &pick);
     let node_id = addressed.as_ref().map(|(id, _)| id.clone());
     let role = addressed.map(|(_, role)| role);
     let node = node_id
@@ -2378,6 +2537,20 @@ fn sync_node_editor_ui(
             | NodeVariantKind::Pattern
     );
     let visible = editable && !start_menu.showing && !is_evaluating(&eval);
+    // The type row turns into a prompt while INSERT stands on the anchor that
+    // carries the type — the same widget as the create prompt, in the place
+    // the property is.
+    let type_prompt = visible
+        && *mode == EditorMode::Insert
+        && matches!(role, Some(layout::CellRole::Output { .. }));
+    let candidates = if type_prompt {
+        prompt_candidates(&state, &pick, &prompt.text)
+    } else {
+        Vec::new()
+    };
+    // Clamped on read, the way the create prompt does it: the list is rebuilt
+    // from scratch each time and a stale index must not survive that.
+    let selected = prompt.selected.min(candidates.len().saturating_sub(1));
 
     let fp = NodeEditorFingerprint {
         node_id: node_id.clone(),
@@ -2387,6 +2560,7 @@ fn sync_node_editor_ui(
         func_id: func_id.clone(),
         dropdown_open: dropdown_state.open.clone(),
         role: role.clone(),
+        insert_prompt: type_prompt.then(|| (prompt.text.clone(), selected)),
         visible,
     };
 
@@ -2445,13 +2619,17 @@ fn sync_node_editor_ui(
                 match &role {
                     Some(layout::CellRole::Output { .. }) => {
                         spawn_labeled_row(panel, font, "Type", |slot| {
-                            spawn_type_dropdown(
-                                slot,
-                                font,
-                                &node_id,
-                                r#type,
-                                &dropdown_state.open,
-                            );
+                            if type_prompt {
+                                spawn_type_prompt(slot, font, &prompt.text, &candidates, selected);
+                            } else {
+                                spawn_type_dropdown(
+                                    slot,
+                                    font,
+                                    &node_id,
+                                    r#type,
+                                    &dropdown_state.open,
+                                );
+                            }
                         });
                     }
                     _ => {
@@ -2597,6 +2775,72 @@ fn spawn_name_input(
                 TextInputDisplay,
                 NodeEditorEntity,
             ));
+        });
+}
+
+/// The type row while INSERT is typing into it: the same text line and the
+/// same suggestion rows the create prompt uses, in the place the dropdown
+/// otherwise stands.
+///
+/// The rows carry `NodeEditorEntity` and **not** `InsertPromptEntity`: the two
+/// prompts are despawned by two different syncs, and a row tagged for the other
+/// one would be swept away by a rebuild this panel never hears about.
+fn spawn_type_prompt(
+    panel: &mut ChildSpawnerCommands,
+    font: &Handle<Font>,
+    text: &str,
+    candidates: &[Suggestion],
+    selected: usize,
+) {
+    panel
+        .spawn((
+            Node {
+                flex_direction: FlexDirection::Column,
+                flex_grow: 1.0,
+                min_width: Val::Px(0.0),
+                row_gap: Val::Px(2.0),
+                ..default()
+            },
+            NodeEditorEntity,
+        ))
+        .with_children(|column| {
+            column
+                .spawn((
+                    editor_text_input_node(),
+                    BackgroundColor(Color::srgba(0.06, 0.06, 0.12, 0.95)),
+                    BorderColor::all(Color::srgb(0.133, 0.827, 0.933)),
+                    NodeEditorEntity,
+                ))
+                .with_children(|row| {
+                    row.spawn((
+                        Text::new(format!("{}|", text)),
+                        text_font(font, 14.0),
+                        // A prefix no type answers to is said on the text, the
+                        // same way the create prompt says it.
+                        TextColor(if candidates.is_empty() {
+                            Color::srgb(0.95, 0.30, 0.30)
+                        } else {
+                            Color::srgb(0.91, 0.89, 0.87)
+                        }),
+                    ));
+                });
+            if candidates.is_empty() {
+                return;
+            }
+            column
+                .spawn((
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        padding: UiRect::all(Val::Px(2.0)),
+                        border_radius: BorderRadius::all(Val::Px(4.0)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgba(0.08, 0.08, 0.14, 0.98)),
+                    NodeEditorEntity,
+                ))
+                .with_children(|options| {
+                    spawn_prompt_rows(options, font, candidates, selected);
+                });
         });
 }
 
@@ -2947,23 +3191,8 @@ fn handle_dropdown_option_click(
         }
         match &option.choice {
             DropdownChoice::Type(new_choice) => {
-                let node = state
-                    .layout_graph
-                    .find_node_graph_mut(&option.node_id)
-                    .and_then(|a| a.graph.nodes.get_mut(&option.node_id));
-                match node {
-                    Some(model::node::ENode::Constant { r#type, .. })
-                    | Some(model::node::ENode::TypeCast { r#type, .. })
-                    | Some(model::node::ENode::Source { r#type, .. })
-                    | Some(model::node::ENode::Pattern { r#type, .. }) => {
-                        let value = value_of_etype(r#type);
-                        *r#type = make_etype(*new_choice, value);
-                        // Anchor heights follow declared types, so a type
-                        // change reshapes the node and its neighbours.
-                        state.resettle();
-                        rebuild.0 = true;
-                    }
-                    _ => {}
+                if set_node_type(&mut state, &option.node_id, *new_choice) {
+                    rebuild.0 = true;
                 }
             }
             DropdownChoice::BoolValue(v) => {
@@ -4915,10 +5144,20 @@ fn text_input_focus(
     let evaluating = is_evaluating(&eval);
     // By the layout's reckoning, not the key's position — see
     // `handle_editor_keys`.
-    let escaped = key_events.read().any(|ev| {
-        ev.state == bevy::input::ButtonState::Pressed
-            && matches!(ev.logical_key, bevy::input::keyboard::Key::Escape)
-    });
+    //
+    // Enter counts as well as Escape: both mean "done here", and a field that
+    // keeps focus keeps `keyboard_captured` true, which would leave the graph
+    // deaf to `hjkl` until something was clicked. In a modal Enter stays
+    // inert — there the buttons commit.
+    let finished = key_events
+        .read()
+        .filter(|ev| ev.state == bevy::input::ButtonState::Pressed)
+        .fold((false, false), |(esc, enter), ev| {
+            (
+                esc || matches!(ev.logical_key, bevy::input::keyboard::Key::Escape),
+                enter || matches!(ev.logical_key, bevy::input::keyboard::Key::Enter),
+            )
+        });
 
     for (interaction, mut input, mut border, modal_tag) in input_q.iter_mut() {
         // During evaluation only modal inputs may take focus.
@@ -4933,7 +5172,8 @@ fn text_input_focus(
             input.focused = false;
         }
 
-        if escaped {
+        let (escaped, entered) = finished;
+        if escaped || (entered && modal_tag.is_none()) {
             input.focused = false;
         }
 
@@ -4946,93 +5186,170 @@ fn text_input_focus(
     }
 }
 
+/// The name field's focus is not a property of the mouse but a function of the
+/// mode: in INSERT on a Source's body cell the keys go into the name, and
+/// nowhere else do they. So this writes `focused` **both** ways and is the last
+/// writer in the frame — what `text_input_focus` concluded from a click or an
+/// Escape does not hold for this one box.
+///
+/// Being total is the point. A click on something that does not move the caret
+/// — the panel's own background, the Evaluate button — would otherwise blur the
+/// field and leave INSERT with neither a field nor a prompt: a dead end. Here
+/// the focus simply comes back. And in NORMAL the box is never focused, so
+/// `keyboard_captured` is false there and `hjkl` keeps working.
+///
+/// It never writes the mode; the other direction is `handle_source_name_click`.
+fn sync_source_name_focus(
+    mode: Res<EditorMode>,
+    state: Res<GraphState>,
+    pick: Res<PickState>,
+    start_menu: Res<StartMenu>,
+    eval: Res<EvalState>,
+    mut input_q: Query<(&NodeEditorTextInput, &mut TextInput)>,
+) {
+    let wanted = if *mode == EditorMode::Insert && !start_menu.showing && !is_evaluating(&eval) {
+        match insert_target(&state, &pick) {
+            InsertTarget::Name(id) => Some(id),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    for (editor_input, mut input) in input_q.iter_mut() {
+        if editor_input.field != NodeEditorField::SourceName {
+            continue;
+        }
+        let want = wanted.as_ref() == Some(&editor_input.node_id);
+        // Guarded: `handle_node_editor_text_input` watches `Changed<TextInput>`,
+        // and a write marks the component whether or not it changed anything.
+        if input.focused != want {
+            input.focused = want;
+        }
+    }
+}
+
+/// Clicking into the name box is the same act as pressing `i` on the body cell
+/// it belongs to, so it means the same thing — exactly as the "Add" button
+/// means `i` on an empty one.
+///
+/// Edge-triggered, and that is what keeps it from fighting
+/// `sync_source_name_focus`: an Escape blurs the field without producing an
+/// interaction edge, so it cannot bounce straight back into INSERT.
+fn handle_source_name_click(
+    interaction_q: Query<(&Interaction, &NodeEditorTextInput), Changed<Interaction>>,
+    eval: Res<EvalState>,
+    mut mode: ResMut<EditorMode>,
+    mut prompt: ResMut<InsertPrompt>,
+    mut rebuild: ResMut<NeedsRebuild>,
+) {
+    if is_evaluating(&eval) {
+        return;
+    }
+    for (interaction, editor_input) in interaction_q.iter() {
+        if *interaction != Interaction::Pressed
+            || editor_input.field != NodeEditorField::SourceName
+        {
+            continue;
+        }
+        // Guarded so a press doesn't mark `EditorMode` changed for nothing.
+        if *mode != EditorMode::Insert {
+            *mode = EditorMode::Insert;
+            prompt.clear();
+            // The caret is drawn per mode, and it is a scene entity.
+            rebuild.0 = true;
+        }
+    }
+}
+
 fn text_input_keyboard(
     mut input_q: Query<(&mut TextInput, &Children), With<TextInputBox>>,
     mut text_q: Query<&mut Text, With<TextInputDisplay>>,
     mut key_events: MessageReader<KeyboardInput>,
 ) {
+    // Read once, outside the loop over the fields. Two reasons, and the first
+    // is a bug the inner `read()` used to hide: with nothing focused the
+    // reader was never touched, so the batch stood until the next frame — and
+    // the key that *gave* a field its focus then got typed into it. The second
+    // is that the first focused field used to drain the batch, starving any
+    // other.
+    let pressed: Vec<&KeyboardInput> = key_events
+        .read()
+        .filter(|ev| ev.state == bevy::input::ButtonState::Pressed)
+        .collect();
+
     for (mut input, children) in input_q.iter_mut() {
-        if !input.focused {
-            continue;
-        }
+        if input.focused {
+            for ev in &pressed {
+                let input_cursor = input.cursor;
 
-        let mut changed = false;
-
-        for ev in key_events.read() {
-            if ev.state != bevy::input::ButtonState::Pressed {
-                continue;
-            }
-
-            let input_cursor = input.cursor;
-
-            match &ev.logical_key {
-                bevy::input::keyboard::Key::Character(s) => {
-                    input.value.insert_str(input_cursor, s.as_str());
-                    input.cursor += s.len();
-                    changed = true;
-                }
-                bevy::input::keyboard::Key::Space => {
-                    input.value.insert(input_cursor, ' ');
-                    input.cursor += 1;
-                    changed = true;
-                }
-                bevy::input::keyboard::Key::Backspace => {
-                    if input.cursor > 0 {
-                        let prev = input.value[..input.cursor]
-                            .char_indices()
-                            .last()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        input.value.remove(prev);
-                        input.cursor = prev;
-                        changed = true;
+                match &ev.logical_key {
+                    bevy::input::keyboard::Key::Character(s) => {
+                        input.value.insert_str(input_cursor, s.as_str());
+                        input.cursor += s.len();
                     }
-                }
-                bevy::input::keyboard::Key::Delete => {
-                    if input.cursor < input.value.len() {
-                        input.value.remove(input_cursor);
-                        changed = true;
+                    bevy::input::keyboard::Key::Space => {
+                        input.value.insert(input_cursor, ' ');
+                        input.cursor += 1;
                     }
-                }
-                bevy::input::keyboard::Key::ArrowLeft => {
-                    if input.cursor > 0 {
-                        input.cursor = input.value[..input.cursor]
-                            .char_indices()
-                            .last()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
+                    bevy::input::keyboard::Key::Backspace => {
+                        if input.cursor > 0 {
+                            let prev = input.value[..input.cursor]
+                                .char_indices()
+                                .last()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                            input.value.remove(prev);
+                            input.cursor = prev;
+                        }
                     }
-                }
-                bevy::input::keyboard::Key::ArrowRight => {
-                    if input.cursor < input.value.len() {
-                        input.cursor += input.value[input.cursor..]
-                            .chars()
-                            .next()
-                            .map(|c| c.len_utf8())
-                            .unwrap_or(0);
+                    bevy::input::keyboard::Key::Delete => {
+                        if input.cursor < input.value.len() {
+                            input.value.remove(input_cursor);
+                        }
                     }
+                    bevy::input::keyboard::Key::ArrowLeft => {
+                        if input.cursor > 0 {
+                            input.cursor = input.value[..input.cursor]
+                                .char_indices()
+                                .last()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
+                        }
+                    }
+                    bevy::input::keyboard::Key::ArrowRight => {
+                        if input.cursor < input.value.len() {
+                            input.cursor += input.value[input.cursor..]
+                                .chars()
+                                .next()
+                                .map(|c| c.len_utf8())
+                                .unwrap_or(0);
+                        }
+                    }
+                    bevy::input::keyboard::Key::Home => {
+                        input.cursor = 0;
+                    }
+                    bevy::input::keyboard::Key::End => {
+                        input.cursor = input.value.len();
+                    }
+                    _ => {}
                 }
-                bevy::input::keyboard::Key::Home => {
-                    input.cursor = 0;
-                }
-                bevy::input::keyboard::Key::End => {
-                    input.cursor = input.value.len();
-                }
-                bevy::input::keyboard::Key::Escape => {
-                    input.focused = false;
-                }
-                _ => {}
             }
         }
 
-        // Update display text with blinking cursor
+        // Outside the focus test on purpose: a field that just lost focus has
+        // to lose its cursor bar with it, and only this writes the text.
+        // Guarded on inequality, because writing it unconditionally would
+        // dirty every text node in the UI every frame.
         if let Ok(mut text) = text_q.get_mut(children[0]) {
             let (before, after) = input.value.split_at(input.cursor);
-            text.0 = if input.focused {
+            let wanted = if input.focused {
                 format!("{}|{}", before, after)
             } else {
                 input.value.clone()
             };
+            if text.0 != wanted {
+                text.0 = wanted;
+            }
         }
     }
 }
@@ -5105,12 +5422,17 @@ fn apply_room_insert(
 
 /// Everything the keyboard means to the editor itself, in one pass over the
 /// batch: the mode switch (`i` enters INSERT, `Esc` returns to NORMAL), and
-/// then INSERT's two jobs — the room-makers `Space`, `Return` and
-/// `Shift+Return`, which act on the scope the caret addresses and in that
-/// scope's local coordinates, and the prompt, into which every other key
-/// writes what is to be created: a node kind's name, a function's name, or a
-/// literal value. `Space` belongs to the prompt rather than to the room-makers
-/// for the length of an unclosed quote, and only then.
+/// then INSERT's jobs — the room-makers `Space`, `Return` and `Shift+Return`,
+/// which act on the scope the caret addresses and in that scope's local
+/// coordinates, and the prompt, into which every other key writes.
+///
+/// What the prompt is *for* is a question about the caret's cell, not about
+/// this system: on a free cell it names what to create, on a Source's output
+/// anchor it names a type (`insert_target`). The room-makers belong to the
+/// first case alone — where the prompt edits a property of a node that already
+/// stands there, making room is not an answer to anything. `Space` belongs to
+/// the prompt rather than to the room-makers for the length of an unclosed
+/// quote, and only then.
 ///
 /// Mode switch and prompt have to be **one** system: the key that enters
 /// INSERT is consumed at the very point that flips the mode, so it cannot also
@@ -5125,11 +5447,15 @@ fn apply_room_insert(
 /// puts it, whatever the user actually types. Only Shift, which no message
 /// carries, still comes from `ButtonInput`.
 ///
-/// While something else owns the keyboard the batch is dropped rather than
-/// left standing: a message survives two updates, so keys struck under the
-/// guard would otherwise fire once it lifts — an `Esc` that unfocused a field
-/// would leave INSERT on the next frame, and a field's text would land in the
-/// prompt.
+/// While something else owns the keyboard the batch is walked but ignored,
+/// rather than left standing: a message survives two updates, so keys struck
+/// under the guard would otherwise fire once it lifts — and a field's text
+/// would land in the prompt.
+///
+/// Two keys are the exception, and only while the guard means "a field is
+/// being typed into": `Esc` and `Enter` end the typing, and since that field
+/// *is* what INSERT means on a Source's body cell, leaving it is leaving the
+/// mode. One key, one thought.
 fn handle_editor_keys(
     mut key_events: MessageReader<KeyboardInput>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -5142,14 +5468,37 @@ fn handle_editor_keys(
     mut pick: ResMut<PickState>,
     mut rebuild: ResMut<NeedsRebuild>,
 ) {
-    if keyboard_captured(&text_inputs, &start_menu, &eval) {
-        key_events.clear();
-        return;
-    }
+    let captured = keyboard_captured(&text_inputs, &start_menu, &eval);
+    // Of the four reasons the keyboard can be taken, only one is "the user is
+    // typing"; the start menu, a modal and a running evaluation do not belong
+    // to the editor at all.
+    let typing = captured && !start_menu.showing && !is_evaluating(&eval);
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let target = insert_target(&state, &pick);
 
     for ev in key_events.read() {
         if ev.state != bevy::input::ButtonState::Pressed {
+            continue;
+        }
+        if captured {
+            // One key gets through a field that is being typed into, and only
+            // to end the typing: the field is INSERT while it has the keys, so
+            // the way out of the field is the way out of the mode. Everything
+            // else belongs to the field — and the batch is walked rather than
+            // left standing, because a message survives two updates and would
+            // otherwise fire once the guard lifts.
+            if typing
+                && *mode == EditorMode::Insert
+                && matches!(
+                    ev.logical_key,
+                    bevy::input::keyboard::Key::Escape | bevy::input::keyboard::Key::Enter
+                )
+            {
+                prompt.clear();
+                *mode = EditorMode::Normal;
+                // The caret is drawn per mode, and it is a scene entity.
+                rebuild.0 = true;
+            }
             continue;
         }
         match (*mode, &ev.logical_key) {
@@ -5205,9 +5554,16 @@ fn handle_editor_keys(
                     let selected = first_selection(&prompt_candidates(&state, &pick, &prompt.text));
                     prompt.selected = selected;
                 }
-                // The room-makers are bounded to one insert per press: a held
-                // key auto-repeats, and the repeats must not each open a cell.
-                bevy::input::keyboard::Key::Space if prompt.text.is_empty() && !ev.repeat => {
+                // The room-makers belong to the prompt that builds: where the
+                // prompt edits a property of a node that already stands there,
+                // making room is not an answer to anything. They are also
+                // bounded to one insert per press — a held key auto-repeats,
+                // and the repeats must not each open a cell.
+                bevy::input::keyboard::Key::Space
+                    if target == InsertTarget::Create
+                        && prompt.text.is_empty()
+                        && !ev.repeat =>
+                {
                     if apply_room_insert(
                         &mut state,
                         &mut pick,
@@ -5218,7 +5574,11 @@ fn handle_editor_keys(
                     }
                     break;
                 }
-                bevy::input::keyboard::Key::Enter if prompt.text.is_empty() && !ev.repeat => {
+                bevy::input::keyboard::Key::Enter
+                    if target == InsertTarget::Create
+                        && prompt.text.is_empty()
+                        && !ev.repeat =>
+                {
                     let inserted = if shift {
                         apply_room_insert(
                             &mut state,
@@ -5240,17 +5600,24 @@ fn handle_editor_keys(
                     break;
                 }
                 bevy::input::keyboard::Key::Enter if !ev.repeat => {
-                    // Commit what is written. The caret stays on the cell the
-                    // node now fills, and INSERT stays on, so the next name
-                    // can be typed straight away.
+                    // Commit what is written. After creating, the caret stays
+                    // on the cell the node now fills and INSERT stays on, so
+                    // the next one can be typed straight away. Declaring a
+                    // type is one answer to one question — it is finished, and
+                    // staying would only offer to answer it again.
                     let candidates = prompt_candidates(&state, &pick, &prompt.text);
                     let selected = prompt.selected.min(candidates.len().saturating_sub(1));
-                    if let Some(suggestion) =
-                        candidates.get(selected).filter(|suggestion| suggestion.allowed)
+                    if let Some(action) = candidates
+                        .get(selected)
+                        .filter(|suggestion| suggestion.allowed)
+                        .map(|suggestion| suggestion.action.clone())
                     {
-                        if insert_node_kind(&mut state, &pick, &suggestion.kind) {
+                        if apply_prompt_action(&mut state, &pick, &action) {
                             prompt.clear();
                             rebuild.0 = true;
+                            if matches!(action, PromptAction::SetType(_)) {
+                                *mode = EditorMode::Normal;
+                            }
                         }
                     }
                     break;
@@ -5281,7 +5648,16 @@ fn handle_arrow_keys(
     // a node (Ctrl+key) is a NORMAL operation too. The letters are dropped
     // along with the guard, so a key struck under it doesn't fire once it
     // lifts.
-    if is_evaluating(&eval) || *mode == EditorMode::Insert {
+    //
+    // `keyboard_captured` covers the arrows here, not just the letters. It
+    // used to gate only `hjkl`, and the arrows — which come from `ButtonInput`
+    // rather than from the message — walked straight past it: typing in a
+    // field, Left and Right moved the text cursor *and* the caret, and the
+    // travelling caret pulled the panel out from under the typist.
+    if is_evaluating(&eval)
+        || *mode == EditorMode::Insert
+        || keyboard_captured(&text_inputs, &start_menu, &eval)
+    {
         key_events.clear();
         return;
     }
@@ -5307,29 +5683,21 @@ fn handle_arrow_keys(
     // `hjkl` rides alongside the arrows. Like the mode letters in
     // `handle_editor_keys` they are read from `logical_key`, the character the
     // layout produced, so the binding follows the letter rather than its
-    // QWERTY position. A focused field or an open menu swallows them — the
-    // arrows keep working there, since nothing else claims them for the
-    // caret. Repeats are dropped so a held key steps once, the way
+    // QWERTY position. Repeats are dropped so a held key steps once, the way
     // `just_pressed` bounds the arrows.
-    let letter = if keyboard_captured(&text_inputs, &start_menu, &eval) {
-        key_events.clear();
-        None
-    } else {
-        key_events
-            .read()
-            .filter(|ev| ev.state == bevy::input::ButtonState::Pressed && !ev.repeat)
-            .find_map(|ev| match &ev.logical_key {
-                bevy::input::keyboard::Key::Character(s) => {
-                    let mut chars = s.chars();
-                    // Shift reports the uppercase character; the shifted
-                    // meaning comes from the modifier, as it does for the
-                    // arrows.
-                    let c = chars.next()?.to_ascii_lowercase();
-                    (chars.next().is_none() && matches!(c, 'h' | 'j' | 'k' | 'l')).then_some(c)
-                }
-                _ => None,
-            })
-    };
+    let letter = key_events
+        .read()
+        .filter(|ev| ev.state == bevy::input::ButtonState::Pressed && !ev.repeat)
+        .find_map(|ev| match &ev.logical_key {
+            bevy::input::keyboard::Key::Character(s) => {
+                let mut chars = s.chars();
+                // Shift reports the uppercase character; the shifted meaning
+                // comes from the modifier, as it does for the arrows.
+                let c = chars.next()?.to_ascii_lowercase();
+                (chars.next().is_none() && matches!(c, 'h' | 'j' | 'k' | 'l')).then_some(c)
+            }
+            _ => None,
+        });
 
     let arrow = if keys.just_pressed(KeyCode::ArrowUp) {
         Some('k')
@@ -5669,6 +6037,7 @@ fn main() {
                     (
                         handle_delete_node_button,
                         handle_add_button,
+                        handle_source_name_click,
                         handle_insert_prompt_click,
                         handle_hamburger_button,
                         handle_start_menu_new_button,
@@ -5677,15 +6046,30 @@ fn main() {
                         sync_start_menu_ui,
                         pick_nodes,
                     )
-                        .chain(),
+                        .chain()
+                        // A click resolves before the keys of the same frame.
+                        // Both `handle_add_button` and
+                        // `handle_source_name_click` set the mode, and the
+                        // keyboard chain projects the mode onto the name box's
+                        // focus at its end — ambiguous, that projection could
+                        // run on the mode the click was about to change.
+                        .before(handle_editor_keys),
                     highlight_hovered,
                     update_selection_display,
                     update_grid_material,
                     update_cursor,
-                    // Editor keys before the text field: while a field has
-                    // focus, Escape belongs to it, and `text_input_focus`
-                    // clears that focus in the same frame.
-                    (handle_editor_keys, text_input_focus, text_input_keyboard).chain(),
+                    // Mode before focus before keys before the projection of
+                    // the mode back onto the focus. The last link has to be
+                    // last: were the name box focused in the same frame that
+                    // `i` flips the mode, `text_input_keyboard` would type that
+                    // `i` into the name.
+                    (
+                        handle_editor_keys,
+                        text_input_focus,
+                        text_input_keyboard,
+                        sync_source_name_focus,
+                    )
+                        .chain(),
                     handle_arrow_keys,
                     trigger_camera_focus_on_selection_change,
                 ),
@@ -5745,7 +6129,11 @@ fn main() {
                 sync_node_editor_ui,
                 sync_insert_prompt_ui,
             )
-                .chain(),
+                .chain()
+                // Both panels now draw what was typed this frame, so they have
+                // to run after the keys landed — otherwise the type prompt
+                // shows the previous frame's text every other frame.
+                .after(text_input_keyboard),
         )
         .run();
 }
