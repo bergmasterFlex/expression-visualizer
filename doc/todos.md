@@ -96,11 +96,19 @@ rules out, and it is prominent in every screenshot.
   | `TypeCast` | the band cell between its two anchors | the target type |
   | `Match` | the cell of each pattern's band, one per level | that pattern |
   | `FunctionCall` | **every** cell of the body | which function is called — the name is written along the body and its length *is* the body's extent, so editing it lengthens/shortens the node |
-  | `Source` | first of its two Z cells | its declared type |
-  | `Source` | second cell (the output anchor) | its name |
+  | `Source` | **every** cell of its body | its name — the name is written on the body, so its length *is* the body's extent, exactly as for a `FunctionCall` |
+  | `Source` | the output anchor's cell | its declared type |
   | `Source` | — | its **index** is not typed at all: the index is the lateral order, so it is changed by **moving** the node |
-  | `Tunnel` | same two cells, one volume down | declared type, then name |
+  | `Tunnel` | same cells, one volume down | name on the body, declared type on the anchor |
   | `Sink`, `BranchSource` | — | nothing: they have no static parameter |
+
+  **The two `Source` rows are the other way round from the thesis**, which puts
+  the type on the first Z cell and the name on the second. The code now follows
+  the picture instead: the name is printed along the body, so the body is where
+  it is edited, and the type hangs off the output anchor, so that is where the
+  type is edited. The thesis has to be pulled along — this is the one divergence
+  in this file where the code moved first, deliberately. `Tunnel` follows the
+  same order for the same reason.
 
 - **Values are entered as text and cannot be left invalid.** The editor refuses
   text that is not a value of the kind the cell holds; what stands there after

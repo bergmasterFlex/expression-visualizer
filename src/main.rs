@@ -2304,6 +2304,10 @@ struct NodeEditorFingerprint {
     typecast_has_value: bool,
     func_id: Option<model::function_declaration::FunctionDeclarationId>,
     dropdown_open: Option<(model::node::Id, DropdownKind)>,
+    /// Which of the node's cells the caret addresses. The panel shows the one
+    /// property that cell stands for, so moving between two cells of the *same*
+    /// node has to rebuild it — node and variant are unchanged then.
+    role: Option<layout::CellRole>,
     visible: bool,
 }
 
@@ -2320,14 +2324,24 @@ fn sync_node_editor_ui(
     mut cache: Local<NodeEditorFingerprint>,
 ) {
     let caret = state.caret_graph(&pick);
-    // The panel edits the property this address stands for, so it only opens
-    // on a node's body cell — never on one of its anchor rows.
-    let node_id = caret.and_then(|(layout, local)| {
+    // The panel edits the property this address stands for, so *which* of the
+    // node's cells is addressed decides what it shows, not only which node. A
+    // body cell is the node's own property. A Source answers on its output
+    // anchor too: that cell is where its declared type lives, while its body is
+    // where its name is — printed on it.
+    let addressed = caret.and_then(|(layout, local)| {
         let id = layout.node_at(local)?;
         let ln = layout.layout_nodes.get(&id)?;
-        let node_local = local - ln.pos.round().as_ivec3();
-        matches!(ln.shape.role_at(node_local), Some(layout::CellRole::Body)).then_some(id)
+        let role = ln.shape.role_at(local - ln.pos.round().as_ivec3())?.clone();
+        let opens = match (&role, layout.graph.nodes.get(&id)?) {
+            (layout::CellRole::Body, _) => true,
+            (layout::CellRole::Output { .. }, model::node::ENode::Source { .. }) => true,
+            _ => false,
+        };
+        opens.then_some((id, role))
     });
+    let node_id = addressed.as_ref().map(|(id, _)| id.clone());
+    let role = addressed.map(|(_, role)| role);
     let node = node_id
         .as_ref()
         .and_then(|id| caret.and_then(|(layout, _)| layout.graph.nodes.get(id)));
@@ -2335,7 +2349,11 @@ fn sync_node_editor_ui(
     let type_choice = node.and_then(|n| match n {
         model::node::ENode::Constant { r#type, .. }
         | model::node::ENode::TypeCast { r#type, .. }
-        | model::node::ENode::Pattern { r#type, .. } => Some(type_choice_of(r#type)),
+        | model::node::ENode::Pattern { r#type, .. }
+        // A Source belongs here as much as the others: its type is what the
+        // dropdown on its output cell sets, so the panel has to notice when it
+        // changes rather than leaning on `dropdown_open` closing to do it.
+        | model::node::ENode::Source { r#type, .. } => Some(type_choice_of(r#type)),
         _ => None,
     });
     let typecast_has_value = match node {
@@ -2368,6 +2386,7 @@ fn sync_node_editor_ui(
         typecast_has_value,
         func_id: func_id.clone(),
         dropdown_open: dropdown_state.open.clone(),
+        role: role.clone(),
         visible,
     };
 
@@ -2418,12 +2437,29 @@ fn sync_node_editor_ui(
                 }
             }
             model::node::ENode::Source { name, r#type, .. } => {
-                spawn_labeled_row(panel, font, "Name", |slot| {
-                    spawn_name_input(slot, font, &node_id, name);
-                });
-                spawn_labeled_row(panel, font, "Type", |slot| {
-                    spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
-                });
+                spawn_editor_label(panel, font, "Source");
+                // One cell, one property: the body carries the name — it is
+                // printed along it — and the output anchor carries the declared
+                // type. Showing both at once would put the choice back in the
+                // panel, which is what the cell layout exists to avoid.
+                match &role {
+                    Some(layout::CellRole::Output { .. }) => {
+                        spawn_labeled_row(panel, font, "Type", |slot| {
+                            spawn_type_dropdown(
+                                slot,
+                                font,
+                                &node_id,
+                                r#type,
+                                &dropdown_state.open,
+                            );
+                        });
+                    }
+                    _ => {
+                        spawn_labeled_row(panel, font, "Name", |slot| {
+                            spawn_name_input(slot, font, &node_id, name);
+                        });
+                    }
+                }
             }
             model::node::ENode::TypeCast { r#type, .. } => {
                 spawn_editor_label(panel, font, "TypeCast");
