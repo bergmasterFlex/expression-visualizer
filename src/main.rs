@@ -779,6 +779,18 @@ fn spawn_graph_nodes(
     // lives in the program-level edge table — so flatten once here instead of
     // per anchor, and hand the same view to the renderer and the edge pass.
     let flat_graph = state.root_graph().flattened_graph();
+    // Rasterising text needs a font synchronously — see `edge::FONT_BYTES` for
+    // why that one bypasses the asset server — and both passes below want the
+    // same one, so it is built once here.
+    let glyph_font =
+        ab_glyph::FontRef::try_from_slice(edge::FONT_BYTES).expect("bundled font is valid");
+    // Cache body-face textures per (text, cells, colour) within this spawn
+    // pass. Local rather than a resource on purpose: a resource would hold
+    // strong handles past the rebuild, so renaming a source would leave one
+    // dead texture behind per keystroke. Here the only handle lives in the
+    // material, which `clear_scene` drops, and the image goes with it.
+    let mut face_tex_cache: std::collections::HashMap<(String, u32, [u8; 4]), Handle<Image>> =
+        std::collections::HashMap::new();
     for walked in state.layout_graph.walk_all() {
         let layout_node = walked.layout_node;
         let node_id = &layout_node.node_id;
@@ -841,6 +853,37 @@ fn spawn_graph_nodes(
                     SceneEntity,
                 ));
             }
+        }
+
+        // Text printed onto a body face: the name a Source carries on its top
+        // face rather than beside itself.
+        for face in render_node.text_faces {
+            let key = (
+                face.text.clone(),
+                face.cells,
+                face.background.to_srgba().to_u8_array(),
+            );
+            let texture = face_tex_cache
+                .entry(key)
+                .or_insert_with(|| {
+                    edge::rasterize_face_text(
+                        &glyph_font,
+                        &face.text,
+                        face.cells,
+                        face.background,
+                        &mut images,
+                    )
+                })
+                .clone();
+            commands.spawn((
+                Mesh3d(meshes.add(face.mesh)),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color_texture: Some(texture),
+                    ..face.material
+                })),
+                face.transform,
+                SceneEntity,
+            ));
         }
 
         // Markers the node owns directly rather than through an anchor: a
@@ -917,8 +960,6 @@ fn spawn_graph_nodes(
             (edge::LeafKind, String),
             Handle<Image>,
         > = std::collections::HashMap::new();
-        let value_font =
-            ab_glyph::FontRef::try_from_slice(edge::FONT_BYTES).expect("bundled font is valid");
 
         for e in state.root_graph().edges() {
             let src_id = &e.from_anchor.anchor_id;
@@ -992,7 +1033,7 @@ fn spawn_graph_nodes(
                     let handle = value_marquee_cache
                         .entry((kind, text.clone()))
                         .or_insert_with(|| {
-                            edge::rasterize_marquee_text(&value_font, &text, &mut images)
+                            edge::rasterize_marquee_text(&glyph_font, &text, &mut images)
                         })
                         .clone();
                     (edge::RIBBON_LINE_HEIGHT, handle, 1.0)
@@ -2986,6 +3027,10 @@ fn handle_node_editor_text_input(
                 if let model::node::ENode::Source { name, .. } = node {
                     if *name != input.value {
                         *name = input.value.clone();
+                        // The name is written along the body, so it decides
+                        // how many cells that body claims — renaming reshapes
+                        // the node exactly the way retyping a value does.
+                        state.resettle();
                         rebuild.0 = true;
                     }
                 }

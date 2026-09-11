@@ -364,3 +364,108 @@ pub fn rasterize_marquee_text(
     });
     images.add(image)
 }
+
+/// Pixels per cell in a body-face text texture.
+///
+/// A name is read at the near end of the zoom range (`camera::MAX_CELL_PIXELS`
+/// is 160 px per cell) and a runtime image carries no mip chain, so the choice
+/// is between blur up there and shimmer down at the default 40, where three
+/// characters are thirteen pixels wide and unreadable either way. Sharp where
+/// it is actually read.
+const FACE_TEX_CELL_PX: u32 = 128;
+
+/// Rasterise `text` across a `cells`-by-one-cell body face: fixed pitch,
+/// `layout::NAME_CHARS_PER_CELL` characters per cell, white glyphs over
+/// `background`.
+///
+/// Unlike `rasterize_marquee_text` the text is **not** stretched to the texture
+/// width. The pitch is the meaning here — the body is as long as the name needs
+/// — so a character has to be exactly a third of a cell, or the body's length
+/// stops being a count of characters.
+///
+/// The background colour is baked in and the alpha left at 1 rather than
+/// leaving the glyphs on transparency: the face then sits in the opaque pass,
+/// writes depth (which is what keeps the scope's grid plane off the name), and
+/// is indistinguishable from the body under it. Straight alpha would also
+/// require painting the colour into fully transparent pixels, or bilinear
+/// filtering drags dark seams around every glyph.
+pub fn rasterize_face_text(
+    font: &FontRef<'_>,
+    text: &str,
+    cells: u32,
+    background: Color,
+    images: &mut Assets<Image>,
+) -> Handle<Image> {
+    let w = (cells.max(1) * FACE_TEX_CELL_PX) as usize;
+    let h = FACE_TEX_CELL_PX as usize;
+    let bg = background.to_srgba().to_u8_array();
+    let mut buf: Vec<u8> = bg.iter().copied().cycle().take(w * h * 4).collect();
+
+    let pitch = FACE_TEX_CELL_PX as f32 / crate::layout::NAME_CHARS_PER_CELL as f32;
+    // `PxScale` is measured against the font's ascent-to-descent span, not
+    // against its em square — for this face that is 1.32 em — so the size that
+    // makes one advance a third of a cell is measured off the font rather than
+    // derived from a nominal em size.
+    let unit = font.as_scaled(PxScale::from(1.0));
+    let unit_advance = unit.h_advance(unit.font.glyph_id('0'));
+    let px = PxScale::from(if unit_advance > 0.0 {
+        pitch / unit_advance
+    } else {
+        pitch
+    });
+    let scaled = font.as_scaled(px);
+    let baseline_y =
+        scaled.ascent() + (FACE_TEX_CELL_PX as f32 - (scaled.ascent() - scaled.descent())) * 0.5;
+    // The body is a whole number of cells, so the room the name does not fill
+    // is split between its two ends rather than hung off one of them.
+    let used = text.chars().count() as f32 * pitch;
+    let mut pen_x = (w as f32 - used) * 0.5;
+
+    for c in text.chars() {
+        let glyph = scaled
+            .font
+            .glyph_id(c)
+            .with_scale_and_position(px, ab_glyph::point(pen_x, baseline_y));
+        if let Some(outline) = font.outline_glyph(glyph) {
+            let bounds = outline.px_bounds();
+            outline.draw(|gx, gy, coverage| {
+                let px_x = gx as i32 + bounds.min.x as i32;
+                let px_y = gy as i32 + bounds.min.y as i32;
+                if px_x < 0 || px_y < 0 || px_x as usize >= w || px_y as usize >= h {
+                    return;
+                }
+                let idx = (px_y as usize * w + px_x as usize) * 4;
+                for channel in 0..3 {
+                    let lit = bg[channel] as f32 + (255.0 - bg[channel] as f32) * coverage;
+                    buf[idx + channel] = buf[idx + channel].max(lit as u8);
+                }
+            });
+        }
+        // Fixed step: no accumulated advance, no stretch.
+        pen_x += pitch;
+    }
+
+    let mut image = Image::new(
+        Extent3d {
+            width: w as u32,
+            height: h as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        buf,
+        TextureFormat::Rgba8UnormSrgb,
+        bevy::asset::RenderAssetUsages::RENDER_WORLD,
+    );
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        // Clamped on both axes: this texture is a single printed face, not a
+        // marquee, so a repeat would bleed one end of the name into the other.
+        address_mode_u: ImageAddressMode::ClampToEdge,
+        address_mode_v: ImageAddressMode::ClampToEdge,
+        address_mode_w: ImageAddressMode::ClampToEdge,
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
+        ..default()
+    });
+    images.add(image)
+}

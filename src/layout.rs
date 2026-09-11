@@ -95,6 +95,27 @@ impl LayoutNode {
 /// Z=0, so the arms start one cell behind it and their branch volumes one
 /// further still (see `LayoutGraph::sub_layout_origin`).
 pub const PATTERN_LOCAL_Z: f32 = 1.0;
+/// Monospace characters that fit across one cell along the axis a name is
+/// written on. The rasteriser steps by `1/N` of a cell, which is what makes a
+/// body's length *a count of characters* rather than a guess.
+pub const NAME_CHARS_PER_CELL: usize = 3;
+
+/// Cells a Source's body claims along +Z: one per `NAME_CHARS_PER_CELL`
+/// characters of its name, never fewer than the one cell it has always owned.
+///
+/// `chars().count()`, not `len()`: the name is user text and the field it is
+/// typed into counts characters, so an umlaut is one character here and two
+/// bytes there — `len()` would hand that name a cell it does not fill.
+/// Counting scalar values is still not counting glyphs, but it is exactly what
+/// the rasteriser walks, so length and pitch cannot disagree.
+pub fn source_body_cells(name: &str) -> i32 {
+    // On `usize`, because `i32::div_ceil` is not stable.
+    name.chars()
+        .count()
+        .div_ceil(NAME_CHARS_PER_CELL)
+        .max(1) as i32
+}
+
 /// Cells an anchor claims: `infer::anchor_rows` of them, growing along +Y from
 /// row 0, all in column `x` at depth `z`.
 fn anchor_cells(
@@ -577,12 +598,16 @@ impl LayoutGraph {
     /// | node | cells (`x|z`) |
     /// |---|---|
     /// | Sink | `0\|0` input |
-    /// | Source / Constant | `0\|0` body, `0\|1` output |
+    /// | Constant | `0\|0` body, `0\|1` output |
+    /// | Source (name of n chars) | `0\|0..k-1` body, `0\|k` output, `k = ceil(n/3)` |
     /// | TypeCast | `0\|0` input, `0\|1` body, `0\|2` output |
     /// | FunctionCall (n inputs) | `i\|0` input i, `(0..n)\|1..2` body, `0\|3` output |
     /// | Match | `0\|0` input, output directly behind the deepest branch |
     /// | Pattern | one cell |
     /// | BranchSource | `0\|0` output |
+    ///
+    /// The Source's depth is the one cell count here that the node kind does
+    /// not fix: its body carries its name, so `source_body_cells` decides it.
     ///
     /// An anchor claims `infer::anchor_rows` cells along +Y from its own row.
     /// A Match's Patterns and branch volumes are separate nodes and
@@ -601,8 +626,27 @@ impl LayoutGraph {
                     CellRole::Input { index: 0, leaf }
                 }));
             }
-            crate::model::node::ENode::Source { output_anchor, .. }
-            | crate::model::node::ENode::Constant { output_anchor, .. } => {
+            // A Source writes its name along its body, so the body is as long
+            // as the name needs and the output sits one cell behind its end.
+            crate::model::node::ENode::Source {
+                name,
+                output_anchor,
+                ..
+            } => {
+                let depth = source_body_cells(name);
+                for z in 0..depth {
+                    cells.push((IVec3::new(0, 0, z), CellRole::Body));
+                }
+                cells.extend(anchor_cells(
+                    flat_graph,
+                    fds,
+                    output_anchor,
+                    0,
+                    depth,
+                    |leaf| CellRole::Output { leaf },
+                ));
+            }
+            crate::model::node::ENode::Constant { output_anchor, .. } => {
                 cells.push((IVec3::ZERO, CellRole::Body));
                 cells.extend(anchor_cells(flat_graph, fds, output_anchor, 0, 1, |leaf| {
                     CellRole::Output { leaf }
@@ -1062,12 +1106,18 @@ impl LayoutGraph {
                     if id == owner_id || related.contains(id) {
                         return None;
                     }
-                    // A BranchSource cannot be displaced — it is pinned to its
-                    // branch origin — so never pick one as the intruder, or the
-                    // settle loop would spin until its iteration cap.
+                    // Neither of these can be displaced, so picking one only
+                    // spins the loop to its iteration cap. A BranchSource is
+                    // pinned to its branch origin. The Sink is placed by
+                    // `settle_sink` a moment later, which pulls it behind the
+                    // deepest footprint anyway, and `move_node_delta` refuses
+                    // every move into its row.
                     if matches!(
                         layout.graph.nodes.get(id),
-                        Some(crate::model::node::ENode::BranchSource { .. })
+                        Some(
+                            crate::model::node::ENode::BranchSource { .. }
+                                | crate::model::node::ENode::Sink { .. }
+                        )
                     ) {
                         return None;
                     }
@@ -1096,12 +1146,19 @@ impl LayoutGraph {
                     layout.graph.nodes.get(&intruder_id),
                     Some(crate::model::node::ENode::Source { .. })
                 );
+                // `move_node_delta` refuses a move onto or past the Sink's row
+                // — that row is the Sink's alone — so a Z push aiming there
+                // cannot be carried out, and retrying it would burn the
+                // iteration cap and leave the intruder inside the footprint.
+                let z_blocked = layout.sink_z().is_some_and(|s| bbox.max.z + 1 >= s);
                 // Priority: Z (deeper) → X (sideways) → Y (downward). Y is a
                 // last resort because it crosses row boundaries; XZ keeps
-                // the intruder on the same floor.
+                // the intruder on the same floor. Sideways is the exit that
+                // always exists: `push_x` is never zero and its target is
+                // clamped into the non-negative octant.
                 let (best_axis, best_dist) = if is_source {
                     (0u8, push_x)
-                } else if push_z != 0 {
+                } else if push_z != 0 && !z_blocked {
                     (2u8, push_z)
                 } else if push_x != 0 {
                     (0u8, push_x)
@@ -1116,8 +1173,15 @@ impl LayoutGraph {
                 if delta.length_squared() < 0.25 {
                     break;
                 }
-                let (new_layout, _) = layout.move_node_delta(intruder_id, delta);
+                let before = layout.layout_nodes.get(&intruder_id).map(|ln| ln.pos);
+                let (new_layout, _) = layout.move_node_delta(intruder_id.clone(), delta);
                 layout = new_layout;
+                // A push the constraints refuse is not worth repeating —
+                // nothing about the next iteration would differ, and the cap
+                // is there to catch a runaway, not to poll one.
+                if layout.layout_nodes.get(&intruder_id).map(|ln| ln.pos) == before {
+                    break;
+                }
             }
         }
         layout.settle_sink().harmonize_match_sinks()

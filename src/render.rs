@@ -181,6 +181,24 @@ pub struct RenderBand {
     pub kind: crate::edge::LeafKind,
 }
 
+/// A face of a body with text printed on it — the name a Source carries on its
+/// top face, rather than a label floating beside the node.
+///
+/// The texture is the spawner's job, not the renderer's: rasterising one needs
+/// `Assets<Image>`, which only the spawner has. So this hands over the string
+/// and how many cells it has to fill, and the spawner rasterises, caches and
+/// fills in `base_color_texture`. `background` is the body's own colour, baked
+/// into the texture so the face and the body under it are indistinguishable.
+pub struct RenderTextFace {
+    pub mesh: Mesh,
+    pub transform: Transform,
+    /// Everything but `base_color_texture`, which the spawner supplies.
+    pub material: StandardMaterial,
+    pub text: String,
+    pub cells: u32,
+    pub background: Color,
+}
+
 pub struct RenderNode {
     /// `None` for nodes drawn purely as bands or markers; the node entity is
     /// still spawned so picking and selection keep working.
@@ -192,6 +210,7 @@ pub struct RenderNode {
     pub markers: Vec<RenderTypeMarker>,
     pub bands: Vec<RenderBand>,
     pub labels: Vec<RenderLabel>,
+    pub text_faces: Vec<RenderTextFace>,
 }
 
 pub struct RenderAnchor {
@@ -250,6 +269,20 @@ const VALUE_LINE_THICKNESS: f32 = CELL * 0.02;
 /// World-space padding between the tip of the gizmo line and the value
 /// label's projection point.
 const VALUE_LABEL_Z_PADDING: f32 = CELL / 30.0;
+/// How far a text face floats above the body face it prints on.
+///
+/// Coplanar is not an option, and for two reasons rather than one. The obvious
+/// one is that both surfaces would land in the same depth bucket. The other is
+/// that a scope's grid plane lies at world Y=0 — exactly the plane a body's top
+/// face lies in — and washes its 55% veil over every top face in the scene. An
+/// opaque quad in front of it fails that plane's depth test instead.
+///
+/// The bound camera's depth axis is world X and its elevation is a shear, not
+/// a tilt, so a lift of `l` in Y buys about `1.6 · l` of depth separation. The
+/// depth buffer resolves some `2·10⁻⁵` world units over its range, so a
+/// five-hundredth of a cell clears it by two orders of magnitude while staying
+/// under a third of a pixel at the tightest zoom.
+const BODY_FACE_LIFT: f32 = CELL / 500.0;
 
 /// Sort key that fixes the vertical order of type-marker rectangles.
 /// Returns `None` for variants that should not render a rectangle.
@@ -310,8 +343,11 @@ pub fn ordered_supported_leaves(t: &crate::infer::EType) -> Vec<crate::infer::ET
     leaves
 }
 
-/// Body of a source node, rendered as a wire band rather than a solid slab:
-/// it *is* the start of the value's path, and the marquee names its type.
+/// Body of a Constant, rendered as a wire band rather than a solid slab: it
+/// *is* the start of the value's path, and the marquee names its type.
+///
+/// A Source used to be drawn this way too. It no longer is: it carries a name,
+/// and a name needs a face to be written on, so it got a solid body instead.
 ///
 /// Reuses the edge ribbon (`edge::build_ribbon_mesh`) with a hand-built
 /// straight curve through the body cell — `EdgeCurve`'s control points are
@@ -513,16 +549,108 @@ pub fn layoutnode_to_rendernode(
     };
     let node = graph.nodes.get(&layout_node.node_id).unwrap();
     match node {
-        // Source nodes (a declared constant, a named variable): body band at
-        // `0|0` naming the type, output anchor at `0|1`.
+        // A named declaration: an opaque body in the colour of its type, as
+        // long as its name needs, with the name printed on the top face and
+        // the output anchor one cell behind the body's end.
+        crate::model::node::ENode::Source {
+            name,
+            r#type,
+            output_anchor,
+        } => {
+            let depth = crate::layout::source_body_cells(name);
+            let output_world = cell(0, 0, depth);
+            let output_eval_type = crate::infer::graph_type_to_eval_type(r#type);
+            let output_value = crate::layout::value_of_etype(r#type);
+            // A body is a body: it stands in front of what is behind it.
+            // `type_marker_color` paints anchor *bands*, which are translucent
+            // so an edge behind one stays visible — hence the opaque override.
+            let body_color = type_marker_color(&output_eval_type).with_alpha(1.0);
+            let cell_x = LAYOUT_SCALE.x.abs();
+            let cell_y = LAYOUT_SCALE.y.abs();
+            let cell_z = LAYOUT_SCALE.z.abs();
+            // Midpoint of the first and last body cell — no sign juggling, and
+            // it stays right whichever way `LAYOUT_SCALE` points.
+            let body_center = (cell(0, 0, 0) + cell(0, 0, depth - 1)) * 0.5;
+            // One cell tall: a Source declares a leaf type, never a sum, so
+            // its output is always a single row. Were that ever to change, the
+            // body would follow `anchor_rows` the way a FunctionCall's far
+            // face does.
+            let body_size = Vec3::new(cell_x, cell_y, depth as f32 * cell_z);
+            // Layout Y=0 is the body's upper bound and layout +Y is world −Y,
+            // so the top face lies half a cell *above* the centre in world
+            // terms.
+            let top_y = body_center.y + cell_y * 0.5;
+            let body_material = || StandardMaterial {
+                base_color: body_color,
+                // `emissive` would be dead weight: for an unlit material the
+                // shader skips the lighting pass that would add it. Unlit also
+                // keeps the name face and the body identical by construction —
+                // a lit body would glow on hover while the face, being its own
+                // entity, would not.
+                unlit: true,
+                ..default()
+            };
+            let name_face = RenderTextFace {
+                // Width runs along local +X, height along local +Y; the
+                // rotation below maps those onto world −Z and −X.
+                mesh: Rectangle::new(depth as f32 * cell_z, cell_x).mesh().build(),
+                transform: Transform {
+                    translation: Vec3::new(
+                        body_center.x,
+                        top_y + BODY_FACE_LIFT,
+                        body_center.z,
+                    ),
+                    // A `Rectangle` is built in the XY plane. Laying it flat
+                    // alone (the `x` term) would run the text along world +X,
+                    // which slants away from the viewer; the `y` term turns it
+                    // so the text reads along world −Z, i.e. layout +Z, which
+                    // the projection draws exactly left to right. What is left
+                    // — local +Y onto world −X — keeps the basis right-handed,
+                    // which is what stops the glyphs coming out mirrored.
+                    rotation: Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)
+                        * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+                    scale: Vec3::ONE,
+                },
+                material: body_material(),
+                text: name.clone(),
+                cells: depth as u32,
+                background: body_color,
+            };
+            RenderNode {
+                node: Some(RenderObject {
+                    mesh: Cuboid::new(body_size.x, body_size.y, body_size.z)
+                        .mesh()
+                        .build(),
+                    material: body_material(),
+                    transform: Transform::from_translation(body_center),
+                }),
+                anchors: std::collections::HashMap::from([(
+                    output_anchor.clone(),
+                    RenderAnchor {
+                        pick_center: output_world,
+                        type_markers: build_type_markers(
+                            &output_eval_type,
+                            output_value.as_deref(),
+                            output_world,
+                            false,
+                        ),
+                        plain_body: None,
+                    },
+                )]),
+                markers: vec![],
+                bands: vec![],
+                // The name is on the body now, and the type is in the body's
+                // colour and at the output anchor — nothing left to float
+                // beside the node.
+                labels: vec![],
+                text_faces: vec![name_face],
+            }
+        }
+        // A literal: body band at `0|0` naming the type, output anchor at
+        // `0|1`.
         crate::model::node::ENode::Constant {
             r#type,
             output_anchor,
-        }
-        | crate::model::node::ENode::Source {
-            r#type,
-            output_anchor,
-            ..
         } => {
             let body_world = cell(0, 0, 0);
             let output_world = cell(0, 0, 1);
@@ -558,16 +686,10 @@ pub fn layoutnode_to_rendernode(
                 )]),
                 markers: vec![],
                 bands,
-                labels: match node {
-                    crate::model::node::ENode::Source { .. } => vec![RenderLabel {
-                        text: label_for_node(node, function_declarations),
-                        color: Color::WHITE,
-                        font_size: 18.0,
-                        world_pos: body_world,
-                        offset: Vec2::ZERO,
-                    }],
-                    _ => vec![],
-                },
+                // A literal draws itself: the value hangs off the output
+                // anchor, so there is nothing for a body label to add.
+                labels: vec![],
+                text_faces: vec![],
             }
         }
         // Input anchor at `0|0`, body (the target type) at `0|1`, output at
@@ -631,6 +753,7 @@ pub fn layoutnode_to_rendernode(
                 markers: vec![],
                 bands: vec![],
                 labels: vec![],
+                text_faces: vec![],
             }
         }
         // Input anchors along `i|0`, body spanning the full width at `z=1..2`,
@@ -771,6 +894,7 @@ pub fn layoutnode_to_rendernode(
                         }),
                 )
                 .collect(),
+                text_faces: vec![],
             }
         }
         // Nothing but an input anchor, sitting alone on the scope's last Z row.
@@ -796,6 +920,7 @@ pub fn layoutnode_to_rendernode(
                 markers: vec![],
                 bands: vec![],
                 labels: vec![],
+                text_faces: vec![],
             }
         }
         // A Pattern declares the type its arm matches and fixes its branch's
@@ -814,6 +939,7 @@ pub fn layoutnode_to_rendernode(
             ),
             bands: vec![],
             labels: vec![],
+            text_faces: vec![],
         },
         // Mirror of the Sink: a single output anchor at the branch origin. Its
         // type is the owning Pattern's, resolved through `infer::anchor_type`.
@@ -839,6 +965,7 @@ pub fn layoutnode_to_rendernode(
                 markers: vec![],
                 bands: vec![],
                 labels: vec![],
+                text_faces: vec![],
             }
         }
         crate::model::node::ENode::Match {
@@ -883,6 +1010,7 @@ pub fn layoutnode_to_rendernode(
                 markers: vec![],
                 bands: vec![],
                 labels: vec![],
+                text_faces: vec![],
             }
         }
         crate::model::node::ENode::Root { .. } => {
