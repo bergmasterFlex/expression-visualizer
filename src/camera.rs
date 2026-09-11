@@ -456,7 +456,11 @@ fn unshear_corners(
 ) -> [bevy::math::Vec3A; 8] {
     corners.map(|corner| {
         let along = corner.z + focal_distance;
-        bevy::math::Vec3A::new(corner.x - depth.x * along, corner.y - depth.y * along, corner.z)
+        bevy::math::Vec3A::new(
+            corner.x - depth.x * along,
+            corner.y - depth.y * along,
+            corner.z,
+        )
     })
 }
 
@@ -539,8 +543,7 @@ impl bevy::camera::CameraProjection for ObliquePerspective {
     fn update(&mut self, width: f32, height: f32) {
         self.perspective.aspect_ratio = width / height;
         let visible_world_height = height / self.cell_pixels;
-        self.perspective.fov =
-            2.0 * (visible_world_height * 0.5 / self.focal_distance).atan();
+        self.perspective.fov = 2.0 * (visible_world_height * 0.5 / self.focal_distance).atan();
     }
 
     fn far(&self) -> f32 {

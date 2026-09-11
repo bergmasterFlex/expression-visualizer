@@ -154,12 +154,73 @@ struct NeedsRebuild(bool);
 
 /// Editor mode, vim style. NORMAL navigates the caret through the volume the
 /// graph already occupies; INSERT freezes the caret and turns `Space`,
-/// `Return` and `Shift+Return` into the inserts that make room inside it.
+/// `Return` and `Shift+Return` into the inserts that make room inside it,
+/// while every other key writes a node kind's name into `InsertPrompt`.
 #[derive(Resource, Default, Clone, Copy, PartialEq, Eq)]
 enum EditorMode {
     #[default]
     Normal,
     Insert,
+}
+
+/// What has been typed in INSERT so far, and which suggestion it stands on.
+///
+/// Deliberately **not** a `TextInput`: a focused text field makes
+/// `keyboard_captured` true, and that is what gives `Space`, `Return` and
+/// `Escape` their INSERT meanings. A field here would turn `Space` into a
+/// blank and `Escape` into a mere unfocus — the three behaviours that have to
+/// survive. `selected` indexes the *displayed* list, so it is re-clamped on
+/// every rebuild rather than trusted.
+#[derive(Resource, Default)]
+struct InsertPrompt {
+    text: String,
+    selected: usize,
+}
+
+impl InsertPrompt {
+    fn clear(&mut self) {
+        self.text.clear();
+        self.selected = 0;
+    }
+}
+
+/// The node kinds a user action can create. `ENode` has more variants, but
+/// `Root`, `Sink` and `BranchSource` only ever come into being as part of
+/// something else, so they are not offered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AddKind {
+    Constant,
+    Source,
+    FunctionCall,
+    Match,
+    Pattern,
+    TypeCast,
+}
+
+/// List order of the suggestions. Every label is unique in its first letter,
+/// so one keystroke settles the choice.
+const ADD_KINDS: [AddKind; 6] = [
+    AddKind::Constant,
+    AddKind::Source,
+    AddKind::FunctionCall,
+    AddKind::Match,
+    AddKind::Pattern,
+    AddKind::TypeCast,
+];
+
+impl AddKind {
+    /// The name that is typed to pick this kind — the `ENode` variant's name,
+    /// the same vocabulary the thesis uses, not a UI phrase like "Add Match".
+    fn label(self) -> &'static str {
+        match self {
+            AddKind::Constant => "Constant",
+            AddKind::Source => "Source",
+            AddKind::FunctionCall => "FunctionCall",
+            AddKind::Match => "Match",
+            AddKind::Pattern => "Pattern",
+            AddKind::TypeCast => "TypeCast",
+        }
+    }
 }
 
 /// Marker for any spawned scene entity (cleaned on rebuild).
@@ -171,15 +232,25 @@ struct SceneEntity;
 struct DeleteNodeButton;
 #[derive(Component)]
 struct HamburgerButton;
-#[derive(Component, Clone, PartialEq, Eq)]
-enum EGraphActionButton {
-    AddConstantButton,
-    AddSourceButton,
-    AddTypeCastButton,
-    AddFunctionCallButton,
-    AddMatchButton,
-    AddPatternButton,
-}
+/// The one button left of the six former "Add …" ones: it only enters INSERT,
+/// where the kind is typed rather than picked.
+#[derive(Component)]
+struct AddNodeButton;
+
+/// Root of the INSERT-mode prompt, which stands in the "Add" button's slot.
+#[derive(Component)]
+struct InsertPromptPanel;
+
+/// Marker on the two rows the prompt respawns on a change — the text row and
+/// the suggestion list. Only those two carry it: `despawn` takes their
+/// children with them, and an entity despawned twice warns.
+#[derive(Component)]
+struct InsertPromptEntity;
+
+/// A clickable suggestion row, so the mouse path the "Add" button opens does
+/// not dead-end at a keyboard-only list.
+#[derive(Component)]
+struct InsertPromptOption(AddKind);
 
 #[derive(Resource)]
 struct StartMenu {
@@ -1106,36 +1177,20 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
     // Hamburger menu button (top-left) — opens the menu modal.
     spawn_hamburger_button(&mut commands, Vec2::new(12.0, 12.0));
 
-    let mut y_offset = 60.0;
     spawn_ui_button(
         &mut commands,
         &ui_font.0,
         "Delete Node",
         DeleteNodeButton,
-        Vec2::new(12.0, y_offset),
+        Vec2::new(12.0, 60.0),
         Display::Flex,
     );
-    for (label, action) in [
-        ("Add Constant", EGraphActionButton::AddConstantButton),
-        ("Add Source", EGraphActionButton::AddSourceButton),
-        (
-            "Add FunctionCall",
-            EGraphActionButton::AddFunctionCallButton,
-        ),
-        ("Add Match", EGraphActionButton::AddMatchButton),
-        ("Add Pattern", EGraphActionButton::AddPatternButton),
-        ("Add TypeCast", EGraphActionButton::AddTypeCastButton),
-    ] {
-        y_offset += 36.0;
-        spawn_ui_button(
-            &mut commands,
-            &ui_font.0,
-            label,
-            action,
-            Vec2::new(12.0, y_offset),
-            Display::Flex,
-        );
-    }
+    // The six "Add …" buttons are gone: what is created is typed at the
+    // prompt that takes this slot in INSERT. The button is the mouse's way in
+    // and does nothing but enter that mode. It hides itself, so unlike the
+    // other buttons it must not also answer to `HideDuringStartMenu` — two
+    // writers on one `display` flicker on the transition frame.
+    spawn_insert_mode_button(&mut commands, &ui_font.0, Vec2::new(12.0, 96.0));
 
     // Bottom-left, opposite the mode indicator in the bottom-right corner.
     spawn_corner_button(
@@ -1342,6 +1397,55 @@ fn spawn_ui_button<C: Bundle>(
         });
 }
 
+/// The "Add" button. Same look as `spawn_ui_button` produces, minus
+/// `HideDuringStartMenu`: `sync_add_button` is its only writer, so the start
+/// menu's bulk toggle must not reach it.
+fn spawn_insert_mode_button(commands: &mut Commands, font: &Handle<Font>, pos: Vec2) {
+    commands
+        .spawn((
+            Button,
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(pos.y),
+                left: Val::Px(pos.x),
+                padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+            AddNodeButton,
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Text::new("Add"),
+                text_font(font, 14.0),
+                TextColor(Color::srgb(0.6, 0.6, 0.7)),
+            ));
+        });
+}
+
+/// The INSERT prompt's panel, standing in the "Add" button's slot. Empty at
+/// startup — `sync_insert_prompt_ui` fills it. `Button` on the root so
+/// `pick_nodes`' `over_ui` test covers it and a click on the panel doesn't
+/// move the caret to whatever cell lies behind it, the same reason
+/// `spawn_node_editor_panel` carries one.
+fn spawn_insert_prompt_panel(mut commands: Commands) {
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(96.0),
+            left: Val::Px(12.0),
+            width: Val::Px(200.0),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(4.0),
+            display: Display::None,
+            ..default()
+        },
+        Button,
+        InsertPromptPanel,
+    ));
+}
+
 fn spawn_hamburger_button(commands: &mut Commands, pos: Vec2) {
     let bar = || Node {
         width: Val::Px(20.0),
@@ -1416,113 +1520,104 @@ fn handle_delete_node_button(
     }
 }
 
-fn update_add_pattern_button_visuals(
-    pick: Res<PickState>,
-    state: Res<GraphState>,
-    mut button_q: Query<(
-        &Interaction,
-        &mut BackgroundColor,
-        &Children,
-        &EGraphActionButton,
-    )>,
-    mut text_color_q: Query<&mut TextColor>,
-) {
-    let enabled = matches!(
-        state
-            .caret_graph(&pick)
-            .and_then(|(layout, local)| {
-                layout
-                    .node_at(local)
-                    .and_then(|id| layout.graph.nodes.get(&id))
-            })
-            .cloned(),
-        Some(model::node::ENode::Pattern { .. })
-    );
-    for (interaction, mut bg, children, action) in button_q.iter_mut() {
-        if *action != EGraphActionButton::AddPatternButton {
-            continue;
+/// May a node of this kind come into being at `local`?
+///
+/// The single source for both the greying of the suggestions and what `Enter`
+/// accepts. It was written twice before — the handler and the button visuals —
+/// and the two copies disagreed about a branch scope's `z == 0` plane and
+/// about the sink row.
+///
+/// `graph` is the scope the caret addresses, `local` the caret in that scope's
+/// coordinates.
+fn kind_allowed(
+    graph: &layout::LayoutGraph,
+    is_root_scope: bool,
+    local: IVec3,
+    kind: AddKind,
+) -> bool {
+    // The scope's last Z row belongs to its Sink alone.
+    if graph.sink_z().is_some_and(|z| local.z >= z) {
+        return false;
+    }
+    match kind {
+        // The one kind that *needs* an occupied cell: a Pattern is added
+        // below the Pattern the caret stands on.
+        AddKind::Pattern => matches!(
+            graph
+                .node_at(local)
+                .and_then(|id| graph.graph.nodes.get(&id)),
+            Some(model::node::ENode::Pattern { .. })
+        ),
+        // Every scope reserves its Z=0 plane as the source row, and only the
+        // root scope's holds Sources — a branch's already holds its
+        // BranchSource.
+        AddKind::Source => {
+            graph.node_at(local).is_none() && is_root_scope && local.z == 0 && local.y == 0
         }
-        let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
-            continue;
-        };
-        if !enabled {
-            bg.0 = Color::srgba(0.10, 0.10, 0.13, 0.9);
-            text_color.0 = Color::srgb(0.35, 0.35, 0.4);
-            continue;
-        }
-        match *interaction {
-            Interaction::Hovered | Interaction::Pressed => {
-                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                text_color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                text_color.0 = Color::srgb(0.6, 0.6, 0.7);
-            }
-        }
+        _ => graph.node_at(local).is_none() && local.z != 0,
     }
 }
 
-fn update_add_generic_button_visuals(
-    pick: Res<PickState>,
-    state: Res<GraphState>,
-    mut button_q: Query<(
-        &Interaction,
-        &mut BackgroundColor,
-        &Children,
-        &EGraphActionButton,
-    )>,
-    mut text_color_q: Query<&mut TextColor>,
-) {
-    let caret = state.caret_graph(&pick);
-    let pos_free = caret
-        .map(|(layout, local)| layout.node_at(local).is_none())
-        .unwrap_or(false);
-    // Source row = the root scope's whole Z=0 plane; nothing but a Source
-    // may be created there. A Source additionally needs the Y=0 row.
-    let in_root_scope = state
-        .scope_of_caret(&pick)
-        .map(|s| s.path.is_empty())
-        .unwrap_or(false);
-    let source_row = in_root_scope && caret.map(|(_, local)| local.z == 0).unwrap_or(false);
-    let source_slot = source_row && caret.map(|(_, local)| local.y == 0).unwrap_or(false);
-    // The scope's last Z row belongs to its Sink alone.
-    let sink_row = caret
-        .map(|(layout, local)| layout.sink_z().is_some_and(|z| local.z >= z))
-        .unwrap_or(false);
-    for (interaction, mut bg, children, action) in button_q.iter_mut() {
-        if *action == EGraphActionButton::AddPatternButton {
-            continue;
-        }
-        let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
-            continue;
-        };
-        let source_locked = *action == EGraphActionButton::AddSourceButton && !source_slot;
-        let source_row_locked = source_row
-            && matches!(
-                *action,
-                EGraphActionButton::AddConstantButton
-                    | EGraphActionButton::AddFunctionCallButton
-                    | EGraphActionButton::AddTypeCastButton
-                    | EGraphActionButton::AddMatchButton
-            );
-        let enabled = pos_free && !source_locked && !source_row_locked && !sink_row;
-        if !enabled {
-            bg.0 = Color::srgba(0.10, 0.10, 0.13, 0.9);
-            text_color.0 = Color::srgb(0.35, 0.35, 0.4);
-            continue;
-        }
-        match *interaction {
-            Interaction::Hovered | Interaction::Pressed => {
-                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                text_color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                text_color.0 = Color::srgb(0.6, 0.6, 0.7);
-            }
-        }
+/// Create a node of this kind at the caret. Returns whether the graph
+/// actually changed, so the caller knows whether to flag a rebuild.
+///
+/// The caret does not follow: it keeps addressing the cell, which now holds
+/// the new node.
+fn insert_node_kind(state: &mut GraphState, pick: &PickState, kind: AddKind) -> bool {
+    // The caret's scope is the editing target — there is nothing else to
+    // agree with, so no context guard is needed here.
+    let Some(scope) = state.scope_of_caret(pick) else {
+        return false;
+    };
+    let node_id_domain = state.node_id_domain.clone();
+    let anchor_id_domain = state.anchor_id_domain.clone();
+    let scope_graph = state.root_graph().resolve_context(&scope.path);
+    if !kind_allowed(scope_graph, scope.path.is_empty(), scope.local, kind) {
+        return false;
     }
+    let new_pos = scope.local.as_vec3();
+    let (new_layout, new_node_id_domain, new_anchor_id_domain) = match kind {
+        AddKind::Constant => scope_graph.plus_constant(
+            model::r#type::EType::Int { value: None },
+            new_pos,
+            node_id_domain,
+            anchor_id_domain,
+        ),
+        AddKind::Source => scope_graph.plus_source(new_pos, node_id_domain, anchor_id_domain),
+        AddKind::FunctionCall => scope_graph.plus_function_call(
+            state
+                .function_declarations
+                .iter()
+                .find(|(_, d)| d.name == "+")
+                .map(|(id, decl)| (id.clone(), decl))
+                .unwrap(),
+            new_pos,
+            node_id_domain,
+            anchor_id_domain,
+        ),
+        AddKind::TypeCast => scope_graph.plus_type_cast(
+            model::r#type::EType::Int { value: None },
+            new_pos,
+            node_id_domain,
+            anchor_id_domain,
+        ),
+        AddKind::Match => scope_graph.plus_match(new_pos, node_id_domain, anchor_id_domain),
+        AddKind::Pattern => {
+            // `kind_allowed` already established that this is a Pattern. The
+            // selected Pattern keeps its row, so the caret stays where it is.
+            let Some(id) = scope_graph.node_at(scope.local) else {
+                return false;
+            };
+            scope_graph.plus_pattern_below(&id, node_id_domain, anchor_id_domain)
+        }
+    };
+    if let Some(target) = state.root_graph_mut().resolve_context_mut(&scope.path) {
+        *target = new_layout;
+    }
+    state.node_id_domain = new_node_id_domain;
+    state.anchor_id_domain = new_anchor_id_domain;
+    state.resettle();
+    true
 }
 
 fn update_delete_button_visuals(
@@ -1563,131 +1658,287 @@ fn update_delete_button_visuals(
     }
 }
 
-fn handle_add_node_button(
-    mut interaction_q: Query<
-        (
-            &Interaction,
-            &mut BackgroundColor,
-            &Children,
-            &EGraphActionButton,
-        ),
-        (Changed<Interaction>, With<EGraphActionButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
-    mut state: ResMut<GraphState>,
-    mut rebuild: ResMut<NeedsRebuild>,
-    pick: Res<PickState>,
-    mut commands: Commands,
-    scene_entities: Query<Entity, With<SceneEntity>>,
+/// The "Add" button does one thing: enter INSERT. What is created is typed
+/// there, so the button no longer knows about node kinds at all.
+fn handle_add_button(
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<AddNodeButton>)>,
     eval: Res<EvalState>,
+    mut mode: ResMut<EditorMode>,
+    mut prompt: ResMut<InsertPrompt>,
+    mut rebuild: ResMut<NeedsRebuild>,
 ) {
     if is_evaluating(&eval) {
         return;
     }
-    for (interaction, mut bg, children, action) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
+    for interaction in interaction_q.iter() {
+        // Guarded so a press doesn't mark `EditorMode` changed for nothing.
+        if *interaction == Interaction::Pressed && *mode != EditorMode::Insert {
+            *mode = EditorMode::Insert;
+            prompt.clear();
+            // The caret is drawn per mode, and it is a scene entity.
+            rebuild.0 = true;
+        }
+    }
+}
 
+/// The "Add" button's only writer: it shows in NORMAL and steps aside for the
+/// prompt in INSERT, plus the usual hover tint. Folding the start menu and the
+/// modals in here rather than wearing `HideDuringStartMenu` keeps it at one
+/// writer, the way `sync_node_editor_ui` does for its panel.
+fn sync_add_button(
+    mode: Res<EditorMode>,
+    start_menu: Res<StartMenu>,
+    eval: Res<EvalState>,
+    mut button_q: Query<
+        (&Interaction, &mut Node, &mut BackgroundColor, &Children),
+        With<AddNodeButton>,
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+) {
+    let visible = *mode == EditorMode::Normal
+        && !start_menu.showing
+        && !modal_is_open(&eval)
+        && !is_evaluating(&eval);
+    let desired = if visible {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    for (interaction, mut node, mut bg, children) in button_q.iter_mut() {
+        if node.display != desired {
+            node.display = desired;
+        }
+        let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
+            continue;
+        };
         match *interaction {
-            Interaction::Pressed => {
-                // The caret's scope is the editing target — there is nothing
-                // else to agree with, so no context guard is needed here.
-                let Some(scope) = state.scope_of_caret(&pick) else {
-                    continue;
-                };
-                let is_root_scope = scope.path.is_empty();
-                let local = scope.local;
-                let new_pos = local.as_vec3();
-                let scope_graph = state.root_graph().resolve_context(&scope.path);
-                let target_occupied = scope_graph.node_at(local).is_some();
-                if target_occupied && *action != EGraphActionButton::AddPatternButton {
-                    continue;
-                }
-                // Every scope reserves its Z=0 plane as the source row. Only a
-                // Source may be created there, and only in the root scope
-                // — a branch's Z=0 already holds its BranchSource. Refuse
-                // every other creation action defensively.
-                let is_source_row = local.z == 0;
-                let source_allowed = is_source_row && is_root_scope && local.y == 0;
-                // The scope's last Z row belongs to its Sink alone.
-                if scope_graph.sink_z().is_some_and(|z| local.z >= z) {
-                    continue;
-                }
-                if is_source_row
-                    && !matches!(*action, EGraphActionButton::AddPatternButton)
-                    && !(source_allowed && *action == EGraphActionButton::AddSourceButton)
-                {
-                    continue;
-                }
-                let node_id_domain = state.node_id_domain.clone();
-                let anchor_id_domain = state.anchor_id_domain.clone();
-                let (new_layout, new_node_id_domain, new_anchor_id_domain) = match action {
-                    EGraphActionButton::AddConstantButton => scope_graph.plus_constant(
-                        model::r#type::EType::Int { value: None },
-                        new_pos,
-                        node_id_domain,
-                        anchor_id_domain,
-                    ),
-                    EGraphActionButton::AddSourceButton => {
-                        // Sources occupy the root scope's source row at
-                        // (x, 0, 0) — refuse anything else defensively; the
-                        // enable-check normally greys the button out first.
-                        if !source_allowed {
-                            continue;
-                        }
-                        scope_graph.plus_source(new_pos, node_id_domain, anchor_id_domain)
-                    }
-                    EGraphActionButton::AddFunctionCallButton => scope_graph.plus_function_call(
-                        state
-                            .function_declarations
-                            .iter()
-                            .find(|(_, d)| d.name == "+")
-                            .map(|(id, decl)| (id.clone(), decl))
-                            .unwrap(),
-                        new_pos,
-                        node_id_domain,
-                        anchor_id_domain,
-                    ),
-                    EGraphActionButton::AddTypeCastButton => scope_graph.plus_type_cast(
-                        model::r#type::EType::Int { value: None },
-                        new_pos,
-                        node_id_domain,
-                        anchor_id_domain,
-                    ),
-                    EGraphActionButton::AddMatchButton => {
-                        scope_graph.plus_match(new_pos, node_id_domain, anchor_id_domain)
-                    }
-                    EGraphActionButton::AddPatternButton => match scope_graph.node_at(local) {
-                        Some(id)
-                            if matches!(
-                                scope_graph.graph.nodes.get(&id),
-                                Some(model::node::ENode::Pattern { .. })
-                            ) =>
-                        {
-                            // The selected Pattern keeps its row, so the caret
-                            // stays where it is.
-                            scope_graph.plus_pattern_below(&id, node_id_domain, anchor_id_domain)
-                        }
-                        _ => continue,
-                    },
-                };
-                if let Some(target) = state.root_graph_mut().resolve_context_mut(&scope.path) {
-                    *target = new_layout;
-                }
-                state.node_id_domain = new_node_id_domain;
-                state.anchor_id_domain = new_anchor_id_domain;
-                state.resettle();
-                rebuild.0 = true;
-            }
-            Interaction::Hovered => {
+            Interaction::Hovered | Interaction::Pressed => {
                 bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
+                text_color.0 = Color::srgb(0.85, 0.85, 0.9);
             }
             Interaction::None => {
                 bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                color.0 = Color::srgb(0.6, 0.6, 0.7);
+                text_color.0 = Color::srgb(0.6, 0.6, 0.7);
             }
         }
     }
+}
+
+/// Clicking a suggestion is the same act as `Enter` on it — without this the
+/// "Add" button would hand a mouse user a list they cannot use.
+fn handle_insert_prompt_click(
+    interaction_q: Query<(&Interaction, &InsertPromptOption), Changed<Interaction>>,
+    eval: Res<EvalState>,
+    mut state: ResMut<GraphState>,
+    // Read-only: the caret keeps addressing the cell the node now fills.
+    pick: Res<PickState>,
+    mut prompt: ResMut<InsertPrompt>,
+    mut rebuild: ResMut<NeedsRebuild>,
+) {
+    if is_evaluating(&eval) {
+        return;
+    }
+    for (interaction, option) in interaction_q.iter() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        if insert_node_kind(&mut state, &pick, option.0) {
+            prompt.clear();
+            rebuild.0 = true;
+        }
+    }
+}
+
+/// The suggestions the prompt currently offers: every kind whose name carries
+/// the typed prefix, each paired with whether it may be created at the caret.
+///
+/// The prefix filters, the legality only greys — those are two different
+/// questions, and typing must not make a row silently disappear because the
+/// caret happens to stand somewhere it is not allowed.
+fn prompt_candidates(state: &GraphState, pick: &PickState, text: &str) -> Vec<(AddKind, bool)> {
+    // Shift reports the uppercase character and the labels are CamelCase, so
+    // the comparison has to ignore case in both directions.
+    let prefix = text.to_ascii_lowercase();
+    let scope = state.scope_of_caret(pick);
+    let resolved = scope.as_ref().map(|s| {
+        (
+            state.root_graph().resolve_context(&s.path),
+            s.path.is_empty(),
+            s.local,
+        )
+    });
+    ADD_KINDS
+        .iter()
+        .filter(|kind| kind.label().to_ascii_lowercase().starts_with(&prefix))
+        .map(|&kind| {
+            let allowed = resolved
+                .is_some_and(|(graph, is_root, local)| kind_allowed(graph, is_root, local, kind));
+            (kind, allowed)
+        })
+        .collect()
+}
+
+/// Step the highlight to the next committable suggestion, wrapping around.
+/// Rows that are greyed out can never be committed, so the highlight does not
+/// stop on them; with nothing legal in the list it stays put.
+fn step_selection(candidates: &[(AddKind, bool)], from: usize, delta: isize) -> usize {
+    let len = candidates.len();
+    if len == 0 {
+        return 0;
+    }
+    let mut index = from.min(len - 1);
+    for _ in 0..len {
+        index = (index as isize + delta).rem_euclid(len as isize) as usize;
+        if candidates[index].1 {
+            return index;
+        }
+    }
+    from
+}
+
+/// Where the highlight lands after the text changed: the first suggestion
+/// that can actually be committed.
+fn first_selection(candidates: &[(AddKind, bool)]) -> usize {
+    candidates.iter().position(|(_, ok)| *ok).unwrap_or(0)
+}
+
+#[derive(Default, PartialEq, Eq, Clone)]
+struct InsertPromptFingerprint {
+    visible: bool,
+    text: String,
+    selected: usize,
+    candidates: Vec<(AddKind, bool)>,
+}
+
+/// The INSERT prompt: what was typed, and under it the node kinds that name
+/// could still become. Sole writer of the panel's `display`, so the start menu
+/// and the modals are folded in here rather than left to
+/// `HideDuringStartMenu`; contents are respawned only when the fingerprint
+/// moves, the way `sync_node_editor_ui` does it.
+fn sync_insert_prompt_ui(
+    mut commands: Commands,
+    mode: Res<EditorMode>,
+    prompt: Res<InsertPrompt>,
+    state: Res<GraphState>,
+    pick: Res<PickState>,
+    start_menu: Res<StartMenu>,
+    eval: Res<EvalState>,
+    ui_font: Res<UiFont>,
+    mut panel_q: Query<(Entity, &mut Node), With<InsertPromptPanel>>,
+    prompt_children_q: Query<Entity, With<InsertPromptEntity>>,
+    mut cache: Local<InsertPromptFingerprint>,
+) {
+    let visible = *mode == EditorMode::Insert
+        && !start_menu.showing
+        && !modal_is_open(&eval)
+        && !is_evaluating(&eval);
+    let candidates = if visible {
+        prompt_candidates(&state, &pick, &prompt.text)
+    } else {
+        Vec::new()
+    };
+    // Clamped on read, not on write: a caret move under a standing prompt may
+    // shorten the list, and a stale index must not survive that.
+    let selected = prompt.selected.min(candidates.len().saturating_sub(1));
+
+    let fp = InsertPromptFingerprint {
+        visible,
+        text: prompt.text.clone(),
+        selected,
+        candidates: candidates.clone(),
+    };
+    if *cache == fp {
+        return;
+    }
+    *cache = fp;
+
+    for e in prompt_children_q.iter() {
+        commands.entity(e).despawn();
+    }
+
+    let Ok((panel_entity, mut panel_node)) = panel_q.single_mut() else {
+        return;
+    };
+    panel_node.display = if visible {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    if !visible {
+        return;
+    }
+
+    let font = &ui_font.0;
+    // A prefix nothing answers to is shown on the text itself. An empty box
+    // below would read as a broken widget instead of as a refusal.
+    let text_color = if candidates.is_empty() {
+        Color::srgb(0.95, 0.30, 0.30)
+    } else {
+        Color::srgb(0.91, 0.89, 0.87)
+    };
+    commands.entity(panel_entity).with_children(|panel| {
+        panel
+            .spawn((
+                editor_text_input_node(),
+                BackgroundColor(Color::srgba(0.06, 0.06, 0.12, 0.95)),
+                BorderColor::all(Color::srgb(0.133, 0.827, 0.933)),
+                InsertPromptEntity,
+            ))
+            .with_children(|row| {
+                row.spawn((
+                    Text::new(format!("{}|", prompt.text)),
+                    text_font(font, 14.0),
+                    TextColor(text_color),
+                ));
+            });
+        if candidates.is_empty() {
+            return;
+        }
+        panel
+            .spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    padding: UiRect::all(Val::Px(2.0)),
+                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.08, 0.08, 0.14, 0.98)),
+                InsertPromptEntity,
+            ))
+            .with_children(|options| {
+                for (index, (kind, allowed)) in candidates.iter().enumerate() {
+                    // Only a committable row can hold the highlight, so a
+                    // greyed one never looks like the answer to `Enter`.
+                    let highlighted = index == selected && *allowed;
+                    options
+                        .spawn((
+                            Button,
+                            Node {
+                                padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                                border_radius: BorderRadius::all(Val::Px(3.0)),
+                                ..default()
+                            },
+                            BackgroundColor(if highlighted {
+                                Color::srgba(0.2, 0.2, 0.3, 0.95)
+                            } else {
+                                Color::srgba(0.0, 0.0, 0.0, 0.0)
+                            }),
+                            InsertPromptOption(*kind),
+                        ))
+                        .with_children(|row| {
+                            row.spawn((
+                                Text::new(kind.label()),
+                                text_font(font, 14.0),
+                                TextColor(if *allowed {
+                                    Color::srgb(0.85, 0.85, 0.9)
+                                } else {
+                                    Color::srgb(0.35, 0.35, 0.4)
+                                }),
+                            ));
+                        });
+                }
+            });
+    });
 }
 
 // ── Node editor UI ──────────────────────────────────────────
@@ -2512,8 +2763,7 @@ fn handle_camera_mode_button(
                         // burying it.
                         let (theta, phi) = camera::oblique_view_angles();
                         let visible_world = height / orbit.cell_pixels;
-                        orbit.free_fov =
-                            2.0 * (visible_world * 0.5 / orbit.radius).atan();
+                        orbit.free_fov = 2.0 * (visible_world * 0.5 / orbit.radius).atan();
                         orbit.mode = camera::CameraMode::Free;
                         tween.to_view(&orbit, theta, phi, orbit.radius, orbit.target);
                     }
@@ -4291,7 +4541,7 @@ fn text_input_focus(
     let clicked_outside = mouse.just_pressed(MouseButton::Left);
     let evaluating = is_evaluating(&eval);
     // By the layout's reckoning, not the key's position — see
-    // `handle_mode_keys`.
+    // `handle_editor_keys`.
     let escaped = key_events.read().any(|ev| {
         ev.state == bevy::input::ButtonState::Pressed
             && matches!(ev.logical_key, bevy::input::keyboard::Key::Escape)
@@ -4453,93 +4703,22 @@ fn keyboard_captured(
         || text_inputs.iter().any(|input| input.focused)
 }
 
-/// NORMAL ⇄ INSERT, vim style: `i` enters INSERT, `Esc` returns to NORMAL.
-///
-/// `Esc` also unfocuses a text field, and that case is claimed by
-/// `text_input_focus` — while a field has focus the mode stays put, so the
-/// first `Esc` leaves the field and the second leaves INSERT.
-///
-/// Both are read from `logical_key`, the key the layout produced, not from
-/// `KeyCode`, which names the physical position. A CapsLock remapped to Escape
-/// still reports the CapsLock position, so a `KeyCode::Escape` binding would
-/// never fire for it — and a command letter like `i` would sit wherever QWERTY
-/// puts it, whatever the user actually types.
-fn handle_mode_keys(
-    mut key_events: MessageReader<KeyboardInput>,
-    text_inputs: Query<&TextInput>,
-    start_menu: Res<StartMenu>,
-    eval: Res<EvalState>,
-    mut mode: ResMut<EditorMode>,
-    mut rebuild: ResMut<NeedsRebuild>,
-) {
-    if keyboard_captured(&text_inputs, &start_menu, &eval) {
-        return;
-    }
-    for ev in key_events.read() {
-        if ev.state != bevy::input::ButtonState::Pressed {
-            continue;
-        }
-        let next = match &ev.logical_key {
-            bevy::input::keyboard::Key::Escape => EditorMode::Normal,
-            bevy::input::keyboard::Key::Character(s) if s.as_str() == "i" => EditorMode::Insert,
-            _ => continue,
-        };
-        if *mode != next {
-            *mode = next;
-            // The caret is drawn per mode, and it is a scene entity.
-            rebuild.0 = true;
-        }
-    }
-}
-
-/// INSERT mode's three room-makers, all acting on the scope the caret
-/// addresses and in that scope's local coordinates: `Space` opens a single
-/// cell in the caret's column, `Return` a whole X column, `Shift+Return` a
-/// whole Y row. Everything at or beyond the caret is pushed one cell outward
-/// and the usual settling cascade grows the scope around it.
-///
-/// The caret rides the insert instead of staying behind in the freed cell,
-/// so it keeps addressing whatever it pointed at. An insert the layout
-/// refuses — it would have to cut a node in half — leaves the graph untouched.
-fn handle_insert_keys(
-    keys: Res<ButtonInput<KeyCode>>,
-    mode: Res<EditorMode>,
-    text_inputs: Query<&TextInput>,
-    start_menu: Res<StartMenu>,
-    eval: Res<EvalState>,
-    mut state: ResMut<GraphState>,
-    mut pick: ResMut<PickState>,
-    mut rebuild: ResMut<NeedsRebuild>,
-) {
-    if *mode != EditorMode::Insert || keyboard_captured(&text_inputs, &start_menu, &eval) {
-        return;
-    }
-    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
-    let Some(scope) = state.scope_of_caret(&pick) else {
-        return;
+/// Apply an insert that makes room and let the caret ride it, so it keeps
+/// addressing whatever it pointed at. An insert the layout refuses — it would
+/// have to cut a node in half — leaves the graph untouched, which is what the
+/// `None` stands for.
+fn apply_room_insert(
+    state: &mut GraphState,
+    pick: &mut PickState,
+    make: impl FnOnce(&layout::LayoutGraph, &CaretScope) -> Option<layout::LayoutGraph>,
+    delta: IVec3,
+) -> bool {
+    let Some(scope) = state.scope_of_caret(pick) else {
+        return false;
     };
     let scope_graph = state.root_graph().resolve_context(&scope.path);
-    // The direction the insert pushes, which is also the direction the caret
-    // follows it in.
-    let (delta, inserted) = if keys.just_pressed(KeyCode::Space) {
-        (IVec3::Z, scope_graph.plus_empty_cell(scope.local))
-    } else if keys.just_pressed(KeyCode::Enter) {
-        if shift {
-            (
-                IVec3::Y,
-                scope_graph.plus_empty_slab(layout::Axis::Y, scope.local.y),
-            )
-        } else {
-            (
-                IVec3::X,
-                scope_graph.plus_empty_slab(layout::Axis::X, scope.local.x),
-            )
-        }
-    } else {
-        return;
-    };
-    let Some(new_layout) = inserted else {
-        return;
+    let Some(new_layout) = make(scope_graph, &scope) else {
+        return false;
     };
     if let Some(target) = state.root_graph_mut().resolve_context_mut(&scope.path) {
         *target = new_layout;
@@ -4548,56 +4727,235 @@ fn handle_insert_keys(
     pick.selected_pos = state
         .root_graph()
         .clamp_to_volume(pick.selected_pos + delta);
-    rebuild.0 = true;
+    true
 }
 
+/// Everything the keyboard means to the editor itself, in one pass over the
+/// batch: the mode switch (`i` enters INSERT, `Esc` returns to NORMAL), and
+/// then INSERT's two jobs — the room-makers `Space`, `Return` and
+/// `Shift+Return`, which act on the scope the caret addresses and in that
+/// scope's local coordinates, and the prompt, into which every other key
+/// writes a node kind's name.
+///
+/// Mode switch and prompt have to be **one** system: the key that enters
+/// INSERT is consumed at the very point that flips the mode, so it cannot also
+/// be typed into the prompt. Two systems could only approximate that by
+/// throwing away a whole frame's batch, losing the first real keystroke
+/// whenever a hitch queues it together with the `i`.
+///
+/// Keys are read from `logical_key`, the key the layout produced, not from
+/// `KeyCode`, which names the physical position. A CapsLock remapped to Escape
+/// still reports the CapsLock position, so a `KeyCode::Escape` binding would
+/// never fire for it — and a command letter like `i` would sit wherever QWERTY
+/// puts it, whatever the user actually types. Only Shift, which no message
+/// carries, still comes from `ButtonInput`.
+///
+/// While something else owns the keyboard the batch is dropped rather than
+/// left standing: a message survives two updates, so keys struck under the
+/// guard would otherwise fire once it lifts — an `Esc` that unfocused a field
+/// would leave INSERT on the next frame, and a field's text would land in the
+/// prompt.
+fn handle_editor_keys(
+    mut key_events: MessageReader<KeyboardInput>,
+    keys: Res<ButtonInput<KeyCode>>,
+    text_inputs: Query<&TextInput>,
+    start_menu: Res<StartMenu>,
+    eval: Res<EvalState>,
+    mut mode: ResMut<EditorMode>,
+    mut prompt: ResMut<InsertPrompt>,
+    mut state: ResMut<GraphState>,
+    mut pick: ResMut<PickState>,
+    mut rebuild: ResMut<NeedsRebuild>,
+) {
+    if keyboard_captured(&text_inputs, &start_menu, &eval) {
+        key_events.clear();
+        return;
+    }
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+
+    for ev in key_events.read() {
+        if ev.state != bevy::input::ButtonState::Pressed {
+            continue;
+        }
+        match (*mode, &ev.logical_key) {
+            (_, bevy::input::keyboard::Key::Escape) => {
+                // Escape leaves INSERT outright and drops what was typed —
+                // there is no half-written name worth keeping.
+                prompt.clear();
+                if *mode != EditorMode::Normal {
+                    *mode = EditorMode::Normal;
+                    // The caret is drawn per mode, and it is a scene entity.
+                    rebuild.0 = true;
+                }
+            }
+            (EditorMode::Normal, bevy::input::keyboard::Key::Character(s)) if s.as_str() == "i" => {
+                prompt.clear();
+                *mode = EditorMode::Insert;
+                rebuild.0 = true;
+            }
+            // NORMAL's own keys belong to `handle_arrow_keys`.
+            (EditorMode::Normal, _) => {}
+            (EditorMode::Insert, key) => match key {
+                bevy::input::keyboard::Key::Character(s) => {
+                    // A single press can carry more than one character when a
+                    // dead key resolves; control characters are not a name.
+                    if !s.is_empty() && !s.chars().any(|c| c.is_control()) {
+                        prompt.text.push_str(s.as_str());
+                        let selected =
+                            first_selection(&prompt_candidates(&state, &pick, &prompt.text));
+                        prompt.selected = selected;
+                    }
+                }
+                bevy::input::keyboard::Key::Backspace => {
+                    prompt.text.pop();
+                    let selected = first_selection(&prompt_candidates(&state, &pick, &prompt.text));
+                    prompt.selected = selected;
+                }
+                bevy::input::keyboard::Key::ArrowDown | bevy::input::keyboard::Key::ArrowUp => {
+                    let delta = if matches!(key, bevy::input::keyboard::Key::ArrowDown) {
+                        1
+                    } else {
+                        -1
+                    };
+                    let candidates = prompt_candidates(&state, &pick, &prompt.text);
+                    prompt.selected = step_selection(&candidates, prompt.selected, delta);
+                }
+                // The room-makers are bounded to one insert per press: a held
+                // key auto-repeats, and the repeats must not each open a cell.
+                bevy::input::keyboard::Key::Space if prompt.text.is_empty() && !ev.repeat => {
+                    if apply_room_insert(
+                        &mut state,
+                        &mut pick,
+                        |graph, scope| graph.plus_empty_cell(scope.local),
+                        IVec3::Z,
+                    ) {
+                        rebuild.0 = true;
+                    }
+                    break;
+                }
+                bevy::input::keyboard::Key::Enter if prompt.text.is_empty() && !ev.repeat => {
+                    let inserted = if shift {
+                        apply_room_insert(
+                            &mut state,
+                            &mut pick,
+                            |graph, scope| graph.plus_empty_slab(layout::Axis::Y, scope.local.y),
+                            IVec3::Y,
+                        )
+                    } else {
+                        apply_room_insert(
+                            &mut state,
+                            &mut pick,
+                            |graph, scope| graph.plus_empty_slab(layout::Axis::X, scope.local.x),
+                            IVec3::X,
+                        )
+                    };
+                    if inserted {
+                        rebuild.0 = true;
+                    }
+                    break;
+                }
+                bevy::input::keyboard::Key::Enter if !ev.repeat => {
+                    // Commit what is written. The caret stays on the cell the
+                    // node now fills, and INSERT stays on, so the next name
+                    // can be typed straight away.
+                    let candidates = prompt_candidates(&state, &pick, &prompt.text);
+                    let selected = prompt.selected.min(candidates.len().saturating_sub(1));
+                    if let Some(&(kind, true)) = candidates.get(selected) {
+                        if insert_node_kind(&mut state, &pick, kind) {
+                            prompt.clear();
+                            rebuild.0 = true;
+                        }
+                    }
+                    break;
+                }
+                // A space is in no kind's name, and there is no undo: a stray
+                // one mid-typing must not reshape the graph.
+                _ => {}
+            },
+        }
+    }
+}
+
+/// Caret navigation in NORMAL: the arrow keys and the vim letters `hjkl`,
+/// which are the same four directions under two names.
 fn handle_arrow_keys(
     keys: Res<ButtonInput<KeyCode>>,
+    mut key_events: MessageReader<KeyboardInput>,
+    text_inputs: Query<&TextInput>,
+    start_menu: Res<StartMenu>,
     mut state: ResMut<GraphState>,
     mut pick: ResMut<PickState>,
     mut rebuild: ResMut<NeedsRebuild>,
     eval: Res<EvalState>,
     mode: Res<EditorMode>,
 ) {
-    // INSERT mode freezes the caret: the arrows belong to NORMAL, and moving
-    // a node (Ctrl+arrow) is a NORMAL operation too.
+    // INSERT mode freezes the caret: the keys belong to NORMAL, and moving
+    // a node (Ctrl+key) is a NORMAL operation too. The letters are dropped
+    // along with the guard, so a key struck under it doesn't fire once it
+    // lifts.
     if is_evaluating(&eval) || *mode == EditorMode::Insert {
+        key_events.clear();
         return;
     }
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
 
-    // Direction of each arrow in layout coordinates. Layout `+Y` renders
-    // downward and `+Z` runs source-to-sink, so both are inverted relative to
-    // the pre-flip bindings — the keys still move the caret the same way on
-    // screen.
-    let delta = if keys.just_pressed(KeyCode::ArrowUp) {
-        if shift {
-            Some(IVec3::new(0, -1, 0))
-        } else {
-            Some(IVec3::new(-1, 0, 0))
+    // Direction of each key in layout coordinates, named by its vim letter —
+    // the arrows carry the same four names. Layout `+Y` renders downward and
+    // `+Z` runs source-to-sink, so both are inverted relative to the pre-flip
+    // bindings — the keys still move the caret the same way on screen.
+    fn caret_delta(dir: char, shift: bool) -> Option<IVec3> {
+        match (dir, shift) {
+            ('k', false) => Some(IVec3::new(-1, 0, 0)),
+            ('k', true) => Some(IVec3::new(0, -1, 0)),
+            ('j', false) => Some(IVec3::new(1, 0, 0)),
+            ('j', true) => Some(IVec3::new(0, 1, 0)),
+            ('h', false) => Some(IVec3::new(0, 0, -1)),
+            ('l', false) => Some(IVec3::new(0, 0, 1)),
+            _ => None,
         }
+    }
+
+    // `hjkl` rides alongside the arrows. Like the mode letters in
+    // `handle_editor_keys` they are read from `logical_key`, the character the
+    // layout produced, so the binding follows the letter rather than its
+    // QWERTY position. A focused field or an open menu swallows them — the
+    // arrows keep working there, since nothing else claims them for the
+    // caret. Repeats are dropped so a held key steps once, the way
+    // `just_pressed` bounds the arrows.
+    let letter = if keyboard_captured(&text_inputs, &start_menu, &eval) {
+        key_events.clear();
+        None
+    } else {
+        key_events
+            .read()
+            .filter(|ev| ev.state == bevy::input::ButtonState::Pressed && !ev.repeat)
+            .find_map(|ev| match &ev.logical_key {
+                bevy::input::keyboard::Key::Character(s) => {
+                    let mut chars = s.chars();
+                    // Shift reports the uppercase character; the shifted
+                    // meaning comes from the modifier, as it does for the
+                    // arrows.
+                    let c = chars.next()?.to_ascii_lowercase();
+                    (chars.next().is_none() && matches!(c, 'h' | 'j' | 'k' | 'l')).then_some(c)
+                }
+                _ => None,
+            })
+    };
+
+    let arrow = if keys.just_pressed(KeyCode::ArrowUp) {
+        Some('k')
     } else if keys.just_pressed(KeyCode::ArrowDown) {
-        if shift {
-            Some(IVec3::new(0, 1, 0))
-        } else {
-            Some(IVec3::new(1, 0, 0))
-        }
+        Some('j')
     } else if keys.just_pressed(KeyCode::ArrowLeft) {
-        if !shift {
-            Some(IVec3::new(0, 0, -1))
-        } else {
-            None
-        }
+        Some('h')
     } else if keys.just_pressed(KeyCode::ArrowRight) {
-        if !shift {
-            Some(IVec3::new(0, 0, 1))
-        } else {
-            None
-        }
+        Some('l')
     } else {
         None
     };
+
+    let delta = arrow.or(letter).and_then(|dir| caret_delta(dir, shift));
 
     let Some(delta) = delta else {
         return;
@@ -4626,7 +4984,7 @@ fn handle_arrow_keys(
             rebuild.0 = true;
         }
     } else {
-        // Plain arrow: navigate the selection between grid crossings. The
+        // Plain move: navigate the selection between grid crossings. The
         // caret stays inside the graph volume — its faces are where the grid
         // ends, and only an explicit action may push them outward — so a move
         // against a face is simply no move at all.
@@ -4681,7 +5039,11 @@ fn anchor_hover_system(
         // Same reason as in `update_world_labels`: under the orthographic
         // projection a point behind the camera still projects, so it would
         // otherwise become a hover target.
-        if cam_tf.forward().dot(global_tf.translation() - cam_tf.translation()) <= 0.0 {
+        if cam_tf
+            .forward()
+            .dot(global_tf.translation() - cam_tf.translation())
+            <= 0.0
+        {
             continue;
         }
         let Ok(screen_pos) = camera.world_to_viewport(cam_tf, global_tf.translation()) else {
@@ -4892,6 +5254,7 @@ fn main() {
         .init_resource::<StartMenu>()
         .init_resource::<DropdownState>()
         .init_resource::<EditorMode>()
+        .init_resource::<InsertPrompt>()
         .add_systems(
             Startup,
             (
@@ -4901,6 +5264,7 @@ fn main() {
                 spawn_ui,
                 spawn_selection_display,
                 spawn_node_editor_panel,
+                spawn_insert_prompt_panel,
                 spawn_fps_display,
                 spawn_breadcrumb_display,
                 spawn_mode_display,
@@ -4916,7 +5280,8 @@ fn main() {
                     animate_nodes,
                     (
                         handle_delete_node_button,
-                        handle_add_node_button,
+                        handle_add_button,
+                        handle_insert_prompt_click,
                         handle_hamburger_button,
                         handle_start_menu_new_button,
                         handle_start_menu_controls_button,
@@ -4929,11 +5294,10 @@ fn main() {
                     update_selection_display,
                     update_grid_material,
                     update_cursor,
-                    // Mode keys before the text field: while a field has
+                    // Editor keys before the text field: while a field has
                     // focus, Escape belongs to it, and `text_input_focus`
                     // clears that focus in the same frame.
-                    (handle_mode_keys, text_input_focus, text_input_keyboard).chain(),
-                    handle_insert_keys,
+                    (handle_editor_keys, text_input_focus, text_input_keyboard).chain(),
                     handle_arrow_keys,
                     trigger_camera_focus_on_selection_change,
                 ),
@@ -4978,8 +5342,7 @@ fn main() {
                 sync_evaluate_button_visibility,
                 update_step_button_visuals,
                 update_delete_button_visuals,
-                update_add_pattern_button_visuals,
-                update_add_generic_button_visuals,
+                sync_add_button,
                 sync_value_labels,
             )
                 .chain(),
@@ -4992,6 +5355,7 @@ fn main() {
                 handle_value_enable_checkbox,
                 handle_node_editor_text_input,
                 sync_node_editor_ui,
+                sync_insert_prompt_ui,
             )
                 .chain(),
         )
