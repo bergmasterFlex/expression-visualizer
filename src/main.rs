@@ -169,8 +169,9 @@ enum EditorMode {
 /// `keyboard_captured` true, and that is what gives `Space`, `Return` and
 /// `Escape` their INSERT meanings. A field here would turn `Space` into a
 /// blank and `Escape` into a mere unfocus — the three behaviours that have to
-/// survive. `selected` indexes the *displayed* list, so it is re-clamped on
-/// every rebuild rather than trusted.
+/// survive. `selected` indexes the *candidate* list — not the window of it
+/// that fits on screen, which is derived from `selected` rather than the other
+/// way round — and is re-clamped on every rebuild rather than trusted.
 #[derive(Resource, Default)]
 struct InsertPrompt {
     text: String,
@@ -187,40 +188,54 @@ impl InsertPrompt {
 /// The node kinds a user action can create. `ENode` has more variants, but
 /// `Root`, `Sink` and `BranchSource` only ever come into being as part of
 /// something else, so they are not offered.
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// A `FunctionCall` carries the function it will call: the prompt offers one
+/// row per declared function, so an unbound call is not something one can
+/// pick. That costs `Copy` — `FunctionDeclarationId` owns a `usize` but does
+/// not derive it — so the kind travels by reference from here on.
+#[derive(Clone, PartialEq, Eq)]
 enum AddKind {
     Constant,
     Source,
-    FunctionCall,
+    FunctionCall(model::function_declaration::FunctionDeclarationId),
     Match,
     Pattern,
     TypeCast,
 }
 
-/// List order of the suggestions. Every label is unique in its first letter,
-/// so one keystroke settles the choice.
-const ADD_KINDS: [AddKind; 6] = [
-    AddKind::Constant,
-    AddKind::Source,
-    AddKind::FunctionCall,
-    AddKind::Match,
-    AddKind::Pattern,
-    AddKind::TypeCast,
+/// The kinds that name themselves, in list order, each under its `ENode`
+/// variant's name — the vocabulary the thesis uses, not a UI phrase like
+/// "Add Match". A function call is missing here because it has no name of its
+/// own: it is listed once per declared function, under that function's name.
+///
+/// They stand ahead of the functions, and that is what keeps one keystroke
+/// enough for them. The letters are no longer unique — `c` also reaches
+/// `charAt` and `concat`, `m` also `mod`, `max` and `min` — but the highlight
+/// starts on the first committable row, so `c` still settles on `Constant`.
+const NODE_KINDS: [(AddKind, &str); 5] = [
+    (AddKind::Constant, "Constant"),
+    (AddKind::Source, "Source"),
+    (AddKind::Match, "Match"),
+    (AddKind::Pattern, "Pattern"),
+    (AddKind::TypeCast, "TypeCast"),
 ];
 
-impl AddKind {
-    /// The name that is typed to pick this kind — the `ENode` variant's name,
-    /// the same vocabulary the thesis uses, not a UI phrase like "Add Match".
-    fn label(self) -> &'static str {
-        match self {
-            AddKind::Constant => "Constant",
-            AddKind::Source => "Source",
-            AddKind::FunctionCall => "FunctionCall",
-            AddKind::Match => "Match",
-            AddKind::Pattern => "Pattern",
-            AddKind::TypeCast => "TypeCast",
-        }
-    }
+/// One row of the INSERT prompt: what it would build, what it is called, and
+/// the muted right column that tells `charAt` from `concat` before the node
+/// exists.
+///
+/// It owns its strings instead of borrowing the catalogue on purpose: the list
+/// is built from a `&GraphState` and the picked kind then goes to
+/// `insert_node_kind(&mut state, …)`, which a borrowed declaration in here
+/// would keep from compiling.
+#[derive(Clone, PartialEq, Eq)]
+struct Suggestion {
+    kind: AddKind,
+    /// Typed to reach the row, and shown in its left column.
+    label: String,
+    /// The parameter types, empty for a kind that takes none.
+    detail: String,
+    allowed: bool,
 }
 
 /// Marker for any spawned scene entity (cleaned on rebuild).
@@ -1435,7 +1450,7 @@ fn spawn_insert_prompt_panel(mut commands: Commands) {
             position_type: PositionType::Absolute,
             top: Val::Px(96.0),
             left: Val::Px(12.0),
-            width: Val::Px(200.0),
+            width: Val::Px(280.0),
             flex_direction: FlexDirection::Column,
             row_gap: Val::Px(4.0),
             display: Display::None,
@@ -1533,7 +1548,7 @@ fn kind_allowed(
     graph: &layout::LayoutGraph,
     is_root_scope: bool,
     local: IVec3,
-    kind: AddKind,
+    kind: &AddKind,
 ) -> bool {
     // The scope's last Z row belongs to its Sink alone.
     if graph.sink_z().is_some_and(|z| local.z >= z) {
@@ -1563,7 +1578,7 @@ fn kind_allowed(
 ///
 /// The caret does not follow: it keeps addressing the cell, which now holds
 /// the new node.
-fn insert_node_kind(state: &mut GraphState, pick: &PickState, kind: AddKind) -> bool {
+fn insert_node_kind(state: &mut GraphState, pick: &PickState, kind: &AddKind) -> bool {
     // The caret's scope is the editing target — there is nothing else to
     // agree with, so no context guard is needed here.
     let Some(scope) = state.scope_of_caret(pick) else {
@@ -1584,17 +1599,20 @@ fn insert_node_kind(state: &mut GraphState, pick: &PickState, kind: AddKind) -> 
             anchor_id_domain,
         ),
         AddKind::Source => scope_graph.plus_source(new_pos, node_id_domain, anchor_id_domain),
-        AddKind::FunctionCall => scope_graph.plus_function_call(
-            state
-                .function_declarations
-                .iter()
-                .find(|(_, d)| d.name == "+")
-                .map(|(id, decl)| (id.clone(), decl))
-                .unwrap(),
-            new_pos,
-            node_id_domain,
-            anchor_id_domain,
-        ),
+        AddKind::FunctionCall(function_declaration_id) => {
+            // The declaration decides the call's arity — `plus_function_call`
+            // mints one input anchor per parameter — so a kind naming a
+            // function the catalogue does not hold builds nothing.
+            let Some(declaration) = state.function_declarations.get(function_declaration_id) else {
+                return false;
+            };
+            scope_graph.plus_function_call(
+                (function_declaration_id.clone(), declaration),
+                new_pos,
+                node_id_domain,
+                anchor_id_domain,
+            )
+        }
         AddKind::TypeCast => scope_graph.plus_type_cast(
             model::r#type::EType::Int { value: None },
             new_pos,
@@ -1742,20 +1760,21 @@ fn handle_insert_prompt_click(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        if insert_node_kind(&mut state, &pick, option.0) {
+        if insert_node_kind(&mut state, &pick, &option.0) {
             prompt.clear();
             rebuild.0 = true;
         }
     }
 }
 
-/// The suggestions the prompt currently offers: every kind whose name carries
-/// the typed prefix, each paired with whether it may be created at the caret.
+/// The suggestions the prompt currently offers: the node kinds and every
+/// declared function whose name carries the typed prefix, each with whether it
+/// may be created at the caret.
 ///
 /// The prefix filters, the legality only greys — those are two different
 /// questions, and typing must not make a row silently disappear because the
 /// caret happens to stand somewhere it is not allowed.
-fn prompt_candidates(state: &GraphState, pick: &PickState, text: &str) -> Vec<(AddKind, bool)> {
+fn prompt_candidates(state: &GraphState, pick: &PickState, text: &str) -> Vec<Suggestion> {
     // Shift reports the uppercase character and the labels are CamelCase, so
     // the comparison has to ignore case in both directions.
     let prefix = text.to_ascii_lowercase();
@@ -1767,21 +1786,80 @@ fn prompt_candidates(state: &GraphState, pick: &PickState, text: &str) -> Vec<(A
             s.local,
         )
     });
-    ADD_KINDS
+    // A HashMap has no order, so an as-it-comes iteration would reshuffle the
+    // list between frames. Sorted by name, like the node editor's function
+    // dropdown sorts it — byte order, which puts the symbols ahead of the
+    // words and leaves `||` behind `substr`.
+    let mut functions: Vec<_> = state.function_declarations.iter().collect();
+    functions.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+
+    NODE_KINDS
         .iter()
-        .filter(|kind| kind.label().to_ascii_lowercase().starts_with(&prefix))
-        .map(|&kind| {
+        .map(|(kind, label)| (kind.clone(), label.to_string(), String::new()))
+        .chain(functions.into_iter().map(|(id, declaration)| {
+            (
+                AddKind::FunctionCall(id.clone()),
+                declaration.name.clone(),
+                signature_detail(declaration),
+            )
+        }))
+        .filter(|(_, label, _)| label.to_ascii_lowercase().starts_with(&prefix))
+        .map(|(kind, label, detail)| {
             let allowed = resolved
-                .is_some_and(|(graph, is_root, local)| kind_allowed(graph, is_root, local, kind));
-            (kind, allowed)
+                .is_some_and(|(graph, is_root, local)| kind_allowed(graph, is_root, local, &kind));
+            Suggestion {
+                kind,
+                label,
+                detail,
+                allowed,
+            }
         })
         .collect()
+}
+
+/// The parameter types of a declared function, for the prompt's muted right
+/// column: it is what tells `charAt` from `concat`, and `substr` from `min`,
+/// before the node exists.
+///
+/// Inputs only. The output type is what the finished node's own output anchor
+/// shows, and spelling it out here would nearly double the widest row.
+fn signature_detail(
+    declaration: &model::function_declaration::FunctionDeclaration,
+) -> String {
+    declaration
+        .inputs
+        .iter()
+        .map(|parameter| match &parameter.r#type {
+            // An unconstrained parameter — `=` and `!=` compare any two values
+            // — has no name in the type language: `EType::None` is the failed
+            // result, not a top type, and the declaration's doc says `EType`
+            // must not grow one. So this column says it in prose instead.
+            None => "any".to_string(),
+            Some(r#type) => short_type_name(r#type),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A type as the suggestion list spells it. `EType`'s own rendering writes
+/// `Integer`, which is the right word everywhere it has room; a row that has
+/// to fit `Char|String,Char|String` beside a name does not.
+fn short_type_name(r#type: &infer::EType) -> String {
+    match r#type {
+        infer::EType::Int(_) => "Int".to_string(),
+        infer::EType::SumType(parts) => parts
+            .iter()
+            .map(short_type_name)
+            .collect::<Vec<_>>()
+            .join("|"),
+        other => other.to_string(),
+    }
 }
 
 /// Step the highlight to the next committable suggestion, wrapping around.
 /// Rows that are greyed out can never be committed, so the highlight does not
 /// stop on them; with nothing legal in the list it stays put.
-fn step_selection(candidates: &[(AddKind, bool)], from: usize, delta: isize) -> usize {
+fn step_selection(candidates: &[Suggestion], from: usize, delta: isize) -> usize {
     let len = candidates.len();
     if len == 0 {
         return 0;
@@ -1789,7 +1867,7 @@ fn step_selection(candidates: &[(AddKind, bool)], from: usize, delta: isize) -> 
     let mut index = from.min(len - 1);
     for _ in 0..len {
         index = (index as isize + delta).rem_euclid(len as isize) as usize;
-        if candidates[index].1 {
+        if candidates[index].allowed {
             return index;
         }
     }
@@ -1798,8 +1876,34 @@ fn step_selection(candidates: &[(AddKind, bool)], from: usize, delta: isize) -> 
 
 /// Where the highlight lands after the text changed: the first suggestion
 /// that can actually be committed.
-fn first_selection(candidates: &[(AddKind, bool)]) -> usize {
-    candidates.iter().position(|(_, ok)| *ok).unwrap_or(0)
+fn first_selection(candidates: &[Suggestion]) -> usize {
+    candidates
+        .iter()
+        .position(|suggestion| suggestion.allowed)
+        .unwrap_or(0)
+}
+
+/// How many suggestions are on screen at once. There is no scrolling in this
+/// codebase, so a longer list is windowed rather than clipped — the highlight
+/// has to be able to walk all the way to the last entry.
+const PROMPT_ROWS: usize = 8;
+
+/// The slice of the candidate list that is on screen, always containing
+/// `selected`.
+///
+/// Derived from `selected` rather than remembered: a stored scroll offset
+/// would go stale the moment a keystroke or a caret move reshapes the list,
+/// the same reason `selected` itself is re-clamped on read. The cost is that
+/// the list slides by one per keypress once the highlight passes the middle,
+/// instead of standing still until the highlight reaches an edge.
+fn prompt_window(len: usize, selected: usize) -> std::ops::Range<usize> {
+    if len <= PROMPT_ROWS {
+        return 0..len;
+    }
+    let start = selected
+        .saturating_sub(PROMPT_ROWS / 2)
+        .min(len - PROMPT_ROWS);
+    start..start + PROMPT_ROWS
 }
 
 #[derive(Default, PartialEq, Eq, Clone)]
@@ -1807,7 +1911,7 @@ struct InsertPromptFingerprint {
     visible: bool,
     text: String,
     selected: usize,
-    candidates: Vec<(AddKind, bool)>,
+    candidates: Vec<Suggestion>,
 }
 
 /// The INSERT prompt: what was typed, and under it the node kinds that name
@@ -1906,16 +2010,37 @@ fn sync_insert_prompt_ui(
                 InsertPromptEntity,
             ))
             .with_children(|options| {
-                for (index, (kind, allowed)) in candidates.iter().enumerate() {
+                let window = prompt_window(candidates.len(), selected);
+                // What the window hides is said, not swallowed: the list is
+                // long enough that a silent cut would read as "that is all
+                // there is".
+                if window.start > 0 {
+                    spawn_prompt_hint(options, font, format!("… {} more above", window.start));
+                }
+                for (index, suggestion) in candidates
+                    .iter()
+                    .enumerate()
+                    .take(window.end)
+                    .skip(window.start)
+                {
                     // Only a committable row can hold the highlight, so a
                     // greyed one never looks like the answer to `Enter`.
-                    let highlighted = index == selected && *allowed;
+                    let highlighted = index == selected && suggestion.allowed;
+                    let label_color = if suggestion.allowed {
+                        Color::srgb(0.85, 0.85, 0.9)
+                    } else {
+                        Color::srgb(0.35, 0.35, 0.4)
+                    };
                     options
                         .spawn((
                             Button,
                             Node {
                                 padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
                                 border_radius: BorderRadius::all(Val::Px(3.0)),
+                                flex_direction: FlexDirection::Row,
+                                justify_content: JustifyContent::SpaceBetween,
+                                align_items: AlignItems::Center,
+                                column_gap: Val::Px(12.0),
                                 ..default()
                             },
                             BackgroundColor(if highlighted {
@@ -1923,22 +2048,65 @@ fn sync_insert_prompt_ui(
                             } else {
                                 Color::srgba(0.0, 0.0, 0.0, 0.0)
                             }),
-                            InsertPromptOption(*kind),
+                            InsertPromptOption(suggestion.kind.clone()),
                         ))
                         .with_children(|row| {
                             row.spawn((
-                                Text::new(kind.label()),
+                                Text::new(suggestion.label.clone()),
                                 text_font(font, 14.0),
-                                TextColor(if *allowed {
-                                    Color::srgb(0.85, 0.85, 0.9)
-                                } else {
-                                    Color::srgb(0.35, 0.35, 0.4)
-                                }),
+                                TextColor(label_color),
                             ));
+                            // Spawned only when it says something —
+                            // `SpaceBetween` already puts a lone child at the
+                            // start, so a node kind needs no empty placeholder
+                            // to stay left-aligned.
+                            if !suggestion.detail.is_empty() {
+                                row.spawn((
+                                    Text::new(suggestion.detail.clone()),
+                                    text_font(font, 12.0),
+                                    TextColor(if suggestion.allowed {
+                                        Color::srgb(0.6, 0.6, 0.7)
+                                    } else {
+                                        label_color
+                                    }),
+                                    // The signature is the row's width, not
+                                    // its slack: shrinking it would wrap
+                                    // `Char|String,Char|String` onto a second
+                                    // line and make the rows uneven.
+                                    Node {
+                                        flex_shrink: 0.0,
+                                        ..default()
+                                    },
+                                ));
+                            }
                         });
+                }
+                if window.end < candidates.len() {
+                    spawn_prompt_hint(
+                        options,
+                        font,
+                        format!("… {} more below", candidates.len() - window.end),
+                    );
                 }
             });
     });
+}
+
+/// A row that counts what the window leaves off. It carries neither `Button`
+/// nor `InsertPromptOption`: clicking a tally must not build anything.
+fn spawn_prompt_hint(options: &mut ChildSpawnerCommands, font: &Handle<Font>, text: String) {
+    options
+        .spawn(Node {
+            padding: UiRect::axes(Val::Px(8.0), Val::Px(2.0)),
+            ..default()
+        })
+        .with_children(|row| {
+            row.spawn((
+                Text::new(text),
+                text_font(font, 12.0),
+                TextColor(Color::srgb(0.35, 0.35, 0.4)),
+            ));
+        });
 }
 
 // ── Node editor UI ──────────────────────────────────────────
@@ -4860,8 +5028,10 @@ fn handle_editor_keys(
                     // can be typed straight away.
                     let candidates = prompt_candidates(&state, &pick, &prompt.text);
                     let selected = prompt.selected.min(candidates.len().saturating_sub(1));
-                    if let Some(&(kind, true)) = candidates.get(selected) {
-                        if insert_node_kind(&mut state, &pick, kind) {
+                    if let Some(suggestion) =
+                        candidates.get(selected).filter(|suggestion| suggestion.allowed)
+                    {
+                        if insert_node_kind(&mut state, &pick, &suggestion.kind) {
                             prompt.clear();
                             rebuild.0 = true;
                         }
