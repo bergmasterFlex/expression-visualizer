@@ -634,10 +634,16 @@ impl std::fmt::Display for EValue {
 }
 
 impl EValue {
-    /// Parse a user-typed Source input string into a value of the declared
-    /// type. Sources carry their value in `user_source_values` (their type
-    /// literal is `None` at declaration time), so this is the path from the
-    /// prompt modal into evaluation.
+    /// Parse a user-typed string into a value of the declared type. Sources
+    /// carry their value in `user_source_values` (their type literal is
+    /// `None` at declaration time), so this is the path from the prompt modal
+    /// into evaluation.
+    ///
+    /// It is also the editor's own check: the INSERT prompt asks it whether
+    /// the literal being typed is a value of the type it names, and offers the
+    /// suggestion only when it is. Validating there against the same function
+    /// the evaluation runs on is the point — what the prompt accepts cannot
+    /// fail later.
     pub fn parse(target: &crate::model::r#type::EType, raw: &str) -> Result<EValue, String> {
         match target {
             crate::model::r#type::EType::Bool { .. } => raw

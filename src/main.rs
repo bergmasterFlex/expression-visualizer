@@ -189,13 +189,24 @@ impl InsertPrompt {
 /// `Root`, `Sink` and `BranchSource` only ever come into being as part of
 /// something else, so they are not offered.
 ///
-/// A `FunctionCall` carries the function it will call: the prompt offers one
-/// row per declared function, so an unbound call is not something one can
-/// pick. That costs `Copy` — `FunctionDeclarationId` owns a `usize` but does
-/// not derive it — so the kind travels by reference from here on.
+/// Two of them carry what makes them themselves, because the prompt offers one
+/// row per possible answer rather than one row per kind: a `FunctionCall`
+/// names the function it will call, a `Constant` the value it will hold.
+///
+/// The constant carries a `TypeChoice` and the raw literal rather than a
+/// finished `model::r#type::EType` for two reasons. That type has no
+/// `PartialEq`, which `Suggestion`'s fingerprint needs — and deriving one
+/// would be worse than the missing derive: an `EType` is a type *plus* an
+/// optional literal, so `==` on it answers neither "same type"
+/// (`Int{Some("1")} != Int{Some("01")}`) nor "same value" (`Int{None}` twice).
+/// The pair is also what the node editor already passes around, as
+/// `make_etype(type_choice_of(…), value)`.
+///
+/// All of that costs `Copy` — neither `FunctionDeclarationId` nor `String`
+/// derives it — so the kind travels by reference from here on.
 #[derive(Clone, PartialEq, Eq)]
 enum AddKind {
-    Constant,
+    Constant(TypeChoice, Option<String>),
     Source,
     FunctionCall(model::function_declaration::FunctionDeclarationId),
     Match,
@@ -205,19 +216,36 @@ enum AddKind {
 
 /// The kinds that name themselves, in list order, each under its `ENode`
 /// variant's name — the vocabulary the thesis uses, not a UI phrase like
-/// "Add Match". A function call is missing here because it has no name of its
-/// own: it is listed once per declared function, under that function's name.
+/// "Add Match".
 ///
-/// They stand ahead of the functions, and that is what keeps one keystroke
-/// enough for them. The letters are no longer unique — `c` also reaches
-/// `charAt` and `concat`, `m` also `mod`, `max` and `min` — but the highlight
-/// starts on the first committable row, so `c` still settles on `Constant`.
-const NODE_KINDS: [(AddKind, &str); 5] = [
-    (AddKind::Constant, "Constant"),
+/// Two are missing because they have no name of their own. A function call is
+/// listed once per declared function, under that function's name; a constant
+/// is whatever literal was typed. A constant with no value would in any case
+/// be a node that cannot be evaluated — `eval_value_for_type` refuses it — and
+/// that the editor cannot empty again, so the prompt no longer offers one.
+///
+/// The kinds stand ahead of the functions, and that is what keeps one
+/// keystroke enough for them: the letters are not unique — `m` also reaches
+/// `mod`, `max` and `min` — but the highlight starts on the first committable
+/// row, so `m` still settles on `Match`.
+const NODE_KINDS: [(AddKind, &str); 4] = [
     (AddKind::Source, "Source"),
     (AddKind::Match, "Match"),
     (AddKind::Pattern, "Pattern"),
     (AddKind::TypeCast, "TypeCast"),
+];
+
+/// The three values that are written as a word instead of as a shape. They are
+/// ordinary prefix-filtered rows, not literals read off the text: `true` is
+/// typed letter by letter the way `TypeCast` is, and nothing about `t`, `r`,
+/// `u`, `e` announces a value the way a digit or a quote does.
+///
+/// `none` carries no value because it *has* none — `EType::None` has no
+/// payload, and `make_etype` would drop one anyway.
+const LITERAL_KEYWORDS: [(&str, TypeChoice, Option<&str>); 3] = [
+    ("true", TypeChoice::Bool, Some("true")),
+    ("false", TypeChoice::Bool, Some("false")),
+    ("none", TypeChoice::None, None),
 ];
 
 /// One row of the INSERT prompt: what it would build, what it is called, and
@@ -1592,8 +1620,8 @@ fn insert_node_kind(state: &mut GraphState, pick: &PickState, kind: &AddKind) ->
     }
     let new_pos = scope.local.as_vec3();
     let (new_layout, new_node_id_domain, new_anchor_id_domain) = match kind {
-        AddKind::Constant => scope_graph.plus_constant(
-            model::r#type::EType::Int { value: None },
+        AddKind::Constant(choice, value) => scope_graph.plus_constant(
+            make_etype(*choice, value.clone()),
             new_pos,
             node_id_domain,
             anchor_id_domain,
@@ -1773,7 +1801,9 @@ fn handle_insert_prompt_click(
 ///
 /// The prefix filters, the legality only greys — those are two different
 /// questions, and typing must not make a row silently disappear because the
-/// caret happens to stand somewhere it is not allowed.
+/// caret happens to stand somewhere it is not allowed. The typed literal is
+/// the exception that proves it: there the prefix is not something to filter
+/// by, it *is* the row.
 fn prompt_candidates(state: &GraphState, pick: &PickState, text: &str) -> Vec<Suggestion> {
     // Shift reports the uppercase character and the labels are CamelCase, so
     // the comparison has to ignore case in both directions.
@@ -1793,28 +1823,114 @@ fn prompt_candidates(state: &GraphState, pick: &PickState, text: &str) -> Vec<Su
     let mut functions: Vec<_> = state.function_declarations.iter().collect();
     functions.sort_by(|a, b| a.1.name.cmp(&b.1.name));
 
-    NODE_KINDS
-        .iter()
-        .map(|(kind, label)| (kind.clone(), label.to_string(), String::new()))
-        .chain(functions.into_iter().map(|(id, declaration)| {
-            (
-                AddKind::FunctionCall(id.clone()),
-                declaration.name.clone(),
-                signature_detail(declaration),
-            )
-        }))
-        .filter(|(_, label, _)| label.to_ascii_lowercase().starts_with(&prefix))
-        .map(|(kind, label, detail)| {
-            let allowed = resolved
-                .is_some_and(|(graph, is_root, local)| kind_allowed(graph, is_root, local, &kind));
-            Suggestion {
-                kind,
-                label,
-                detail,
-                allowed,
-            }
-        })
-        .collect()
+    let caret_allows = |kind: &AddKind| {
+        resolved.is_some_and(|(graph, is_root, local)| kind_allowed(graph, is_root, local, kind))
+    };
+
+    let mut candidates: Vec<Suggestion> = Vec::new();
+    // The typed literal is not prefix-filtered — it *is* the text, and nothing
+    // could hide behind it: no declared name begins with a digit or a quote.
+    // It leads the list because it is the most literal reading of what stands
+    // there.
+    if let Some((choice, raw, _closed)) = typed_literal(text) {
+        let r#type = make_etype(choice, Some(raw.clone()));
+        // Checked with the one validator this codebase has, and the same one
+        // the value will meet again at evaluation time — so a row that commits
+        // here cannot fail there. It reads the raw text, not the typed one:
+        // its `Char` arm wants exactly one character and would refuse `'c'`.
+        let parses = eval::EValue::parse(&r#type, &raw).is_ok();
+        let kind = AddKind::Constant(choice, Some(raw));
+        let allowed = parses && caret_allows(&kind);
+        candidates.push(Suggestion {
+            kind,
+            // Through the type's own rendering while it parses, which puts the
+            // quotes back on: `'a` is offered as `'a'`, so the closing quote
+            // reads as implied rather than as missing. What does not parse
+            // keeps the typed text — dressing `'ab` up as `'ab'` would promise
+            // something that cannot be built.
+            label: if parses {
+                r#type.to_string()
+            } else {
+                text.to_string()
+            },
+            detail: literal_type_name(choice),
+            allowed,
+        });
+    }
+
+    candidates.extend(
+        NODE_KINDS
+            .iter()
+            .map(|(kind, label)| (kind.clone(), label.to_string(), String::new()))
+            .chain(LITERAL_KEYWORDS.iter().map(|(label, choice, value)| {
+                (
+                    AddKind::Constant(*choice, value.map(str::to_string)),
+                    label.to_string(),
+                    literal_type_name(*choice),
+                )
+            }))
+            .chain(functions.into_iter().map(|(id, declaration)| {
+                (
+                    AddKind::FunctionCall(id.clone()),
+                    declaration.name.clone(),
+                    signature_detail(declaration),
+                )
+            }))
+            .filter(|(_, label, _)| label.to_ascii_lowercase().starts_with(&prefix))
+            .map(|(kind, label, detail)| {
+                let allowed = caret_allows(&kind);
+                Suggestion {
+                    kind,
+                    label,
+                    detail,
+                    allowed,
+                }
+            }),
+    );
+    candidates
+}
+
+/// The literal the prompt text spells, if it spells one: its type, the raw
+/// text between the quotes, and whether a closing quote has been typed.
+///
+/// The closing quote is optional — `'a` and `'a'` name the same character — so
+/// the raw text drops a leading quote and *at most one* matching trailing one.
+/// That makes `'''` the apostrophe and `''` nothing at all, which is not a
+/// character and so cannot be committed. The empty *string* on the other hand
+/// exists, so a lone `"` is a complete literal while a lone `'` is not.
+///
+/// A bare `-` or `+` is not a number, it is the name of a function, and the
+/// list has to keep offering it.
+fn typed_literal(text: &str) -> Option<(TypeChoice, String, bool)> {
+    let first = text.chars().next()?;
+    let quote = match first {
+        '\'' => TypeChoice::Char,
+        '"' => TypeChoice::String,
+        c if c.is_ascii_digit() => return Some((TypeChoice::Int, text.to_string(), false)),
+        '-' | '+' if text.len() > 1 => return Some((TypeChoice::Int, text.to_string(), false)),
+        _ => return None,
+    };
+    // Both quotes are ASCII, so one byte is one quote and the slicing is safe.
+    let body = &text[1..];
+    let closed = body.ends_with(first);
+    let raw = if closed {
+        &body[..body.len() - 1]
+    } else {
+        body
+    };
+    Some((quote, raw.to_string(), closed))
+}
+
+/// Whether `Space` writes a space instead of making room: inside a quote that
+/// has not been closed yet, and only there. Without it a string with a space
+/// in it could not be typed at all. It asks `typed_literal`, so opening and
+/// closing are decided in one place — were the two to drift apart, `Space`
+/// would type into a literal the parser already considers finished.
+fn in_open_quote(text: &str) -> bool {
+    matches!(
+        typed_literal(text),
+        Some((TypeChoice::Char | TypeChoice::String, _, false))
+    )
 }
 
 /// The parameter types of a declared function, for the prompt's muted right
@@ -1839,6 +1955,14 @@ fn signature_detail(
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// A literal's type for that same column — through `short_type_name` as well,
+/// so `Int` reads as `Int` in both halves of the list rather than as `Integer`
+/// in one of them. `type_choice_label` keeps the long word for the node
+/// editor's dropdown, which has the room for it.
+fn literal_type_name(choice: TypeChoice) -> String {
+    short_type_name(&infer::graph_type_to_eval_type(&make_etype(choice, None)))
 }
 
 /// A type as the suggestion list spells it. `EType`'s own rendering writes
@@ -4903,7 +5027,9 @@ fn apply_room_insert(
 /// then INSERT's two jobs — the room-makers `Space`, `Return` and
 /// `Shift+Return`, which act on the scope the caret addresses and in that
 /// scope's local coordinates, and the prompt, into which every other key
-/// writes a node kind's name.
+/// writes what is to be created: a node kind's name, a function's name, or a
+/// literal value. `Space` belongs to the prompt rather than to the room-makers
+/// for the length of an unclosed quote, and only then.
 ///
 /// Mode switch and prompt have to be **one** system: the key that enters
 /// INSERT is consumed at the very point that flips the mode, so it cannot also
@@ -4988,6 +5114,16 @@ fn handle_editor_keys(
                     let candidates = prompt_candidates(&state, &pick, &prompt.text);
                     prompt.selected = step_selection(&candidates, prompt.selected, delta);
                 }
+                // Inside an unclosed quote the space bar writes a space —
+                // `Key::Space` is its own variant, so the `Character` arm
+                // never sees one and a string could otherwise not hold one.
+                // The guard needs a non-empty text, the room-maker below an
+                // empty one, so the two can never both fire.
+                bevy::input::keyboard::Key::Space if in_open_quote(&prompt.text) => {
+                    prompt.text.push(' ');
+                    let selected = first_selection(&prompt_candidates(&state, &pick, &prompt.text));
+                    prompt.selected = selected;
+                }
                 // The room-makers are bounded to one insert per press: a held
                 // key auto-repeats, and the repeats must not each open a cell.
                 bevy::input::keyboard::Key::Space if prompt.text.is_empty() && !ev.repeat => {
@@ -5038,8 +5174,9 @@ fn handle_editor_keys(
                     }
                     break;
                 }
-                // A space is in no kind's name, and there is no undo: a stray
-                // one mid-typing must not reshape the graph.
+                // A space outside an open quote is in no name the list holds,
+                // and there is no undo: a stray one mid-typing must neither
+                // land in the text nor reshape the graph.
                 _ => {}
             },
         }
