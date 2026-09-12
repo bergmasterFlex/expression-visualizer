@@ -14,6 +14,8 @@ struct EdgeParams {
     line_half_thickness: f32,
     line_mode_end: f32,
     arc_total: f32,
+    dash_period: f32,
+    dash_duty: f32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: EdgeParams;
@@ -37,7 +39,24 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // a degenerate curve, whose total length is zero.
     let along = clamp(in.uv.x / max(params.arc_total, 1e-6), 0.0, 1.0);
     let line_mode = mix(params.line_mode_start, params.line_mode_end, along);
-    let coverage = mix(1.0, line_coverage, line_mode);
+    // Vertical cut-outs across the band. `uv.x` is raw arc length in world
+    // units, so the period is a world length and not a share of the edge: a
+    // long edge gets more dashes, never longer ones. `0.0` leaves the band
+    // whole, which is what everything but a pending edge asks for.
+    var dash = 1.0;
+    if params.dash_period > 0.0 {
+        let phase = fract(in.uv.x / params.dash_period);
+        // The derivative is taken on the unfolded coordinate: `fract` jumps at
+        // the end of every period and `uv.x` does not. Same precaution
+        // `grid.wgsl` takes for its lines.
+        let aa = max(fwidth(in.uv.x) / params.dash_period, 1e-5);
+        // The dash is centred on `phase = 0.5`, so both of its flanks fall
+        // inside the period and neither is cut off at the wrap.
+        let edge_dist = params.dash_duty * 0.5 - abs(phase - 0.5);
+        dash = smoothstep(-aa, aa, edge_dist);
+    }
+
+    let coverage = mix(1.0, line_coverage, line_mode) * dash;
 
     let out_color = vec4<f32>(params.band_color.rgb, coverage * params.band_color.a);
 

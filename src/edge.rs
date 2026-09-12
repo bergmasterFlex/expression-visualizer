@@ -24,6 +24,16 @@ pub const RIBBON_LINE_HEIGHT: f32 = crate::render::CELL / 4.0;
 pub const RIBBON_LINE_HALF_THICKNESS_UV: f32 = 0.1;
 pub const RIBBON_SEGMENTS: usize = 40;
 
+/// Length of one dash-plus-gap of a pending edge's band, in world units along
+/// the ribbon's arc.
+///
+/// Measured in cells, because the band is read against the grid it lies over:
+/// a period that fits the grid's beat keeps the gaps from reading as an
+/// accident of where a cell line happened to fall.
+pub const RIBBON_DASH_PERIOD: f32 = crate::render::CELL * 0.6;
+/// Share of a period that is dash: 0.36 of a cell drawn, 0.24 left out.
+pub const RIBBON_DASH_DUTY: f32 = 0.6;
+
 /// Bytes of the bundled JetBrainsMono TTF. Exposed so callers that need to
 /// rasterise text at spawn time (see `rasterize_face_text`) don't have to
 /// `include_bytes!` the same path themselves.
@@ -308,6 +318,15 @@ pub struct EdgeMaterial {
     /// returns it; anything non-zero will do where both modes agree.
     #[uniform(0)]
     pub arc_total: f32,
+    /// World length of one dash-plus-gap along the ribbon's arc. `0.0` means a
+    /// solid band, which is what every edge whose type is decided carries. Only
+    /// a pending edge sets it, and the gaps are the whole of what it says: a
+    /// band drawn through would claim the type is settled.
+    #[uniform(0)]
+    pub dash_period: f32,
+    /// Share of a period that is dash. Read only where `dash_period` stands.
+    #[uniform(0)]
+    pub dash_duty: f32,
 }
 
 impl Material for EdgeMaterial {

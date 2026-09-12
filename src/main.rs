@@ -1119,7 +1119,46 @@ fn spawn_graph_nodes(
         let src_type = infer::anchor_type(&flat_graph, src_id, &state.function_declarations)
             .unwrap_or(infer::EType::Pending);
         let source_leaves = render::ordered_supported_leaves(&src_type);
+
+        let curve = edge::EdgeCurve::from_endpoints(from_world, to_world);
+
+        // Spawned before the strands and before anything may leave the loop:
+        // an edge the user wired exists whatever the inferer has to say about
+        // it, and the entity that stands for it should not depend on that
+        // either.
+        let edge_root = commands
+            .spawn((
+                Edge {
+                    from_anchor: *anchor_entities.get(src_id).unwrap(),
+                    to_anchor: *anchor_entities.get(tgt_id).unwrap(),
+                    source_anchor_id: src_id.clone(),
+                },
+                Transform::IDENTITY,
+                Visibility::Inherited,
+                SceneEntity,
+            ))
+            .id();
+
+        // A source type with no rows — `Pending`, or an anchor the inferer
+        // could not resolve at all — leaves no row for a strand to run along.
+        // Drawn all the same: what is undecided is the type, not the wiring,
+        // and an edge left out reads as an edge never made. One band on the
+        // anchors' own row, wearing the grey `plain_anchor_body` gives either
+        // end, cut across by the pattern that says the type is still open.
         if source_leaves.is_empty() {
+            spawn_pending_ribbon(
+                &mut commands,
+                &mut meshes,
+                &mut materials_edge,
+                from_world,
+                to_world,
+                // A band at both ends: there is nothing to taper into, and a
+                // hairline would spell a value where there is not even a type
+                // yet.
+                whole_row_end(from_world.y, false),
+                whole_row_end(to_world.y, false),
+                Some(edge_root),
+            );
             continue;
         }
 
@@ -1139,21 +1178,6 @@ fn spawn_graph_nodes(
         // rendered leaf swaps to the thin "value line" style — same rule
         // the anchor markers follow, via the same lookup.
         let src_graph_value = infer::anchor_literal(&flat_graph, src_id);
-
-        let curve = edge::EdgeCurve::from_endpoints(from_world, to_world);
-
-        let edge_root = commands
-            .spawn((
-                Edge {
-                    from_anchor: *anchor_entities.get(src_id).unwrap(),
-                    to_anchor: *anchor_entities.get(tgt_id).unwrap(),
-                    source_anchor_id: src_id.clone(),
-                },
-                Transform::IDENTITY,
-                Visibility::Inherited,
-                SceneEntity,
-            ))
-            .id();
 
         for (k, leaf) in source_leaves.iter().enumerate() {
             // Same row offsets the marker stack uses, so each ribbon meets
@@ -1199,6 +1223,8 @@ fn spawn_graph_nodes(
                     line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
                     line_mode_end: line_mode,
                     arc_total: 1.0,
+                    dash_period: 0.0,
+                    dash_duty: 0.0,
                 })),
                 ChildOf(edge_root),
                 SceneEntity,
@@ -4399,9 +4425,67 @@ fn spawn_link_ribbon(
             line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
             line_mode_end: end.line_mode,
             arc_total,
+            dash_period: 0.0,
+            dash_duty: 0.0,
         })),
         SceneEntity,
     ));
+}
+
+/// Spawn one pending ribbon: the connection is there, the type that would
+/// colour it is not.
+///
+/// The twin of `spawn_link_ribbon`, and deliberately without its `leaf` — there
+/// is none to ask. What it fixes instead is the one appearance every undecided
+/// strand in the picture wears: the neutral grey of a pending anchor body, cut
+/// across by gaps. One function for all of them, so an edge and a link cannot
+/// end up saying "not decided yet" in two different ways.
+///
+/// `parent` is what a graph edge hangs its strands off — its `Edge` root. A
+/// link passes `None`, for the reason `spawn_link_ribbon` gives just above.
+#[allow(clippy::too_many_arguments)]
+fn spawn_pending_ribbon(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials_edge: &mut Assets<edge::EdgeMaterial>,
+    from: Vec3,
+    to: Vec3,
+    start: edge::RibbonEnd,
+    end: edge::RibbonEnd,
+    parent: Option<Entity>,
+) {
+    let curve = edge::EdgeCurve::from_endpoints(from, to);
+    let (mesh, arc_total) = edge::build_tapered_ribbon_mesh(&curve, &start, &end);
+    let mut spawned = commands.spawn((
+        Mesh3d(meshes.add(mesh)),
+        MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
+            // Through the same call the coloured strands go through, of the
+            // same type the grey anchor bodies are drawn from, so a band and
+            // the two cells it joins cannot come apart.
+            band_color: render::type_marker_color(&infer::EType::Pending).to_linear(),
+            time: 0.0,
+            line_mode_start: start.line_mode,
+            line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
+            line_mode_end: end.line_mode,
+            arc_total,
+            dash_period: edge::RIBBON_DASH_PERIOD,
+            dash_duty: edge::RIBBON_DASH_DUTY,
+        })),
+        SceneEntity,
+    ));
+    if let Some(parent) = parent {
+        spawned.insert(ChildOf(parent));
+    }
+}
+
+/// A ribbon end that takes a whole leaf row as a band: what a strand wears
+/// where nothing narrower has been said about it.
+///
+/// The row an undecided anchor offers is its own — `plain_anchor_body` draws
+/// exactly one, a full `TYPE_MARKER_Y_STEP` tall — so a pending band meets it
+/// by claiming all of it.
+fn whole_row_end(row_center_y: f32, as_line: bool) -> edge::RibbonEnd {
+    edge::ribbon_end(row_center_y, &infer::RowSpan::FULL, as_line)
 }
 
 /// Fan an anchor's rows out onto one declared-type cell: every row that cell
@@ -4411,11 +4495,20 @@ fn spawn_link_ribbon(
 /// make the same statement with it, so they are drawn by the same code. The
 /// caller supplies the anchor side once and calls this per cell.
 ///
-/// A row the cell can never describe gets nothing. Note the deliberate
+/// The two ways a row can end up with no coloured strand are not the same thing
+/// and are not drawn the same way.
+///
+/// A row the cell **can never describe** gets nothing. Note the deliberate
 /// divergence from the edge pass, which aims an unmatched leaf at row 0:
 /// docking a `Bool` arm onto an `Integer` band would draw the lie that it
 /// consumes it. Here the gap *is* the statement — a Match reads as
 /// non-exhaustive, a cast as able to fail.
+///
+/// A cell that has **not said yet** what it describes — `declared` is `None`,
+/// an arm or a cast target the user has not typed — makes no such statement,
+/// and neither does a row that is not there because what arrives is still
+/// `Pending`. Those get a pending band: the cell is wired to the anchor either
+/// way, and only what travels between them is open.
 #[allow(clippy::too_many_arguments)]
 fn spawn_declared_cell_links(
     commands: &mut Commands,
@@ -4425,42 +4518,62 @@ fn spawn_declared_cell_links(
     in_leaves: &[infer::EType],
     in_value: Option<&str>,
     band_pos: Vec3,
-    declared: &model::r#type::EType,
+    declared: Option<&model::r#type::EType>,
 ) {
-    let declared_leaf = infer::graph_type_to_eval_type(declared);
-    let declared_value = layout::value_of_etype(declared);
+    let declared_leaf = declared.map(infer::graph_type_to_eval_type);
+    let declared_value = declared.and_then(layout::value_of_etype);
+    // Leave by the band's far face. The cell centre is the outward face, where
+    // the *incoming* edge already ends.
+    let from = render::anchor_body_face_world(in_pos, true);
+    // The cell fills its own row whatever it declares — or fails to declare —
+    // so the taper happens entirely at the anchor end.
+    let cell_is_line = declared_leaf
+        .as_ref()
+        .is_some_and(|leaf| render::leaf_is_drawn_as_line(leaf, declared_value.as_deref()));
+
     // Every row the cell can take something from, not just one: an `Integer`
     // arm against a `1|2` anchor consumes both rows, and has to be seen doing
     // it or the match would read as missing an arm.
-    for (row, anchor_leaf) in in_leaves.iter().enumerate() {
-        let Some(span) = infer::claimed_span(anchor_leaf, &declared_leaf) else {
+    //
+    // `max(1)` rather than the leaf count alone: an anchor whose type is
+    // undecided has no leaf rows, but it still has the one row its grey
+    // `plain_anchor_body` is drawn on, and that is where its band leaves from.
+    for row in 0..in_leaves.len().max(1) {
+        let anchor_leaf = in_leaves.get(row);
+        let row_y = in_pos.y + render::leaf_row_offset(row);
+        let row_is_line =
+            anchor_leaf.is_some_and(|leaf| render::leaf_is_drawn_as_line(leaf, in_value));
+
+        // Both sides have to have spoken before the strand can carry a type:
+        // what travels here is what the cell consumes, and it takes an arriving
+        // type *and* a declared one to say how much of it that is.
+        let (Some(anchor_leaf), Some(declared_leaf)) = (anchor_leaf, declared_leaf.as_ref()) else {
+            spawn_pending_ribbon(
+                commands,
+                meshes,
+                materials_edge,
+                from,
+                // A declared-type cell is drawn input-side, so its near face is
+                // the cell centre — which is the face this meets.
+                band_pos,
+                whole_row_end(row_y, row_is_line),
+                whole_row_end(band_pos.y, cell_is_line),
+                None,
+            );
             continue;
         };
-        let start = edge::ribbon_end(
-            in_pos.y + render::leaf_row_offset(row),
-            &span,
-            render::leaf_is_drawn_as_line(anchor_leaf, in_value),
-        );
-        // The cell fills its own row whatever it declares, so the taper happens
-        // entirely at the anchor end.
-        let end = edge::ribbon_end(
-            band_pos.y,
-            &infer::RowSpan::FULL,
-            render::leaf_is_drawn_as_line(&declared_leaf, declared_value.as_deref()),
-        );
+        let Some(span) = infer::claimed_span(anchor_leaf, declared_leaf) else {
+            continue;
+        };
         spawn_link_ribbon(
             commands,
             meshes,
             materials_edge,
             anchor_leaf,
-            // Leave by the band's far face. The cell centre is the outward
-            // face, where the *incoming* edge already ends.
-            render::anchor_body_face_world(in_pos, true),
-            // A declared-type cell is drawn input-side, so its near face is the
-            // cell centre — which is the face this meets.
+            from,
             band_pos,
-            start,
-            end,
+            edge::ribbon_end(row_y, &span, row_is_line),
+            whole_row_end(band_pos.y, cell_is_line),
         );
     }
 }
@@ -4524,11 +4637,11 @@ fn spawn_match_links(
         let in_value = infer::incoming_anchor_literal(flat_graph, input_anchor);
         if let Some(&in_pos) = anchor_world_positions.get(input_anchor) {
             for pattern_id in patterns {
-                // An arm that declares nothing consumes nothing, so there is
-                // nothing to draw reaching it.
+                // An arm that declares nothing is still an arm: what reaches it
+                // is undecided, not absent, and `spawn_declared_cell_links`
+                // draws that as a pending band.
                 let Some(model::node::ENode::Pattern {
-                    r#type: Some(arm_type),
-                    ..
+                    r#type: arm_type, ..
                 }) = flat_graph.nodes.get(pattern_id)
                 else {
                     continue;
@@ -4544,7 +4657,7 @@ fn spawn_match_links(
                     &in_leaves,
                     in_value.as_deref(),
                     band_pos,
-                    arm_type,
+                    arm_type.as_ref(),
                 );
             }
         }
@@ -4554,6 +4667,12 @@ fn spawn_match_links(
         // The mirror image: here the branch's Sink is the declared, narrow side
         // and the Match's output is the band. Several sinks landing on one
         // output row is what sum-type normalisation looks like.
+        //
+        // Empty while the Match output is `Pending`, which one undecided branch
+        // is enough to cause (`infer::match_output_type`). That decides which
+        // *row* a strand lands on and nothing else: a branch whose own type is
+        // settled still draws its strand, aimed at the anchor's own row, rather
+        // than being blanked by a sibling it has nothing to do with.
         let out_leaves = render::ordered_supported_leaves(
             &infer::anchor_type(flat_graph, output_anchor, decls).unwrap_or(infer::EType::Pending),
         );
@@ -4578,12 +4697,57 @@ fn spawn_match_links(
             let Some(&sink_pos) = anchor_world_positions.get(sink_input) else {
                 continue;
             };
-            let Some(sink_type) = infer::incoming_anchor_type(flat_graph, sink_input, decls) else {
-                continue;
-            };
             let sink_value = infer::incoming_anchor_literal(flat_graph, sink_input);
-            let sink_leaves = render::ordered_supported_leaves(&sink_type);
+            let sink_leaves = infer::incoming_anchor_type(flat_graph, sink_input, decls)
+                .map(|t| render::ordered_supported_leaves(&t))
+                .unwrap_or_default();
+            let from = render::anchor_body_face_world(sink_pos, true);
+            // Arrive at the output band's near face, in front of it — aiming at
+            // the cell centre would run the strand through the whole band
+            // before stopping at its back.
+            let to = render::anchor_body_face_world(out_pos, false);
+
+            // What travels here is what the branch produces, so the branch's
+            // own Sink is what is asked. Nothing wired into it, or wired and
+            // itself still `Pending`, and there is a connection to draw with no
+            // type to draw it in.
+            if sink_leaves.is_empty() {
+                spawn_pending_ribbon(
+                    commands,
+                    meshes,
+                    materials_edge,
+                    from,
+                    to,
+                    whole_row_end(sink_pos.y, false),
+                    whole_row_end(out_pos.y, false),
+                    None,
+                );
+                continue;
+            }
+
             for (k, leaf) in sink_leaves.iter().enumerate() {
+                // The output has not decided what it is yet, so there is no row
+                // to pick and the strand aims at the anchor's own — the same
+                // fallback the edge pass uses for a leaf its target has no row
+                // for. It carries the branch's own colour all the same: what
+                // *this* branch produces is settled even while the union of all
+                // of them is not.
+                if out_leaves.is_empty() {
+                    let as_line = render::leaf_is_drawn_as_line(leaf, sink_value.as_deref());
+                    spawn_link_ribbon(
+                        commands,
+                        meshes,
+                        materials_edge,
+                        leaf,
+                        from,
+                        to,
+                        whole_row_end(sink_pos.y + render::leaf_row_offset(k), as_line),
+                        // The same shape at both ends: there is nothing at the
+                        // output end that could ask for a different one.
+                        whole_row_end(out_pos.y, as_line),
+                    );
+                    continue;
+                }
                 for (row, out_leaf) in out_leaves.iter().enumerate() {
                     // What this branch produces claims its share of the output
                     // row it lands on. Two branches yielding `true` and `false`
@@ -4607,19 +4771,7 @@ fn spawn_match_links(
                         &span,
                         render::leaf_is_drawn_as_line(out_leaf, None),
                     );
-                    spawn_link_ribbon(
-                        commands,
-                        meshes,
-                        materials_edge,
-                        leaf,
-                        render::anchor_body_face_world(sink_pos, true),
-                        // Arrive at the output band's near face, in front of
-                        // it — aiming at the cell centre would run the strand
-                        // through the whole band before stopping at its back.
-                        render::anchor_body_face_world(out_pos, false),
-                        start,
-                        end,
-                    );
+                    spawn_link_ribbon(commands, meshes, materials_edge, leaf, from, to, start, end);
                 }
             }
         }
@@ -4661,10 +4813,8 @@ fn spawn_cast_links(
     let decls = &state.function_declarations;
     for walked in state.layout_graph.walk_all() {
         let node_id = &walked.layout_node.node_id;
-        // A cast with no target chosen declares nothing, so nothing reaches it
-        // and nothing can fail — its output is `Pending` either way.
         let Some(model::node::ENode::TypeCast {
-            r#type: Some(target),
+            r#type,
             input_anchor,
             output_anchor,
         }) = walked.layout_graph.graph.nodes.get(node_id)
@@ -4692,10 +4842,17 @@ fn spawn_cast_links(
             &in_leaves,
             in_value.as_deref(),
             band_pos,
-            target,
+            r#type.as_ref(),
         );
 
         // ── What the target cannot take, reaching the `none` ──
+        //
+        // A cast with no target chosen declares nothing, so nothing can fail
+        // against it and its output is `Pending` either way. The leg above is
+        // the whole of what such a cast is drawn as, and it is drawn pending.
+        let Some(target) = r#type else {
+            continue;
+        };
         let out_leaves = render::ordered_supported_leaves(
             &infer::anchor_type(flat_graph, output_anchor, decls).unwrap_or(infer::EType::Pending),
         );
