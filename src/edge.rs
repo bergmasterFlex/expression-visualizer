@@ -131,13 +131,85 @@ pub fn leaf_kind_of(t: &EType) -> Option<LeafKind> {
     }
 }
 
-/// Build a vertical ribbon that follows `curve`, extruded ±height/2 in Y
-/// around `y_center(t) = mix(y_start, y_end, t)`. UV.x is arc length in world
-/// units (so the shader can tile the label texture with `uv.x / tile_length`),
-/// UV.y is 0 at the bottom edge and 1 at the top.
-pub fn build_ribbon_mesh(curve: &EdgeCurve, y_start: f32, y_end: f32, height: f32) -> Mesh {
+/// One end of a ribbon: where its two edges sit in world Y, and how that end is
+/// drawn — `0.0` a solid band, `1.0` a hairline.
+///
+/// The three travel together so a caller cannot pair the wrong `line_mode` with
+/// a Y-pair. `build_tapered_ribbon_mesh` reads only the two Y values; the mode
+/// is for the material, which is built from the same struct.
+pub struct RibbonEnd {
+    pub y_top: f32,
+    pub y_bottom: f32,
+    pub line_mode: f32,
+}
+
+impl RibbonEnd {
+    /// A hairline centred on `y`.
+    ///
+    /// The mesh is `RIBBON_LINE_HEIGHT` tall rather than flat, and that is not
+    /// a rounding-up: a ribbon of no height has no triangles to rasterise, its
+    /// `uv.y` spans nothing, and the marquee it carries would be crushed into a
+    /// stripe. The *visible* line is the shader's, at `uv.y = 0.5` — which is
+    /// exactly `y`. The height around it is room for the glyphs.
+    fn hairline(y: f32) -> Self {
+        let half = RIBBON_LINE_HEIGHT * 0.5;
+        Self {
+            y_top: y + half,
+            y_bottom: y - half,
+            line_mode: 1.0,
+        }
+    }
+}
+
+/// The end of a ribbon that meets leaf row `row_center_y`, claiming `span` of
+/// it. `as_line` says whether that row is itself drawn as a line rather than as
+/// a band — ask `render::leaf_is_drawn_as_line`, which is what the marker stack
+/// asks.
+///
+/// Where a hairline sits depends on *why* it is one, and the two reasons are
+/// not the same:
+///
+/// - the row is drawn as a line, so there is no band for the span to take a
+///   share of. The ribbon meets the line where the marker stack draws it, on
+///   the row's middle.
+/// - the row is a band, but what claims it is a literal of an unbounded type,
+///   which takes none of its height. It can then only attach at an edge, and
+///   the edge is the top one: a band is read from the top down.
+///
+/// Everything else is a real share of the band — a whole one for a base type,
+/// half of one for `true` or `false` — and is drawn as a band of that height.
+pub fn ribbon_end(row_center_y: f32, span: &crate::infer::RowSpan, as_line: bool) -> RibbonEnd {
+    let (y_top, y_bottom) = crate::render::row_span_world_y(row_center_y, span);
+    if as_line {
+        RibbonEnd::hairline(row_center_y)
+    } else if span.is_degenerate() {
+        RibbonEnd::hairline(y_top)
+    } else {
+        RibbonEnd {
+            y_top,
+            y_bottom,
+            line_mode: 0.0,
+        }
+    }
+}
+
+/// Build a vertical ribbon that follows `curve`, with its top and bottom edge
+/// interpolated independently from `start` to `end` — so a band can open out of
+/// a line along the ribbon's length.
+///
+/// The curve's own Y is discarded: both ends state their Y outright, and the
+/// curve is asked only where to be in X and Z. UV.x is arc length in world
+/// units (so the shader can tile the label texture with `uv.x / tile_length`,
+/// and normalise it against the returned total to interpolate `line_mode`),
+/// UV.y is 0 at the top edge and 1 at the bottom.
+///
+/// Returns the mesh and its total arc length.
+pub fn build_tapered_ribbon_mesh(
+    curve: &EdgeCurve,
+    start: &RibbonEnd,
+    end: &RibbonEnd,
+) -> (Mesh, f32) {
     let n = RIBBON_SEGMENTS;
-    let half = height * 0.5;
 
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity((n + 1) * 2);
     let mut normals: Vec<[f32; 3]> = Vec::with_capacity((n + 1) * 2);
@@ -152,13 +224,14 @@ pub fn build_ribbon_mesh(curve: &EdgeCurve, y_start: f32, y_end: f32, height: f3
             arc += (p - prev).length();
         }
         prev = p;
-        let y = y_start + (y_end - y_start) * t;
+        let y_bottom = start.y_bottom + (end.y_bottom - start.y_bottom) * t;
+        let y_top = start.y_top + (end.y_top - start.y_top) * t;
         // Bottom vertex (uv.y = 1), top vertex (uv.y = 0). Order chosen so
         // the strip winds consistently.
-        positions.push([p.x, y - half, p.z]);
+        positions.push([p.x, y_bottom, p.z]);
         normals.push([0.0, 1.0, 0.0]);
         uvs.push([arc, 1.0]);
-        positions.push([p.x, y + half, p.z]);
+        positions.push([p.x, y_top, p.z]);
         normals.push([0.0, 1.0, 0.0]);
         uvs.push([arc, 0.0]);
     }
@@ -181,7 +254,19 @@ pub fn build_ribbon_mesh(curve: &EdgeCurve, y_start: f32, y_end: f32, height: f3
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_indices(bevy::mesh::Indices::U32(indices));
-    mesh
+    (mesh, arc)
+}
+
+/// Ribbon of constant `height`, centred on a `y_start` → `y_end` ramp. What an
+/// ordinary graph edge is drawn as, where both ends wear the same shape.
+pub fn build_ribbon_mesh(curve: &EdgeCurve, y_start: f32, y_end: f32, height: f32) -> Mesh {
+    let half = height * 0.5;
+    let end_at = |y: f32| RibbonEnd {
+        y_top: y + half,
+        y_bottom: y - half,
+        line_mode: 0.0,
+    };
+    build_tapered_ribbon_mesh(curve, &end_at(y_start), &end_at(y_end)).0
 }
 
 pub const EDGE_SHADER_HANDLE: Handle<Shader> = uuid_handle!("45444745-0000-4000-8000-000000000001");
@@ -201,18 +286,30 @@ pub struct EdgeMaterial {
     /// Seconds since app start, updated each frame.
     #[uniform(0)]
     pub time: f32,
-    /// 0.0 = solid band (full ribbon coverage); 1.0 = hairline coverage that
-    /// is only visible in a thin band around `uv.y = 0.5` and cut out where
-    /// the marquee glyph texture has ink.
+    /// Coverage style at the ribbon's start, interpolated toward
+    /// `line_mode_end` along its length: 0.0 = solid band (full ribbon
+    /// coverage); 1.0 = hairline coverage that is only visible in a thin band
+    /// around `uv.y = 0.5` and cut out where the marquee glyph texture has ink.
+    ///
+    /// It varies along the ribbon rather than being one value per edge because
+    /// a value flowing into a Match arrives as a line and leaves the arm that
+    /// accepts its whole type as a band. The two ends genuinely wear different
+    /// shapes, and the strand between them has to become one from the other.
     #[uniform(0)]
-    pub line_mode: f32,
-    /// Half-thickness of the hairline in `uv.y` space when `line_mode == 1.0`.
+    pub line_mode_start: f32,
+    /// Half-thickness of the hairline in `uv.y` space, where the interpolated
+    /// line mode is 1.0.
     #[uniform(0)]
     pub line_half_thickness: f32,
+    /// Coverage style at the ribbon's end. Equal to `line_mode_start` for an
+    /// ordinary edge, whose two ends are the same shape.
     #[uniform(0)]
-    pub _pad0: f32,
+    pub line_mode_end: f32,
+    /// Total arc length of the ribbon in world units — what `uv.x` is divided
+    /// by to place a fragment between the two line modes. `build_tapered_ribbon_mesh`
+    /// returns it; anything non-zero will do where both modes agree.
     #[uniform(0)]
-    pub _pad1: f32,
+    pub arc_total: f32,
     #[uniform(0)]
     pub _pad2: f32,
     #[texture(1)]

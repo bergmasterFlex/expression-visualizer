@@ -10,10 +10,10 @@ struct EdgeParams {
     scroll_speed: f32,
     tile_length: f32,
     time: f32,
-    line_mode: f32,
+    line_mode_start: f32,
     line_half_thickness: f32,
-    _pad0: f32,
-    _pad1: f32,
+    line_mode_end: f32,
+    arc_total: f32,
     _pad2: f32,
 }
 
@@ -65,7 +65,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         dist_from_line);
     let line_coverage = line_edge * (1.0 - column_mask);
 
-    let coverage = mix(1.0, line_coverage, params.line_mode);
+    // How far along the ribbon this fragment sits. uv.x is raw arc length and
+    // is constant across the ribbon's height (both vertices of a column carry
+    // the same value), so this varies only along the length — exactly linear in
+    // the along-curve parameter, with no cross-talk from uv.y. The guard covers
+    // a degenerate curve, whose total length is zero.
+    let along = clamp(in.uv.x / max(params.arc_total, 1e-6), 0.0, 1.0);
+    let line_mode = mix(params.line_mode_start, params.line_mode_end, along);
+    let coverage = mix(1.0, line_coverage, line_mode);
 
     let rgb = mix(params.band_color.rgb, params.letter_color.rgb, letter_alpha);
     let a = max(coverage * params.band_color.a, letter_alpha * params.letter_color.a);

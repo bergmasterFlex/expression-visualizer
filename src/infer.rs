@@ -1,9 +1,21 @@
+/// A type as the inferer sees it.
+///
+/// The four value kinds carry the literal they are pinned to, as the text the
+/// user typed — the same text `model::r#type::EType` holds, and unparsed for
+/// the same reason: half a number is still what stands on the node, and there
+/// is no moment at which the graph is allowed to disagree with what is written
+/// on it.
+///
+/// A pinned literal makes the type *narrower*, not merely decorated: `1` and
+/// `2` are two types, and a sum of them is not `Integer`. Nothing widens a
+/// literal back to its base type except a value set that covers it (see
+/// `normalize_leaves`) or an explicit TypeCast.
 #[derive(Debug, Clone)]
 pub enum EType {
-    Int(Option<i32>),
-    Bool(Option<bool>),
+    Int(Option<String>),
+    Bool(Option<String>),
     String(Option<String>),
-    Char(Option<char>),
+    Char(Option<String>),
     /// The inferer could not (yet) decide this output type: a Match whose
     /// branches are incomplete, or a Match/TypeCast with no input edge, where
     /// total-vs-partial cannot be decided. Propagates outward until a node
@@ -17,34 +29,10 @@ pub enum EType {
 impl ToString for EType {
     fn to_string(&self) -> String {
         match self {
-            EType::Int(value) => {
-                if let Some(value) = value {
-                    value.to_string()
-                } else {
-                    "Integer".to_string()
-                }
-            }
-            EType::Bool(value) => {
-                if let Some(value) = value {
-                    value.to_string()
-                } else {
-                    "Bool".to_string()
-                }
-            }
-            EType::String(value) => {
-                if let Some(value) = value {
-                    value.to_string()
-                } else {
-                    "String".to_string()
-                }
-            }
-            EType::Char(value) => {
-                if let Some(value) = value {
-                    value.to_string()
-                } else {
-                    "Char".to_string()
-                }
-            }
+            EType::Int(value) => value.clone().unwrap_or_else(|| "Integer".to_string()),
+            EType::Bool(value) => value.clone().unwrap_or_else(|| "Bool".to_string()),
+            EType::String(value) => value.clone().unwrap_or_else(|| "String".to_string()),
+            EType::Char(value) => value.clone().unwrap_or_else(|| "Char".to_string()),
             EType::Pending => "pending".to_string(),
             EType::None => "None".to_string(),
             EType::SumType(sub_types) => sub_types
@@ -56,14 +44,31 @@ impl ToString for EType {
     }
 }
 
-/// Convert the graph-level type descriptor into the evaluation-level type,
-/// discarding any user-typed value literal.
-pub fn graph_type_to_eval_type(t: &crate::model::r#type::EType) -> EType {
+/// The literal a leaf is pinned to, if any. `none` answers `None`: its value is
+/// its type, so there is nothing pinned *to* it.
+pub fn leaf_literal(t: &EType) -> Option<&str> {
     match t {
-        crate::model::r#type::EType::Bool { .. } => EType::Bool(None),
-        crate::model::r#type::EType::Int { .. } => EType::Int(None),
-        crate::model::r#type::EType::Char { .. } => EType::Char(None),
-        crate::model::r#type::EType::String { .. } => EType::String(None),
+        EType::Int(value) | EType::Bool(value) | EType::String(value) | EType::Char(value) => {
+            value.as_deref()
+        }
+        _ => Option::None,
+    }
+}
+
+/// Convert the graph-level type descriptor into the evaluation-level type,
+/// literal included.
+///
+/// The literal used to be dropped here and carried alongside as a string
+/// (`anchor_literal`). It is kept now because a Match's output is the union of
+/// what its branches produce, and a union that forgets which values it is made
+/// of cannot tell `true` from `Bool`.
+pub fn graph_type_to_eval_type(t: &crate::model::r#type::EType) -> EType {
+    let value = crate::layout::value_of_etype(t);
+    match t {
+        crate::model::r#type::EType::Bool { .. } => EType::Bool(value),
+        crate::model::r#type::EType::Int { .. } => EType::Int(value),
+        crate::model::r#type::EType::Char { .. } => EType::Char(value),
+        crate::model::r#type::EType::String { .. } => EType::String(value),
         crate::model::r#type::EType::None { .. } => EType::None,
     }
 }
@@ -94,6 +99,268 @@ pub fn row_leaves(t: &EType) -> Vec<EType> {
             )
         })
         .collect()
+}
+
+/// The vertical slice of one leaf row that a type claims, as fractions of that
+/// row's height: `0.0` is the row's top edge, `1.0` its bottom edge.
+///
+/// A row is one band and a band is one type, so what a *pattern* takes out of
+/// it is the share of that type's inhabitants it stands for. A base type names
+/// all of them and takes the whole band. `Integer` has infinitely many, so `42`
+/// takes infinitely little — nothing at all — and can only be drawn at an edge
+/// rather than across a height. `Bool` has exactly two, so `true` and `false`
+/// take half each and together leave no gap.
+///
+/// This is the arithmetic an exhaustiveness check is made of: the spans a
+/// Match's arms claim of a row either cover it, leave a hole — an arm is
+/// missing — or overlap, and then one of them is redundant. It lives here
+/// rather than in the renderer for the reason `row_leaves` gives just above: it
+/// is a fact about the type, which the drawing merely follows. A linter should
+/// not have to reach through Bevy to ask it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RowSpan {
+    pub top: f32,
+    pub bottom: f32,
+}
+
+impl RowSpan {
+    /// The whole band: what a base type claims, and what `none` claims, whose
+    /// one value *is* the type.
+    pub const FULL: RowSpan = RowSpan {
+        top: 0.0,
+        bottom: 1.0,
+    };
+    /// What `true` claims of a Bool band. Bool is the only type small enough
+    /// that naming one of its values is worth a share of the band rather than a
+    /// line on it.
+    pub const TOP_HALF: RowSpan = RowSpan {
+        top: 0.0,
+        bottom: 0.5,
+    };
+    /// What `false` claims. Together with `TOP_HALF` the band is covered
+    /// exactly once, which is what makes a two-armed Bool match read as
+    /// exhaustive without anything having to say so.
+    pub const BOTTOM_HALF: RowSpan = RowSpan {
+        top: 0.5,
+        bottom: 1.0,
+    };
+    /// No height at all — a *place on the band* rather than a share of it. A
+    /// literal of an unbounded type attaches here, at the row's top edge,
+    /// because that is the edge a band is read from.
+    pub const TOP_EDGE: RowSpan = RowSpan {
+        top: 0.0,
+        bottom: 0.0,
+    };
+
+    pub fn height(&self) -> f32 {
+        self.bottom - self.top
+    }
+
+    /// True for a span that claims none of the row. Callers that turn a span
+    /// into geometry have to know, because a shape of zero height is no shape.
+    pub fn is_degenerate(&self) -> bool {
+        self.height() <= f32::EPSILON
+    }
+
+    /// True when both spans claim some of the same slice.
+    ///
+    /// Nothing calls this yet: it is the question the exhaustiveness linter
+    /// will ask of a Match's arms, and it is stated here, beside the spans it
+    /// compares, rather than left to be re-derived somewhere that has no
+    /// business knowing how a band is divided.
+    ///
+    /// Two degenerate spans at the same edge do *not* overlap: neither takes
+    /// anything, so neither can take it from the other. `1` and `2` are
+    /// distinct arms however close their lines are drawn, and a linter reading
+    /// this must not call them redundant.
+    #[allow(dead_code)]
+    pub fn overlaps(&self, other: &RowSpan) -> bool {
+        self.top.max(other.top) < self.bottom.min(other.bottom)
+    }
+}
+
+/// The share of `leaf`'s band that a value of it claims. A `literal` of `None`
+/// asks about the type itself, which is the whole band.
+///
+/// `literal` is graph-level text — what the user typed — so `Bool` is parsed
+/// here rather than trusted. Text that is neither `true` nor `false` names no
+/// inhabitant anything could be pointed at, so it claims nothing; that is
+/// honest, and it is the only answer that does not panic on a half-typed word.
+pub fn literal_row_span(leaf: &EType, literal: Option<&str>) -> RowSpan {
+    let Some(literal) = literal else {
+        return RowSpan::FULL;
+    };
+    match leaf {
+        // Pinning `none`'s literal to `none` narrows nothing: the value and the
+        // type are the same statement, so the row stays wholly claimed.
+        EType::None => RowSpan::FULL,
+        EType::Bool(_) => match literal {
+            "true" => RowSpan::TOP_HALF,
+            "false" => RowSpan::BOTTOM_HALF,
+            _ => RowSpan::TOP_EDGE,
+        },
+        // Unbounded: one value out of infinitely many is 0% of the band.
+        EType::Int(_) | EType::Char(_) | EType::String(_) => RowSpan::TOP_EDGE,
+        // Neither claims a row of its own (`row_leaves`), so neither is ever
+        // asked — answered anyway, because a total function is easier to trust
+        // than one with a hole in it.
+        EType::Pending | EType::SumType(_) => RowSpan::FULL,
+    }
+}
+
+/// True when `wider` admits every value `narrower` admits.
+///
+/// This is the question `types_match` cannot answer. `types_match` compares
+/// *shapes* and deliberately ignores literals, which is right for asking
+/// whether two things are the same kind of thing. Subsumption asks the other
+/// question — may this value travel here — and a literal is not the same kind
+/// of statement as its base type: `Integer` admits `1`, and `1` does not admit
+/// `Integer`.
+///
+/// Sums are handled per leaf and in no particular order, unlike `types_match`,
+/// whose pairwise-in-order rule is about equality rather than admission. So
+/// `Integer` subsumes `1|2` — which is what makes a cast from it total.
+///
+/// `Pending` subsumes nothing and is subsumed by nothing: an undecided type
+/// makes no claim either way, and pretending otherwise would let an unfinished
+/// graph look finished.
+pub fn subsumes(wider: &EType, narrower: &EType) -> bool {
+    let wide_leaves = flatten_type(wider);
+    flatten_type(narrower).iter().all(|leaf| {
+        wide_leaves
+            .iter()
+            .any(|wide| leaf_subsumes_leaf(wide, leaf))
+    })
+}
+
+/// Subsumption between two single leaves. Same kind, and either the wider one
+/// names no literal — the whole type, so every value of it — or both name the
+/// same one.
+fn leaf_subsumes_leaf(wider: &EType, narrower: &EType) -> bool {
+    if matches!(wider, EType::Pending) || matches!(narrower, EType::Pending) {
+        return false;
+    }
+    if !types_match(wider, narrower) {
+        return false;
+    }
+    match leaf_literal(wider) {
+        Option::None => true,
+        Some(wide) => leaf_literal(narrower) == Some(wide),
+    }
+}
+
+/// Collapse a set of leaves into the narrowest type admitting all of them.
+///
+/// Three rules, applied in order, and all three are the same rule seen from
+/// different sides — *never widen a value set that was not asked to be
+/// widened*:
+///
+/// 1. the same leaf twice is one leaf. Two arms yielding `true` yield `true`.
+/// 2. a base type swallows the literals of its own kind. `1|Integer` is
+///    `Integer`, because `Integer` already admits `1`.
+/// 3. literals whose spans cover their band without a gap *are* the base type,
+///    and are written as it. In practice only `Bool` can reach this — `true`
+///    and `false` take half the band each — which is exactly right: a type with
+///    two inhabitants can be exhausted by naming both, and one with infinitely
+///    many never can.
+///
+/// Rule 3 is why this reads the spans rather than special-casing `Bool`. The
+/// arithmetic already knows how many values a band holds; saying it twice would
+/// be a second place to get it wrong.
+pub fn normalize_leaves(leaves: Vec<EType>) -> Vec<EType> {
+    // Rule 1.
+    let mut out: Vec<EType> = Vec::new();
+    for leaf in leaves {
+        if !out.iter().any(|seen| leaf_subsumes_leaf(seen, &leaf)) {
+            out.push(leaf);
+        }
+    }
+    // Rule 3: a kind whose literals cover their band is that kind, whole. Done
+    // before rule 2 so the base type it introduces does the swallowing there.
+    let covered: Vec<EType> = out
+        .iter()
+        .filter(|leaf| leaf_literal(leaf).is_some())
+        .filter(|leaf| {
+            let spans: Vec<RowSpan> = out
+                .iter()
+                .filter(|other| types_match(other, leaf))
+                .filter_map(|other| leaf_literal(other).map(|v| literal_row_span(other, Some(v))))
+                .collect();
+            spans_cover_band(&spans)
+        })
+        .map(|leaf| base_type_of(leaf))
+        .collect();
+    out.extend(covered);
+    // Rule 2.
+    let bases: Vec<EType> = out
+        .iter()
+        .filter(|leaf| leaf_literal(leaf).is_none())
+        .cloned()
+        .collect();
+    out.retain(|leaf| {
+        leaf_literal(leaf).is_none() || !bases.iter().any(|base| leaf_subsumes_leaf(base, leaf))
+    });
+    // Rule 1 again: rule 3 may have introduced the same base type once per
+    // literal that asked for it.
+    let mut deduped: Vec<EType> = Vec::new();
+    for leaf in out {
+        if !deduped.iter().any(|seen| leaf_subsumes_leaf(seen, &leaf)) {
+            deduped.push(leaf);
+        }
+    }
+    deduped
+}
+
+/// The same kind with no literal pinned to it — the whole type the literal was
+/// one value of.
+pub fn base_type_of(leaf: &EType) -> EType {
+    match leaf {
+        EType::Int(_) => EType::Int(Option::None),
+        EType::Bool(_) => EType::Bool(Option::None),
+        EType::String(_) => EType::String(Option::None),
+        EType::Char(_) => EType::Char(Option::None),
+        other => other.clone(),
+    }
+}
+
+/// True when `spans` leave no part of the band `0.0..1.0` unclaimed.
+///
+/// Degenerate spans contribute nothing, which is the point: no number of
+/// integer literals ever covers the Integer band, however many are named.
+fn spans_cover_band(spans: &[RowSpan]) -> bool {
+    let mut ordered: Vec<&RowSpan> = spans.iter().filter(|s| !s.is_degenerate()).collect();
+    ordered.sort_by(|a, b| {
+        a.top
+            .partial_cmp(&b.top)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut reached = 0.0_f32;
+    for span in ordered {
+        if span.top > reached + f32::EPSILON {
+            return false;
+        }
+        reached = reached.max(span.bottom);
+    }
+    reached >= 1.0 - f32::EPSILON
+}
+
+/// The share of the leaf row `row` that `claimant` takes, or `None` where the
+/// two can never describe the same value.
+///
+/// Both directions matter and they are not symmetric. A claimant that admits
+/// everything the row holds takes the row entire — an `Integer` arm against an
+/// `Integer` row, but also an `Integer` arm against a `1` row, which has no
+/// height to divide. A claimant *narrower* than the row takes only its share of
+/// it, which is where `true` gets half a Bool band and `42` gets a line on an
+/// Integer one.
+pub fn claimed_span(row: &EType, claimant: &EType) -> Option<RowSpan> {
+    if leaf_subsumes_leaf(claimant, row) {
+        Some(RowSpan::FULL)
+    } else if leaf_subsumes_leaf(row, claimant) {
+        Some(literal_row_span(row, leaf_literal(claimant)))
+    } else {
+        Option::None
+    }
 }
 
 /// How many cells an anchor occupies along Y: one per sum-type member, never
@@ -238,15 +505,22 @@ fn anchor_type_uncycled(
     let node_id = graph.anchor_to_node.get(anchor_id)?;
     match graph.nodes.get(node_id)? {
         // Declared types are fixed: they never depend on what flows in.
+        // A Constant *is* its value, so its literal narrows its type: a `42`
+        // node has the type `42`, and a Match fed from it sees exactly that.
         crate::model::node::ENode::Constant {
             r#type,
             output_anchor,
-        }
-        | crate::model::node::ENode::Source {
+        } => (anchor_id == output_anchor).then(|| graph_type_to_eval_type(r#type)),
+        // A Source is the opposite case, and the literal on it must *not*
+        // narrow anything. What a Source produces comes from the evaluation
+        // prompt; a literal written on it is the shape of that answer, not the
+        // answer. Letting it through would type the graph on a value that may
+        // never arrive.
+        crate::model::node::ENode::Source {
             r#type,
             output_anchor,
             ..
-        } => (anchor_id == output_anchor).then(|| graph_type_to_eval_type(r#type)),
+        } => (anchor_id == output_anchor).then(|| base_type_of(&graph_type_to_eval_type(r#type))),
         // A branch source hands the matched value into its branch, so it
         // carries its Pattern's declared type — the narrowing the Match
         // performs. It has no type of its own to declare.
@@ -338,7 +612,11 @@ fn type_cast_output_type(
     let target = graph_type_to_eval_type(target);
     match incoming_type(graph, input_anchor, function_declarations, visiting) {
         None | Some(EType::Pending) => EType::Pending,
-        Some(incoming) if !types_match(&incoming, &target) => {
+        // Total exactly when the target already admits everything that arrives.
+        // Asked as subsumption rather than as equality because widening is the
+        // ordinary use of a cast: `1|2` cast to `Integer` cannot fail, and a
+        // `none` hung off it would claim a sad path that does not exist.
+        Some(incoming) if !subsumes(&target, &incoming) => {
             EType::SumType(vec![target, EType::None])
         }
         Some(_) => target,
@@ -370,12 +648,13 @@ fn match_output_type(
             None | Some(EType::Pending) => return EType::Pending,
             Some(t) => t,
         };
-        for leaf in flatten_type(&branch) {
-            if !leaves.iter().any(|seen| types_match(seen, &leaf)) {
-                leaves.push(leaf);
-            }
-        }
+        leaves.extend(flatten_type(&branch));
     }
+    // The union is narrowed, not flattened: branches all yielding `true` yield
+    // `true`, and `1` beside `2` stays `1|2`. Widening to the base type is
+    // something the graph has to say out loud — with a TypeCast — or something
+    // the values themselves prove by covering the band between them.
+    let mut leaves = normalize_leaves(leaves);
     match leaves.len() {
         0 => EType::Pending,
         1 => leaves.remove(0),
@@ -502,6 +781,21 @@ pub fn anchor_literal(
         _ => None,
     }
 }
+/// graph-level literal of whatever feeds `input`, if any.
+///
+/// `anchor_literal` answers about the anchor it is handed, and an input that
+/// constrains nothing — a Sink's, a Match's — owns no type to pin a literal to,
+/// so it answers `None` there however concrete the arriving value is. What
+/// arrives is a literal or it is not, though, and an anchor that draws what
+/// arrives has to know which. So the question is forwarded one hop upstream, to
+/// the anchor that does own it.
+pub fn incoming_anchor_literal(
+    graph: &crate::model::term_graph::TermGraph,
+    input: &crate::model::anchor::Id,
+) -> Option<String> {
+    source_anchor_for_input(graph, input).and_then(|source| anchor_literal(graph, &source))
+}
+
 /// Structural type equality, ignoring any carried value literal. Two `SumType`s
 /// match when their leaves match pairwise in order.
 pub fn types_match(a: &EType, b: &EType) -> bool {

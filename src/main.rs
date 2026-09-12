@@ -922,6 +922,10 @@ fn spawn_graph_nodes(
     let mut node_entites = std::collections::HashMap::<model::node::Id, Entity>::new();
     let mut anchor_entities = std::collections::HashMap::<model::anchor::Id, Entity>::new();
     let mut anchor_world_positions = std::collections::HashMap::<model::anchor::Id, Vec3>::new();
+    // A Pattern owns no anchor, so the cell its band sits on is recorded here
+    // instead — the link pass has to meet that band and would otherwise have no
+    // way to ask where it is.
+    let mut pattern_band_positions = std::collections::HashMap::<model::node::Id, Vec3>::new();
     // Type inference resolves edges, and every edge (pattern branches included)
     // lives in the program-level edge table — so flatten once here instead of
     // per anchor, and hand the same view to the renderer and the edge pass.
@@ -942,6 +946,12 @@ fn spawn_graph_nodes(
         let layout_node = walked.layout_node;
         let node_id = &layout_node.node_id;
         let node = walked.layout_graph.graph.nodes.get(node_id).unwrap();
+        if matches!(node, model::node::ENode::Pattern { .. }) {
+            pattern_band_positions.insert(
+                node_id.clone(),
+                render::pattern_band_world(layout_node, walked.extra_offset),
+            );
+        }
         let render_node = render::layoutnode_to_rendernode(
             layout_node,
             walked.layout_graph,
@@ -1149,10 +1159,12 @@ fn spawn_graph_nodes(
                 // Same row offsets the marker stack uses, so each ribbon meets
                 // its marker exactly.
                 let y_src = render::leaf_row_offset(k);
-                let leaf_kind = edge::leaf_kind_of(leaf);
-                let y_tgt = if let Some(idx) = target_leaves
-                    .iter()
-                    .position(|l| edge::leaf_kind_of(l) == leaf_kind)
+                // Which row at the target will accept this strand: the one that
+                // admits it. Asked as subsumption rather than by kind because a
+                // row may be a literal now — a `1` strand belongs on the `1`
+                // row of a `1|2` anchor, not merely on some Integer row.
+                let y_tgt = if let Some(idx) =
+                    target_leaves.iter().position(|l| infer::subsumes(l, leaf))
                 {
                     render::leaf_row_offset(idx)
                 } else {
@@ -1167,9 +1179,12 @@ fn spawn_graph_nodes(
                 // asked of the same leaf, so the two meet in the same shape
                 // where the edge lands.
                 //
-                // The literal is a property of the whole source anchor and
-                // `none` is a property of the one leaf, which is why `none` is
-                // tested per strand: in `Char|None` only the second one thins.
+                // The leaf's own literal is asked first and the anchor's is the
+                // fallback, exactly as `leaf_line_text` asks them, so a strand
+                // and the row it lands on wear the same shape. `none` is a
+                // property of the one leaf either way: in `Char|None` only the
+                // second one thins.
+                let strand_value = infer::leaf_literal(leaf).or(src_graph_value.as_deref());
                 let (height, label, line_mode) = if kind == edge::LeafKind::None {
                     // Its marquee already says `none`, and the prebuilt texture
                     // is padded for the gap the hairline's glyph mask needs.
@@ -1178,7 +1193,7 @@ fn spawn_graph_nodes(
                         edge_labels.by_kind.get(&kind).cloned().unwrap(),
                         1.0,
                     )
-                } else if let Some(value) = src_graph_value.as_deref() {
+                } else if let Some(value) = strand_value {
                     let text = format!("  {}  {}  ", value, kind.type_name());
                     let handle = value_marquee_cache
                         .entry((kind, text.clone()))
@@ -1208,10 +1223,13 @@ fn spawn_graph_nodes(
                         scroll_speed: render::CELL * 0.5,
                         tile_length: render::CELL,
                         time: 0.0,
-                        line_mode,
+                        // Both ends of an ordinary edge wear the same shape, so
+                        // there is nothing for the interpolation to do and
+                        // `arc_total` only has to be non-zero.
+                        line_mode_start: line_mode,
                         line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
-                        _pad0: 0.0,
-                        _pad1: 0.0,
+                        line_mode_end: line_mode,
+                        arc_total: 1.0,
                         _pad2: 0.0,
                         label,
                     })),
@@ -1220,6 +1238,24 @@ fn spawn_graph_nodes(
                 ));
             }
         }
+
+        // Inside the same guard and sharing the same marquee cache: a link is
+        // the same substance as an edge — same ribbon, same scrolling label —
+        // so a value that reaches a Match and the arm it is handed to are
+        // spelled alike, and each string is rasterised once for both passes.
+        spawn_match_links(
+            &mut commands,
+            &mut meshes,
+            &mut materials_edge,
+            &mut images,
+            edge_labels,
+            &glyph_font,
+            &mut value_marquee_cache,
+            &state,
+            &flat_graph,
+            &anchor_world_positions,
+            &pattern_band_positions,
+        );
     }
 
     for walked_graph in state.root_graph().walk_all_graphs() {
@@ -4359,6 +4395,286 @@ fn rebuild_scene(
 pub struct WorldLabel {
     pub world_pos: Vec3,
     pub offset: Vec2, // screen-space pixel offset
+}
+
+/// Spawn one structural link: a ribbon from `from` to `to` whose two ends may
+/// wear different shapes.
+///
+/// No `Edge` component and no parent entity. `Edge` holds an `Entity` for each
+/// end, and a Pattern's band is no anchor — there is nothing to point at. A
+/// link is not something the user wired, so nothing needs to pick it, follow it
+/// or take it apart.
+#[allow(clippy::too_many_arguments)]
+fn spawn_link_ribbon(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials_edge: &mut Assets<edge::EdgeMaterial>,
+    images: &mut Assets<Image>,
+    edge_labels: &edge::EdgeLabelTextures,
+    glyph_font: &ab_glyph::FontRef<'_>,
+    marquee_cache: &mut std::collections::HashMap<(edge::LeafKind, String), Handle<Image>>,
+    leaf: &infer::EType,
+    value: Option<&str>,
+    from: Vec3,
+    to: Vec3,
+    start: edge::RibbonEnd,
+    end: edge::RibbonEnd,
+) {
+    let Some(kind) = edge::leaf_kind_of(leaf) else {
+        return;
+    };
+    let curve = edge::EdgeCurve::from_endpoints(from, to);
+    let (mesh, arc_total) = edge::build_tapered_ribbon_mesh(&curve, &start, &end);
+    // The same choice the edge pass makes: a strand carrying a value says the
+    // value and its type, a strand carrying a type says the type. `none` keeps
+    // its own prebuilt marquee, which is already padded for the gap a
+    // hairline's glyph mask needs.
+    let label = match value {
+        Some(value) if kind != edge::LeafKind::None => {
+            let text = format!("  {}  {}  ", value, kind.type_name());
+            marquee_cache
+                .entry((kind, text.clone()))
+                .or_insert_with(|| edge::rasterize_marquee_text(glyph_font, &text, images))
+                .clone()
+        }
+        _ => edge_labels.by_kind.get(&kind).cloned().unwrap(),
+    };
+    commands.spawn((
+        Mesh3d(meshes.add(mesh)),
+        MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
+            band_color: render::type_marker_color(leaf).to_linear(),
+            letter_color: LinearRgba::WHITE,
+            scroll_speed: render::CELL * 0.5,
+            tile_length: render::CELL,
+            time: 0.0,
+            line_mode_start: start.line_mode,
+            line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
+            line_mode_end: end.line_mode,
+            arc_total,
+            _pad2: 0.0,
+            label,
+        })),
+        SceneEntity,
+    ));
+}
+
+/// Draw the connections a Match is made *of* rather than wired from: what
+/// arrives at its input reaching each arm's band, and what each branch produces
+/// reaching its output.
+///
+/// These are not edges. No `Edge` ever crosses a branch's volume boundary — a
+/// branch reads the matched value from its own `BranchSource` instead — so the
+/// edge table says nothing about them and they have to be drawn from the
+/// structure itself.
+///
+/// What they show is a **consumption**. Each arm claims a slice of the band its
+/// scrutinee arrives on (`infer::RowSpan`): a whole band for a base type, half
+/// of one for `true` or `false`, and nothing at all — a line at the band's top
+/// edge — for a literal of a type with infinitely many values. Claimed exactly
+/// once over the anchor's whole height, the Match is exhaustive. A gap is a
+/// missing arm and an overlap a redundant one, and both are left standing where
+/// they can be seen rather than reported: the picture is the report, and the
+/// linter that will read these same spans comes after it.
+///
+/// A plain `fn` and not a system: the two maps it needs are locals of
+/// `spawn_graph_nodes`, and making them a resource would buy nothing but an
+/// ordering constraint.
+#[allow(clippy::too_many_arguments)]
+fn spawn_match_links(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials_edge: &mut Assets<edge::EdgeMaterial>,
+    images: &mut Assets<Image>,
+    edge_labels: &edge::EdgeLabelTextures,
+    glyph_font: &ab_glyph::FontRef<'_>,
+    marquee_cache: &mut std::collections::HashMap<(edge::LeafKind, String), Handle<Image>>,
+    state: &GraphState,
+    flat_graph: &model::term_graph::TermGraph,
+    anchor_world_positions: &std::collections::HashMap<model::anchor::Id, Vec3>,
+    pattern_band_positions: &std::collections::HashMap<model::node::Id, Vec3>,
+) {
+    let decls = &state.function_declarations;
+    // `walk_all` reaches every scope with its offset already composed, and a
+    // Match's Patterns always live in the same LayoutGraph the Match does
+    // (`plus_match`), so a nested Match needs nothing path-aware here — it is
+    // reached like any other and resolves its arms by lookup.
+    for walked in state.layout_graph.walk_all() {
+        let Some(model::node::ENode::Match {
+            patterns,
+            input_anchor,
+            output_anchor,
+        }) = walked
+            .layout_graph
+            .graph
+            .nodes
+            .get(&walked.layout_node.node_id)
+        else {
+            continue;
+        };
+
+        // ── What arrives, reaching the arms ──
+        //
+        // Read through the same calls the Match's own anchor is drawn from, so
+        // the rows a strand aims at are the rows that are actually there.
+        let in_leaves = infer::incoming_anchor_type(flat_graph, input_anchor, decls)
+            .map(|t| render::ordered_supported_leaves(&t))
+            .unwrap_or_default();
+        let in_value = infer::incoming_anchor_literal(flat_graph, input_anchor);
+        if let Some(&in_pos) = anchor_world_positions.get(input_anchor) {
+            for pattern_id in patterns {
+                // An arm that declares nothing consumes nothing, and an arm
+                // whose type could never arrive here consumes nothing either.
+                // Both are drawn as exactly that — a band with no strand
+                // reaching it. Note the deliberate divergence from the edge
+                // pass, which aims an unmatched leaf at row 0: docking a `Bool`
+                // arm onto an `Integer` band would draw the lie that it
+                // consumes it.
+                let Some(model::node::ENode::Pattern {
+                    r#type: Some(arm_type),
+                    ..
+                }) = flat_graph.nodes.get(pattern_id)
+                else {
+                    continue;
+                };
+                let Some(&band_pos) = pattern_band_positions.get(pattern_id) else {
+                    continue;
+                };
+                let arm_leaf = infer::graph_type_to_eval_type(arm_type);
+                let arm_value = layout::value_of_etype(arm_type);
+                // Every row the arm can take something from, not just one: an
+                // `Integer` arm against a `1|2` anchor consumes both rows, and
+                // has to be seen doing it or the match would read as missing an
+                // arm. `claimed_span` answers `None` for a row the arm can
+                // never describe, which is what skips it.
+                for (row, anchor_leaf) in in_leaves.iter().enumerate() {
+                    let Some(span) = infer::claimed_span(anchor_leaf, &arm_leaf) else {
+                        continue;
+                    };
+                    let start = edge::ribbon_end(
+                        in_pos.y + render::leaf_row_offset(row),
+                        &span,
+                        render::leaf_is_drawn_as_line(anchor_leaf, in_value.as_deref()),
+                    );
+                    // An arm fills its own cell whatever it declares, so the
+                    // taper happens entirely at the anchor end.
+                    let end = edge::ribbon_end(
+                        band_pos.y,
+                        &infer::RowSpan::FULL,
+                        render::leaf_is_drawn_as_line(&arm_leaf, arm_value.as_deref()),
+                    );
+                    spawn_link_ribbon(
+                        commands,
+                        meshes,
+                        materials_edge,
+                        images,
+                        edge_labels,
+                        glyph_font,
+                        marquee_cache,
+                        anchor_leaf,
+                        // What the row itself holds, or what arrives, or else
+                        // what the arm names: a strand from a typed band to the
+                        // arm `42` is carrying 42 and nothing else, even where
+                        // the band it left cannot say so.
+                        infer::leaf_literal(anchor_leaf)
+                            .or(in_value.as_deref())
+                            .or(arm_value.as_deref()),
+                        // Leave by the band's far face. The cell centre is the
+                        // outward face, where the *incoming* edge already ends.
+                        render::anchor_body_face_world(in_pos, true),
+                        // The arm's band is drawn input-side, so its near face
+                        // is the cell centre — which is the face this meets.
+                        band_pos,
+                        start,
+                        end,
+                    );
+                }
+            }
+        }
+
+        // ── What each branch produces, reaching the output ──
+        //
+        // The mirror image: here the branch's Sink is the declared, narrow side
+        // and the Match's output is the band. Several sinks landing on one
+        // output row is what sum-type normalisation looks like.
+        let out_leaves = render::ordered_supported_leaves(
+            &infer::anchor_type(flat_graph, output_anchor, decls).unwrap_or(infer::EType::Pending),
+        );
+        let Some(&out_pos) = anchor_world_positions.get(output_anchor) else {
+            continue;
+        };
+        for pattern_id in patterns {
+            // The whole branch resolves through the flattened graph: a Pattern
+            // names its Sink, a Sink names its anchor, and every branch node is
+            // in `flat_graph`. No layout traversal is needed for any of it.
+            let Some(model::node::ENode::Pattern { sink_node_id, .. }) =
+                flat_graph.nodes.get(pattern_id)
+            else {
+                continue;
+            };
+            let Some(model::node::ENode::Sink {
+                input_anchor: sink_input,
+            }) = flat_graph.nodes.get(sink_node_id)
+            else {
+                continue;
+            };
+            let Some(&sink_pos) = anchor_world_positions.get(sink_input) else {
+                continue;
+            };
+            let Some(sink_type) = infer::incoming_anchor_type(flat_graph, sink_input, decls) else {
+                continue;
+            };
+            let sink_value = infer::incoming_anchor_literal(flat_graph, sink_input);
+            let sink_leaves = render::ordered_supported_leaves(&sink_type);
+            for (k, leaf) in sink_leaves.iter().enumerate() {
+                // The literal a branch produces belongs to the leaf now, and
+                // the sink's own anchor literal is the fallback — the same
+                // order the marker stack reads them in.
+                let produced = infer::leaf_literal(leaf).or(sink_value.as_deref());
+                for (row, out_leaf) in out_leaves.iter().enumerate() {
+                    // What this branch produces claims its share of the output
+                    // row it lands on. Two branches yielding `true` and `false`
+                    // cover the Bool band between them — which is why the
+                    // output *is* `Bool` and not `true|false`. Two yielding `1`
+                    // and `2` land on their own rows, because the output kept
+                    // them apart rather than widening to `Integer`.
+                    let Some(span) = infer::claimed_span(out_leaf, leaf) else {
+                        continue;
+                    };
+                    let start = edge::ribbon_end(
+                        sink_pos.y + render::leaf_row_offset(k),
+                        &span,
+                        render::leaf_is_drawn_as_line(leaf, sink_value.as_deref()),
+                    );
+                    // The Match output is drawn from its type alone — deriving
+                    // an extra literal for it would be constant folding — so it
+                    // is a line only where its own type says so.
+                    let end = edge::ribbon_end(
+                        out_pos.y + render::leaf_row_offset(row),
+                        &span,
+                        render::leaf_is_drawn_as_line(out_leaf, None),
+                    );
+                    spawn_link_ribbon(
+                        commands,
+                        meshes,
+                        materials_edge,
+                        images,
+                        edge_labels,
+                        glyph_font,
+                        marquee_cache,
+                        leaf,
+                        produced,
+                        render::anchor_body_face_world(sink_pos, true),
+                        // Arrive at the output band's near face, in front of
+                        // it — aiming at the cell centre would run the strand
+                        // through the whole band before stopping at its back.
+                        render::anchor_body_face_world(out_pos, false),
+                        start,
+                        end,
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Spawn a UI text label that tracks a world position.

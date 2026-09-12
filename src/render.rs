@@ -356,6 +356,83 @@ pub fn ordered_supported_leaves(t: &crate::infer::EType) -> Vec<crate::infer::ET
     leaves
 }
 
+/// World-space Y of the top and bottom edge of `span` within the leaf row
+/// centred at `row_center_y`.
+///
+/// A span is stated in the band's own reading direction — `0.0` is its top edge
+/// — while rows are stacked along layout +Y, which is world −Y. The step is
+/// therefore taken from `LAYOUT_SCALE` exactly as `leaf_row_offset` takes it,
+/// so a flip of the axis convention moves both together instead of leaving this
+/// one silently upside down.
+///
+/// The pair is returned top first, i.e. the larger world Y first.
+pub fn row_span_world_y(row_center_y: f32, span: &crate::infer::RowSpan) -> (f32, f32) {
+    let step = LAYOUT_SCALE.y.signum() * TYPE_MARKER_Y_STEP;
+    let row_top = row_center_y - step * 0.5;
+    (row_top + span.top * step, row_top + span.bottom * step)
+}
+
+/// The word a leaf is drawn as a line *of*, when it is drawn as a line at all:
+/// the literal the leaf itself is pinned to, the one pinned to its anchor, or
+/// `none`, which needs nothing pinned to it.
+///
+/// The leaf's own literal comes first and the anchor's is the fallback. A leaf
+/// carries a literal when the type says so — one row of a `1|2` — and the
+/// anchor carries one when the *node* says so, which a Constant does for a type
+/// that names no value of its own. Where both speak they agree; where only one
+/// does, it is the one that knows.
+///
+/// One function rather than two so the shape and the word can never disagree —
+/// there is no state in which something is drawn as a line with nothing written
+/// on it, or writes a value while wearing a band.
+fn leaf_line_text(leaf: &crate::infer::EType, graph_value: Option<&str>) -> Option<String> {
+    match leaf {
+        crate::infer::EType::None => Some(crate::model::r#type::NONE_LITERAL.to_string()),
+        _ => crate::infer::leaf_literal(leaf)
+            .or(graph_value)
+            .map(str::to_string),
+    }
+}
+
+/// True when a leaf is drawn as a thin line rather than as a band: it is
+/// `none`, whose value is its type, or a literal is pinned to it.
+///
+/// Both the marker stack and every ribbon that meets it ask this, of the same
+/// leaf, so the two cannot disagree about what shape they are joining.
+pub fn leaf_is_drawn_as_line(leaf: &crate::infer::EType, graph_value: Option<&str>) -> bool {
+    leaf_line_text(leaf, graph_value).is_some()
+}
+
+/// The face of an anchor's band that faces the node body — the far face of an
+/// input, the near face of an output.
+///
+/// An anchor's *cell centre* is its outward face, which is where an ordinary
+/// edge arrives (see `ANCHOR_DEPTH`). The connections a Match is made of leave
+/// and arrive on the other side, so they need this one instead: a link aimed at
+/// the cell centre of an output would run through the whole band before
+/// stopping at its back.
+pub fn anchor_body_face_world(anchor_world_pos: Vec3, is_input: bool) -> Vec3 {
+    let sign = if is_input { -1.0 } else { 1.0 };
+    Vec3::new(
+        anchor_world_pos.x,
+        anchor_world_pos.y,
+        anchor_world_pos.z + sign * ANCHOR_DEPTH,
+    )
+}
+
+/// World centre of the cell a Pattern names its arm's type on.
+///
+/// A Pattern owns no anchor, so this address exists nowhere else — and it is
+/// needed twice, by the node pass that draws the band and by the link pass that
+/// has to meet it. Written once here so the two cannot drift.
+pub fn pattern_band_world(layout_node: &crate::layout::LayoutNode, extra_offset: Vec3) -> Vec3 {
+    cell_center_world(
+        layout_node.pos
+            + extra_offset
+            + Vec3::new(0.0, 0.0, crate::layout::PATTERN_TYPE_LOCAL_Z as f32),
+    )
+}
+
 /// Build the stack of translucent type rectangles at an anchor.
 ///
 /// `anchor_world_pos` is the world centre of the anchor's **first row** cell.
@@ -405,12 +482,10 @@ fn build_type_markers(
             let color = type_marker_color(&leaf);
             let letter = type_marker_letter(&leaf).to_string();
             let center = Vec3::new(anchor_world_pos.x, y_center, full_rect_z_center);
-            // What this row is drawn as a line *of*: the literal pinned to the
-            // anchor, or the word `none`, which needs nothing pinned to it.
-            let line_text = match leaf {
-                crate::infer::EType::None => Some(crate::model::r#type::NONE_LITERAL.to_string()),
-                _ => graph_value.map(str::to_string),
-            };
+            // What this row is drawn as a line *of*, if it is drawn as one:
+            // `leaf_line_text` is the single place that question is settled, so
+            // a ribbon meeting this row joins the shape it actually finds.
+            let line_text = leaf_line_text(&leaf, graph_value);
 
             if let Some(value) = line_text {
                 // A leaf that stands for a value is drawn as that value and
@@ -589,7 +664,13 @@ pub fn layoutnode_to_rendernode(
         } => {
             let depth = crate::layout::name_body_cells(name);
             let output_world = cell(0, 0, depth);
-            let output_eval_type = crate::infer::graph_type_to_eval_type(r#type);
+            // Base type, literal stripped: what a Source produces comes from
+            // the evaluation prompt, so a literal written on it types nothing
+            // (see `infer::anchor_type`). The literal is still *shown* — it
+            // travels beside the type as `output_value` and the output anchor
+            // draws it as a line, the way any pinned value is drawn.
+            let output_eval_type =
+                crate::infer::base_type_of(&crate::infer::graph_type_to_eval_type(r#type));
             let output_value = crate::layout::value_of_etype(r#type);
             // A Source has no input in the graph — it *is* where a value comes
             // in from outside — but the value has to be seen arriving
@@ -1021,12 +1102,18 @@ pub fn layoutnode_to_rendernode(
             let input_world = cell(0, 0, 0);
             let incoming =
                 crate::infer::incoming_anchor_type(flat_graph, input_anchor, function_declarations);
+            // A Sink constrains nothing, so it owns no type to pin a literal
+            // to — but it is where a branch's value comes to rest, and a value
+            // is drawn as the value. So the literal is read off the anchor
+            // upstream, the one that does own it, and the Sink shows what
+            // actually arrived rather than the shape of what might have.
+            let incoming_value = crate::infer::incoming_anchor_literal(flat_graph, input_anchor);
             RenderNode {
                 node: None,
                 anchors: std::collections::HashMap::from([(
                     input_anchor.clone(),
                     match incoming {
-                        Some(t) => typed_anchor(&t, None, input_world, true),
+                        Some(t) => typed_anchor(&t, incoming_value.as_deref(), input_world, true),
                         None => RenderAnchor {
                             pick_center: input_world,
                             type_markers: vec![],
@@ -1048,7 +1135,7 @@ pub fn layoutnode_to_rendernode(
         crate::model::node::ENode::Pattern { r#type, .. } => {
             let (markers, objects) = declared_type_cell(
                 r#type.as_ref(),
-                cell(0, 0, crate::layout::PATTERN_TYPE_LOCAL_Z),
+                pattern_band_world(layout_node, extra_offset),
             );
             RenderNode {
                 node: None,
@@ -1099,6 +1186,12 @@ pub fn layoutnode_to_rendernode(
             let input_world = cell(0, 0, 0);
             let incoming =
                 crate::infer::incoming_anchor_type(flat_graph, input_anchor, function_declarations);
+            // A Match constrains its input no more than a Sink does, so the
+            // literal comes from upstream for the same reason — and here it
+            // decides the shape the arms are joined to: a value arriving at a
+            // Match is a line, and an arm that accepts a whole type is a band,
+            // which is what makes the link between them widen along its length.
+            let incoming_value = crate::infer::incoming_anchor_literal(flat_graph, input_anchor);
             // The output owns its own cell directly behind the deepest branch;
             // `match_output_z` decides which one. Its type is the union of the
             // branch types, or `Pending` while the inferer cannot decide it.
@@ -1112,7 +1205,9 @@ pub fn layoutnode_to_rendernode(
                     (
                         input_anchor.clone(),
                         match incoming {
-                            Some(t) => typed_anchor(&t, None, input_world, true),
+                            Some(t) => {
+                                typed_anchor(&t, incoming_value.as_deref(), input_world, true)
+                            }
                             None => RenderAnchor {
                                 pick_center: input_world,
                                 type_markers: vec![],
