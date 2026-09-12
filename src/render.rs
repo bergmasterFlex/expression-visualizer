@@ -595,11 +595,7 @@ pub fn layoutnode_to_rendernode(
                 // rotation below maps those onto world −Z and −X.
                 mesh: Rectangle::new(depth as f32 * cell_z, cell_x).mesh().build(),
                 transform: Transform {
-                    translation: Vec3::new(
-                        body_center.x,
-                        top_y + BODY_FACE_LIFT,
-                        body_center.z,
-                    ),
+                    translation: Vec3::new(body_center.x, top_y + BODY_FACE_LIFT, body_center.z),
                     // A `Rectangle` is built in the XY plane. Laying it flat
                     // alone (the `x` term) would run the text along world +X,
                     // which slants away from the viewer; the `y` term turns it

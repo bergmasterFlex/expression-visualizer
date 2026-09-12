@@ -1798,11 +1798,7 @@ fn insert_node_kind(state: &mut GraphState, pick: &PickState, kind: &AddKind) ->
 ///
 /// The existing literal is carried across unchanged — `make_etype` drops it for
 /// `None`, which is the one type that has no value to keep.
-fn set_node_type(
-    state: &mut GraphState,
-    node_id: &model::node::Id,
-    choice: TypeChoice,
-) -> bool {
+fn set_node_type(state: &mut GraphState, node_id: &model::node::Id, choice: TypeChoice) -> bool {
     let node = state
         .layout_graph
         .find_node_graph_mut(node_id)
@@ -2138,9 +2134,7 @@ fn in_open_quote(text: &str) -> bool {
 ///
 /// Inputs only. The output type is what the finished node's own output anchor
 /// shows, and spelling it out here would nearly double the widest row.
-fn signature_detail(
-    declaration: &model::function_declaration::FunctionDeclaration,
-) -> String {
+fn signature_detail(declaration: &model::function_declaration::FunctionDeclaration) -> String {
     declaration
         .inputs
         .iter()
@@ -5278,8 +5272,7 @@ fn handle_source_name_click(
         return;
     }
     for (interaction, editor_input) in interaction_q.iter() {
-        if *interaction != Interaction::Pressed
-            || editor_input.field != NodeEditorField::SourceName
+        if *interaction != Interaction::Pressed || editor_input.field != NodeEditorField::SourceName
         {
             continue;
         }
@@ -5603,9 +5596,7 @@ fn handle_editor_keys(
                 // bounded to one insert per press — a held key auto-repeats,
                 // and the repeats must not each open a cell.
                 bevy::input::keyboard::Key::Space
-                    if target == InsertTarget::Create
-                        && prompt.text.is_empty()
-                        && !ev.repeat =>
+                    if target == InsertTarget::Create && prompt.text.is_empty() && !ev.repeat =>
                 {
                     if apply_room_insert(
                         &mut state,

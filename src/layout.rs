@@ -110,10 +110,7 @@ pub const NAME_CHARS_PER_CELL: usize = 3;
 /// the rasteriser walks, so length and pitch cannot disagree.
 pub fn source_body_cells(name: &str) -> i32 {
     // On `usize`, because `i32::div_ceil` is not stable.
-    name.chars()
-        .count()
-        .div_ceil(NAME_CHARS_PER_CELL)
-        .max(1) as i32
+    name.chars().count().div_ceil(NAME_CHARS_PER_CELL).max(1) as i32
 }
 
 /// Cells an anchor claims: `infer::anchor_rows` of them, growing along +Y from
