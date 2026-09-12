@@ -921,10 +921,12 @@ fn spawn_graph_nodes(
     let mut node_entites = std::collections::HashMap::<model::node::Id, Entity>::new();
     let mut anchor_entities = std::collections::HashMap::<model::anchor::Id, Entity>::new();
     let mut anchor_world_positions = std::collections::HashMap::<model::anchor::Id, Vec3>::new();
-    // A Pattern owns no anchor, so the cell its band sits on is recorded here
-    // instead — the link pass has to meet that band and would otherwise have no
-    // way to ask where it is.
-    let mut pattern_band_positions = std::collections::HashMap::<model::node::Id, Vec3>::new();
+    // A Pattern and a TypeCast both hang their declared type on a cell of their
+    // own rather than on an anchor, so those cells are recorded here — the link
+    // pass has to meet them and would otherwise have no way to ask where they
+    // are. One table for both: node ids are unique across kinds, and every
+    // lookup site already knows which kind it is holding.
+    let mut declared_band_positions = std::collections::HashMap::<model::node::Id, Vec3>::new();
     // Type inference resolves edges, and every edge (pattern branches included)
     // lives in the program-level edge table — so flatten once here instead of
     // per anchor, and hand the same view to the renderer and the edge pass.
@@ -944,11 +946,20 @@ fn spawn_graph_nodes(
         let layout_node = walked.layout_node;
         let node_id = &layout_node.node_id;
         let node = walked.layout_graph.graph.nodes.get(node_id).unwrap();
-        if matches!(node, model::node::ENode::Pattern { .. }) {
-            pattern_band_positions.insert(
-                node_id.clone(),
-                render::pattern_band_world(layout_node, walked.extra_offset),
-            );
+        match node {
+            model::node::ENode::Pattern { .. } => {
+                declared_band_positions.insert(
+                    node_id.clone(),
+                    render::pattern_band_world(layout_node, walked.extra_offset),
+                );
+            }
+            model::node::ENode::TypeCast { .. } => {
+                declared_band_positions.insert(
+                    node_id.clone(),
+                    render::cast_band_world(layout_node, walked.extra_offset),
+                );
+            }
+            _ => {}
         }
         let render_node = render::layoutnode_to_rendernode(
             layout_node,
@@ -1196,8 +1207,8 @@ fn spawn_graph_nodes(
     }
 
     // A link is the same substance as an edge — same ribbon, same taper between
-    // band and line — so the two passes share everything but the table they
-    // read from.
+    // band and line — so these passes share everything but the table they read
+    // from.
     spawn_match_links(
         &mut commands,
         &mut meshes,
@@ -1205,7 +1216,16 @@ fn spawn_graph_nodes(
         &state,
         &flat_graph,
         &anchor_world_positions,
-        &pattern_band_positions,
+        &declared_band_positions,
+    );
+    spawn_cast_links(
+        &mut commands,
+        &mut meshes,
+        &mut materials_edge,
+        &state,
+        &flat_graph,
+        &anchor_world_positions,
+        &declared_band_positions,
     );
 
     for walked_graph in state.root_graph().walk_all_graphs() {
@@ -4384,6 +4404,67 @@ fn spawn_link_ribbon(
     ));
 }
 
+/// Fan an anchor's rows out onto one declared-type cell: every row that cell
+/// can describe gets a strand, claiming the share of the row it takes.
+///
+/// Two kinds own such a cell — a Match's arm and a TypeCast's target — and they
+/// make the same statement with it, so they are drawn by the same code. The
+/// caller supplies the anchor side once and calls this per cell.
+///
+/// A row the cell can never describe gets nothing. Note the deliberate
+/// divergence from the edge pass, which aims an unmatched leaf at row 0:
+/// docking a `Bool` arm onto an `Integer` band would draw the lie that it
+/// consumes it. Here the gap *is* the statement — a Match reads as
+/// non-exhaustive, a cast as able to fail.
+#[allow(clippy::too_many_arguments)]
+fn spawn_declared_cell_links(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials_edge: &mut Assets<edge::EdgeMaterial>,
+    in_pos: Vec3,
+    in_leaves: &[infer::EType],
+    in_value: Option<&str>,
+    band_pos: Vec3,
+    declared: &model::r#type::EType,
+) {
+    let declared_leaf = infer::graph_type_to_eval_type(declared);
+    let declared_value = layout::value_of_etype(declared);
+    // Every row the cell can take something from, not just one: an `Integer`
+    // arm against a `1|2` anchor consumes both rows, and has to be seen doing
+    // it or the match would read as missing an arm.
+    for (row, anchor_leaf) in in_leaves.iter().enumerate() {
+        let Some(span) = infer::claimed_span(anchor_leaf, &declared_leaf) else {
+            continue;
+        };
+        let start = edge::ribbon_end(
+            in_pos.y + render::leaf_row_offset(row),
+            &span,
+            render::leaf_is_drawn_as_line(anchor_leaf, in_value),
+        );
+        // The cell fills its own row whatever it declares, so the taper happens
+        // entirely at the anchor end.
+        let end = edge::ribbon_end(
+            band_pos.y,
+            &infer::RowSpan::FULL,
+            render::leaf_is_drawn_as_line(&declared_leaf, declared_value.as_deref()),
+        );
+        spawn_link_ribbon(
+            commands,
+            meshes,
+            materials_edge,
+            anchor_leaf,
+            // Leave by the band's far face. The cell centre is the outward
+            // face, where the *incoming* edge already ends.
+            render::anchor_body_face_world(in_pos, true),
+            // A declared-type cell is drawn input-side, so its near face is the
+            // cell centre — which is the face this meets.
+            band_pos,
+            start,
+            end,
+        );
+    }
+}
+
 /// Draw the connections a Match is made *of* rather than wired from: what
 /// arrives at its input reaching each arm's band, and what each branch produces
 /// reaching its output.
@@ -4405,7 +4486,6 @@ fn spawn_link_ribbon(
 /// A plain `fn` and not a system: the two maps it needs are locals of
 /// `spawn_graph_nodes`, and making them a resource would buy nothing but an
 /// ordering constraint.
-#[allow(clippy::too_many_arguments)]
 fn spawn_match_links(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -4413,7 +4493,7 @@ fn spawn_match_links(
     state: &GraphState,
     flat_graph: &model::term_graph::TermGraph,
     anchor_world_positions: &std::collections::HashMap<model::anchor::Id, Vec3>,
-    pattern_band_positions: &std::collections::HashMap<model::node::Id, Vec3>,
+    declared_band_positions: &std::collections::HashMap<model::node::Id, Vec3>,
 ) {
     let decls = &state.function_declarations;
     // `walk_all` reaches every scope with its offset already composed, and a
@@ -4444,13 +4524,8 @@ fn spawn_match_links(
         let in_value = infer::incoming_anchor_literal(flat_graph, input_anchor);
         if let Some(&in_pos) = anchor_world_positions.get(input_anchor) {
             for pattern_id in patterns {
-                // An arm that declares nothing consumes nothing, and an arm
-                // whose type could never arrive here consumes nothing either.
-                // Both are drawn as exactly that — a band with no strand
-                // reaching it. Note the deliberate divergence from the edge
-                // pass, which aims an unmatched leaf at row 0: docking a `Bool`
-                // arm onto an `Integer` band would draw the lie that it
-                // consumes it.
+                // An arm that declares nothing consumes nothing, so there is
+                // nothing to draw reaching it.
                 let Some(model::node::ENode::Pattern {
                     r#type: Some(arm_type),
                     ..
@@ -4458,47 +4533,19 @@ fn spawn_match_links(
                 else {
                     continue;
                 };
-                let Some(&band_pos) = pattern_band_positions.get(pattern_id) else {
+                let Some(&band_pos) = declared_band_positions.get(pattern_id) else {
                     continue;
                 };
-                let arm_leaf = infer::graph_type_to_eval_type(arm_type);
-                let arm_value = layout::value_of_etype(arm_type);
-                // Every row the arm can take something from, not just one: an
-                // `Integer` arm against a `1|2` anchor consumes both rows, and
-                // has to be seen doing it or the match would read as missing an
-                // arm. `claimed_span` answers `None` for a row the arm can
-                // never describe, which is what skips it.
-                for (row, anchor_leaf) in in_leaves.iter().enumerate() {
-                    let Some(span) = infer::claimed_span(anchor_leaf, &arm_leaf) else {
-                        continue;
-                    };
-                    let start = edge::ribbon_end(
-                        in_pos.y + render::leaf_row_offset(row),
-                        &span,
-                        render::leaf_is_drawn_as_line(anchor_leaf, in_value.as_deref()),
-                    );
-                    // An arm fills its own cell whatever it declares, so the
-                    // taper happens entirely at the anchor end.
-                    let end = edge::ribbon_end(
-                        band_pos.y,
-                        &infer::RowSpan::FULL,
-                        render::leaf_is_drawn_as_line(&arm_leaf, arm_value.as_deref()),
-                    );
-                    spawn_link_ribbon(
-                        commands,
-                        meshes,
-                        materials_edge,
-                        anchor_leaf,
-                        // Leave by the band's far face. The cell centre is the
-                        // outward face, where the *incoming* edge already ends.
-                        render::anchor_body_face_world(in_pos, true),
-                        // The arm's band is drawn input-side, so its near face
-                        // is the cell centre — which is the face this meets.
-                        band_pos,
-                        start,
-                        end,
-                    );
-                }
+                spawn_declared_cell_links(
+                    commands,
+                    meshes,
+                    materials_edge,
+                    in_pos,
+                    &in_leaves,
+                    in_value.as_deref(),
+                    band_pos,
+                    arm_type,
+                );
             }
         }
 
@@ -4575,6 +4622,129 @@ fn spawn_match_links(
                     );
                 }
             }
+        }
+    }
+}
+
+/// Draw the connections a TypeCast is made of: what arrives at its input
+/// reaching its target cell, and what the target cannot take reaching the
+/// `none` its output carries.
+///
+/// A cast borrows the Match's rhythm with one arm, so the first half is
+/// literally the Match's — `spawn_declared_cell_links`, called once.
+///
+/// The second half is the cast's own, and it is the thing a cast is *about*.
+/// `infer::type_cast_output_type` calls a cast total exactly when its target
+/// subsumes everything arriving, and hangs a `none` off it otherwise. Until now
+/// that `none` appeared at the output with nothing to say where it came from.
+/// It comes from whatever the target does not claim: `RowSpan::complement` of
+/// each row's claimed share, drawn as a strand that runs past the target cell
+/// straight to the `none` row. Past it, not through it — a cast that fails
+/// never reaches its target.
+///
+/// The two halves agree by construction: a total cast claims every row whole,
+/// every complement is empty, and no strand is drawn — which is also exactly
+/// when the output has no `none` row to draw one to.
+///
+/// The reverse leg a Match has, target cell → output anchor, is deliberately
+/// absent. On success the target cell and the output say the same thing, one
+/// cell apart; a strand between them would only spell it twice.
+fn spawn_cast_links(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials_edge: &mut Assets<edge::EdgeMaterial>,
+    state: &GraphState,
+    flat_graph: &model::term_graph::TermGraph,
+    anchor_world_positions: &std::collections::HashMap<model::anchor::Id, Vec3>,
+    declared_band_positions: &std::collections::HashMap<model::node::Id, Vec3>,
+) {
+    let decls = &state.function_declarations;
+    for walked in state.layout_graph.walk_all() {
+        let node_id = &walked.layout_node.node_id;
+        // A cast with no target chosen declares nothing, so nothing reaches it
+        // and nothing can fail — its output is `Pending` either way.
+        let Some(model::node::ENode::TypeCast {
+            r#type: Some(target),
+            input_anchor,
+            output_anchor,
+        }) = walked.layout_graph.graph.nodes.get(node_id)
+        else {
+            continue;
+        };
+        let Some(&in_pos) = anchor_world_positions.get(input_anchor) else {
+            continue;
+        };
+        let Some(&band_pos) = declared_band_positions.get(node_id) else {
+            continue;
+        };
+        // Read through the same call the cast's own input anchor is drawn from,
+        // so the rows a strand aims at are the rows that are actually there.
+        let in_leaves = infer::incoming_anchor_type(flat_graph, input_anchor, decls)
+            .map(|t| render::ordered_supported_leaves(&t))
+            .unwrap_or_default();
+        let in_value = infer::incoming_anchor_literal(flat_graph, input_anchor);
+
+        spawn_declared_cell_links(
+            commands,
+            meshes,
+            materials_edge,
+            in_pos,
+            &in_leaves,
+            in_value.as_deref(),
+            band_pos,
+            target,
+        );
+
+        // ── What the target cannot take, reaching the `none` ──
+        let out_leaves = render::ordered_supported_leaves(
+            &infer::anchor_type(flat_graph, output_anchor, decls).unwrap_or(infer::EType::Pending),
+        );
+        let (Some(&out_pos), Some(none_row)) = (
+            anchor_world_positions.get(output_anchor),
+            out_leaves
+                .iter()
+                .position(|leaf| matches!(leaf, infer::EType::None)),
+        ) else {
+            continue;
+        };
+        let target_leaf = infer::graph_type_to_eval_type(target);
+        for (row, anchor_leaf) in in_leaves.iter().enumerate() {
+            // No claim at all means the whole row fails; a partial claim leaves
+            // its complement. `None` from `complement` means nothing is left,
+            // so this row always succeeds and needs no strand.
+            let failing = match infer::claimed_span(anchor_leaf, &target_leaf) {
+                Option::None => Some(infer::RowSpan::FULL),
+                Some(claimed) => claimed.complement(),
+            };
+            let Some(failing) = failing else {
+                continue;
+            };
+            let start = edge::ribbon_end(
+                in_pos.y + render::leaf_row_offset(row),
+                &failing,
+                render::leaf_is_drawn_as_line(anchor_leaf, in_value.as_deref()),
+            );
+            // `none` is always a line, so the strand tapers into one however
+            // much of the band it left with.
+            let end = edge::ribbon_end(
+                out_pos.y + render::leaf_row_offset(none_row),
+                &infer::RowSpan::FULL,
+                true,
+            );
+            spawn_link_ribbon(
+                commands,
+                meshes,
+                materials_edge,
+                // Coloured as `none` rather than as the row it leaves: what
+                // travels here is not a value of that type, it is the absence
+                // of one, and the colour should say where the strand ends up.
+                &infer::EType::None,
+                render::anchor_body_face_world(in_pos, true),
+                // Arrive at the output band's near face, in front of it.
+                render::anchor_body_face_world(out_pos, false),
+                start,
+                end,
+            );
         }
     }
 }

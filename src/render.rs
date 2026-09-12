@@ -433,6 +433,15 @@ pub fn pattern_band_world(layout_node: &crate::layout::LayoutNode, extra_offset:
     )
 }
 
+/// World centre of the cell a TypeCast names its target type on. The same
+/// address a Pattern's arm has, one node-local hop instead of two: a cast
+/// borrows the Match's rhythm but has no Pattern node to go through.
+pub fn cast_band_world(layout_node: &crate::layout::LayoutNode, extra_offset: Vec3) -> Vec3 {
+    cell_center_world(
+        layout_node.pos + extra_offset + Vec3::new(0.0, 0.0, crate::layout::CAST_TYPE_Z as f32),
+    )
+}
+
 /// Whether a marker stack writes in words what its shape already says.
 ///
 /// The type is in the colour and the value is in the shape — a band for a type,
@@ -919,7 +928,7 @@ pub fn layoutnode_to_rendernode(
             output_anchor,
         } => {
             let input_world = cell(0, 0, 0);
-            let body_world = cell(0, 0, crate::layout::CAST_TYPE_Z);
+            let body_world = cast_band_world(layout_node, extra_offset);
             let output_world = cell(0, 0, crate::layout::CAST_OUTPUT_Z);
             // The output reflects a possibly failed cast as `Sum(target, none)`
             // when a mismatched type flows in, and stays `Pending` while

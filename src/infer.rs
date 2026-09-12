@@ -162,6 +162,41 @@ impl RowSpan {
         self.height() <= f32::EPSILON
     }
 
+    /// The part of the row this span leaves alone, or `None` where it leaves
+    /// nothing.
+    ///
+    /// What a cast's target does not claim is what the cast can fail on, so
+    /// this is the sad path stated as geometry: `FULL` leaves nothing and
+    /// cannot fail, `TOP_HALF` leaves `BOTTOM_HALF` — casting `Bool` to `true`
+    /// fails on exactly `false` — and `TOP_EDGE` leaves the whole band, because
+    /// naming one value out of infinitely many is a promise that almost every
+    /// value breaks.
+    ///
+    /// Only spans lying against an edge have a single-interval complement, and
+    /// only those are ever built: `literal_row_span` makes nothing else. A span
+    /// floating in the middle of a band would leave two pieces, and this
+    /// answers `None` for it rather than picking one — better a missing strand
+    /// than a wrong one, if the model ever grows such a span.
+    pub fn complement(&self) -> Option<RowSpan> {
+        let touches_top = self.top <= f32::EPSILON;
+        let touches_bottom = self.bottom >= 1.0 - f32::EPSILON;
+        if self.is_degenerate() {
+            return Some(RowSpan::FULL);
+        }
+        match (touches_top, touches_bottom) {
+            (true, true) => Option::None,
+            (true, false) => Some(RowSpan {
+                top: self.bottom,
+                bottom: 1.0,
+            }),
+            (false, true) => Some(RowSpan {
+                top: 0.0,
+                bottom: self.top,
+            }),
+            (false, false) => Option::None,
+        }
+    }
+
     /// True when both spans claim some of the same slice.
     ///
     /// Nothing calls this yet: it is the question the exhaustiveness linter
