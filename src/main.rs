@@ -294,7 +294,7 @@ const NODE_KINDS: [(AddKind, &str); 4] = [
 const LITERAL_KEYWORDS: [(&str, TypeChoice, Option<&str>); 3] = [
     ("true", TypeChoice::Bool, Some("true")),
     ("false", TypeChoice::Bool, Some("false")),
-    ("none", TypeChoice::None, None),
+    (model::r#type::NONE_LITERAL, TypeChoice::None, None),
 ];
 
 /// What committing a prompt row does. The prompt is one widget with as many
@@ -1162,7 +1162,23 @@ fn spawn_graph_nodes(
                 let Some(kind) = edge::leaf_kind_of(leaf) else {
                     continue;
                 };
-                let (height, label, line_mode) = if let Some(value) = src_graph_value.as_deref() {
+                // A strand carrying a value is a hairline, a strand carrying a
+                // type is a band — the same question the anchor's markers ask,
+                // asked of the same leaf, so the two meet in the same shape
+                // where the edge lands.
+                //
+                // The literal is a property of the whole source anchor and
+                // `none` is a property of the one leaf, which is why `none` is
+                // tested per strand: in `Char|None` only the second one thins.
+                let (height, label, line_mode) = if kind == edge::LeafKind::None {
+                    // Its marquee already says `none`, and the prebuilt texture
+                    // is padded for the gap the hairline's glyph mask needs.
+                    (
+                        edge::RIBBON_LINE_HEIGHT,
+                        edge_labels.by_kind.get(&kind).cloned().unwrap(),
+                        1.0,
+                    )
+                } else if let Some(value) = src_graph_value.as_deref() {
                     let text = format!("  {}  {}  ", value, kind.type_name());
                     let handle = value_marquee_cache
                         .entry((kind, text.clone()))
@@ -2203,12 +2219,42 @@ fn prompt_candidates(state: &GraphState, pick: &PickState, text: &str) -> Vec<Su
         // `eval_value_for_type` refuses anyway.
         InsertTarget::Edit(_, EditTarget::ConstantValue) => literal_rows(text),
         // Both at once, and that is the whole point of the cell: `Integer`
-        // casts to integers, `42` produces the integer 42.
-        InsertTarget::Edit(_, EditTarget::CastType | EditTarget::PatternType) => literal_rows(text)
-            .into_iter()
-            .chain(type_rows(text))
-            .collect(),
+        // casts to integers, `42` produces the integer 42. A cast has one
+        // answer it cannot give, which is `none`.
+        InsertTarget::Edit(_, EditTarget::CastType) => refuse_none_cast(type_or_literal_rows(text)),
+        InsertTarget::Edit(_, EditTarget::PatternType) => type_or_literal_rows(text),
     }
+}
+
+/// A base type or a literal, in one list — what a TypeCast's and a Pattern's
+/// cell can both be set to.
+fn type_or_literal_rows(text: &str) -> Vec<Suggestion> {
+    literal_rows(text)
+        .into_iter()
+        .chain(type_rows(text))
+        .collect()
+}
+
+/// Refuse `none` as a cast target.
+///
+/// A cast to `none` would ignore whatever flows in and hand back a fixed
+/// `none` — which is a Constant, spelled the long way round and with an input
+/// anchor that means nothing. A Pattern is the opposite case and keeps it: an
+/// arm that matches `none` is how the sad path is caught.
+///
+/// Greyed rather than dropped, because those are two different questions: the
+/// prefix filters and the legality only greys. A row that vanished as the word
+/// was typed would leave the user looking for a typo.
+fn refuse_none_cast(rows: Vec<Suggestion>) -> Vec<Suggestion> {
+    rows.into_iter()
+        .map(|mut row| {
+            if matches!(row.action, PromptAction::SetType(TypeChoice::None, _)) {
+                row.allowed = false;
+                row.detail = "casts nothing".to_string();
+            }
+            row
+        })
+        .collect()
 }
 
 /// Shift reports the uppercase character and the labels are CamelCase, so every
@@ -2651,53 +2697,58 @@ fn spawn_prompt_rows(
         } else {
             Color::srgb(0.35, 0.35, 0.4)
         };
-        options
-            .spawn((
-                Button,
-                Node {
-                    padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
-                    border_radius: BorderRadius::all(Val::Px(3.0)),
-                    flex_direction: FlexDirection::Row,
-                    justify_content: JustifyContent::SpaceBetween,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(12.0),
-                    ..default()
-                },
-                BackgroundColor(if highlighted {
-                    Color::srgba(0.2, 0.2, 0.3, 0.95)
-                } else {
-                    Color::srgba(0.0, 0.0, 0.0, 0.0)
-                }),
-                InsertPromptOption(suggestion.action.clone()),
-            ))
-            .with_children(|row| {
+        let mut entity = options.spawn((
+            Node {
+                padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                border_radius: BorderRadius::all(Val::Px(3.0)),
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(12.0),
+                ..default()
+            },
+            BackgroundColor(if highlighted {
+                Color::srgba(0.2, 0.2, 0.3, 0.95)
+            } else {
+                Color::srgba(0.0, 0.0, 0.0, 0.0)
+            }),
+        ));
+        // A greyed row is not clickable at all, for the same reason the "… N
+        // more" tally is not: what cannot be committed must not be committable
+        // by another route. `Enter` filters on `allowed`, but the click path
+        // commits whatever the row carries — and only the *create* actions are
+        // checked a second time, inside `insert_node_kind`.
+        if suggestion.allowed {
+            entity.insert((Button, InsertPromptOption(suggestion.action.clone())));
+        }
+        entity.with_children(|row| {
+            row.spawn((
+                Text::new(suggestion.label.clone()),
+                text_font(font, 14.0),
+                TextColor(label_color),
+            ));
+            // Spawned only when it says something — `SpaceBetween` already
+            // puts a lone child at the start, so a row without a detail
+            // needs no empty placeholder to stay left-aligned.
+            if !suggestion.detail.is_empty() {
                 row.spawn((
-                    Text::new(suggestion.label.clone()),
-                    text_font(font, 14.0),
-                    TextColor(label_color),
+                    Text::new(suggestion.detail.clone()),
+                    text_font(font, 12.0),
+                    TextColor(if suggestion.allowed {
+                        Color::srgb(0.6, 0.6, 0.7)
+                    } else {
+                        label_color
+                    }),
+                    // The signature is the row's width, not its slack:
+                    // shrinking it would wrap `Char|String,Char|String`
+                    // onto a second line and make the rows uneven.
+                    Node {
+                        flex_shrink: 0.0,
+                        ..default()
+                    },
                 ));
-                // Spawned only when it says something — `SpaceBetween` already
-                // puts a lone child at the start, so a row without a detail
-                // needs no empty placeholder to stay left-aligned.
-                if !suggestion.detail.is_empty() {
-                    row.spawn((
-                        Text::new(suggestion.detail.clone()),
-                        text_font(font, 12.0),
-                        TextColor(if suggestion.allowed {
-                            Color::srgb(0.6, 0.6, 0.7)
-                        } else {
-                            label_color
-                        }),
-                        // The signature is the row's width, not its slack:
-                        // shrinking it would wrap `Char|String,Char|String`
-                        // onto a second line and make the rows uneven.
-                        Node {
-                            flex_shrink: 0.0,
-                            ..default()
-                        },
-                    ));
-                }
-            });
+            }
+        });
     }
     if window.end < candidates.len() {
         spawn_prompt_hint(

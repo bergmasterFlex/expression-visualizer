@@ -89,7 +89,11 @@ impl LeafKind {
             LeafKind::Char => "  Char  ",
             LeafKind::Int => "  Integer  ",
             LeafKind::String => "  String  ",
-            LeafKind::None => "  None  ",
+            // Lowercase, and the only one of the five that is: a `none` strand
+            // is always drawn as a hairline rather than as a band, because
+            // `none` is a value and not a kind of value — so what scrolls
+            // along it is the symbol itself, spelled as it is typed.
+            LeafKind::None => "  none  ",
         }
     }
 

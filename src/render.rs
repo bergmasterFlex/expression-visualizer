@@ -287,19 +287,28 @@ const SOURCE_INDEX_LABEL_OFFSET_X: f32 = 18.0;
 /// under a third of a pixel at the tightest zoom.
 const BODY_FACE_LIFT: f32 = CELL / 500.0;
 
-/// Sort key that fixes the vertical order of type-marker rectangles.
-/// Returns `None` for variants that should not render a rectangle.
+/// Sort key that fixes the vertical order of the rows of a sum type. Returns
+/// `None` for variants that claim no row.
+///
+/// `ordered_supported_leaves` sorts by the *reverse* of this, and row 0 is the
+/// topmost — so the highest number is drawn at the top and `none`, lowest, at
+/// the bottom. That is where it belongs: a sum type reads as "one of these, or
+/// else nothing", and the "or else" is the last thing said, not the first.
 fn type_marker_order(t: &crate::infer::EType) -> Option<u8> {
     match t {
-        crate::infer::EType::Bool(..) => Some(0),
-        crate::infer::EType::Char(..) => Some(1),
-        crate::infer::EType::Int(..) => Some(2),
-        crate::infer::EType::String(..) => Some(3),
-        crate::infer::EType::None => Some(4),
+        crate::infer::EType::None => Some(0),
+        crate::infer::EType::Bool(..) => Some(1),
+        crate::infer::EType::Char(..) => Some(2),
+        crate::infer::EType::Int(..) => Some(3),
+        crate::infer::EType::String(..) => Some(4),
         _ => None,
     }
 }
 
+/// The letter written across a type's band. `none` never asks for one: it is
+/// drawn as a line with its own word at the tip, the way a literal is, so its
+/// arm here is unreachable — kept only because a total function over the leaves
+/// is easier to trust than one with a hole in it.
 fn type_marker_letter(t: &crate::infer::EType) -> &'static str {
     match t {
         crate::infer::EType::Bool(..) => "b",
@@ -334,12 +343,13 @@ pub fn type_marker_color(t: &crate::infer::EType) -> Color {
 pub fn leaf_row_offset(index: usize) -> f32 {
     index as f32 * LAYOUT_SCALE.y.signum() * TYPE_MARKER_Y_STEP
 }
-/// The row-claiming leaves of `t`, sorted into the fixed bottom-to-top stack
-/// order (none at bottom → bool at top).
+/// The row-claiming leaves of `t`, in the order they are stacked: String at the
+/// top, then Int, Char, Bool, and `none` at the bottom (`type_marker_order`).
 ///
 /// Which leaves claim a row is decided by `infer::row_leaves`, so the render
 /// stack and the cell addressing can never disagree about how tall an anchor
-/// is; this only fixes their order.
+/// is; this only fixes their order. Both the marker stack and the edge ribbons
+/// read it, which is what keeps a strand meeting the row it belongs to.
 pub fn ordered_supported_leaves(t: &crate::infer::EType) -> Vec<crate::infer::EType> {
     let mut leaves = crate::infer::row_leaves(t);
     leaves.sort_by_key(|leaf| std::cmp::Reverse(type_marker_order(leaf).unwrap_or(u8::MAX)));
@@ -362,6 +372,12 @@ pub fn ordered_supported_leaves(t: &crate::infer::EType) -> Vec<crate::infer::ET
 /// thin line plus the literal — a value is shown as the value, not as its
 /// type. In practice value-carrying nodes have a single leaf, so this only
 /// fires on one marker per anchor.
+///
+/// `none` takes that same line whether or not anything was pinned to the
+/// anchor, and it is the one leaf that does: it is the type whose value *is*
+/// the type, so there is no band it could honestly wear. That is why the
+/// choice is made per leaf rather than per anchor — in `Char|None` the `Char`
+/// keeps its band and only the `none` row becomes a line.
 fn build_type_markers(
     t: &crate::infer::EType,
     graph_value: Option<&str>,
@@ -389,9 +405,15 @@ fn build_type_markers(
             let color = type_marker_color(&leaf);
             let letter = type_marker_letter(&leaf).to_string();
             let center = Vec3::new(anchor_world_pos.x, y_center, full_rect_z_center);
+            // What this row is drawn as a line *of*: the literal pinned to the
+            // anchor, or the word `none`, which needs nothing pinned to it.
+            let line_text = match leaf {
+                crate::infer::EType::None => Some(crate::model::r#type::NONE_LITERAL.to_string()),
+                _ => graph_value.map(str::to_string),
+            };
 
-            if let Some(value) = graph_value {
-                // A leaf pinned to a literal is drawn as that literal and
+            if let Some(value) = line_text {
+                // A leaf that stands for a value is drawn as that value and
                 // nothing else: one thin line across the anchor's full depth,
                 // its colour carrying the type. No band, no type letter — the
                 // same choice the edge shader makes for value-carrying edges.
@@ -417,7 +439,7 @@ fn build_type_markers(
                         transform: Transform::from_translation(center),
                     }),
                     value_label: Some(RenderLabel {
-                        text: value.to_string(),
+                        text: value,
                         color: Color::WHITE,
                         font_size: 14.0,
                         world_pos: label_world,
@@ -703,9 +725,9 @@ pub fn layoutnode_to_rendernode(
             // The half of the body cell that faces the anchor, so the segment
             // continues the value line the anchor draws into its own half
             // (`build_type_markers`) and the two meet exactly at the cell
-            // boundary. Drawn whether or not the anchor has one: a `none`
-            // constant shows a band there instead, and the body still has to
-            // say where its value comes from.
+            // boundary. Every constant has that line now, `none` included —
+            // its value is its type, so the anchor draws it as a value like
+            // any other.
             let half_depth = LAYOUT_SCALE.z.abs() * 0.5;
             let line_center = Vec3::new(
                 body_world.x,

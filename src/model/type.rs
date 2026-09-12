@@ -1,3 +1,12 @@
+/// How `none` is written wherever it is shown or typed.
+///
+/// Lowercase, because it is a value and not a type name. `none` is the single
+/// symbol of the sad path — the value *is* the type — so what stands on a node
+/// is the symbol itself, the same way `42` and `'a'` stand for themselves. The
+/// word on the node and the word you type at the prompt are this one constant,
+/// so they cannot come apart.
+pub const NONE_LITERAL: &str = "none";
+
 #[derive(Debug, Clone)]
 pub enum EType {
     Bool {
