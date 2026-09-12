@@ -269,6 +269,12 @@ const VALUE_LINE_THICKNESS: f32 = CELL * 0.02;
 /// World-space padding between the tip of the gizmo line and the value
 /// label's projection point.
 const VALUE_LABEL_Z_PADDING: f32 = CELL / 30.0;
+/// Screen-space nudge that carries a Source's index label clear of the type
+/// letter it hangs off, to its right. Measured from the letter rather than from
+/// the cell, because both are glyphs of a fixed pixel size: a gap stated in
+/// pixels then holds at every zoom, while one stated in world units would close
+/// as the camera pulls back.
+const SOURCE_INDEX_LABEL_OFFSET_X: f32 = 18.0;
 /// How far a text face floats above the body face it prints on.
 ///
 /// Coplanar is not an option, and for two reasons rather than one. The obvious
@@ -561,6 +567,43 @@ pub fn layoutnode_to_rendernode(
             let output_world = cell(0, 0, depth);
             let output_eval_type = crate::infer::graph_type_to_eval_type(r#type);
             let output_value = crate::layout::value_of_etype(r#type);
+            // A Source has no input in the graph — it *is* where a value comes
+            // in from outside — but the value has to be seen arriving
+            // somewhere, so one is drawn all the same, one cell in front of the
+            // body. It says the type the Source declares and carries the index
+            // the evaluation prompt asks by, which is otherwise written down
+            // nowhere: the index is the lateral order, so it is read off the
+            // node's place rather than off the node.
+            //
+            // Visual only. It is not in `anchors`, so no edge can end here and
+            // the pointer cannot pick it, and it claims no cell: layout Z=0 is
+            // the scope's first row, so this hangs outside the volume, against
+            // its front face.
+            let input_world = cell(0, 0, -1);
+            // The declared type and nothing else, even where the Source carries
+            // a literal: a literal on a Source is not the value it is evaluated
+            // with — that one comes from the prompt — and the output anchor
+            // already shows it. What arrives here is a value *of this type*.
+            let input_markers = build_type_markers(&output_eval_type, None, input_world, true);
+            // Where `build_type_markers` puts the first row's type letter: the
+            // label leans into the anchor's own half, toward the body.
+            let index_label_world = Vec3::new(
+                input_world.x,
+                input_world.y,
+                input_world.z - TYPE_MARKER_HALF_DEPTH,
+            );
+            let index_label = layout_graph
+                .source_index(&layout_node.node_id)
+                .map(|index| RenderLabel {
+                    text: format!("[{}]", index),
+                    // Neutral grey at the small size, the way a FunctionCall's
+                    // input names are drawn: same kind of label, naming an
+                    // anchor beside the letter that types it.
+                    color: Color::srgb(0.5, 0.5, 0.5),
+                    font_size: 12.0,
+                    world_pos: index_label_world,
+                    offset: Vec2::new(SOURCE_INDEX_LABEL_OFFSET_X, 0.0),
+                });
             // A body is a body: it stands in front of what is behind it.
             // `type_marker_color` paints anchor *bands*, which are translucent
             // so an edge behind one stays visible — hence the opaque override.
@@ -633,12 +676,14 @@ pub fn layoutnode_to_rendernode(
                         plain_body: None,
                     },
                 )]),
-                markers: vec![],
+                // The drawn-only input anchor belongs to the node itself, not
+                // to an anchor of it — the same place a Pattern's band lives.
+                markers: input_markers,
                 bands: vec![],
                 // The name is on the body now, and the type is in the body's
-                // colour and at the output anchor — nothing left to float
-                // beside the node.
-                labels: vec![],
+                // colour and at the output anchor — the index is the one thing
+                // left that has to be written beside the node.
+                labels: index_label.into_iter().collect(),
                 text_faces: vec![name_face],
             }
         }

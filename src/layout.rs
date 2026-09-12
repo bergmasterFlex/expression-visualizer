@@ -1884,6 +1884,47 @@ impl LayoutGraph {
         }
     }
 
+    /// This scope's Sources in lateral order, which is what a Source's index
+    /// *is*. It is the one property that is typed nowhere: the order the
+    /// Sources stand in is the order they are numbered in, so moving one
+    /// renumbers it and everything it passed.
+    ///
+    /// X alone decides it — Sources live on the root wall at Y=0, Z=0, so X is
+    /// the only axis they differ on. The node id breaks a tie rather than
+    /// leaving one, which keeps the order total even mid-move, when two of them
+    /// can briefly share a column.
+    pub fn source_order(&self) -> Vec<crate::model::node::Id> {
+        let mut sources: Vec<&LayoutNode> = self
+            .layout_nodes
+            .values()
+            .filter(|layout_node| {
+                // Only this scope's own Sources: a sub-layout numbers nothing,
+                // because a Source cannot stand in one.
+                matches!(
+                    self.graph.nodes.get(&layout_node.node_id),
+                    Some(crate::model::node::ENode::Source { .. })
+                )
+            })
+            .collect();
+        sources.sort_by(|a, b| {
+            // `total_cmp`, not `partial_cmp`: an X that came out NaN would
+            // otherwise compare equal to everything and scramble the order,
+            // rather than sorting to one end of it.
+            let lateral = a.pos.x.total_cmp(&b.pos.x);
+            lateral.then_with(|| a.node_id.cmp(&b.node_id))
+        });
+        sources
+            .into_iter()
+            .map(|layout_node| layout_node.node_id.clone())
+            .collect()
+    }
+
+    /// Where `node_id` stands in `source_order`; `None` for anything that is
+    /// not a Source of this scope.
+    pub fn source_index(&self, node_id: &crate::model::node::Id) -> Option<usize> {
+        self.source_order().iter().position(|id| id == node_id)
+    }
+
     pub fn plus_source(
         &self,
         pos: Vec3,
@@ -1897,7 +1938,13 @@ impl LayoutGraph {
         let graph = self.graph.plus_node(
             node_id.clone(),
             crate::model::node::ENode::Source {
-                name: "v".to_string(),
+                // Unnamed, not named `v`: the name is printed along the body,
+                // so a default would put a word on the node that nobody wrote
+                // — and one that has to be cleared before the real name can be
+                // typed. An empty name still claims a cell, because
+                // `source_body_cells` floors at one, so there is a body to
+                // stand on and type into.
+                name: String::new(),
                 r#type: crate::model::r#type::EType::Int { value: None },
                 output_anchor: output_anchor_id,
             },

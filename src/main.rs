@@ -3545,18 +3545,45 @@ fn sync_modal_ui(
             spawn_controls_modal(&mut commands, &ui_font.0);
         }
         EvalPhase::SourcePrompt { inputs } => {
-            let graph = state.root_graph().flattened_graph();
-            let rows: Vec<(model::node::Id, String)> = inputs
+            let root = state.root_graph();
+            let graph = root.flattened_graph();
+            // Asked for by index as well as by name, and listed in the index's
+            // order: the index is the one label every Source is certain to
+            // have — a name may be empty and two Sources may carry the same
+            // one — so it leads, and the same number stands on the node itself.
+            let mut rows: Vec<(Option<usize>, model::node::Id, String)> = inputs
                 .iter()
                 .map(|(id, _)| {
                     let name = match graph.nodes.get(id) {
                         Some(model::node::ENode::Source { name, .. }) => name.clone(),
                         _ => "?".to_string(),
                     };
-                    (id.clone(), name)
+                    (root.source_index(id), id.clone(), name)
                 })
                 .collect();
-            spawn_source_modal(&mut commands, &ui_font.0, rows);
+            // A Source with no index cannot happen — every one of them is laid
+            // out in the root scope — but were it to, it sorts last rather than
+            // first, where it would renumber what the eye already read.
+            rows.sort_by(|(a_index, a_id, _), (b_index, b_id, _)| {
+                a_index
+                    .unwrap_or(usize::MAX)
+                    .cmp(&b_index.unwrap_or(usize::MAX))
+                    .then_with(|| a_id.cmp(b_id))
+            });
+            spawn_source_modal(
+                &mut commands,
+                &ui_font.0,
+                rows.into_iter()
+                    .map(|(index, id, name)| {
+                        let label = match index {
+                            Some(index) if name.is_empty() => format!("[{}]", index),
+                            Some(index) => format!("[{}] {}", index, name),
+                            None => name,
+                        };
+                        (id, label)
+                    })
+                    .collect(),
+            );
         }
         _ => {}
     }
@@ -3795,7 +3822,13 @@ fn spawn_source_modal(
                                 text_font(font, 14.0),
                                 TextColor(Color::srgb(0.85, 0.85, 0.9)),
                                 Node {
-                                    width: Val::Px(120.0),
+                                    // Wide enough for the index that now leads
+                                    // the name: at this size the bracketed
+                                    // number costs about four characters, and
+                                    // a column that cannot hold it wraps the
+                                    // label onto a second line and pulls the
+                                    // field beside it out of line.
+                                    width: Val::Px(150.0),
                                     ..default()
                                 },
                                 ModalEntity,
