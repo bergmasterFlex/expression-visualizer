@@ -165,10 +165,27 @@ pub fn ribbon_end(row_center_y: f32, span: &crate::infer::RowSpan, as_line: bool
 /// a line along the ribbon's length.
 ///
 /// The curve's own Y is discarded: both ends state their Y outright, and the
-/// curve is asked only where to be in X and Z. UV.x is arc length in world
-/// units — the shader normalises it against the returned total to know how far
-/// along the ribbon a fragment sits, and interpolates `line_mode` with it. UV.y
-/// is 0 at the top edge and 1 at the bottom.
+/// curve is asked only where to be in X and Z. But *how far along* the curve a
+/// sample sits decides how far Y has fallen by then — the ribbon climbs by
+/// distance travelled, not by curve parameter.
+///
+/// The two are not the same, because the cubic covers its own length unevenly:
+/// the tangents drive it hardest along ±Z at either end, while its X eases in
+/// and out as a smoothstep. Which of the two dominates depends on the edge, so
+/// a Y ramp taken in the parameter runs ahead of the curve on some stretches
+/// and behind on others, and the drop comes out as a shallow-steep-shallow S
+/// rather than a slope.
+///
+/// That S matters more than it looks. The bound camera draws a world
+/// displacement at `(−Δz + 0.296·Δx, Δy − 0.634·Δx)`, so a sideways run and a
+/// drop are only 25° apart on screen and one cell of Y aliases with 1.6 cells
+/// of X. The one cue left is the *shape* of the movement, and it only works
+/// while the two shapes differ: X eases, Y climbs evenly.
+///
+/// UV.x is arc length in world units — the shader normalises it against the
+/// returned total to know how far along the ribbon a fragment sits, and
+/// interpolates `line_mode` with it. UV.y is 0 at the top edge and 1 at the
+/// bottom.
 ///
 /// Returns the mesh and its total arc length.
 pub fn build_tapered_ribbon_mesh(
@@ -182,25 +199,45 @@ pub fn build_tapered_ribbon_mesh(
     let mut normals: Vec<[f32; 3]> = Vec::with_capacity((n + 1) * 2);
     let mut uvs: Vec<[f32; 2]> = Vec::with_capacity((n + 1) * 2);
 
+    // Where the curve goes, and how far it has come by each sample. Two passes,
+    // because the total has to be known before the first Y can be placed.
+    //
+    // The distance is measured in X and Z alone. That is the whole of the curve
+    // the ribbon follows, and it is what the grid shows; the sampled Y is
+    // dropped, so taking it along would measure a path nothing is drawn on —
+    // the curve runs between the anchors' own rows while the ribbon runs
+    // between the two `RibbonEnd`s, and the two agree only by coincidence.
+    let mut samples: Vec<(Vec3, f32)> = Vec::with_capacity(n + 1);
     let mut arc = 0.0_f32;
     let mut prev = curve.sample(0.0);
     for i in 0..=n {
-        let t = i as f32 / n as f32;
-        let p = curve.sample(t);
+        let p = curve.sample(i as f32 / n as f32);
         if i > 0 {
-            arc += (p - prev).length();
+            arc += Vec2::new(p.x - prev.x, p.z - prev.z).length();
         }
         prev = p;
-        let y_bottom = start.y_bottom + (end.y_bottom - start.y_bottom) * t;
-        let y_top = start.y_top + (end.y_top - start.y_top) * t;
+        samples.push((p, arc));
+    }
+    let arc_total = arc;
+
+    for (p, travelled) in samples {
+        // A curve of no length leaves nothing to travel along, so everything
+        // collapses onto `start` rather than dividing by zero.
+        let s = if arc_total > 0.0 {
+            travelled / arc_total
+        } else {
+            0.0
+        };
+        let y_bottom = start.y_bottom + (end.y_bottom - start.y_bottom) * s;
+        let y_top = start.y_top + (end.y_top - start.y_top) * s;
         // Bottom vertex (uv.y = 1), top vertex (uv.y = 0). Order chosen so
         // the strip winds consistently.
         positions.push([p.x, y_bottom, p.z]);
         normals.push([0.0, 1.0, 0.0]);
-        uvs.push([arc, 1.0]);
+        uvs.push([travelled, 1.0]);
         positions.push([p.x, y_top, p.z]);
         normals.push([0.0, 1.0, 0.0]);
-        uvs.push([arc, 0.0]);
+        uvs.push([travelled, 0.0]);
     }
 
     let mut indices: Vec<u32> = Vec::with_capacity(n * 6);
@@ -221,7 +258,7 @@ pub fn build_tapered_ribbon_mesh(
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
     mesh.insert_indices(bevy::mesh::Indices::U32(indices));
-    (mesh, arc)
+    (mesh, arc_total)
 }
 
 /// Ribbon of constant `height`, centred on a `y_start` → `y_end` ramp. What an
