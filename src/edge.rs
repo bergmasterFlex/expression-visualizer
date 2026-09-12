@@ -13,20 +13,20 @@ use crate::infer::EType;
 /// Height of a solid edge band: one anchor row, so band and type marker line
 /// up exactly.
 pub const RIBBON_HEIGHT: f32 = crate::render::CELL;
-/// Ribbon height used when a source anchor carries an graph literal. The band
-/// itself is invisible in that mode (see `edge_band.wgsl`); the height is
-/// kept as-is so the rasterised marquee glyphs stay readable.
+/// Mesh height of a ribbon drawn as a hairline. The band itself is invisible in
+/// that mode (see `edge_band.wgsl`), so this is not a height that is *seen* —
+/// it is the height the visible line is measured against, since
+/// `RIBBON_LINE_HALF_THICKNESS_UV` is a fraction of it. The line comes out
+/// `2 × 0.1 × CELL / 4`, i.e. a twentieth of a cell: thin like a grid line.
 pub const RIBBON_LINE_HEIGHT: f32 = crate::render::CELL / 4.0;
 /// Half-thickness of the value-edge hairline in `uv.y` space (i.e. as a
-/// fraction of `RIBBON_LINE_HEIGHT`). Thin like a grid line.
+/// fraction of `RIBBON_LINE_HEIGHT`).
 pub const RIBBON_LINE_HALF_THICKNESS_UV: f32 = 0.1;
 pub const RIBBON_SEGMENTS: usize = 40;
-const LABEL_TEX_WIDTH: u32 = 256;
-const LABEL_TEX_HEIGHT: u32 = 32;
 
 /// Bytes of the bundled JetBrainsMono TTF. Exposed so callers that need to
-/// rasterise marquee text at spawn time (see `rasterize_marquee_text`) don't
-/// have to `include_bytes!` the same path themselves.
+/// rasterise text at spawn time (see `rasterize_face_text`) don't have to
+/// `include_bytes!` the same path themselves.
 pub const FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
 
 /// Straight cubic Bézier between two anchor world positions. Both tangents
@@ -71,51 +71,17 @@ impl EdgeCurve {
 }
 
 /// Five-way discriminant matching the leaf-type ordering used by anchor stacks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// It carries no data of its own — it exists so `leaf_kind_of` can answer two
+/// questions the ribbon pass has to ask of every leaf: whether the leaf claims a
+/// row at all, and whether it is `none`, which is always drawn as a line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeafKind {
     Bool,
     Char,
     Int,
     String,
     None,
-}
-
-impl LeafKind {
-    /// Marquee text for this leaf. Spaces on both sides keep visible gaps
-    /// between marquee repetitions once the texture is tiled.
-    fn marquee_text(self) -> &'static str {
-        match self {
-            LeafKind::Bool => "  Bool  ",
-            LeafKind::Char => "  Char  ",
-            LeafKind::Int => "  Integer  ",
-            LeafKind::String => "  String  ",
-            // Lowercase, and the only one of the five that is: a `none` strand
-            // is always drawn as a hairline rather than as a band, because
-            // `none` is a value and not a kind of value — so what scrolls
-            // along it is the symbol itself, spelled as it is typed.
-            LeafKind::None => "  none  ",
-        }
-    }
-
-    /// Bare type name, without the marquee padding — used to compose the
-    /// alternating "value + type" marquee on value-carrying edges.
-    pub fn type_name(self) -> &'static str {
-        match self {
-            LeafKind::Bool => "Bool",
-            LeafKind::Char => "Char",
-            LeafKind::Int => "Integer",
-            LeafKind::String => "String",
-            LeafKind::None => "None",
-        }
-    }
-
-    pub const ALL: [LeafKind; 5] = [
-        LeafKind::Bool,
-        LeafKind::Char,
-        LeafKind::Int,
-        LeafKind::String,
-        LeafKind::None,
-    ];
 }
 
 /// Map an `EType` leaf to its `LeafKind`. Sum types and unsupported variants
@@ -147,10 +113,11 @@ impl RibbonEnd {
     /// A hairline centred on `y`.
     ///
     /// The mesh is `RIBBON_LINE_HEIGHT` tall rather than flat, and that is not
-    /// a rounding-up: a ribbon of no height has no triangles to rasterise, its
-    /// `uv.y` spans nothing, and the marquee it carries would be crushed into a
-    /// stripe. The *visible* line is the shader's, at `uv.y = 0.5` — which is
-    /// exactly `y`. The height around it is room for the glyphs.
+    /// a rounding-up: a ribbon of no height has no triangles to rasterise, and
+    /// its `uv.y` would span nothing — but the *visible* line is the shader's,
+    /// at `uv.y = 0.5`, and its thickness is a fraction of that span. So the
+    /// mesh has to carry a height for the line to be a fraction *of*, and the
+    /// line then falls exactly on `y`.
     fn hairline(y: f32) -> Self {
         let half = RIBBON_LINE_HEIGHT * 0.5;
         Self {
@@ -199,9 +166,9 @@ pub fn ribbon_end(row_center_y: f32, span: &crate::infer::RowSpan, as_line: bool
 ///
 /// The curve's own Y is discarded: both ends state their Y outright, and the
 /// curve is asked only where to be in X and Z. UV.x is arc length in world
-/// units (so the shader can tile the label texture with `uv.x / tile_length`,
-/// and normalise it against the returned total to interpolate `line_mode`),
-/// UV.y is 0 at the top edge and 1 at the bottom.
+/// units — the shader normalises it against the returned total to know how far
+/// along the ribbon a fragment sits, and interpolates `line_mode` with it. UV.y
+/// is 0 at the top edge and 1 at the bottom.
 ///
 /// Returns the mesh and its total arc length.
 pub fn build_tapered_ribbon_mesh(
@@ -275,21 +242,15 @@ pub const EDGE_SHADER_HANDLE: Handle<Shader> = uuid_handle!("45444745-0000-4000-
 pub struct EdgeMaterial {
     #[uniform(0)]
     pub band_color: LinearRgba,
-    #[uniform(0)]
-    pub letter_color: LinearRgba,
-    /// World units per second the marquee scrolls (output → input).
-    #[uniform(0)]
-    pub scroll_speed: f32,
-    /// World units the label texture spans before repeating.
-    #[uniform(0)]
-    pub tile_length: f32,
-    /// Seconds since app start, updated each frame.
+    /// Seconds since app start, updated each frame by
+    /// `update_edge_material_time`. Nothing reads it yet — it is kept against a
+    /// coming edge animation.
     #[uniform(0)]
     pub time: f32,
     /// Coverage style at the ribbon's start, interpolated toward
     /// `line_mode_end` along its length: 0.0 = solid band (full ribbon
-    /// coverage); 1.0 = hairline coverage that is only visible in a thin band
-    /// around `uv.y = 0.5` and cut out where the marquee glyph texture has ink.
+    /// coverage); 1.0 = hairline coverage, visible only in a thin band around
+    /// `uv.y = 0.5`.
     ///
     /// It varies along the ribbon rather than being one value per edge because
     /// a value flowing into a Match arrives as a line and leaves the arm that
@@ -310,11 +271,6 @@ pub struct EdgeMaterial {
     /// returns it; anything non-zero will do where both modes agree.
     #[uniform(0)]
     pub arc_total: f32,
-    #[uniform(0)]
-    pub _pad2: f32,
-    #[texture(1)]
-    #[sampler(2)]
-    pub label: Handle<Image>,
 }
 
 impl Material for EdgeMaterial {
@@ -337,11 +293,6 @@ impl Material for EdgeMaterial {
     }
 }
 
-#[derive(Resource)]
-pub struct EdgeLabelTextures {
-    pub by_kind: std::collections::HashMap<LeafKind, Handle<Image>>,
-}
-
 pub struct EdgePlugin;
 
 impl Plugin for EdgePlugin {
@@ -353,117 +304,19 @@ impl Plugin for EdgePlugin {
             Shader::from_wgsl
         );
         app.add_plugins(MaterialPlugin::<EdgeMaterial>::default())
-            .add_systems(Startup, rasterize_label_textures)
             .add_systems(Update, update_edge_material_time);
     }
 }
 
-/// Push the current time into every `EdgeMaterial` so the shader can animate
-/// the marquee. Iterating all materials each frame is cheap at edge counts
-/// we expect (~O(30)) and matches Bevy's `animate_shader` example.
+/// Push the current time into every `EdgeMaterial`. Nothing in the shader reads
+/// it yet; it is kept wound so a coming edge animation has a clock to start
+/// from. Iterating all materials each frame is cheap at edge counts we expect
+/// (~O(30)) and matches Bevy's `animate_shader` example.
 fn update_edge_material_time(time: Res<Time>, mut materials: ResMut<Assets<EdgeMaterial>>) {
     let t = time.elapsed_secs();
     for (_id, m) in materials.iter_mut() {
         m.time = t;
     }
-}
-
-/// Rasterize the five leaf-type labels into repeat-tileable R8Unorm images.
-///
-/// Uses `include_bytes!` on the JetBrainsMono TTF rather than the asset system
-/// to sidestep WASM async-load races — the startup system must have a font
-/// ready synchronously.
-fn rasterize_label_textures(mut images: ResMut<Assets<Image>>, mut commands: Commands) {
-    let font = FontRef::try_from_slice(FONT_BYTES).expect("bundled font is valid");
-
-    let mut by_kind = std::collections::HashMap::new();
-    for kind in LeafKind::ALL {
-        let handle = rasterize_marquee_text(&font, kind.marquee_text(), &mut images);
-        by_kind.insert(kind, handle);
-    }
-    commands.insert_resource(EdgeLabelTextures { by_kind });
-}
-
-/// Rasterise `text` fitted horizontally across a `LABEL_TEX_WIDTH`-wide
-/// R8Unorm texture with wrap-repeat sampling, matching what the marquee
-/// shader expects. Callers that only need the five per-leaf textures should
-/// use the `EdgeLabelTextures` resource; this is for on-demand text
-/// (e.g. value+type marquee strings on value-carrying edges).
-pub fn rasterize_marquee_text(
-    font: &FontRef<'_>,
-    text: &str,
-    images: &mut Assets<Image>,
-) -> Handle<Image> {
-    let w = LABEL_TEX_WIDTH as usize;
-    let h = LABEL_TEX_HEIGHT as usize;
-    let mut buf = vec![0u8; w * h];
-
-    // Fit the text horizontally across the full texture width so the marquee
-    // period matches one "label-length" in UV space.
-    let px = PxScale::from(LABEL_TEX_HEIGHT as f32 * 0.9);
-    let scaled = font.as_scaled(px);
-    let ascent = scaled.ascent();
-    let baseline_y = ascent + (LABEL_TEX_HEIGHT as f32 - (ascent - scaled.descent())) * 0.5;
-
-    let total_advance: f32 = text
-        .chars()
-        .map(|c| scaled.h_advance(scaled.font.glyph_id(c)))
-        .sum();
-    let scale_x = if total_advance > 0.0 {
-        LABEL_TEX_WIDTH as f32 / total_advance
-    } else {
-        1.0
-    };
-
-    let mut pen_x = 0.0_f32;
-    for c in text.chars() {
-        let glyph_id = scaled.font.glyph_id(c);
-        let advance = scaled.h_advance(glyph_id);
-        let glyph =
-            glyph_id.with_scale_and_position(px, ab_glyph::point(pen_x * scale_x, baseline_y));
-        if let Some(outline) = font.outline_glyph(glyph) {
-            let bounds = outline.px_bounds();
-            outline.draw(|gx, gy, coverage| {
-                let px_x = gx as i32 + bounds.min.x as i32;
-                let px_y = gy as i32 + bounds.min.y as i32;
-                if px_x < 0
-                    || px_y < 0
-                    || (px_x as u32) >= LABEL_TEX_WIDTH
-                    || (px_y as u32) >= LABEL_TEX_HEIGHT
-                {
-                    return;
-                }
-                let idx = px_y as usize * w + px_x as usize;
-                let v = (coverage * 255.0) as u8;
-                if v > buf[idx] {
-                    buf[idx] = v;
-                }
-            });
-        }
-        pen_x += advance;
-    }
-
-    let mut image = Image::new(
-        Extent3d {
-            width: LABEL_TEX_WIDTH,
-            height: LABEL_TEX_HEIGHT,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        buf,
-        TextureFormat::R8Unorm,
-        bevy::asset::RenderAssetUsages::RENDER_WORLD,
-    );
-    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-        address_mode_u: ImageAddressMode::Repeat,
-        address_mode_v: ImageAddressMode::ClampToEdge,
-        address_mode_w: ImageAddressMode::ClampToEdge,
-        mag_filter: ImageFilterMode::Linear,
-        min_filter: ImageFilterMode::Linear,
-        mipmap_filter: ImageFilterMode::Linear,
-        ..default()
-    });
-    images.add(image)
 }
 
 /// Pixels per cell in a body-face text texture.
@@ -479,10 +332,10 @@ const FACE_TEX_CELL_PX: u32 = 128;
 /// `layout::NAME_CHARS_PER_CELL` characters per cell, white glyphs over
 /// `background`.
 ///
-/// Unlike `rasterize_marquee_text` the text is **not** stretched to the texture
-/// width. The pitch is the meaning here — the body is as long as the name needs
-/// — so a character has to be exactly a third of a cell, or the body's length
-/// stops being a count of characters.
+/// The text is **not** stretched to the texture width. The pitch is the meaning
+/// here — the body is as long as the name needs — so a character has to be
+/// exactly a third of a cell, or the body's length stops being a count of
+/// characters.
 ///
 /// The background colour is baked in and the alpha left at 1 rather than
 /// leaving the glyphs on transparency: the face then sits in the opaque pass,
@@ -558,8 +411,8 @@ pub fn rasterize_face_text(
         bevy::asset::RenderAssetUsages::RENDER_WORLD,
     );
     image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
-        // Clamped on both axes: this texture is a single printed face, not a
-        // marquee, so a repeat would bleed one end of the name into the other.
+        // Clamped on both axes: this texture is a single printed face, so a
+        // repeat would bleed one end of the name into the other.
         address_mode_u: ImageAddressMode::ClampToEdge,
         address_mode_v: ImageAddressMode::ClampToEdge,
         address_mode_w: ImageAddressMode::ClampToEdge,
