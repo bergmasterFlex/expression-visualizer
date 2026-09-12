@@ -178,16 +178,22 @@ enum EditorMode {
 /// hands it back.) `selected` indexes the *candidate* list — not the window of it
 /// that fits on screen, which is derived from `selected` rather than the other
 /// way round — and is re-clamped on every rebuild rather than trusted.
+///
+/// It is an `Option` because "no row is the answer yet" is a state the prompt
+/// really has, and one the list has to show: while nothing is typed, `Return`
+/// still means the editor's newline, so a highlight standing there would
+/// promise a commit the key does not perform. `None` is what an empty prompt
+/// opens in, and the arrow keys are the way into the list.
 #[derive(Resource, Default)]
 struct InsertPrompt {
     text: String,
-    selected: usize,
+    selected: Option<usize>,
 }
 
 impl InsertPrompt {
     fn clear(&mut self) {
         self.text.clear();
-        self.selected = 0;
+        self.selected = None;
     }
 }
 
@@ -232,8 +238,9 @@ enum AddKind {
 ///
 /// The kinds stand ahead of the functions, and that is what keeps one
 /// keystroke enough for them: the letters are not unique — `m` also reaches
-/// `mod`, `max` and `min` — but the highlight starts on the first committable
-/// row, so `m` still settles on `Match`.
+/// `mod`, `max` and `min` — but a typed letter puts the highlight on the first
+/// committable row, so `m` still settles on `Match`. (The *empty* prompt
+/// highlights nothing at all; the letter is what starts the list answering.)
 const NODE_KINDS: [(AddKind, &str); 4] = [
     (AddKind::Source, "Source"),
     (AddKind::Match, "Match"),
@@ -2172,31 +2179,54 @@ fn short_type_name(r#type: &infer::EType) -> String {
     }
 }
 
-/// Step the highlight to the next committable suggestion, wrapping around.
-/// Rows that are greyed out can never be committed, so the highlight does not
-/// stop on them; with nothing legal in the list it stays put.
-fn step_selection(candidates: &[Suggestion], from: usize, delta: isize) -> usize {
+/// Step the highlight to the next committable suggestion. Rows that are greyed
+/// out can never be committed, so the highlight does not stop on them.
+///
+/// It walks in one direction and **does not wrap**: stepping off either end
+/// leaves the list, and with nothing highlighted `Return` is the editor's
+/// newline again. That is the way back out, and a wrapping list would have none
+/// short of `Escape`. From outside the list the two ends are one keypress away —
+/// down enters at the first row, up at the last.
+fn step_selection(candidates: &[Suggestion], from: Option<usize>, delta: isize) -> Option<usize> {
     let len = candidates.len();
     if len == 0 {
-        return 0;
+        return None;
     }
-    let mut index = from.min(len - 1);
-    for _ in 0..len {
-        index = (index as isize + delta).rem_euclid(len as isize) as usize;
-        if candidates[index].allowed {
-            return index;
+    let mut index = match from {
+        Some(index) => index.min(len - 1) as isize + delta,
+        None if delta > 0 => 0,
+        None => len as isize - 1,
+    };
+    while (0..len as isize).contains(&index) {
+        if candidates[index as usize].allowed {
+            return Some(index as usize);
         }
+        index += delta;
     }
-    from
+    None
 }
 
-/// Where the highlight lands after the text changed: the first suggestion
-/// that can actually be committed.
-fn first_selection(candidates: &[Suggestion]) -> usize {
-    candidates
-        .iter()
-        .position(|suggestion| suggestion.allowed)
-        .unwrap_or(0)
+/// Where the highlight lands after the text changed: the first suggestion that
+/// can actually be committed — and none at all while nothing is typed, because
+/// `Return` on an empty prompt opens a column rather than committing, and a
+/// highlight there would say otherwise. The rule lives here rather than in the
+/// three callers, so there is one place that decides it.
+fn first_selection(text: &str, candidates: &[Suggestion]) -> Option<usize> {
+    if text.is_empty() {
+        return None;
+    }
+    candidates.iter().position(|suggestion| suggestion.allowed)
+}
+
+/// The highlight as it stands against *this* list. Clamped on read rather than
+/// on write: a caret move under a standing prompt can shorten the list, and a
+/// stale index must not survive that. Sole reader of `InsertPrompt::selected`,
+/// so the row that is drawn highlighted and the row `Return` commits can never
+/// come apart.
+fn clamped_selection(candidates: &[Suggestion], selected: Option<usize>) -> Option<usize> {
+    selected
+        .filter(|_| !candidates.is_empty())
+        .map(|index| index.min(candidates.len() - 1))
 }
 
 /// How many suggestions are on screen at once. There is no scrolling in this
@@ -2226,7 +2256,7 @@ fn prompt_window(len: usize, selected: usize) -> std::ops::Range<usize> {
 struct InsertPromptFingerprint {
     visible: bool,
     text: String,
-    selected: usize,
+    selected: Option<usize>,
     candidates: Vec<Suggestion>,
 }
 
@@ -2261,9 +2291,7 @@ fn sync_insert_prompt_ui(
     } else {
         Vec::new()
     };
-    // Clamped on read, not on write: a caret move under a standing prompt may
-    // shorten the list, and a stale index must not survive that.
-    let selected = prompt.selected.min(candidates.len().saturating_sub(1));
+    let selected = clamped_selection(&candidates, prompt.selected);
 
     let fp = InsertPromptFingerprint {
         visible,
@@ -2343,9 +2371,11 @@ fn spawn_prompt_rows(
     options: &mut ChildSpawnerCommands,
     font: &Handle<Font>,
     candidates: &[Suggestion],
-    selected: usize,
+    selected: Option<usize>,
 ) {
-    let window = prompt_window(candidates.len(), selected);
+    // With no highlight the window has nothing to follow, so it sits where the
+    // list starts — which is where the first arrow keypress enters it.
+    let window = prompt_window(candidates.len(), selected.unwrap_or(0));
     // What the window hides is said, not swallowed: the list can be long
     // enough that a silent cut would read as "that is all there is".
     if window.start > 0 {
@@ -2359,7 +2389,7 @@ fn spawn_prompt_rows(
     {
         // Only a committable row can hold the highlight, so a greyed one never
         // looks like the answer to `Enter`.
-        let highlighted = index == selected && suggestion.allowed;
+        let highlighted = selected == Some(index) && suggestion.allowed;
         let label_color = if suggestion.allowed {
             Color::srgb(0.85, 0.85, 0.9)
         } else {
@@ -2477,7 +2507,7 @@ struct NodeEditorFingerprint {
     /// drawing it. That is also the bit that catches the NORMAL→INSERT switch
     /// on an output anchor, where the role stays `Output` and nothing else in
     /// here moves.
-    insert_prompt: Option<(String, usize)>,
+    insert_prompt: Option<(String, Option<usize>)>,
     visible: bool,
 }
 
@@ -2548,9 +2578,7 @@ fn sync_node_editor_ui(
     } else {
         Vec::new()
     };
-    // Clamped on read, the way the create prompt does it: the list is rebuilt
-    // from scratch each time and a stale index must not survive that.
-    let selected = prompt.selected.min(candidates.len().saturating_sub(1));
+    let selected = clamped_selection(&candidates, prompt.selected);
 
     let fp = NodeEditorFingerprint {
         node_id: node_id.clone(),
@@ -2790,7 +2818,7 @@ fn spawn_type_prompt(
     font: &Handle<Font>,
     text: &str,
     candidates: &[Suggestion],
-    selected: usize,
+    selected: Option<usize>,
 ) {
     panel
         .spawn((
@@ -3602,8 +3630,12 @@ fn spawn_controls_modal(commands: &mut Commands, font: &Handle<Font>) {
             "NORMAL: move the selected node vertically",
         ),
         ("i", "Enter INSERT mode"),
+        ("Up/Down", "INSERT: walk the suggestion list"),
         ("Space", "INSERT: open a cell behind the caret"),
-        ("Return", "INSERT: open a column (X)"),
+        (
+            "Return",
+            "INSERT: commit the highlighted row, else open a column (X)",
+        ),
         ("Shift + Return", "INSERT: open a row (Y)"),
         ("Escape", "Unfocus text input, then leave INSERT"),
     ];
@@ -5525,14 +5557,22 @@ fn handle_editor_keys(
                     // dead key resolves; control characters are not a name.
                     if !s.is_empty() && !s.chars().any(|c| c.is_control()) {
                         prompt.text.push_str(s.as_str());
-                        let selected =
-                            first_selection(&prompt_candidates(&state, &pick, &prompt.text));
+                        let selected = first_selection(
+                            &prompt.text,
+                            &prompt_candidates(&state, &pick, &prompt.text),
+                        );
                         prompt.selected = selected;
                     }
                 }
+                // Deleting back to an empty text drops the highlight with it,
+                // which is the other way out of the list: `Return` goes back to
+                // opening a column.
                 bevy::input::keyboard::Key::Backspace => {
                     prompt.text.pop();
-                    let selected = first_selection(&prompt_candidates(&state, &pick, &prompt.text));
+                    let selected = first_selection(
+                        &prompt.text,
+                        &prompt_candidates(&state, &pick, &prompt.text),
+                    );
                     prompt.selected = selected;
                 }
                 bevy::input::keyboard::Key::ArrowDown | bevy::input::keyboard::Key::ArrowUp => {
@@ -5551,7 +5591,10 @@ fn handle_editor_keys(
                 // empty one, so the two can never both fire.
                 bevy::input::keyboard::Key::Space if in_open_quote(&prompt.text) => {
                     prompt.text.push(' ');
-                    let selected = first_selection(&prompt_candidates(&state, &pick, &prompt.text));
+                    let selected = first_selection(
+                        &prompt.text,
+                        &prompt_candidates(&state, &pick, &prompt.text),
+                    );
                     prompt.selected = selected;
                 }
                 // The room-makers belong to the prompt that builds: where the
@@ -5574,9 +5617,16 @@ fn handle_editor_keys(
                     }
                     break;
                 }
+                // `Return` is the newline only while the list has not answered:
+                // a standing highlight — typed to or walked to — takes the key
+                // for the commit below, because that is what a highlight means.
+                // The empty text is still part of the guard beside it: a
+                // half-written name that matches nothing has no highlight
+                // either, and must not open a column behind the typist's back.
                 bevy::input::keyboard::Key::Enter
                     if target == InsertTarget::Create
                         && prompt.text.is_empty()
+                        && prompt.selected.is_none()
                         && !ev.repeat =>
                 {
                     let inserted = if shift {
@@ -5600,15 +5650,19 @@ fn handle_editor_keys(
                     break;
                 }
                 bevy::input::keyboard::Key::Enter if !ev.repeat => {
-                    // Commit what is written. After creating, the caret stays
-                    // on the cell the node now fills and INSERT stays on, so
-                    // the next one can be typed straight away. Declaring a
-                    // type is one answer to one question — it is finished, and
-                    // staying would only offer to answer it again.
+                    // Commit the highlighted row — and with no highlight,
+                    // nothing: an empty type prompt has not been answered yet,
+                    // and there is no second meaning for the key to fall back
+                    // on the way the create prompt has its column.
+                    //
+                    // After creating, the caret stays on the cell the node now
+                    // fills and INSERT stays on, so the next one can be typed
+                    // straight away. Declaring a type is one answer to one
+                    // question — it is finished, and staying would only offer
+                    // to answer it again.
                     let candidates = prompt_candidates(&state, &pick, &prompt.text);
-                    let selected = prompt.selected.min(candidates.len().saturating_sub(1));
-                    if let Some(action) = candidates
-                        .get(selected)
+                    if let Some(action) = clamped_selection(&candidates, prompt.selected)
+                        .and_then(|selected| candidates.get(selected))
                         .filter(|suggestion| suggestion.allowed)
                         .map(|suggestion| suggestion.action.clone())
                     {
