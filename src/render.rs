@@ -433,6 +433,21 @@ pub fn pattern_band_world(layout_node: &crate::layout::LayoutNode, extra_offset:
     )
 }
 
+/// Whether a marker stack writes in words what its shape already says.
+///
+/// The type is in the colour and the value is in the shape — a band for a type,
+/// a line for a value — so the writing is a convenience, not the statement. Once
+/// several bands of the same type stand within a cell or two of each other, the
+/// convenience turns into noise: the same word five times over two cells is
+/// harder to read past than no word at all.
+#[derive(Clone, Copy)]
+enum Lettering {
+    /// The type's letter across a band, the literal beside a line.
+    Spelled,
+    /// Neither. Something adjacent has already spelled it.
+    Silent,
+}
+
 /// Build the stack of translucent type rectangles at an anchor.
 ///
 /// `anchor_world_pos` is the world centre of the anchor's **first row** cell.
@@ -455,11 +470,17 @@ pub fn pattern_band_world(layout_node: &crate::layout::LayoutNode, extra_offset:
 /// the type, so there is no band it could honestly wear. That is why the
 /// choice is made per leaf rather than per anchor — in `Char|None` the `Char`
 /// keeps its band and only the `none` row becomes a line.
+///
+/// `lettering` says whether the stack writes any of that down. Where several
+/// bands for the same type stand within a cell or two of each other — a Match's
+/// input, its arm, the branch source behind it — only one of them needs the
+/// word, and the rest read better without it.
 fn build_type_markers(
     t: &crate::infer::EType,
     graph_value: Option<&str>,
     anchor_world_pos: Vec3,
     is_input: bool,
+    lettering: Lettering,
 ) -> Vec<RenderTypeMarker> {
     let leaves = ordered_supported_leaves(t);
     if leaves.is_empty() {
@@ -513,13 +534,16 @@ fn build_type_markers(
                         },
                         transform: Transform::from_translation(center),
                     }),
-                    value_label: Some(RenderLabel {
-                        text: value,
-                        color: Color::WHITE,
-                        font_size: 14.0,
-                        world_pos: label_world,
-                        offset: Vec2::ZERO,
-                    }),
+                    value_label: match lettering {
+                        Lettering::Spelled => Some(RenderLabel {
+                            text: value,
+                            color: Color::WHITE,
+                            font_size: 14.0,
+                            world_pos: label_world,
+                            offset: Vec2::ZERO,
+                        }),
+                        Lettering::Silent => None,
+                    },
                 }
             } else {
                 RenderTypeMarker {
@@ -536,13 +560,16 @@ fn build_type_markers(
                         },
                         transform: Transform::from_translation(center),
                     }),
-                    label: Some(RenderLabel {
-                        text: letter,
-                        color: Color::WHITE,
-                        font_size: 14.0,
-                        world_pos: center,
-                        offset: Vec2::ZERO,
-                    }),
+                    label: match lettering {
+                        Lettering::Spelled => Some(RenderLabel {
+                            text: letter,
+                            color: Color::WHITE,
+                            font_size: 14.0,
+                            world_pos: center,
+                            offset: Vec2::ZERO,
+                        }),
+                        Lettering::Silent => None,
+                    },
                     value_line: None,
                     value_label: None,
                 }
@@ -560,8 +587,9 @@ fn typed_anchor(
     graph_value: Option<&str>,
     cell_center: Vec3,
     is_input: bool,
+    lettering: Lettering,
 ) -> RenderAnchor {
-    let type_markers = build_type_markers(t, graph_value, cell_center, is_input);
+    let type_markers = build_type_markers(t, graph_value, cell_center, is_input, lettering);
     RenderAnchor {
         // The cell centre is the anchor's outward face, so edges meet it there
         // no matter how many rows the anchor spans.
@@ -574,12 +602,19 @@ fn typed_anchor(
 }
 
 /// A declared type drawn on a cell the way an input anchor is drawn — the
-/// type's band and its letter, or its literal — and the neutral grey where no
-/// type has been chosen yet.
+/// type's band, or its literal's line — and the neutral grey where no type has
+/// been chosen yet.
 ///
 /// Two kinds hang a type on a cell of their own rather than on an anchor: a
 /// Pattern, whose cell is the arm it matches, and a TypeCast, whose cell is what
 /// it casts to. Both are input-side: what the cell names is what may *arrive*.
+///
+/// Usually neither writes anything: a declared type stands between an anchor
+/// that names the same type and one that names what it narrows to, so it is
+/// never the only place the word could be read. `lettering` is how a caller says
+/// that this time it is — which happens to a cast with nothing wired into it,
+/// whose input and output are both grey and whose target cell is then the only
+/// thing on screen that knows the type.
 ///
 /// It returns two vectors because `RenderNode::markers` has no `plain_body` slot
 /// the way `RenderAnchor` does — an unchosen type has no leaves, so
@@ -587,12 +622,13 @@ fn typed_anchor(
 fn declared_type_cell(
     r#type: Option<&crate::model::r#type::EType>,
     cell_center: Vec3,
+    lettering: Lettering,
 ) -> (Vec<RenderTypeMarker>, Vec<RenderObject>) {
     let eval_type = r#type
         .map(crate::infer::graph_type_to_eval_type)
         .unwrap_or(crate::infer::EType::Pending);
     let literal = r#type.and_then(crate::layout::value_of_etype);
-    let markers = build_type_markers(&eval_type, literal.as_deref(), cell_center, true);
+    let markers = build_type_markers(&eval_type, literal.as_deref(), cell_center, true, lettering);
     let objects = markers
         .is_empty()
         .then(|| plain_anchor_body(cell_center, true))
@@ -689,7 +725,13 @@ pub fn layoutnode_to_rendernode(
             // a literal: a literal on a Source is not the value it is evaluated
             // with — that one comes from the prompt — and the output anchor
             // already shows it. What arrives here is a value *of this type*.
-            let input_markers = build_type_markers(&output_eval_type, None, input_world, true);
+            let input_markers = build_type_markers(
+                &output_eval_type,
+                None,
+                input_world,
+                true,
+                Lettering::Spelled,
+            );
             // Where `build_type_markers` puts the first row's type letter: the
             // label leans into the anchor's own half, toward the body.
             let index_label_world = Vec3::new(
@@ -777,6 +819,7 @@ pub fn layoutnode_to_rendernode(
                             output_value.as_deref(),
                             output_world,
                             false,
+                            Lettering::Spelled,
                         ),
                         plain_body: None,
                     },
@@ -854,6 +897,7 @@ pub fn layoutnode_to_rendernode(
                             output_value.as_deref(),
                             output_world,
                             false,
+                            Lettering::Spelled,
                         ),
                         plain_body: None,
                     },
@@ -889,9 +933,34 @@ pub fn layoutnode_to_rendernode(
             let input_eval_type =
                 crate::infer::incoming_anchor_type(flat_graph, input_anchor, function_declarations);
             let elim_value = r#type.as_ref().and_then(crate::layout::value_of_etype);
+            // Built before the target cell, because whether that cell speaks
+            // depends on whether this one does.
+            let output_anchor_render = typed_anchor(
+                &output_eval_type,
+                elim_value.as_deref(),
+                output_world,
+                false,
+                Lettering::Spelled,
+            );
             // Drawn as its arm's band, exactly as a Pattern is: a cast declares
             // what may pass, and that is the same statement a pattern makes.
-            let (markers, objects) = declared_type_cell(r#type.as_ref(), body_world);
+            //
+            // A Pattern can stay silent because its BranchSource stands right
+            // behind it wearing the same type and saying so. A cast has no such
+            // neighbour: with nothing wired in, its input is grey and its output
+            // is `Pending`, which claims no row and so draws grey too — and the
+            // one thing on screen that knows the type would be the only thing
+            // not saying it. So the target cell speaks exactly as long as
+            // nothing downstream of it does.
+            let (markers, objects) = declared_type_cell(
+                r#type.as_ref(),
+                body_world,
+                if output_anchor_render.type_markers.is_empty() {
+                    Lettering::Spelled
+                } else {
+                    Lettering::Silent
+                },
+            );
             RenderNode {
                 // No body of its own — the band *is* the node, the way a
                 // Pattern's is. The node entity is still spawned for picking.
@@ -902,7 +971,9 @@ pub fn layoutnode_to_rendernode(
                         match input_eval_type {
                             // A typecast constrains nothing, so its input shows
                             // whatever arrives — and a neutral body when idle.
-                            Some(t) => typed_anchor(&t, None, input_world, true),
+                            Some(t) => {
+                                typed_anchor(&t, None, input_world, true, Lettering::Spelled)
+                            }
                             None => RenderAnchor {
                                 pick_center: input_world,
                                 type_markers: vec![],
@@ -910,15 +981,7 @@ pub fn layoutnode_to_rendernode(
                             },
                         },
                     ),
-                    (
-                        output_anchor.clone(),
-                        typed_anchor(
-                            &output_eval_type,
-                            elim_value.as_deref(),
-                            output_world,
-                            false,
-                        ),
-                    ),
+                    (output_anchor.clone(), output_anchor_render),
                 ]),
                 markers,
                 objects,
@@ -1056,7 +1119,9 @@ pub fn layoutnode_to_rendernode(
                         (
                             anchor_id.clone(),
                             match shown {
-                                Some(t) => typed_anchor(&t, None, input_world, true),
+                                Some(t) => {
+                                    typed_anchor(&t, None, input_world, true, Lettering::Spelled)
+                                }
                                 None => RenderAnchor {
                                     pick_center: input_world,
                                     type_markers: vec![],
@@ -1067,7 +1132,13 @@ pub fn layoutnode_to_rendernode(
                     })
                     .chain([(
                         output_anchor.clone(),
-                        typed_anchor(&function_declaration.output_type, None, output_world, false),
+                        typed_anchor(
+                            &function_declaration.output_type,
+                            None,
+                            output_world,
+                            false,
+                            Lettering::Spelled,
+                        ),
                     )])
                     .collect(),
                 markers: vec![],
@@ -1096,8 +1167,9 @@ pub fn layoutnode_to_rendernode(
             }
         }
         // Nothing but an input anchor, sitting alone on the scope's last Z row.
-        // It constrains nothing, so it renders exactly like a Match or
-        // TypeCast input: whatever type arrives, a neutral body when idle.
+        // It constrains nothing, so it takes the shape of whatever type arrives
+        // — a neutral body when idle — but it takes it silently, and the
+        // program's Sink alone speaks again on the far side of the back wall.
         crate::model::node::ENode::Sink { input_anchor } => {
             let input_world = cell(0, 0, 0);
             let incoming =
@@ -1108,21 +1180,80 @@ pub fn layoutnode_to_rendernode(
             // upstream, the one that does own it, and the Sink shows what
             // actually arrived rather than the shape of what might have.
             let incoming_value = crate::infer::incoming_anchor_literal(flat_graph, input_anchor);
+            // The Sink's own anchor says nothing in words. Whatever reaches it
+            // was already named by the anchor it left — a Sink adds no step, it
+            // only ends one — and inside a branch it stands two cells from the
+            // Match's output, which names the same thing again.
+            //
+            // The program's Sink is the exception, and it says its piece on the
+            // far side instead. See `outgoing_markers`.
+            let anchor = match incoming.as_ref() {
+                Some(t) => typed_anchor(
+                    t,
+                    incoming_value.as_deref(),
+                    input_world,
+                    true,
+                    Lettering::Silent,
+                ),
+                None => RenderAnchor {
+                    pick_center: input_world,
+                    type_markers: vec![],
+                    plain_body: Some(plain_anchor_body(input_world, true)),
+                },
+            };
+            // Mirror of the drawn-only input a Source hangs against the front
+            // face: the program's result, named once, where the program ends.
+            //
+            // Visual only, like that one. It is not in `anchors`, so no edge can
+            // end here and the pointer cannot pick it, and it claims no cell —
+            // `grid_bounds` stops at the Sink's own row, so this hangs outside
+            // the volume against its back face. Drawn as an *output* so the band
+            // fills the half of its cell that faces the volume and sits flush
+            // against that face, the way the Source's sits flush against the
+            // front one.
+            //
+            // Only the program's Sink. A branch's Sink is followed by its
+            // Match's output two cells on, which already names the same value,
+            // and the cell right behind it belongs to that Match's envelope.
+            let outgoing_world = cell(0, 0, 1);
+            let is_program_sink = layout_node.node_id == flat_graph.sink_node_id;
+            let outgoing_markers = if is_program_sink {
+                incoming
+                    .as_ref()
+                    .map(|t| {
+                        build_type_markers(
+                            t,
+                            incoming_value.as_deref(),
+                            outgoing_world,
+                            false,
+                            Lettering::Spelled,
+                        )
+                    })
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
+            // The exit is always drawn, grey until there is something to say —
+            // it belongs to the program and not to its state. A program has an
+            // end whether or not anything reaches it yet, and a wall with
+            // nothing on it reads as a program with nothing wired rather than as
+            // a program without an end.
+            //
+            // Grey covers both ways of having nothing: no edge into the Sink,
+            // and an edge whose type is still `Pending` — which claims no row,
+            // so it builds no markers either. Asking the markers rather than the
+            // type is what folds the two together, the same way
+            // `declared_type_cell` folds them.
+            let outgoing_objects: Vec<RenderObject> = (is_program_sink
+                && outgoing_markers.is_empty())
+            .then(|| plain_anchor_body(outgoing_world, false))
+            .into_iter()
+            .collect();
             RenderNode {
                 node: None,
-                anchors: std::collections::HashMap::from([(
-                    input_anchor.clone(),
-                    match incoming {
-                        Some(t) => typed_anchor(&t, incoming_value.as_deref(), input_world, true),
-                        None => RenderAnchor {
-                            pick_center: input_world,
-                            type_markers: vec![],
-                            plain_body: Some(plain_anchor_body(input_world, true)),
-                        },
-                    },
-                )]),
-                markers: vec![],
-                objects: vec![],
+                anchors: std::collections::HashMap::from([(input_anchor.clone(), anchor)]),
+                markers: outgoing_markers,
+                objects: outgoing_objects,
                 labels: vec![],
                 text_faces: vec![],
             }
@@ -1132,10 +1263,15 @@ pub fn layoutnode_to_rendernode(
         // BranchSource, behind it in the branch volume. It is drawn as that
         // type's band, like an input anchor: the value it accepts is what the
         // band names. Its first cell is the gap it holds open and stays empty.
+        //
+        // Silent unconditionally, unlike a cast's target: the BranchSource is
+        // one cell behind it wearing the same type and naming it, whatever the
+        // Match's input happens to be.
         crate::model::node::ENode::Pattern { r#type, .. } => {
             let (markers, objects) = declared_type_cell(
                 r#type.as_ref(),
                 pattern_band_world(layout_node, extra_offset),
+                Lettering::Silent,
             );
             RenderNode {
                 node: None,
@@ -1165,6 +1301,7 @@ pub fn layoutnode_to_rendernode(
                         output_value.as_deref(),
                         output_world,
                         false,
+                        Lettering::Spelled,
                     ),
                 )]),
                 markers: vec![],
@@ -1205,9 +1342,13 @@ pub fn layoutnode_to_rendernode(
                     (
                         input_anchor.clone(),
                         match incoming {
-                            Some(t) => {
-                                typed_anchor(&t, incoming_value.as_deref(), input_world, true)
-                            }
+                            Some(t) => typed_anchor(
+                                &t,
+                                incoming_value.as_deref(),
+                                input_world,
+                                true,
+                                Lettering::Spelled,
+                            ),
                             None => RenderAnchor {
                                 pick_center: input_world,
                                 type_markers: vec![],
@@ -1217,7 +1358,13 @@ pub fn layoutnode_to_rendernode(
                     ),
                     (
                         output_anchor.clone(),
-                        typed_anchor(&output_eval_type, None, out_world, false),
+                        typed_anchor(
+                            &output_eval_type,
+                            None,
+                            out_world,
+                            false,
+                            Lettering::Spelled,
+                        ),
                     ),
                 ]),
                 markers: vec![],
