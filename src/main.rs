@@ -2130,10 +2130,10 @@ fn handle_insert_prompt_click(
 
 /// What follows a committed row, whichever key or click committed it.
 ///
-/// Creating leaves INSERT on, so the next node can be typed straight away —
-/// and where what was created is not finished yet, the caret is already on the
-/// cell that finishes it. Changing a property is one answer to one question:
-/// it is done, and staying would only offer to answer it again.
+/// INSERT stays on only while there is something left to say at the caret. A
+/// commit does not move the caret, so what it lands on is the node that was
+/// just built — and for most kinds that node is already finished by the row
+/// that built it.
 fn commit_outcome(
     outcome: Inserted,
     action: &PromptAction,
@@ -2144,13 +2144,28 @@ fn commit_outcome(
 ) {
     prompt.clear();
     rebuild.0 = true;
+    let stay = match (&outcome, action) {
+        // Its one mandatory property is still missing, and the caret has been
+        // put on the cell that names it.
+        (Inserted::Pending(_), _) => true,
+        // A Source arrives nameless, and the caret is left standing on the body
+        // its name is written along — so the keystrokes after it are the name.
+        (Inserted::Done, PromptAction::Create(AddKind::Source)) => true,
+        // Everything else is complete the moment it appears. A Constant *is*
+        // its literal and a call *is* its function, and both were typed to
+        // reach the row that built them — so the cell the caret is left on
+        // holds the answer that was just given, and staying would do nothing
+        // but offer to give it again. Changing a property is finished for the
+        // same reason.
+        _ => false,
+    };
     // Answering a property is what finishes a node, so any commit clears the
     // mark — and a new one only ever comes from a `Create`.
     pending.0 = match outcome {
         Inserted::Pending(edit) => Some(edit),
         Inserted::Done => None,
     };
-    if !matches!(action, PromptAction::Create(_)) {
+    if !stay {
         *mode = EditorMode::Normal;
     }
 }
@@ -5328,11 +5343,10 @@ fn handle_editor_keys(
                     // answered yet, and there is no second meaning for the key
                     // to fall back on the way the create prompt has its column.
                     //
-                    // After creating, the caret stays on the cell the node now
-                    // fills and INSERT stays on, so the next one can be typed
-                    // straight away. Changing a property is one answer to one
-                    // question — it is finished, and staying would only offer
-                    // to answer it again.
+                    // What the commit leaves behind — whether INSERT goes on
+                    // and whether a node is owed a property — is
+                    // `commit_outcome`'s, because the mouse path has to reach
+                    // the same conclusion.
                     let candidates = prompt_candidates(&state, &pick, &prompt.text);
                     if let Some(action) = clamped_selection(&candidates, prompt.selected)
                         .and_then(|selected| candidates.get(selected))
