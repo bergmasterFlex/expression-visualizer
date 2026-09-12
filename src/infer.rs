@@ -258,9 +258,15 @@ fn anchor_type_uncycled(
                 return None;
             }
             match graph.nodes.get(pattern)? {
-                crate::model::node::ENode::Pattern { r#type, .. } => {
-                    Some(graph_type_to_eval_type(r#type))
-                }
+                // An arm that declares nothing yet types nothing: its source
+                // carries `Pending`, which is what the branch downstream of it
+                // reads and what the renderer draws grey.
+                crate::model::node::ENode::Pattern { r#type, .. } => Some(
+                    r#type
+                        .as_ref()
+                        .map(graph_type_to_eval_type)
+                        .unwrap_or(EType::Pending),
+                ),
                 _ => None,
             }
         }
@@ -283,7 +289,13 @@ fn anchor_type_uncycled(
             input_anchor,
             output_anchor,
         } => (anchor_id == output_anchor).then(|| {
-            type_cast_output_type(graph, r#type, input_anchor, function_declarations, visiting)
+            type_cast_output_type(
+                graph,
+                r#type.as_ref(),
+                input_anchor,
+                function_declarations,
+                visiting,
+            )
         }),
         crate::model::node::ENode::Match {
             patterns,
@@ -310,13 +322,19 @@ fn anchor_type_uncycled(
 /// `Sum(target, none)`. Which of the two applies cannot be decided before an
 /// incoming type is known, so an unconnected (or itself pending) input makes
 /// the output `Pending`.
+///
+/// A cast with no target chosen yet is pending before the input is even looked
+/// at: there is nothing to be total or partial *to*.
 fn type_cast_output_type(
     graph: &crate::model::term_graph::TermGraph,
-    target: &crate::model::r#type::EType,
+    target: Option<&crate::model::r#type::EType>,
     input_anchor: &crate::model::anchor::Id,
     function_declarations: &FunctionDeclarations,
     visiting: &mut std::collections::HashSet<crate::model::anchor::Id>,
 ) -> EType {
+    let Some(target) = target else {
+        return EType::Pending;
+    };
     let target = graph_type_to_eval_type(target);
     match incoming_type(graph, input_anchor, function_declarations, visiting) {
         None | Some(EType::Pending) => EType::Pending,
@@ -462,7 +480,7 @@ pub fn anchor_literal(
             input_anchor,
             output_anchor,
         } => (anchor_id == input_anchor || anchor_id == output_anchor)
-            .then(|| crate::layout::value_of_etype(r#type))
+            .then(|| r#type.as_ref().and_then(crate::layout::value_of_etype))
             .flatten(),
         crate::model::node::ENode::BranchSource {
             pattern,
@@ -473,7 +491,7 @@ pub fn anchor_literal(
             }
             match graph.nodes.get(pattern)? {
                 crate::model::node::ENode::Pattern { r#type, .. } => {
-                    crate::layout::value_of_etype(r#type)
+                    r#type.as_ref().and_then(crate::layout::value_of_etype)
                 }
                 _ => None,
             }

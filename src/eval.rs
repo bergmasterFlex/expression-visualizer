@@ -247,14 +247,23 @@ impl State {
                 r#type,
                 input_anchor,
                 ..
-            } => input_anchor_ids_to_values
-                .get(&input_anchor)
-                .ok_or_else(|| vec!["no value found for input anchor for type cast".to_string()])
-                .map(|value| {
-                    self.with_produced(
-                        node_id,
-                        Self::eval_value_for_type_cast(value.clone(), r#type),
-                    )
+            } => r#type
+                // A cast with no declared target has nothing to cast *to*. It
+                // is a half-built node rather than a failing one, so this is an
+                // error of the graph and not a `none` travelling along an edge.
+                .ok_or_else(|| vec!["type cast has no declared type".to_string()])
+                .and_then(|r#type| {
+                    input_anchor_ids_to_values
+                        .get(&input_anchor)
+                        .ok_or_else(|| {
+                            vec!["no value found for input anchor for type cast".to_string()]
+                        })
+                        .map(|value| {
+                            self.with_produced(
+                                node_id,
+                                Self::eval_value_for_type_cast(value.clone(), r#type),
+                            )
+                        })
                 }),
             crate::model::node::ENode::Source { name, .. } => user_source_values
                 .get(node_id)
@@ -348,9 +357,14 @@ impl State {
         patterns
             .into_iter()
             .find(|pattern_id| match graph.nodes.get(pattern_id) {
-                Some(crate::model::node::ENode::Pattern { r#type, .. }) => {
-                    Self::value_matches_type(&input_value, r#type)
-                }
+                // An arm that declares nothing matches nothing. A Match of
+                // nothing but such arms falls through to the same error as one
+                // whose arms simply do not cover the value, which is what it
+                // is: no arm matched.
+                Some(crate::model::node::ENode::Pattern {
+                    r#type: Some(r#type),
+                    ..
+                }) => Self::value_matches_type(&input_value, r#type),
                 _ => false,
             })
             .ok_or_else(|| format!("no pattern matched value {}", input_value))

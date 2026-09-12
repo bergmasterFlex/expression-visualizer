@@ -20,6 +20,19 @@ pub enum CellRole {
     Output { leaf: usize },
     /// The node's own property: the type it declares, or the function it calls.
     Body,
+    /// A cell the node claims without it naming a property: room held open.
+    ///
+    /// It is what gives a Match its rhythm — input anchor, gap, arm — and a
+    /// TypeCast the same one, which is how a cast reads as the one-armed match
+    /// it is rather than as a node kind of its own.
+    ///
+    /// A Pattern's gap does a second job: it is the address the *next* arm is
+    /// added at, which is why the Pattern has to **own** it rather than leave it
+    /// as free space. `kind_allowed` asks "is the caret standing on a Pattern",
+    /// and its catch-all refuses every other kind on an occupied cell — a cell
+    /// belonging to nobody would answer no to the first and yes to the second,
+    /// so a Constant could be built inside the Match's envelope.
+    Gap,
 }
 
 /// Node-local cell layout: every cell a node claims, and what each one means.
@@ -91,24 +104,44 @@ impl LayoutNode {
     }
 }
 
-/// Match-local Z of the Pattern row. The Match's own input anchor owns local
-/// Z=0, so the arms start one cell behind it and their branch volumes one
-/// further still (see `LayoutGraph::sub_layout_origin`).
+/// Match-local Z where a Pattern begins. The Match's own input anchor owns
+/// local Z=0, so the arms start one cell behind it.
+///
+/// That first cell of a Pattern is its gap, not its type — see
+/// `PATTERN_TYPE_LOCAL_Z`.
 pub const PATTERN_LOCAL_Z: f32 = 1.0;
+/// Pattern-local Z of the cell that names the arm's type. Local 0 is the gap
+/// the Pattern holds open in front of it, which is where the next arm is added.
+pub const PATTERN_TYPE_LOCAL_Z: i32 = 1;
+/// Pattern-local Z where the branch volume begins: one cell behind the type, so
+/// the `BranchSource` adjoins the arm whose value it carries.
+const BRANCH_LOCAL_Z: i32 = PATTERN_TYPE_LOCAL_Z + 1;
+
+/// A `TypeCast` borrows the Match's rhythm — input anchor, gap, arm — with one
+/// arm and no branch behind it. These are its node-local Z addresses, named
+/// once so its cell layout and the mesh drawn on it cannot drift apart.
+pub const CAST_TYPE_Z: i32 = 2;
+/// One cell behind the arm, where a Match would start its branch.
+pub const CAST_OUTPUT_Z: i32 = CAST_TYPE_Z + 1;
 /// Monospace characters that fit across one cell along the axis a name is
 /// written on. The rasteriser steps by `1/N` of a cell, which is what makes a
 /// body's length *a count of characters* rather than a guess.
 pub const NAME_CHARS_PER_CELL: usize = 3;
 
-/// Cells a Source's body claims along +Z: one per `NAME_CHARS_PER_CELL`
-/// characters of its name, never fewer than the one cell it has always owned.
+/// Cells a body claims along +Z to carry a name: one per `NAME_CHARS_PER_CELL`
+/// characters, never fewer than the one cell it has always owned.
 ///
-/// `chars().count()`, not `len()`: the name is user text and the field it is
+/// Two kinds write a name along their body and are therefore as long as it
+/// needs — a Source its own, a FunctionCall the name of the function it calls —
+/// and they share the rule because it is the same rule: the length of the word
+/// *is* the extent of the node.
+///
+/// `chars().count()`, not `len()`: the name is user text and the prompt it is
 /// typed into counts characters, so an umlaut is one character here and two
 /// bytes there — `len()` would hand that name a cell it does not fill.
 /// Counting scalar values is still not counting glyphs, but it is exactly what
 /// the rasteriser walks, so length and pitch cannot disagree.
-pub fn source_body_cells(name: &str) -> i32 {
+pub fn name_body_cells(name: &str) -> i32 {
     // On `usize`, because `i32::div_ceil` is not stable.
     name.chars().count().div_ceil(NAME_CHARS_PER_CELL).max(1) as i32
 }
@@ -597,14 +630,19 @@ impl LayoutGraph {
     /// | Sink | `0\|0` input |
     /// | Constant | `0\|0` body, `0\|1` output |
     /// | Source (name of n chars) | `0\|0..k-1` body, `0\|k` output, `k = ceil(n/3)` |
-    /// | TypeCast | `0\|0` input, `0\|1` body, `0\|2` output |
-    /// | FunctionCall (n inputs) | `i\|0` input i, `(0..n)\|1..2` body, `0\|3` output |
+    /// | TypeCast | `0\|0` input, `0\|1` gap, `0\|2` body, `0\|3` output |
+    /// | FunctionCall (n inputs, name of m chars) | `i\|0` input i, `(0..n)\|1..k` body, `0\|k+1` output, `k = ceil(m/3)` |
     /// | Match | `0\|0` input, output directly behind the deepest branch |
-    /// | Pattern | one cell |
+    /// | Pattern | `0\|0` gap, `0\|1` body |
     /// | BranchSource | `0\|0` output |
     ///
-    /// The Source's depth is the one cell count here that the node kind does
-    /// not fix: its body carries its name, so `source_body_cells` decides it.
+    /// The two depths the node kind does not fix are the ones that carry a name
+    /// written along the body: a Source's own and a FunctionCall's function.
+    /// `name_body_cells` decides both.
+    ///
+    /// A Pattern's and a TypeCast's gap is the cell that gives a Match its
+    /// rhythm; a Pattern's is also the address the next arm is added at. See
+    /// `CellRole::Gap`.
     ///
     /// An anchor claims `infer::anchor_rows` cells along +Y from its own row.
     /// A Match's Patterns and branch volumes are separate nodes and
@@ -630,7 +668,7 @@ impl LayoutGraph {
                 output_anchor,
                 ..
             } => {
-                let depth = source_body_cells(name);
+                let depth = name_body_cells(name);
                 for z in 0..depth {
                     cells.push((IVec3::new(0, 0, z), CellRole::Body));
                 }
@@ -664,15 +702,24 @@ impl LayoutGraph {
                 cells.extend(anchor_cells(flat_graph, fds, input_anchor, 0, 0, |leaf| {
                     CellRole::Input { index: 0, leaf }
                 }));
-                cells.push((IVec3::new(0, 0, 1), CellRole::Body));
-                cells.extend(anchor_cells(flat_graph, fds, output_anchor, 0, 2, |leaf| {
-                    CellRole::Output { leaf }
-                }));
+                // The same rhythm a Match has — input anchor, gap, arm — one
+                // arm wide. A cast *is* a match with a single arm and no
+                // alternatives, and standing it in that rhythm is what says so.
+                cells.push((IVec3::new(0, 0, CAST_TYPE_Z - 1), CellRole::Gap));
+                cells.push((IVec3::new(0, 0, CAST_TYPE_Z), CellRole::Body));
+                cells.extend(anchor_cells(
+                    flat_graph,
+                    fds,
+                    output_anchor,
+                    0,
+                    CAST_OUTPUT_Z,
+                    |leaf| CellRole::Output { leaf },
+                ));
             }
             crate::model::node::ENode::FunctionCall {
+                function_declaration_id,
                 input_anchors,
                 output_anchor,
-                ..
             } => {
                 for (index, anchor) in input_anchors.iter().enumerate() {
                     cells.extend(anchor_cells(
@@ -684,18 +731,34 @@ impl LayoutGraph {
                         move |leaf| CellRole::Input { index, leaf },
                     ));
                 }
-                // Body spans the full input width, two cells deep — it carries
-                // the name of the referenced function.
+                // The body spans the full input width, and is as deep as the
+                // name of the called function needs — the same rule a Source's
+                // body follows, because it is the same act: the name is written
+                // along the body, so its length is the body's extent.
+                //
+                // The name lives on the declaration rather than on the node, so
+                // it is looked up here. A call naming a function the catalogue
+                // does not hold keeps the one cell the floor guarantees.
+                let depth = name_body_cells(
+                    fds.get(function_declaration_id)
+                        .map(|declaration| declaration.name.as_str())
+                        .unwrap_or_default(),
+                );
                 for x in 0..input_anchors.len().max(1) as i32 {
-                    for z in 1..=2 {
+                    for z in 1..=depth {
                         cells.push((IVec3::new(x, 0, z), CellRole::Body));
                     }
                 }
                 // Output stays in column 0 so its address does not move when
                 // the call is swapped for a function of different arity.
-                cells.extend(anchor_cells(flat_graph, fds, output_anchor, 0, 3, |leaf| {
-                    CellRole::Output { leaf }
-                }));
+                cells.extend(anchor_cells(
+                    flat_graph,
+                    fds,
+                    output_anchor,
+                    0,
+                    depth + 1,
+                    |leaf| CellRole::Output { leaf },
+                ));
             }
             crate::model::node::ENode::Match {
                 input_anchor,
@@ -714,9 +777,16 @@ impl LayoutGraph {
                     |leaf| CellRole::Output { leaf },
                 ));
             }
-            // A Pattern owns no anchor: one cell declaring the arm's type.
+            // A Pattern owns no anchor: a gap it holds open in front of itself,
+            // and behind that the one cell declaring the arm's type. The gap is
+            // where the *next* arm is added — see `CellRole::Gap` for why the
+            // Pattern has to own it rather than leave it free.
+            crate::model::node::ENode::Pattern { .. } => {
+                cells.push((IVec3::ZERO, CellRole::Gap));
+                cells.push((IVec3::new(0, 0, PATTERN_TYPE_LOCAL_Z), CellRole::Body));
+            }
             // Root is never laid out.
-            crate::model::node::ENode::Pattern { .. } | crate::model::node::ENode::Root {} => {
+            crate::model::node::ENode::Root {} => {
                 cells.push((IVec3::ZERO, CellRole::Body));
             }
         }
@@ -726,10 +796,11 @@ impl LayoutGraph {
     /// Match-local Z of the output anchor, one empty cell behind the deepest
     /// branch.
     ///
-    /// Patterns sit at match-local Z=1 and their branch volumes start at Z=2,
-    /// so a branch reaching branch-local Z=d ends at match-local `2 + d` — its
-    /// Sink. The gap keeps that Sink and the Match's own output from butting
-    /// up against each other.
+    /// Patterns begin at `PATTERN_LOCAL_Z` and their branch volumes a further
+    /// `BRANCH_LOCAL_Z` behind that, so a branch reaching branch-local Z=d ends
+    /// at match-local `PATTERN_LOCAL_Z + BRANCH_LOCAL_Z + d` — its Sink. The
+    /// trailing gap keeps that Sink and the Match's own output from butting up
+    /// against each other.
     pub fn match_output_z(&self, patterns: &[crate::model::node::Id]) -> i32 {
         let deepest_sink = patterns
             .iter()
@@ -738,7 +809,7 @@ impl LayoutGraph {
             .map(|b| b.max.z)
             .max()
             .unwrap_or(0);
-        2 + deepest_sink + 2
+        PATTERN_LOCAL_Z as i32 + BRANCH_LOCAL_Z + deepest_sink + 2
     }
 
     /// Union of all visible grid cells in this LayoutGraph's local coords.
@@ -825,9 +896,9 @@ impl LayoutGraph {
     ///     Pattern's own y (patterns are assumed to occupy consecutive rows).
     ///   - X: union of every Pattern's sub-graph X extent, translated by the
     ///     Pattern's outer position.
-    ///   - Z: from the Pattern's own Z (the parent-facing side) out to its
-    ///     branch: the branch origin sits one cell behind the Pattern, so the
-    ///     sub-graph Z range is offset by 1, plus one further cell of padding.
+    ///   - Z: from the Pattern's own first cell — its gap — out to its branch:
+    ///     the branch origin sits `BRANCH_LOCAL_Z` behind the Pattern, so the
+    ///     sub-graph Z range is offset by that, plus one cell of padding.
     /// Recursion via `inner_footprint` — inner matches inflate their host
     /// Pattern's sub-graph bbox and thus the outer footprint too.
     pub fn match_footprint(&self, match_id: &crate::model::node::Id) -> Option<AABB> {
@@ -854,8 +925,14 @@ impl LayoutGraph {
                 None => (0, 0, 0),
             };
             let arm = AABB {
+                // From the Pattern's own first cell — its gap — out past its
+                // branch, plus the one padding cell the Match's output needs.
                 min: IVec3::new(p_pos.x + x_min, p_pos.y, p_pos.z),
-                max: IVec3::new(p_pos.x + x_max, p_pos.y + arm_y - 1, p_pos.z + z_max + 2),
+                max: IVec3::new(
+                    p_pos.x + x_max,
+                    p_pos.y + arm_y - 1,
+                    p_pos.z + BRANCH_LOCAL_Z + z_max + 1,
+                ),
             };
             bbox = AABB::union_opt(bbox, Some(arm));
         }
@@ -1452,7 +1529,7 @@ impl LayoutGraph {
 
     pub fn plus_type_cast(
         &self,
-        r#type: crate::model::r#type::EType,
+        r#type: Option<crate::model::r#type::EType>,
         pos: Vec3,
         node_id_domain: NodeIdDomain,
         anchor_id_domain: AnchorIdDomain,
@@ -1526,28 +1603,13 @@ impl LayoutGraph {
         (layout, node_id_domain, anchor_id_domain)
     }
 
-    pub fn with_function_call_replaced(
-        &self,
-        node_id: &crate::model::node::Id,
-        new_fn: (
-            crate::model::function_declaration::FunctionDeclarationId,
-            &crate::model::function_declaration::FunctionDeclaration,
-        ),
-        node_id_domain: NodeIdDomain,
-        anchor_id_domain: AnchorIdDomain,
-    ) -> (Self, NodeIdDomain, AnchorIdDomain) {
-        let pos = self.layout_nodes.get(node_id).unwrap().pos;
-        self.minus_node(node_id)
-            .plus_function_call(new_fn, pos, node_id_domain, anchor_id_domain)
-    }
-
     /// Create a `Match` container plus its initial `Pattern` child at `pos`.
     /// The Match's synthetic LayoutNode mirrors the lowest Pattern's pos so
     /// rendering can iterate `layout_nodes` uniformly. The Pattern is created
     /// with a fresh sub-graph (BranchSource + Sink) and a matching entry in
-    /// `sub_layouts[pattern_id]`. The branch volume starts one cell behind the
-    /// Pattern, so branch-local (0,0,0) — the BranchSource — is the cell
-    /// adjoining the Pattern in +Z.
+    /// `sub_layouts[pattern_id]`. The branch volume starts behind the Pattern's
+    /// own cells, so branch-local (0,0,0) — the BranchSource — is the cell
+    /// adjoining the arm's type in +Z.
     pub fn plus_match(
         &self,
         pos: Vec3,
@@ -1578,7 +1640,10 @@ impl LayoutGraph {
             pattern_node_id.clone(),
             crate::model::node::ENode::Pattern {
                 parent_match: match_node_id.clone(),
-                r#type: crate::model::r#type::EType::Int { value: None },
+                // Untyped: the caret lands on the cell that names the arm's
+                // type and INSERT stays on, so it is either typed in the next
+                // keystrokes or the whole Match goes away with the Escape.
+                r#type: None,
                 sink_node_id: sub_sink_id.clone(),
             },
         );
@@ -1603,8 +1668,9 @@ impl LayoutGraph {
                 .chain([(pattern_node_id.clone(), pattern_sub_layout)])
                 .collect(),
         }
-        // The Match keeps `pos` for its input anchor; the Pattern sits one cell
-        // behind it, and its branch one further (`sub_layout_origin`).
+        // The Match keeps `pos` for its input anchor; the Pattern begins one
+        // cell behind it — with its gap, then its type — and its branch behind
+        // those (`sub_layout_origin`).
         ._plus_layout_node(&pattern_node_id, pos + Vec3::new(0.0, 0.0, PATTERN_LOCAL_Z))
         ._plus_layout_node(&match_node_id, pos);
         (layout, node_id_domain, anchor_id_domain)
@@ -1613,10 +1679,11 @@ impl LayoutGraph {
     /// LayoutGraph for a fresh Pattern's sub-graph: the branch's `BranchSource` at
     /// branch-local (0,0,0) and its Sink at (0,0,2).
     ///
-    /// Branch-local (0,0,0) is the Pattern's cell + Z1 (see
-    /// `sub_layout_origin`), so the source sits directly behind its Pattern.
-    /// The Sink at Z=2 leaves exactly one free working cell at Z=1 from birth;
-    /// `settle_sink` pushes it further back as the branch fills up.
+    /// Branch-local (0,0,0) is the Pattern's position + `BRANCH_LOCAL_Z` (see
+    /// `sub_layout_origin`), so the source sits directly behind the cell that
+    /// names its arm's type. The Sink at Z=2 leaves exactly one free working
+    /// cell at Z=1 from birth; `settle_sink` pushes it further back as the
+    /// branch fills up.
     fn initial_pattern_sub_layout(
         sub_graph: &crate::model::term_graph::TermGraph,
         sub_sink_id: &crate::model::node::Id,
@@ -1732,7 +1799,9 @@ impl LayoutGraph {
             new_pattern_id.clone(),
             crate::model::node::ENode::Pattern {
                 parent_match: parent_id.clone(),
-                r#type: crate::model::r#type::EType::Int { value: None },
+                // Untyped, like the arm `plus_match` builds: the caret follows
+                // to the cell that names it.
+                r#type: None,
                 sink_node_id: new_sub_sink_id.clone(),
             },
         );
@@ -1942,7 +2011,7 @@ impl LayoutGraph {
                 // so a default would put a word on the node that nobody wrote
                 // — and one that has to be cleared before the real name can be
                 // typed. An empty name still claims a cell, because
-                // `source_body_cells` floors at one, so there is a body to
+                // `name_body_cells` floors at one, so there is a body to
                 // stand on and type into.
                 name: String::new(),
                 r#type: crate::model::r#type::EType::Int { value: None },
@@ -1962,11 +2031,11 @@ impl LayoutGraph {
     /// Grid-space origin of `owner_id`'s sub-layout, in this LayoutGraph's own
     /// coordinates.
     ///
-    /// A Pattern's branch volume starts one cell *behind* the Pattern (+Z):
+    /// A Pattern's branch volume starts behind the Pattern's own cells (+Z):
     /// the Pattern itself belongs to the Match volume, not to the branch, so
-    /// branch-local (0,0,0) — where the `BranchSource` sits — lands at the
-    /// Pattern's Z+1. Every other owner (the Root wrapper) contributes no
-    /// shift.
+    /// branch-local (0,0,0) — where the `BranchSource` sits — lands at
+    /// `BRANCH_LOCAL_Z`, just past the cell that names the arm's type. Every
+    /// other owner (the Root wrapper) contributes no shift.
     fn sub_layout_origin(&self, owner_id: &crate::model::node::Id) -> Vec3 {
         let base = self
             .layout_nodes
@@ -1977,7 +2046,7 @@ impl LayoutGraph {
             self.graph.nodes.get(owner_id),
             Some(crate::model::node::ENode::Pattern { .. })
         ) {
-            base + Vec3::new(0.0, 0.0, 1.0)
+            base + Vec3::new(0.0, 0.0, BRANCH_LOCAL_Z as f32)
         } else {
             base
         }
@@ -2302,6 +2371,19 @@ impl LayoutGraph {
         None
     }
 
+    /// Read-only twin of `find_node_graph_mut`, for the callers that only want
+    /// to look a node's property up — the prompt opens on what is already
+    /// there, and asking for a `&mut` to read it would make every such caller
+    /// need a `ResMut` it has no use for.
+    pub fn find_node_graph(&self, target: &crate::model::node::Id) -> Option<&LayoutGraph> {
+        if self.graph.nodes.contains_key(target) {
+            return Some(self);
+        }
+        self.sub_layouts
+            .values()
+            .find_map(|sub| sub.find_node_graph(target))
+    }
+
     /// Return the LayoutGraph that holds `target` in its `graph.nodes` map.
     /// Used by editor handlers to mutate node fields without needing to
     /// know which sub-layout the node lives in.
@@ -2345,9 +2427,10 @@ impl LayoutGraph {
     /// could not be placed where a node is about to be inserted.
     ///
     /// Every scope claims its own source row at local Z=0. A Pattern is not
-    /// part of its branch volume — the branch starts one cell behind it — so
-    /// the Pattern stays addressable in the Match's scope while branch-local
-    /// Z=0 belongs to the branch's BranchSource.
+    /// part of its branch volume — the branch starts behind the Pattern's own
+    /// two cells — so both of them, the gap and the arm's type, stay
+    /// addressable in the Match's scope while branch-local Z=0 belongs to the
+    /// branch's BranchSource.
     ///
     /// `None` when the address lies outside every scope; callers treat that as
     /// "nothing to edit here".

@@ -164,36 +164,72 @@ enum EditorMode {
 }
 
 /// What has been typed in INSERT so far, and which suggestion it stands on.
-/// One resource for both prompts — the one that creates and the one that
-/// declares a type — because the caret decides which of them is live, so the
-/// two can never be live at once and a second resource would only add the
-/// question of which one to believe.
+/// One resource for every prompt — the one that creates and the one that edits
+/// whichever property the caret's cell names — because the caret decides which
+/// of them is live, so no two can be live at once and a second resource would
+/// only add the question of which one to believe.
 ///
 /// Deliberately **not** a `TextInput`: a focused text field makes
 /// `keyboard_captured` true, and that is what gives `Space`, `Return` and
 /// `Escape` their INSERT meanings. A field here would turn `Space` into a
 /// blank and `Escape` into a mere unfocus — the three behaviours that have to
-/// survive. (The Source *name* is the one place where a real field is right,
-/// and there that is the whole point: it takes the keyboard, and `Escape`
-/// hands it back.) `selected` indexes the *candidate* list — not the window of it
-/// that fits on screen, which is derived from `selected` rather than the other
-/// way round — and is re-clamped on every rebuild rather than trusted.
+/// survive. So it grows the parts of a text field that are worth having
+/// instead: `cursor` is a byte offset into `text`, and `Left`/`Right`/`Home`/
+/// `End`/`Delete` move and edit at it. They are affordable because the list
+/// only ever claimed `Up`/`Down`, and they are *needed* because the prompt now
+/// opens on the value that is already there — without a cursor, correcting one
+/// character of `charAt` would mean deleting back to it.
+///
+/// `selected` indexes the *candidate* list — not the window of it that fits on
+/// screen, which is derived from `selected` rather than the other way round —
+/// and is re-clamped on every rebuild rather than trusted.
 ///
 /// It is an `Option` because "no row is the answer yet" is a state the prompt
-/// really has, and one the list has to show: while nothing is typed, `Return`
-/// still means the editor's newline, so a highlight standing there would
-/// promise a commit the key does not perform. `None` is what an empty prompt
-/// opens in, and the arrow keys are the way into the list.
+/// really has, and one the list has to show: while nothing is typed on a
+/// *create* prompt, `Return` still means the editor's newline, so a highlight
+/// standing there would promise a commit the key does not perform.
 #[derive(Resource, Default)]
 struct InsertPrompt {
     text: String,
+    /// Byte offset into `text`, always on a character boundary.
+    cursor: usize,
     selected: Option<usize>,
 }
 
 impl InsertPrompt {
     fn clear(&mut self) {
         self.text.clear();
+        self.cursor = 0;
         self.selected = None;
+    }
+
+    /// Replace the text wholesale and put the cursor behind it — what opening
+    /// the prompt on an existing value does. The caller sets `selected`, which
+    /// depends on candidates this type knows nothing about.
+    fn set_text(&mut self, text: String) {
+        self.cursor = text.len();
+        self.text = text;
+    }
+
+    fn insert_str(&mut self, s: &str) {
+        self.text.insert_str(self.cursor, s);
+        self.cursor += s.len();
+    }
+
+    /// Byte offset of the character boundary one step before the cursor, and
+    /// one step after it. `None` at the respective end.
+    fn prev_boundary(&self) -> Option<usize> {
+        self.text[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+    }
+
+    fn next_boundary(&self) -> Option<usize> {
+        self.text[self.cursor..]
+            .chars()
+            .next()
+            .map(|c| self.cursor + c.len_utf8())
     }
 }
 
@@ -211,8 +247,8 @@ impl InsertPrompt {
 /// would be worse than the missing derive: an `EType` is a type *plus* an
 /// optional literal, so `==` on it answers neither "same type"
 /// (`Int{Some("1")} != Int{Some("01")}`) nor "same value" (`Int{None}` twice).
-/// The pair is also what the node editor already passes around, as
-/// `make_etype(type_choice_of(…), value)`.
+/// The pair is also what `PromptAction::SetType` carries, for the same reason
+/// and into the same `make_etype`.
 ///
 /// All of that costs `Copy` — neither `FunctionDeclarationId` nor `String`
 /// derives it — so the kind travels by reference from here on.
@@ -261,16 +297,59 @@ const LITERAL_KEYWORDS: [(&str, TypeChoice, Option<&str>); 3] = [
     ("none", TypeChoice::None, None),
 ];
 
-/// What committing a prompt row does. The prompt is one widget with two jobs,
-/// because INSERT means whatever the caret's cell is: on a free cell it builds
-/// a node, on a Source's output anchor it declares that Source's type.
+/// What committing a prompt row does. The prompt is one widget with as many
+/// jobs as there are editable cells, because INSERT means whatever the caret's
+/// cell is: on a free cell it builds a node, on a property cell it changes that
+/// property.
 ///
-/// One type rather than two prompts is what keeps the rest small — the typing,
-/// the highlight, the window and the click path never learn which job is on.
+/// One type rather than one prompt per job is what keeps the rest small — the
+/// typing, the highlight, the window and the click path never learn which job
+/// is on. Which node each setter acts on comes from the caret, not from the
+/// row, for the same reason `Create` does: a row can never point at something
+/// that has moved on since it was drawn.
 #[derive(Clone, PartialEq, Eq)]
 enum PromptAction {
     Create(AddKind),
-    SetType(TypeChoice),
+    SetName(String),
+    /// A type and, where it is a literal, that literal's text. One action for
+    /// four properties — a Source's declared type (never a literal), a
+    /// Constant's value (always one, bar `none`), a TypeCast's target and a
+    /// Pattern's arm — because all four are the same question asked of
+    /// different cells.
+    SetType(TypeChoice, Option<String>),
+}
+
+/// A node the prompt has built whose one mandatory property has not been given
+/// yet.
+///
+/// It stands in the graph while it is being answered, so what is being built
+/// can be seen — but it is not finished, and Escape unmakes it rather than
+/// leaving behind a placeholder nobody chose. Three kinds need this: a
+/// `TypeCast`, a `Pattern` and a `Match`, whose property is not part of the
+/// name that was typed to create it. A `Constant` carries its literal and a
+/// `FunctionCall` its function already, and a `Source` has nothing mandatory —
+/// its name may be empty and its type is settled on a second cell.
+#[derive(Clone, PartialEq, Eq)]
+struct PendingEdit {
+    /// Removed whole on Escape. For a Match this is its one `Pattern`, not the
+    /// Match: `minus_node` takes a parent Match with its last Pattern, so
+    /// naming the Pattern removes both — and the Pattern is what the caret
+    /// stands on anyway.
+    node: model::node::Id,
+    /// Where the caret goes back to, so a cancelled insert leaves no trace.
+    caret_before: IVec3,
+}
+
+#[derive(Resource, Default)]
+struct PendingNode(Option<PendingEdit>);
+
+/// What building a node left behind.
+enum Inserted {
+    /// The node is finished; nothing is owed.
+    Done,
+    /// The caret has been moved onto the cell that names the missing property,
+    /// and INSERT stays on to collect it.
+    Pending(PendingEdit),
 }
 
 /// One row of the INSERT prompt: what it would do, what it is called, and the
@@ -309,10 +388,10 @@ struct AddNodeButton;
 #[derive(Component)]
 struct InsertPromptPanel;
 
-/// Marker on the two rows the prompt respawns on a change — the text row and
-/// the suggestion list. Only those two carry it: `despawn` takes their
-/// children with them, and an entity despawned twice warns.
-#[derive(Component)]
+/// Marker on what the prompt respawns on a change — its column, the text row
+/// and the suggestion list. Only those carry it: `despawn` takes their children
+/// with them, and an entity despawned twice warns.
+#[derive(Component, Clone)]
 struct InsertPromptEntity;
 
 /// A clickable suggestion row, so the mouse path the "Add" button opens does
@@ -436,13 +515,10 @@ impl GraphState {
     }
 }
 
-/// The node the caret addresses and which of its cells — but only for the
-/// cells that stand for an editable property, which is what both the panel and
-/// INSERT mode ask about.
-///
-/// A body cell is the node's own property. A Source answers on its output
-/// anchor as well: that cell is where its declared type lives, while its body
-/// is where its name is, printed on it.
+/// The node the caret addresses and which of its cells. Purely mechanical —
+/// whether that cell *names* anything is `insert_target`'s question, and asking
+/// it in one place is what keeps the panel and INSERT mode from disagreeing
+/// about which cell edits what.
 fn addressed_cell(
     state: &GraphState,
     pick: &PickState,
@@ -451,28 +527,50 @@ fn addressed_cell(
     let id = layout.node_at(local)?;
     let ln = layout.layout_nodes.get(&id)?;
     let role = ln.shape.role_at(local - ln.pos.round().as_ivec3())?.clone();
-    let opens = match (&role, layout.graph.nodes.get(&id)?) {
-        (layout::CellRole::Body, _) => true,
-        (layout::CellRole::Output { .. }, model::node::ENode::Source { .. }) => true,
-        _ => false,
-    };
-    opens.then_some((id, role))
+    Some((id, role))
+}
+
+/// Which property of a node one of its cells stands for: one variant per
+/// (kind, cell) pair, and none for a cell that names nothing.
+///
+/// This is the whole editing model. A cell names at most one property, so
+/// standing on it and choosing what to change are one act — which is why there
+/// is no property panel offering a node's type and its value at the same time.
+#[derive(Clone, PartialEq, Eq)]
+enum EditTarget {
+    /// Printed along the body, so the body is where it is typed.
+    SourceName,
+    /// Hangs off the output anchor, so that is where it is declared.
+    SourceType,
+    /// Both of a Constant's cells answer for its literal: the value *is* the
+    /// node, so there is no second thing either cell could mean. The type is
+    /// not carried separately — it is whatever the literal spells.
+    ConstantValue,
+    /// The cell between a TypeCast's two anchors: a base type to cast to, or a
+    /// literal to produce. Its anchors name nothing.
+    CastType,
+    /// The type a Pattern's arm matches, on the Pattern's one cell.
+    PatternType,
+    // A FunctionCall is deliberately absent. Which function a call calls is
+    // fixed when it is built: a different function has a different arity, so
+    // re-pointing a call is re-wiring it, and every edge into it would have to
+    // go somewhere. Rather than answer that, the question is not asked — the
+    // call is deleted and another built. Its body cells therefore name nothing.
 }
 
 /// What INSERT mode does at the caret. The mode is one key, but it means
 /// whatever the addressed cell is.
 ///
-/// `Create` is the default for everything — including an occupied cell of some
-/// other node kind — so that only the two Source cases change and nothing else
-/// has to be re-decided.
+/// `Create` is what a cell that names no property falls back to — an empty cell,
+/// an anchor row, a hole in a multi-column node. On an occupied cell that is
+/// already inert, because `kind_allowed` greys every row there; what it keeps
+/// alive is the room-makers, which are the reason to stand on such a cell.
 #[derive(Clone, PartialEq, Eq)]
 enum InsertTarget {
     /// Build something: the prompt offers node kinds, functions and literals.
     Create,
-    /// A Source's name, typed into the panel's own field rather than a prompt.
-    Name(model::node::Id),
-    /// A Source's declared type, through the prompt in the panel.
-    Type(model::node::Id),
+    /// Change something that already stands there.
+    Edit(model::node::Id, EditTarget),
 }
 
 fn insert_target(state: &GraphState, pick: &PickState) -> InsertTarget {
@@ -482,18 +580,58 @@ fn insert_target(state: &GraphState, pick: &PickState) -> InsertTarget {
     let Some((layout, _)) = state.caret_graph(pick) else {
         return InsertTarget::Create;
     };
-    // Only a Source has the two cells this distinction is about. A body cell of
-    // anything else names a property the panel already edits its own way.
-    if !matches!(
-        layout.graph.nodes.get(&id),
-        Some(model::node::ENode::Source { .. })
-    ) {
+    let Some(node) = layout.graph.nodes.get(&id) else {
         return InsertTarget::Create;
-    }
-    match role {
-        layout::CellRole::Body => InsertTarget::Name(id),
-        layout::CellRole::Output { .. } => InsertTarget::Type(id),
-        layout::CellRole::Input { .. } => InsertTarget::Create,
+    };
+    let property = match (node, &role) {
+        (model::node::ENode::Source { .. }, layout::CellRole::Body) => EditTarget::SourceName,
+        (model::node::ENode::Source { .. }, layout::CellRole::Output { .. }) => {
+            EditTarget::SourceType
+        }
+        // The one kind whose two cells say the same thing, because it only has
+        // the one thing to say.
+        (
+            model::node::ENode::Constant { .. },
+            layout::CellRole::Body | layout::CellRole::Output { .. },
+        ) => EditTarget::ConstantValue,
+        (model::node::ENode::TypeCast { .. }, layout::CellRole::Body) => EditTarget::CastType,
+        (model::node::ENode::Pattern { .. }, layout::CellRole::Body) => EditTarget::PatternType,
+        // A FunctionCall's body cells fall through with everything else: the
+        // function is not changeable, so they name nothing. See `EditTarget`.
+        _ => return InsertTarget::Create,
+    };
+    InsertTarget::Edit(id, property)
+}
+
+/// The property the target names, spelled the way it would be typed — which is
+/// what the prompt opens on, so that changing a value starts from the value.
+///
+/// `EType`'s own `Display` is exactly that spelling already: `Integer` for a
+/// bare type, `42`, `'a'`, `"word"` for a literal.
+fn property_text(state: &GraphState, node_id: &model::node::Id, target: &EditTarget) -> String {
+    let Some(node) = state
+        .layout_graph
+        .find_node_graph(node_id)
+        .and_then(|graph| graph.graph.nodes.get(node_id))
+    else {
+        return String::new();
+    };
+    match (target, node) {
+        (EditTarget::SourceName, model::node::ENode::Source { name, .. }) => name.clone(),
+        (EditTarget::SourceType, model::node::ENode::Source { r#type, .. }) => {
+            type_choice_label(type_choice_of(r#type)).to_string()
+        }
+        (EditTarget::ConstantValue, model::node::ENode::Constant { r#type, .. }) => {
+            r#type.to_string()
+        }
+        (EditTarget::CastType, model::node::ENode::TypeCast { r#type, .. })
+        | (EditTarget::PatternType, model::node::ENode::Pattern { r#type, .. }) => r#type
+            .as_ref()
+            .map(ToString::to_string)
+            // Nothing chosen yet is nothing to open on, so the prompt starts
+            // empty and the first keystroke is the whole answer.
+            .unwrap_or_default(),
+        _ => String::new(),
     }
 }
 
@@ -627,29 +765,10 @@ struct ValueLabel {
 #[derive(Component)]
 struct NodeEditorPanel;
 
-/// Tag on every descendant of the editor panel that is rebuilt when the
-/// selection or dropdown state changes.
-#[derive(Component)]
+/// Tag on every descendant of the editor panel, which is rebuilt whenever the
+/// addressed cell or what is being typed into it changes.
+#[derive(Component, Clone)]
 struct NodeEditorEntity;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum NodeEditorField {
-    SourceName,
-    Value,
-}
-
-#[derive(Component)]
-struct NodeEditorTextInput {
-    node_id: model::node::Id,
-    field: NodeEditorField,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DropdownKind {
-    Type,
-    Function,
-    BoolValue,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TypeChoice {
@@ -667,62 +786,6 @@ const TYPE_CHOICES: [TypeChoice; 5] = [
     TypeChoice::Int,
     TypeChoice::None,
 ];
-
-#[derive(Clone, PartialEq, Eq)]
-enum DropdownChoice {
-    Type(TypeChoice),
-    Function(model::function_declaration::FunctionDeclarationId),
-    BoolValue(bool),
-}
-
-#[derive(Component)]
-struct Dropdown {
-    node_id: model::node::Id,
-    kind: DropdownKind,
-}
-
-#[derive(Component)]
-struct DropdownOption {
-    node_id: model::node::Id,
-    kind: DropdownKind,
-    choice: DropdownChoice,
-}
-
-#[derive(Component)]
-struct ValueEnableCheckbox {
-    node_id: model::node::Id,
-}
-
-/// At most one dropdown is open at a time; `open` identifies which one by
-/// `(node_id, kind)` — stable across panel rebuilds.
-#[derive(Resource, Default)]
-struct DropdownState {
-    open: Option<(model::node::Id, DropdownKind)>,
-}
-
-#[derive(Default, PartialEq, Eq, Clone, Copy)]
-enum NodeVariantKind {
-    #[default]
-    None,
-    Constant,
-    TypeCast,
-    Source,
-    FunctionCall,
-    Pattern,
-    Other,
-}
-
-fn variant_kind(node: Option<&model::node::ENode>) -> NodeVariantKind {
-    match node {
-        None => NodeVariantKind::None,
-        Some(model::node::ENode::Constant { .. }) => NodeVariantKind::Constant,
-        Some(model::node::ENode::TypeCast { .. }) => NodeVariantKind::TypeCast,
-        Some(model::node::ENode::Source { .. }) => NodeVariantKind::Source,
-        Some(model::node::ENode::FunctionCall { .. }) => NodeVariantKind::FunctionCall,
-        Some(model::node::ENode::Pattern { .. }) => NodeVariantKind::Pattern,
-        Some(_) => NodeVariantKind::Other,
-    }
-}
 
 fn type_choice_of(t: &model::r#type::EType) -> TypeChoice {
     match t {
@@ -743,8 +806,6 @@ fn type_choice_label(t: TypeChoice) -> &'static str {
         TypeChoice::None => "None",
     }
 }
-
-use layout::value_of_etype;
 
 fn make_etype(choice: TypeChoice, value: Option<String>) -> model::r#type::EType {
     match choice {
@@ -888,8 +949,8 @@ fn spawn_graph_nodes(
             &state.function_declarations,
             walked.extra_offset,
         );
-        // A node whose body is a band has no mesh of its own; the entity is
-        // still spawned so picking and selection keep working.
+        // A node drawn only as markers or loose objects has no mesh of its own;
+        // the entity is still spawned so picking and selection keep working.
         let node_entity = match render_node.node {
             Some(obj) => commands
                 .spawn((
@@ -915,30 +976,17 @@ fn spawn_graph_nodes(
                 .id(),
         };
 
-        // Body bands (source nodes): the same marquee ribbon the edges use, so
-        // a source reads as the start of its own wire.
-        if let Some(edge_labels) = edge_labels.as_ref() {
-            for band in render_node.bands {
-                commands.spawn((
-                    Mesh3d(meshes.add(band.mesh)),
-                    MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
-                        band_color: band.color.to_linear(),
-                        letter_color: LinearRgba::WHITE,
-                        scroll_speed: render::CELL * 0.5,
-                        tile_length: render::CELL,
-                        time: 0.0,
-                        line_mode: 0.0,
-                        line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
-                        _pad0: 0.0,
-                        _pad1: 0.0,
-                        _pad2: 0.0,
-                        label: edge_labels.by_kind[&band.kind].clone(),
-                    })),
-                    Transform::IDENTITY,
-                    Visibility::Inherited,
-                    SceneEntity,
-                ));
-            }
+        // Meshes a node owns without their being its body or one of its
+        // anchors: the line and the point a Constant is drawn as. They carry no
+        // `NodeEntity`, so nothing picks them and nothing hovers them — the
+        // node's own entity, spawned above, answers for all of that.
+        for object in render_node.objects {
+            commands.spawn((
+                Mesh3d(meshes.add(object.mesh)),
+                MeshMaterial3d(materials.add(object.material)),
+                object.transform,
+                SceneEntity,
+            ));
         }
 
         // Text printed onto a body face: the name a Source carries on its top
@@ -1400,13 +1448,11 @@ struct SemiOrthoCheckbox;
 #[derive(Component)]
 struct SemiOrthoCheckboxBox;
 
-/// A labelled checkbox pinned to a screen corner.
-///
-/// The node editor's checkbox (`spawn_typecast_checkbox_and_value`) is a bare
-/// swatch that gets respawned on every panel rebuild; a corner widget stands
-/// still instead, so this one carries a label, makes the whole row clickable,
-/// and leaves the swatch to a sync system. Colours and size are the panel's, so
-/// the two read as the same control.
+/// A labelled checkbox pinned to a screen corner — the last one in the editor,
+/// and a setting rather than a property of the graph, which is why it is not a
+/// prompt. It stands still instead of being respawned, so it carries its own
+/// label, makes the whole row clickable, and leaves the swatch to a sync
+/// system.
 fn spawn_corner_checkbox<C: Bundle>(
     commands: &mut Commands,
     font: &Handle<Font>,
@@ -1679,15 +1725,35 @@ fn handle_delete_node_button(
         if is_fixture {
             continue;
         }
-        let updated = caret_graph.minus_node(&selected_node_id);
-        if let Some((caret_graph_mut, _)) = state.caret_graph_mut(&pick) {
-            *caret_graph_mut = updated;
-            // Removing a node can shrink a constraint-less input that fed off
-            // it, so shapes have to be recomputed, not just the layout.
-            state.resettle();
+        if remove_node_at_caret(&mut state, &pick, &selected_node_id) {
             rebuild.0 = true;
         }
     }
+}
+
+/// Take a node out of the scope the caret stands in. Returns whether the graph
+/// changed, so the caller knows whether to flag a rebuild.
+///
+/// Caret-relative rather than by a global search, because both callers are:
+/// the delete button acts on what the caret selects, and the rollback of an
+/// unfinished node acts on the node the caret was put on to finish it.
+fn remove_node_at_caret(
+    state: &mut GraphState,
+    pick: &PickState,
+    node_id: &model::node::Id,
+) -> bool {
+    let Some((caret_graph, _)) = state.caret_graph(pick) else {
+        return false;
+    };
+    let updated = caret_graph.minus_node(node_id);
+    let Some((caret_graph_mut, _)) = state.caret_graph_mut(pick) else {
+        return false;
+    };
+    *caret_graph_mut = updated;
+    // Removing a node can shrink a constraint-less input that fed off it, so
+    // shapes have to be recomputed, not just the layout.
+    state.resettle();
+    true
 }
 
 /// May a node of this kind come into being at `local`?
@@ -1710,8 +1776,11 @@ fn kind_allowed(
         return false;
     }
     match kind {
-        // The one kind that *needs* an occupied cell: a Pattern is added
-        // below the Pattern the caret stands on.
+        // The one kind that *needs* an occupied cell: a Pattern is added below
+        // the Pattern the caret stands on. In practice that is always its gap
+        // cell — the other one names the arm's type, so INSERT there edits
+        // instead of building — and the gap belongs to the Pattern precisely so
+        // that this test can find it.
         AddKind::Pattern => matches!(
             graph
                 .node_at(local)
@@ -1728,22 +1797,27 @@ fn kind_allowed(
     }
 }
 
-/// Create a node of this kind at the caret. Returns whether the graph
-/// actually changed, so the caller knows whether to flag a rebuild.
+/// Create a node of this kind at the caret. `None` when nothing was built.
 ///
-/// The caret does not follow: it keeps addressing the cell, which now holds
-/// the new node.
-fn insert_node_kind(state: &mut GraphState, pick: &PickState, kind: &AddKind) -> bool {
+/// For most kinds the caret does not follow: it keeps addressing the cell,
+/// which now holds the new node. The three kinds that come into the world
+/// unfinished are the exception — there the caret moves onto the cell that
+/// names the missing property, because that is where it has to be answered, and
+/// the `PendingEdit` that comes back is what an Escape undoes.
+fn insert_node_kind(
+    state: &mut GraphState,
+    pick: &mut PickState,
+    kind: &AddKind,
+) -> Option<Inserted> {
     // The caret's scope is the editing target — there is nothing else to
     // agree with, so no context guard is needed here.
-    let Some(scope) = state.scope_of_caret(pick) else {
-        return false;
-    };
+    let scope = state.scope_of_caret(pick)?;
+    let caret_before = pick.selected_pos;
     let node_id_domain = state.node_id_domain.clone();
     let anchor_id_domain = state.anchor_id_domain.clone();
     let scope_graph = state.root_graph().resolve_context(&scope.path);
     if !kind_allowed(scope_graph, scope.path.is_empty(), scope.local, kind) {
-        return false;
+        return None;
     }
     let new_pos = scope.local.as_vec3();
     let (new_layout, new_node_id_domain, new_anchor_id_domain) = match kind {
@@ -1758,9 +1832,7 @@ fn insert_node_kind(state: &mut GraphState, pick: &PickState, kind: &AddKind) ->
             // The declaration decides the call's arity — `plus_function_call`
             // mints one input anchor per parameter — so a kind naming a
             // function the catalogue does not hold builds nothing.
-            let Some(declaration) = state.function_declarations.get(function_declaration_id) else {
-                return false;
-            };
+            let declaration = state.function_declarations.get(function_declaration_id)?;
             scope_graph.plus_function_call(
                 (function_declaration_id.clone(), declaration),
                 new_pos,
@@ -1768,19 +1840,20 @@ fn insert_node_kind(state: &mut GraphState, pick: &PickState, kind: &AddKind) ->
                 anchor_id_domain,
             )
         }
-        AddKind::TypeCast => scope_graph.plus_type_cast(
-            model::r#type::EType::Int { value: None },
-            new_pos,
-            node_id_domain,
-            anchor_id_domain,
-        ),
+        // Built without a type at all, rather than with a placeholder one: the
+        // caret lands on the cell that names it and INSERT stays on, so it is
+        // either typed in the next keystrokes or the node goes away with the
+        // Escape. Nothing that was never chosen is ever shown.
+        AddKind::TypeCast => {
+            scope_graph.plus_type_cast(None, new_pos, node_id_domain, anchor_id_domain)
+        }
         AddKind::Match => scope_graph.plus_match(new_pos, node_id_domain, anchor_id_domain),
         AddKind::Pattern => {
-            // `kind_allowed` already established that this is a Pattern. The
-            // selected Pattern keeps its row, so the caret stays where it is.
-            let Some(id) = scope_graph.node_at(scope.local) else {
-                return false;
-            };
+            // `kind_allowed` already established that the caret stands on a
+            // Pattern — on its gap cell, which is the address for this. The
+            // selected arm keeps its row and the new one goes below it, which
+            // is where the caret follows to.
+            let id = scope_graph.node_at(scope.local)?;
             scope_graph.plus_pattern_below(&id, node_id_domain, anchor_id_domain)
         }
     };
@@ -1790,28 +1863,73 @@ fn insert_node_kind(state: &mut GraphState, pick: &PickState, kind: &AddKind) ->
     state.node_id_domain = new_node_id_domain;
     state.anchor_id_domain = new_anchor_id_domain;
     state.resettle();
-    true
+
+    // Where the property that is still missing is edited, relative to the cell
+    // the node was built on. All three sit in the scope it was built in, so no
+    // descent into a branch is needed.
+    //
+    // Two of the steps are `2 * Z` for the same reason: both a TypeCast and a
+    // Match hold a gap open after their input anchor, so what names the type is
+    // the second cell behind it, not the first. A new Pattern goes one row
+    // below the gap the caret was standing on, and one cell further back again
+    // to reach its own type.
+    let step = match kind {
+        AddKind::TypeCast | AddKind::Match => IVec3::Z * 2,
+        AddKind::Pattern => IVec3::Y + IVec3::Z,
+        _ => return Some(Inserted::Done),
+    };
+    pick.selected_pos = state.root_graph().clamp_to_volume(caret_before + step);
+    // Read back rather than threaded out of the builders: every one of them
+    // mints its ids internally, and the node standing on the property cell is
+    // the node that was just built — for a Match that is its Pattern, which is
+    // both what the caret addresses and what removing takes the Match with.
+    //
+    // If it cannot be found the node is still there and the graph still
+    // changed; only the offer to unmake it is lost, and saying `Done` is the
+    // reading that leaves nothing dangling.
+    let Some(node) = state
+        .caret_graph(pick)
+        .and_then(|(layout, local)| layout.node_at(local))
+    else {
+        return Some(Inserted::Done);
+    };
+    Some(Inserted::Pending(PendingEdit { node, caret_before }))
 }
 
-/// Declare a new type on whichever node carries one. Returns whether the graph
-/// changed, so the caller knows whether to flag a rebuild.
+/// Declare a new type — and, where the row named a literal, that literal — on
+/// whichever node carries one. Returns whether the graph changed, so the caller
+/// knows whether to flag a rebuild.
 ///
-/// The existing literal is carried across unchanged — `make_etype` drops it for
-/// `None`, which is the one type that has no value to keep.
-fn set_node_type(state: &mut GraphState, node_id: &model::node::Id, choice: TypeChoice) -> bool {
+/// Type and literal are written together, which is what lets one keystroke say
+/// both: `42` on a TypeCast makes it produce the integer 42, `Integer` makes it
+/// cast to integers. The two used to be two acts, a dropdown and a checkbox,
+/// and the half-state between them — a literal pinned but not yet typed — is
+/// gone with them.
+fn set_node_type(
+    state: &mut GraphState,
+    node_id: &model::node::Id,
+    choice: TypeChoice,
+    value: Option<String>,
+) -> bool {
     let node = state
         .layout_graph
         .find_node_graph_mut(node_id)
         .and_then(|a| a.graph.nodes.get_mut(node_id));
+    // Two shapes of the same field: a Constant and a Source always carry a
+    // type, a TypeCast and a Pattern carry one only once it has been chosen.
+    // Committing a row is exactly the act that makes the second into the first.
     match node {
         Some(model::node::ENode::Constant { r#type, .. })
-        | Some(model::node::ENode::TypeCast { r#type, .. })
-        | Some(model::node::ENode::Source { r#type, .. })
-        | Some(model::node::ENode::Pattern { r#type, .. }) => {
-            let value = value_of_etype(r#type);
+        | Some(model::node::ENode::Source { r#type, .. }) => {
             *r#type = make_etype(choice, value);
             // Anchor heights follow declared types, so a type change reshapes
             // the node and its neighbours.
+            state.resettle();
+            true
+        }
+        Some(model::node::ENode::TypeCast { r#type, .. })
+        | Some(model::node::ENode::Pattern { r#type, .. }) => {
+            *r#type = Some(make_etype(choice, value));
             state.resettle();
             true
         }
@@ -1819,19 +1937,57 @@ fn set_node_type(state: &mut GraphState, node_id: &model::node::Id, choice: Type
     }
 }
 
-/// Commit a prompt row. Returns whether the graph changed.
-///
-/// `SetType` takes the node from the **caret**, not from the row, for the same
-/// reason `Create` does: the caret is what the prompt is about, so a row can
-/// never point at something that has moved on since it was drawn.
-fn apply_prompt_action(state: &mut GraphState, pick: &PickState, action: &PromptAction) -> bool {
-    match action {
-        PromptAction::Create(kind) => insert_node_kind(state, pick, kind),
-        PromptAction::SetType(choice) => match insert_target(state, pick) {
-            InsertTarget::Type(id) => set_node_type(state, &id, *choice),
-            _ => false,
-        },
+/// Rename a Source. The name is written along the body, so it decides how many
+/// cells that body claims — renaming reshapes the node exactly the way retyping
+/// a value does.
+fn set_source_name(state: &mut GraphState, node_id: &model::node::Id, name: &str) -> bool {
+    let node = state
+        .layout_graph
+        .find_node_graph_mut(node_id)
+        .and_then(|a| a.graph.nodes.get_mut(node_id));
+    match node {
+        Some(model::node::ENode::Source { name: current, .. }) => {
+            *current = name.to_string();
+            state.resettle();
+            true
+        }
+        _ => false,
     }
+}
+
+/// Commit a prompt row. `None` when nothing changed.
+///
+/// Every setter takes the node from the **caret**, not from the row, for the
+/// same reason `Create` does: the caret is what the prompt is about, so a row
+/// can never point at something that has moved on since it was drawn. A row
+/// whose action does not fit the cell the caret now stands on commits nothing.
+///
+/// Only `Create` can come back `Pending` — answering a property is what *ends*
+/// a pending node, never what starts one.
+fn apply_prompt_action(
+    state: &mut GraphState,
+    pick: &mut PickState,
+    action: &PromptAction,
+) -> Option<Inserted> {
+    let target = insert_target(state, pick);
+    let changed = match (action, target) {
+        (PromptAction::Create(kind), _) => return insert_node_kind(state, pick, kind),
+        (PromptAction::SetName(name), InsertTarget::Edit(id, EditTarget::SourceName)) => {
+            set_source_name(state, &id, name)
+        }
+        (
+            PromptAction::SetType(choice, value),
+            InsertTarget::Edit(
+                id,
+                EditTarget::SourceType
+                | EditTarget::ConstantValue
+                | EditTarget::CastType
+                | EditTarget::PatternType,
+            ),
+        ) => set_node_type(state, &id, *choice, value.clone()),
+        _ => false,
+    };
+    changed.then_some(Inserted::Done)
 }
 
 fn update_delete_button_visuals(
@@ -1944,9 +2100,11 @@ fn handle_insert_prompt_click(
     interaction_q: Query<(&Interaction, &InsertPromptOption), Changed<Interaction>>,
     eval: Res<EvalState>,
     mut state: ResMut<GraphState>,
-    // Read-only: the caret keeps addressing the cell the node now fills.
-    pick: Res<PickState>,
+    // Written, not read: a kind that comes into the world unfinished moves the
+    // caret onto the cell that finishes it.
+    mut pick: ResMut<PickState>,
     mut prompt: ResMut<InsertPrompt>,
+    mut pending: ResMut<PendingNode>,
     mut mode: ResMut<EditorMode>,
     mut rebuild: ResMut<NeedsRebuild>,
 ) {
@@ -1957,24 +2115,49 @@ fn handle_insert_prompt_click(
         if *interaction != Interaction::Pressed {
             continue;
         }
-        if apply_prompt_action(&mut state, &pick, &option.0) {
-            prompt.clear();
-            rebuild.0 = true;
-            // Creating leaves INSERT on, so the next node can be typed
-            // straight away. Declaring a type is one answer to one question —
-            // it is finished, and staying would only offer to answer it again.
-            if matches!(option.0, PromptAction::SetType(_)) {
-                *mode = EditorMode::Normal;
-            }
+        if let Some(outcome) = apply_prompt_action(&mut state, &mut pick, &option.0) {
+            commit_outcome(
+                outcome,
+                &option.0,
+                &mut prompt,
+                &mut pending,
+                &mut mode,
+                &mut rebuild,
+            );
         }
     }
 }
 
+/// What follows a committed row, whichever key or click committed it.
+///
+/// Creating leaves INSERT on, so the next node can be typed straight away —
+/// and where what was created is not finished yet, the caret is already on the
+/// cell that finishes it. Changing a property is one answer to one question:
+/// it is done, and staying would only offer to answer it again.
+fn commit_outcome(
+    outcome: Inserted,
+    action: &PromptAction,
+    prompt: &mut InsertPrompt,
+    pending: &mut PendingNode,
+    mode: &mut EditorMode,
+    rebuild: &mut NeedsRebuild,
+) {
+    prompt.clear();
+    rebuild.0 = true;
+    // Answering a property is what finishes a node, so any commit clears the
+    // mark — and a new one only ever comes from a `Create`.
+    pending.0 = match outcome {
+        Inserted::Pending(edit) => Some(edit),
+        Inserted::Done => None,
+    };
+    if !matches!(action, PromptAction::Create(_)) {
+        *mode = EditorMode::Normal;
+    }
+}
+
 /// The suggestions the prompt currently offers — which is a question about the
-/// caret's cell, not only about the typed text. On a Source's output anchor
-/// that is the five base types; everywhere else it is the node kinds, the
-/// literals and every declared function whose name carries the prefix, each
-/// with whether it may be created there.
+/// caret's cell first and about the typed text second. Each cell names one
+/// property, so each answers with the rows that property can take.
 ///
 /// The prefix filters, the legality only greys — those are two different
 /// questions, and typing must not make a row silently disappear because the
@@ -1982,27 +2165,99 @@ fn handle_insert_prompt_click(
 /// the exception that proves it: there the prefix is not something to filter
 /// by, it *is* the row.
 fn prompt_candidates(state: &GraphState, pick: &PickState, text: &str) -> Vec<Suggestion> {
-    // Shift reports the uppercase character and the labels are CamelCase, so
-    // the comparison has to ignore case in both directions.
-    let prefix = text.to_ascii_lowercase();
-    // A declared type is a closed set of five, all of them always legal — the
-    // node already stands there, so nothing about the caret can forbid one.
-    if let InsertTarget::Type(_) = insert_target(state, pick) {
-        return TYPE_CHOICES
-            .iter()
-            .filter(|choice| {
-                type_choice_label(**choice)
-                    .to_ascii_lowercase()
-                    .starts_with(&prefix)
-            })
-            .map(|choice| Suggestion {
-                action: PromptAction::SetType(*choice),
-                label: type_choice_label(*choice).to_string(),
-                detail: String::new(),
-                allowed: true,
-            })
-            .collect();
+    match insert_target(state, pick) {
+        InsertTarget::Create => create_candidates(state, pick, text),
+        // A name answers to no list. The one row is the text itself, which
+        // keeps what `Return` commits visible in the place it is visible for
+        // every other property.
+        InsertTarget::Edit(_, EditTarget::SourceName) => vec![Suggestion {
+            action: PromptAction::SetName(text.to_string()),
+            label: text.to_string(),
+            detail: "Name".to_string(),
+            // An empty name is a name: a Source is identified by its index,
+            // and clearing the name has to stay possible.
+            allowed: true,
+        }],
+        // A declared type is a closed set of five, all of them always legal —
+        // the node already stands there, so nothing about the caret can forbid
+        // one. No literal: what a Source declares is a type, and the value
+        // arrives from outside.
+        InsertTarget::Edit(_, EditTarget::SourceType) => type_rows(text),
+        // A Constant *is* its literal, so only literals are offered. Naming a
+        // bare type here would build a constant with nothing in it, which
+        // `eval_value_for_type` refuses anyway.
+        InsertTarget::Edit(_, EditTarget::ConstantValue) => literal_rows(text),
+        // Both at once, and that is the whole point of the cell: `Integer`
+        // casts to integers, `42` produces the integer 42.
+        InsertTarget::Edit(_, EditTarget::CastType | EditTarget::PatternType) => literal_rows(text)
+            .into_iter()
+            .chain(type_rows(text))
+            .collect(),
     }
+}
+
+/// Shift reports the uppercase character and the labels are CamelCase, so every
+/// prefix test has to ignore case in both directions.
+fn matches_prefix(label: &str, text: &str) -> bool {
+    label
+        .to_ascii_lowercase()
+        .starts_with(&text.to_ascii_lowercase())
+}
+
+/// The five base types, as rows that declare one.
+fn type_rows(text: &str) -> Vec<Suggestion> {
+    TYPE_CHOICES
+        .iter()
+        .filter(|choice| matches_prefix(type_choice_label(**choice), text))
+        .map(|choice| Suggestion {
+            action: PromptAction::SetType(*choice, None),
+            label: type_choice_label(*choice).to_string(),
+            detail: String::new(),
+            allowed: true,
+        })
+        .collect()
+}
+
+/// The literal the text spells, if any, and the three that are written as a
+/// word — as rows that *set* a property rather than build a node. The create
+/// prompt spells the same two sources of literals its own way, because there
+/// they build a Constant instead.
+fn literal_rows(text: &str) -> Vec<Suggestion> {
+    let typed = typed_literal(text).map(|(choice, raw, _closed)| {
+        let r#type = make_etype(choice, Some(raw.clone()));
+        let parses = eval::EValue::parse(&r#type, &raw).is_ok();
+        Suggestion {
+            action: PromptAction::SetType(choice, Some(raw)),
+            label: if parses {
+                r#type.to_string()
+            } else {
+                text.to_string()
+            },
+            detail: literal_type_name(choice),
+            allowed: parses,
+        }
+    });
+    typed
+        .into_iter()
+        .chain(
+            LITERAL_KEYWORDS
+                .iter()
+                .filter(|(label, _, _)| matches_prefix(label, text))
+                .map(|(label, choice, value)| Suggestion {
+                    action: PromptAction::SetType(*choice, value.map(str::to_string)),
+                    label: label.to_string(),
+                    detail: literal_type_name(*choice),
+                    allowed: true,
+                }),
+        )
+        .collect()
+}
+
+/// What the prompt offers on a cell that names nothing: the node kinds, the
+/// literals and every declared function, each with whether it may be created
+/// where the caret stands.
+fn create_candidates(state: &GraphState, pick: &PickState, text: &str) -> Vec<Suggestion> {
+    let prefix = text.to_ascii_lowercase();
     let scope = state.scope_of_caret(pick);
     let resolved = scope.as_ref().map(|s| {
         (
@@ -2012,9 +2267,8 @@ fn prompt_candidates(state: &GraphState, pick: &PickState, text: &str) -> Vec<Su
         )
     });
     // A HashMap has no order, so an as-it-comes iteration would reshuffle the
-    // list between frames. Sorted by name, like the node editor's function
-    // dropdown sorts it — byte order, which puts the symbols ahead of the
-    // words and leaves `||` behind `substr`.
+    // list between frames. Sorted by name — byte order, which puts the symbols
+    // ahead of the words and leaves `||` behind `substr`.
     let mut functions: Vec<_> = state.function_declarations.iter().collect();
     functions.sort_by(|a, b| a.1.name.cmp(&b.1.name));
 
@@ -2152,8 +2406,8 @@ fn signature_detail(declaration: &model::function_declaration::FunctionDeclarati
 
 /// A literal's type for that same column — through `short_type_name` as well,
 /// so `Int` reads as `Int` in both halves of the list rather than as `Integer`
-/// in one of them. `type_choice_label` keeps the long word for the node
-/// editor's dropdown, which has the room for it.
+/// in one of them. `type_choice_label` keeps the long word for the rows that
+/// *are* a type, where it is the thing being named rather than an aside.
 fn literal_type_name(choice: TypeChoice) -> String {
     short_type_name(&infer::graph_type_to_eval_type(&make_etype(choice, None)))
 }
@@ -2202,14 +2456,33 @@ fn step_selection(candidates: &[Suggestion], from: Option<usize>, delta: isize) 
 
 /// Where the highlight lands after the text changed: the first suggestion that
 /// can actually be committed — and none at all while nothing is typed, because
-/// `Return` on an empty prompt opens a column rather than committing, and a
-/// highlight there would say otherwise. The rule lives here rather than in the
-/// three callers, so there is one place that decides it.
+/// nothing typed is nothing chosen. On a create prompt a highlight there would
+/// also take `Return` away from the column it opens; on a node that was built a
+/// keystroke ago and is waiting for its type, it would answer the question with
+/// whatever row happened to sort first.
+///
+/// The one exception is a row that *is* the text. A Source's name answers to no
+/// list: its single row carries whatever has been typed, and an empty name is a
+/// name — a Source is told apart by its index, so clearing the name has to stay
+/// committable. So an empty prompt highlights a row whose label is empty too,
+/// and nothing else.
+///
+/// The rule lives here rather than in the callers, so there is one place that
+/// decides it.
 fn first_selection(text: &str, candidates: &[Suggestion]) -> Option<usize> {
-    if text.is_empty() {
-        return None;
-    }
-    candidates.iter().position(|suggestion| suggestion.allowed)
+    let index = candidates
+        .iter()
+        .position(|suggestion| suggestion.allowed)?;
+    (!text.is_empty() || candidates[index].label.is_empty()).then_some(index)
+}
+
+/// Re-ask the list after the text changed. Every key that edits the text ends
+/// in this, and it is a function rather than six copies because the list
+/// depends on the caret as much as on the text, and that pair is easy to get
+/// half right.
+fn reselect(prompt: &mut InsertPrompt, state: &GraphState, pick: &PickState) {
+    let candidates = prompt_candidates(state, pick, &prompt.text);
+    prompt.selected = first_selection(&prompt.text, &candidates);
 }
 
 /// The highlight as it stands against *this* list. Clamped on read rather than
@@ -2250,6 +2523,7 @@ fn prompt_window(len: usize, selected: usize) -> std::ops::Range<usize> {
 struct InsertPromptFingerprint {
     visible: bool,
     text: String,
+    cursor: usize,
     selected: Option<usize>,
     candidates: Vec<Suggestion>,
 }
@@ -2273,9 +2547,10 @@ fn sync_insert_prompt_ui(
     mut cache: Local<InsertPromptFingerprint>,
 ) {
     let visible = *mode == EditorMode::Insert
-        // Only where INSERT means "build something". Editing a Source's name
-        // or type happens in the node editor's panel, and an empty create
-        // prompt standing beside it would claim a choice that is not on offer.
+        // Only where INSERT means "build something". Changing a property that
+        // already stands there happens in the node editor's panel, where the
+        // property is named, and an empty create prompt standing beside it
+        // would claim a choice that is not on offer.
         && insert_target(&state, &pick) == InsertTarget::Create
         && !start_menu.showing
         && !modal_is_open(&eval)
@@ -2290,6 +2565,7 @@ fn sync_insert_prompt_ui(
     let fp = InsertPromptFingerprint {
         visible,
         text: prompt.text.clone(),
+        cursor: prompt.cursor,
         selected,
         candidates: candidates.clone(),
     };
@@ -2315,52 +2591,23 @@ fn sync_insert_prompt_ui(
     }
 
     let font = &ui_font.0;
-    // A prefix nothing answers to is shown on the text itself. An empty box
-    // below would read as a broken widget instead of as a refusal.
-    let text_color = if candidates.is_empty() {
-        Color::srgb(0.95, 0.30, 0.30)
-    } else {
-        Color::srgb(0.91, 0.89, 0.87)
-    };
     commands.entity(panel_entity).with_children(|panel| {
-        panel
-            .spawn((
-                editor_text_input_node(),
-                BackgroundColor(Color::srgba(0.06, 0.06, 0.12, 0.95)),
-                BorderColor::all(Color::srgb(0.133, 0.827, 0.933)),
-                InsertPromptEntity,
-            ))
-            .with_children(|row| {
-                row.spawn((
-                    Text::new(format!("{}|", prompt.text)),
-                    text_font(font, 14.0),
-                    TextColor(text_color),
-                ));
-            });
-        if candidates.is_empty() {
-            return;
-        }
-        panel
-            .spawn((
-                Node {
-                    flex_direction: FlexDirection::Column,
-                    padding: UiRect::all(Val::Px(2.0)),
-                    border_radius: BorderRadius::all(Val::Px(4.0)),
-                    ..default()
-                },
-                BackgroundColor(Color::srgba(0.08, 0.08, 0.14, 0.98)),
-                InsertPromptEntity,
-            ))
-            .with_children(|options| {
-                spawn_prompt_rows(options, font, &candidates, selected);
-            });
+        spawn_prompt_body(
+            panel,
+            font,
+            &prompt.text,
+            prompt.cursor,
+            &candidates,
+            selected,
+            InsertPromptEntity,
+        );
     });
 }
 
 /// The prompt's suggestion rows, windowed around the highlight. Shared by the
-/// prompt that creates nodes and the one that declares a Source's type: the
-/// rows are the same rows, only the container differs — which is why this
-/// takes no marker of its own and the caller tags its own container.
+/// prompt that creates nodes and the ones that change a property: the rows are
+/// the same rows, only the container differs — which is why this takes no
+/// marker of its own and the caller tags its own container.
 fn spawn_prompt_rows(
     options: &mut ChildSpawnerCommands,
     font: &Handle<Font>,
@@ -2487,29 +2734,45 @@ fn spawn_node_editor_panel(mut commands: Commands) {
 
 #[derive(Default, PartialEq, Eq, Clone)]
 struct NodeEditorFingerprint {
-    node_id: Option<model::node::Id>,
-    variant: NodeVariantKind,
-    type_choice: Option<TypeChoice>,
-    typecast_has_value: bool,
-    func_id: Option<model::function_declaration::FunctionDeclarationId>,
-    dropdown_open: Option<(model::node::Id, DropdownKind)>,
-    /// Which of the node's cells the caret addresses. The panel shows the one
-    /// property that cell stands for, so moving between two cells of the *same*
-    /// node has to rebuild it — node and variant are unchanged then.
-    role: Option<layout::CellRole>,
-    /// The prompt's text and highlight, but only while the panel is the one
-    /// drawing it. That is also the bit that catches the NORMAL→INSERT switch
-    /// on an output anchor, where the role stays `Output` and nothing else in
-    /// here moves.
-    insert_prompt: Option<(String, Option<usize>)>,
+    /// The node and the one property the addressed cell names. Moving between
+    /// two cells of the *same* node changes the property, which is why this is
+    /// not keyed on the node alone.
+    target: Option<(model::node::Id, EditTarget)>,
+    /// What that property says right now. The panel echoes it outside INSERT,
+    /// and a commit can change it under a standing panel.
+    value: String,
+    /// The prompt's text, cursor and highlight, but only while the panel is the
+    /// one drawing it. That is also the bit that catches the NORMAL→INSERT
+    /// switch, where nothing else in here moves.
+    prompt: Option<(String, usize, Option<usize>)>,
+    candidates: Vec<Suggestion>,
     visible: bool,
 }
 
+/// What the panel calls the node, and what it calls the one property the
+/// addressed cell names. A total function of the target, so the panel needs no
+/// second look at the node to write its heading.
+fn target_labels(target: &EditTarget) -> (&'static str, &'static str) {
+    match target {
+        EditTarget::SourceName => ("Source", "Name"),
+        EditTarget::SourceType => ("Source", "Type"),
+        EditTarget::ConstantValue => ("Constant", "Value"),
+        EditTarget::CastType => ("TypeCast", "Type"),
+        EditTarget::PatternType => ("Pattern", "Type"),
+    }
+}
+
+/// The panel beside the caret: the kind of node the caret stands on, and the
+/// one property its cell names — as a prompt while INSERT is typing into it,
+/// and as plain text otherwise.
+///
+/// One row, never two. A cell names one property, so there is never a second
+/// one to show; the panel that used to offer a node's type and its value at the
+/// same time is what the cell layout exists to replace.
 fn sync_node_editor_ui(
     mut commands: Commands,
     state: Res<GraphState>,
     pick: Res<PickState>,
-    dropdown_state: Res<DropdownState>,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
     mode: Res<EditorMode>,
@@ -2519,73 +2782,32 @@ fn sync_node_editor_ui(
     editor_children_q: Query<Entity, With<NodeEditorEntity>>,
     mut cache: Local<NodeEditorFingerprint>,
 ) {
-    let caret = state.caret_graph(&pick);
-    // The panel edits the property this address stands for, so *which* of the
-    // node's cells is addressed decides what it shows, not only which node.
-    let addressed = addressed_cell(&state, &pick);
-    let node_id = addressed.as_ref().map(|(id, _)| id.clone());
-    let role = addressed.map(|(_, role)| role);
-    let node = node_id
-        .as_ref()
-        .and_then(|id| caret.and_then(|(layout, _)| layout.graph.nodes.get(id)));
-    let variant = variant_kind(node);
-    let type_choice = node.and_then(|n| match n {
-        model::node::ENode::Constant { r#type, .. }
-        | model::node::ENode::TypeCast { r#type, .. }
-        | model::node::ENode::Pattern { r#type, .. }
-        // A Source belongs here as much as the others: its type is what the
-        // dropdown on its output cell sets, so the panel has to notice when it
-        // changes rather than leaning on `dropdown_open` closing to do it.
-        | model::node::ENode::Source { r#type, .. } => Some(type_choice_of(r#type)),
-        _ => None,
-    });
-    let typecast_has_value = match node {
-        Some(model::node::ENode::TypeCast { r#type, .. })
-        | Some(model::node::ENode::Pattern { r#type, .. }) => value_of_etype(r#type).is_some(),
-        _ => false,
+    let target = match insert_target(&state, &pick) {
+        InsertTarget::Edit(id, edit) => Some((id, edit)),
+        // A cell that names no property has no panel. What INSERT does there is
+        // build, and the create prompt draws itself in its own place.
+        InsertTarget::Create => None,
     };
-    let func_id = match node {
-        Some(model::node::ENode::FunctionCall {
-            function_declaration_id,
-            ..
-        }) => Some(function_declaration_id.clone()),
-        _ => None,
-    };
-
-    let editable = matches!(
-        variant,
-        NodeVariantKind::Constant
-            | NodeVariantKind::TypeCast
-            | NodeVariantKind::Source
-            | NodeVariantKind::FunctionCall
-            | NodeVariantKind::Pattern
-    );
-    let visible = editable && !start_menu.showing && !is_evaluating(&eval);
-    // The type row turns into a prompt while INSERT stands on the anchor that
-    // carries the type — the same widget as the create prompt, in the place
-    // the property is.
-    let type_prompt = visible
-        && *mode == EditorMode::Insert
-        && matches!(role, Some(layout::CellRole::Output { .. }));
-    let candidates = if type_prompt {
+    let visible = target.is_some() && !start_menu.showing && !is_evaluating(&eval);
+    let editing = visible && *mode == EditorMode::Insert;
+    let candidates = if editing {
         prompt_candidates(&state, &pick, &prompt.text)
     } else {
         Vec::new()
     };
     let selected = clamped_selection(&candidates, prompt.selected);
+    let value = target
+        .as_ref()
+        .map(|(id, edit)| property_text(&state, id, edit))
+        .unwrap_or_default();
 
     let fp = NodeEditorFingerprint {
-        node_id: node_id.clone(),
-        variant,
-        type_choice,
-        typecast_has_value,
-        func_id: func_id.clone(),
-        dropdown_open: dropdown_state.open.clone(),
-        role: role.clone(),
-        insert_prompt: type_prompt.then(|| (prompt.text.clone(), selected)),
+        target: target.clone(),
+        value: value.clone(),
+        prompt: editing.then(|| (prompt.text.clone(), prompt.cursor, selected)),
+        candidates: candidates.clone(),
         visible,
     };
-
     if *cache == fp {
         return;
     }
@@ -2603,115 +2825,38 @@ fn sync_node_editor_ui(
     } else {
         Display::None
     };
+    let Some((_, edit)) = target else {
+        return;
+    };
     if !visible {
         return;
     }
 
-    let node = node.unwrap();
-    let node_id = node_id.unwrap();
-
+    let (kind_label, property_label) = target_labels(&edit);
     let font = &ui_font.0;
-    commands
-        .entity(panel_entity)
-        .with_children(|panel| match node {
-            model::node::ENode::Constant { r#type, .. } => {
-                spawn_editor_label(panel, font, "Constant");
-                spawn_labeled_row(panel, font, "Type", |slot| {
-                    spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
-                });
-                if !matches!(r#type, model::r#type::EType::None { .. }) {
-                    spawn_labeled_row(panel, font, "Value", |slot| {
-                        spawn_value_widget(
-                            slot,
-                            font,
-                            &node_id,
-                            r#type,
-                            true,
-                            &dropdown_state.open,
-                        );
-                    });
-                }
+    commands.entity(panel_entity).with_children(|panel| {
+        spawn_editor_label(panel, font, kind_label);
+        spawn_labeled_row(panel, font, property_label, |slot| {
+            if editing {
+                spawn_prompt_body(
+                    slot,
+                    font,
+                    &prompt.text,
+                    prompt.cursor,
+                    &candidates,
+                    selected,
+                    NodeEditorEntity,
+                );
+            } else {
+                slot.spawn((
+                    Text::new(value.clone()),
+                    text_font(font, 14.0),
+                    TextColor(Color::srgb(0.91, 0.89, 0.87)),
+                    NodeEditorEntity,
+                ));
             }
-            model::node::ENode::Source { name, r#type, .. } => {
-                spawn_editor_label(panel, font, "Source");
-                // One cell, one property: the body carries the name — it is
-                // printed along it — and the output anchor carries the declared
-                // type. Showing both at once would put the choice back in the
-                // panel, which is what the cell layout exists to avoid.
-                match &role {
-                    Some(layout::CellRole::Output { .. }) => {
-                        spawn_labeled_row(panel, font, "Type", |slot| {
-                            if type_prompt {
-                                spawn_type_prompt(slot, font, &prompt.text, &candidates, selected);
-                            } else {
-                                spawn_type_dropdown(
-                                    slot,
-                                    font,
-                                    &node_id,
-                                    r#type,
-                                    &dropdown_state.open,
-                                );
-                            }
-                        });
-                    }
-                    _ => {
-                        spawn_labeled_row(panel, font, "Name", |slot| {
-                            spawn_name_input(slot, font, &node_id, name);
-                        });
-                    }
-                }
-            }
-            model::node::ENode::TypeCast { r#type, .. } => {
-                spawn_editor_label(panel, font, "TypeCast");
-                spawn_labeled_row(panel, font, "Type", |slot| {
-                    spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
-                });
-                if !matches!(r#type, model::r#type::EType::None { .. }) {
-                    spawn_labeled_row(panel, font, "Value", |slot| {
-                        spawn_typecast_checkbox_and_value(
-                            slot,
-                            font,
-                            &node_id,
-                            r#type,
-                            &dropdown_state.open,
-                        );
-                    });
-                }
-            }
-            model::node::ENode::Pattern { r#type, .. } => {
-                spawn_editor_label(panel, font, "Pattern");
-                spawn_labeled_row(panel, font, "Type", |slot| {
-                    spawn_type_dropdown(slot, font, &node_id, r#type, &dropdown_state.open);
-                });
-                if !matches!(r#type, model::r#type::EType::None { .. }) {
-                    spawn_labeled_row(panel, font, "Value", |slot| {
-                        spawn_typecast_checkbox_and_value(
-                            slot,
-                            font,
-                            &node_id,
-                            r#type,
-                            &dropdown_state.open,
-                        );
-                    });
-                }
-            }
-            model::node::ENode::FunctionCall {
-                function_declaration_id,
-                ..
-            } => {
-                spawn_labeled_row(panel, font, "Function", |slot| {
-                    spawn_function_dropdown(
-                        slot,
-                        font,
-                        &node_id,
-                        function_declaration_id,
-                        &state.function_declarations,
-                        &dropdown_state.open,
-                    );
-                });
-            }
-            _ => {}
         });
+    });
 }
 
 fn spawn_editor_label(panel: &mut ChildSpawnerCommands, font: &Handle<Font>, text: &str) {
@@ -2765,56 +2910,36 @@ fn spawn_labeled_row(
         });
 }
 
-fn spawn_name_input(
-    panel: &mut ChildSpawnerCommands,
-    font: &Handle<Font>,
-    node_id: &model::node::Id,
-    current: &str,
-) {
-    panel
-        .spawn((
-            Button,
-            editor_text_input_node(),
-            BackgroundColor(Color::srgba(0.06, 0.06, 0.12, 0.95)),
-            BorderColor::all(Color::srgb(0.12, 0.12, 0.24)),
-            TextInputBox,
-            TextInput {
-                value: current.to_string(),
-                focused: false,
-                cursor: current.len(),
-            },
-            NodeEditorTextInput {
-                node_id: node_id.clone(),
-                field: NodeEditorField::SourceName,
-            },
-            NodeEditorEntity,
-        ))
-        .with_children(|p| {
-            p.spawn((
-                Text::new(current.to_string()),
-                text_font(font, 14.0),
-                TextColor(Color::srgb(0.91, 0.89, 0.87)),
-                TextInputDisplay,
-                NodeEditorEntity,
-            ));
-        });
+/// Shape of a one-line input: the prompt's own text line, and the modal fields
+/// that still are real text boxes.
+fn editor_text_input_node() -> Node {
+    Node {
+        padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
+        border: UiRect::all(Val::Px(1.5)),
+        border_radius: BorderRadius::all(Val::Px(4.0)),
+        flex_grow: 1.0,
+        min_width: Val::Px(0.0),
+        ..default()
+    }
 }
 
-/// The type row while INSERT is typing into it: the same text line and the
-/// same suggestion rows the create prompt uses, in the place the dropdown
-/// otherwise stands.
+/// The prompt itself: the line being typed with the caret drawn at the cursor,
+/// and the suggestion rows under it.
 ///
-/// The rows carry `NodeEditorEntity` and **not** `InsertPromptEntity`: the two
-/// prompts are despawned by two different syncs, and a row tagged for the other
-/// one would be swept away by a rebuild this panel never hears about.
-fn spawn_type_prompt(
-    panel: &mut ChildSpawnerCommands,
+/// Shared by the prompt that creates nodes and the one that changes a property
+/// — they are the same widget, and only the container and its marker differ,
+/// because the two are despawned by two different syncs and a row tagged for
+/// the other one would be swept away by a rebuild its sync never hears about.
+fn spawn_prompt_body(
+    parent: &mut ChildSpawnerCommands,
     font: &Handle<Font>,
     text: &str,
+    cursor: usize,
     candidates: &[Suggestion],
     selected: Option<usize>,
+    marker: impl Bundle + Clone,
 ) {
-    panel
+    parent
         .spawn((
             Node {
                 flex_direction: FlexDirection::Column,
@@ -2823,7 +2948,7 @@ fn spawn_type_prompt(
                 row_gap: Val::Px(2.0),
                 ..default()
             },
-            NodeEditorEntity,
+            marker.clone(),
         ))
         .with_children(|column| {
             column
@@ -2831,14 +2956,16 @@ fn spawn_type_prompt(
                     editor_text_input_node(),
                     BackgroundColor(Color::srgba(0.06, 0.06, 0.12, 0.95)),
                     BorderColor::all(Color::srgb(0.133, 0.827, 0.933)),
-                    NodeEditorEntity,
+                    marker.clone(),
                 ))
                 .with_children(|row| {
+                    let (before, after) = text.split_at(cursor);
                     row.spawn((
-                        Text::new(format!("{}|", text)),
+                        Text::new(format!("{}|{}", before, after)),
                         text_font(font, 14.0),
-                        // A prefix no type answers to is said on the text, the
-                        // same way the create prompt says it.
+                        // A prefix nothing answers to is shown on the text
+                        // itself. An empty box below would read as a broken
+                        // widget instead of as a refusal.
                         TextColor(if candidates.is_empty() {
                             Color::srgb(0.95, 0.30, 0.30)
                         } else {
@@ -2858,495 +2985,12 @@ fn spawn_type_prompt(
                         ..default()
                     },
                     BackgroundColor(Color::srgba(0.08, 0.08, 0.14, 0.98)),
-                    NodeEditorEntity,
+                    marker,
                 ))
                 .with_children(|options| {
                     spawn_prompt_rows(options, font, candidates, selected);
                 });
         });
-}
-
-fn spawn_type_dropdown(
-    panel: &mut ChildSpawnerCommands,
-    font: &Handle<Font>,
-    node_id: &model::node::Id,
-    current: &model::r#type::EType,
-    open: &Option<(model::node::Id, DropdownKind)>,
-) {
-    let current_choice = type_choice_of(current);
-    let label = type_choice_label(current_choice);
-    spawn_dropdown_root(
-        panel,
-        font,
-        node_id,
-        DropdownKind::Type,
-        label,
-        open,
-        |options| {
-            for tc in TYPE_CHOICES {
-                let is_current = tc == current_choice;
-                spawn_dropdown_option(
-                    options,
-                    font,
-                    node_id,
-                    DropdownKind::Type,
-                    DropdownChoice::Type(tc),
-                    type_choice_label(tc),
-                    is_current,
-                );
-            }
-        },
-    );
-}
-
-fn spawn_function_dropdown(
-    panel: &mut ChildSpawnerCommands,
-    font: &Handle<Font>,
-    node_id: &model::node::Id,
-    current: &model::function_declaration::FunctionDeclarationId,
-    declarations: &std::collections::HashMap<
-        model::function_declaration::FunctionDeclarationId,
-        model::function_declaration::FunctionDeclaration,
-    >,
-    open: &Option<(model::node::Id, DropdownKind)>,
-) {
-    let label = declarations
-        .get(current)
-        .map(|d| d.name.as_str())
-        .unwrap_or("?");
-    let mut entries: Vec<(model::function_declaration::FunctionDeclarationId, String)> =
-        declarations
-            .iter()
-            .map(|(id, d)| (id.clone(), d.name.clone()))
-            .collect();
-    entries.sort_by(|a, b| a.1.cmp(&b.1));
-
-    spawn_dropdown_root(
-        panel,
-        font,
-        node_id,
-        DropdownKind::Function,
-        label,
-        open,
-        |options| {
-            for (id, name) in &entries {
-                let is_current = id == current;
-                spawn_dropdown_option(
-                    options,
-                    font,
-                    node_id,
-                    DropdownKind::Function,
-                    DropdownChoice::Function(id.clone()),
-                    name,
-                    is_current,
-                );
-            }
-        },
-    );
-}
-
-fn spawn_value_widget(
-    panel: &mut ChildSpawnerCommands,
-    font: &Handle<Font>,
-    node_id: &model::node::Id,
-    current: &model::r#type::EType,
-    enabled: bool,
-    open: &Option<(model::node::Id, DropdownKind)>,
-) {
-    match current {
-        model::r#type::EType::None { .. } => {}
-        model::r#type::EType::Bool { value } => {
-            let current_bool = value.as_deref() == Some("true");
-            let label = value.as_deref().unwrap_or("Bool");
-            spawn_dropdown_root(
-                panel,
-                font,
-                node_id,
-                DropdownKind::BoolValue,
-                label,
-                open,
-                |options| {
-                    for v in [true, false] {
-                        spawn_dropdown_option(
-                            options,
-                            font,
-                            node_id,
-                            DropdownKind::BoolValue,
-                            DropdownChoice::BoolValue(v),
-                            if v { "true" } else { "false" },
-                            value.is_some() && v == current_bool,
-                        );
-                    }
-                },
-            );
-        }
-        _ => {
-            let initial = value_of_etype(current).unwrap_or_default();
-            let (bg, border, fg) = if enabled {
-                (
-                    Color::srgba(0.06, 0.06, 0.12, 0.95),
-                    Color::srgb(0.12, 0.12, 0.24),
-                    Color::srgb(0.91, 0.89, 0.87),
-                )
-            } else {
-                (
-                    Color::srgba(0.06, 0.06, 0.12, 0.6),
-                    Color::srgb(0.12, 0.12, 0.24),
-                    Color::srgb(0.45, 0.45, 0.5),
-                )
-            };
-            let mut e = panel.spawn((
-                Button,
-                editor_text_input_node(),
-                BackgroundColor(bg),
-                BorderColor::all(border),
-                TextInput {
-                    value: initial.clone(),
-                    focused: false,
-                    cursor: initial.len(),
-                },
-                NodeEditorTextInput {
-                    node_id: node_id.clone(),
-                    field: NodeEditorField::Value,
-                },
-                NodeEditorEntity,
-            ));
-            if enabled {
-                e.insert(TextInputBox);
-            }
-            e.with_children(|p| {
-                p.spawn((
-                    Text::new(initial),
-                    text_font(font, 14.0),
-                    TextColor(fg),
-                    TextInputDisplay,
-                    NodeEditorEntity,
-                ));
-            });
-        }
-    }
-}
-
-fn spawn_typecast_checkbox_and_value(
-    row: &mut ChildSpawnerCommands,
-    font: &Handle<Font>,
-    node_id: &model::node::Id,
-    current: &model::r#type::EType,
-    open: &Option<(model::node::Id, DropdownKind)>,
-) {
-    let enabled = value_of_etype(current).is_some();
-    row.spawn((
-        Button,
-        Node {
-            width: Val::Px(16.0),
-            height: Val::Px(16.0),
-            border: UiRect::all(Val::Px(1.5)),
-            border_radius: BorderRadius::all(Val::Px(3.0)),
-            flex_shrink: 0.0,
-            ..default()
-        },
-        BackgroundColor(if enabled {
-            Color::srgb(0.133, 0.827, 0.933)
-        } else {
-            Color::srgba(0.06, 0.06, 0.12, 0.95)
-        }),
-        BorderColor::all(Color::srgb(0.35, 0.35, 0.5)),
-        ValueEnableCheckbox {
-            node_id: node_id.clone(),
-        },
-        NodeEditorEntity,
-    ));
-    spawn_value_widget(row, font, node_id, current, enabled, open);
-}
-
-fn spawn_dropdown_root(
-    panel: &mut ChildSpawnerCommands,
-    font: &Handle<Font>,
-    node_id: &model::node::Id,
-    kind: DropdownKind,
-    label: &str,
-    open: &Option<(model::node::Id, DropdownKind)>,
-    spawn_options: impl FnOnce(&mut ChildSpawnerCommands),
-) {
-    let is_open = matches!(open, Some((oid, ok)) if oid == node_id && *ok == kind);
-    let mut root = panel.spawn((
-        Node {
-            flex_direction: FlexDirection::Column,
-            flex_grow: 1.0,
-            ..default()
-        },
-        NodeEditorEntity,
-    ));
-    root.with_children(|dd| {
-        dd.spawn((
-            Button,
-            Node {
-                padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
-                border: UiRect::all(Val::Px(1.5)),
-                border_radius: BorderRadius::all(Val::Px(4.0)),
-                justify_content: JustifyContent::SpaceBetween,
-                align_items: AlignItems::Center,
-                flex_direction: FlexDirection::Row,
-                ..default()
-            },
-            BackgroundColor(Color::srgba(0.06, 0.06, 0.12, 0.95)),
-            BorderColor::all(Color::srgb(0.12, 0.12, 0.24)),
-            Dropdown {
-                node_id: node_id.clone(),
-                kind,
-            },
-            NodeEditorEntity,
-        ))
-        .with_children(|b| {
-            b.spawn((
-                Text::new(label.to_string()),
-                text_font(font, 14.0),
-                TextColor(Color::srgb(0.91, 0.89, 0.87)),
-                NodeEditorEntity,
-            ));
-            b.spawn((
-                Text::new(if is_open { "▴" } else { "▾" }),
-                text_font(font, 12.0),
-                TextColor(Color::srgb(0.6, 0.6, 0.7)),
-                NodeEditorEntity,
-            ));
-        });
-        if is_open {
-            dd.spawn((
-                Node {
-                    flex_direction: FlexDirection::Column,
-                    margin: UiRect::top(Val::Px(2.0)),
-                    padding: UiRect::all(Val::Px(2.0)),
-                    border_radius: BorderRadius::all(Val::Px(4.0)),
-                    ..default()
-                },
-                BackgroundColor(Color::srgba(0.08, 0.08, 0.14, 0.98)),
-                NodeEditorEntity,
-            ))
-            .with_children(|options| {
-                spawn_options(options);
-            });
-        }
-    });
-}
-
-fn spawn_dropdown_option(
-    options: &mut ChildSpawnerCommands,
-    font: &Handle<Font>,
-    node_id: &model::node::Id,
-    kind: DropdownKind,
-    choice: DropdownChoice,
-    label: &str,
-    is_current: bool,
-) {
-    options
-        .spawn((
-            Button,
-            Node {
-                padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
-                border_radius: BorderRadius::all(Val::Px(3.0)),
-                justify_content: JustifyContent::SpaceBetween,
-                flex_direction: FlexDirection::Row,
-                ..default()
-            },
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.0)),
-            DropdownOption {
-                node_id: node_id.clone(),
-                kind,
-                choice,
-            },
-            NodeEditorEntity,
-        ))
-        .with_children(|b| {
-            b.spawn((
-                Text::new(label.to_string()),
-                text_font(font, 14.0),
-                TextColor(Color::srgb(0.85, 0.85, 0.9)),
-                NodeEditorEntity,
-            ));
-            b.spawn((
-                Text::new(if is_current { "✓" } else { " " }),
-                text_font(font, 13.0),
-                TextColor(Color::srgb(0.133, 0.827, 0.933)),
-                NodeEditorEntity,
-            ));
-        });
-}
-
-fn editor_text_input_node() -> Node {
-    Node {
-        padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
-        border: UiRect::all(Val::Px(1.5)),
-        border_radius: BorderRadius::all(Val::Px(4.0)),
-        flex_grow: 1.0,
-        min_width: Val::Px(0.0),
-        ..default()
-    }
-}
-
-fn handle_dropdown_click(
-    interaction_q: Query<(&Interaction, &Dropdown), Changed<Interaction>>,
-    mut dropdown_state: ResMut<DropdownState>,
-) {
-    for (interaction, dd) in interaction_q.iter() {
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
-        let key = (dd.node_id.clone(), dd.kind);
-        dropdown_state.open = if dropdown_state.open.as_ref() == Some(&key) {
-            None
-        } else {
-            Some(key)
-        };
-    }
-}
-
-fn handle_dropdown_option_click(
-    interaction_q: Query<(&Interaction, &DropdownOption), Changed<Interaction>>,
-    mut state: ResMut<GraphState>,
-    mut dropdown_state: ResMut<DropdownState>,
-    mut rebuild: ResMut<NeedsRebuild>,
-) {
-    for (interaction, option) in interaction_q.iter() {
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
-        match &option.choice {
-            DropdownChoice::Type(new_choice) => {
-                if set_node_type(&mut state, &option.node_id, *new_choice) {
-                    rebuild.0 = true;
-                }
-            }
-            DropdownChoice::BoolValue(v) => {
-                let node = state
-                    .layout_graph
-                    .find_node_graph_mut(&option.node_id)
-                    .and_then(|a| a.graph.nodes.get_mut(&option.node_id));
-                match node {
-                    Some(model::node::ENode::Constant { r#type, .. })
-                    | Some(model::node::ENode::TypeCast { r#type, .. })
-                    | Some(model::node::ENode::Source { r#type, .. })
-                    | Some(model::node::ENode::Pattern { r#type, .. }) => {
-                        if let model::r#type::EType::Bool { value } = r#type {
-                            *value = Some(if *v { "true" } else { "false" }.to_string());
-                            state.resettle();
-                            rebuild.0 = true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            DropdownChoice::Function(new_fn_id) => {
-                let decl = state.function_declarations.get(new_fn_id).cloned();
-                if let Some(new_decl) = decl {
-                    let node_id_domain = state.node_id_domain.clone();
-                    let anchor_id_domain = state.anchor_id_domain.clone();
-                    if let Some(owning_graph) =
-                        state.layout_graph.find_node_graph_mut(&option.node_id)
-                    {
-                        let (new_layout, new_node_id_domain, new_anchor_id_domain) = owning_graph
-                            .with_function_call_replaced(
-                                &option.node_id,
-                                (new_fn_id.clone(), &new_decl),
-                                node_id_domain,
-                                anchor_id_domain,
-                            );
-                        *owning_graph = new_layout;
-                        state.node_id_domain = new_node_id_domain;
-                        state.anchor_id_domain = new_anchor_id_domain;
-                        state.resettle();
-                        rebuild.0 = true;
-                    }
-                }
-            }
-        }
-        dropdown_state.open = None;
-    }
-}
-
-fn handle_value_enable_checkbox(
-    interaction_q: Query<(&Interaction, &ValueEnableCheckbox), Changed<Interaction>>,
-    mut state: ResMut<GraphState>,
-    mut rebuild: ResMut<NeedsRebuild>,
-) {
-    for (interaction, cb) in interaction_q.iter() {
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
-        let r#type = match state
-            .layout_graph
-            .find_node_graph_mut(&cb.node_id)
-            .and_then(|a| a.graph.nodes.get_mut(&cb.node_id))
-        {
-            Some(model::node::ENode::TypeCast { r#type, .. })
-            | Some(model::node::ENode::Pattern { r#type, .. }) => r#type,
-            _ => continue,
-        };
-        let current = value_of_etype(r#type);
-        let toggled: Option<String> = if current.is_some() {
-            None
-        } else {
-            Some(String::new())
-        };
-        *r#type = make_etype(type_choice_of(r#type), toggled);
-        // Pinning or unpinning a literal changes how the anchor renders and,
-        // through a BranchSource, what its branch declares.
-        state.resettle();
-        rebuild.0 = true;
-    }
-}
-
-fn handle_node_editor_text_input(
-    input_q: Query<(&NodeEditorTextInput, &TextInput), Changed<TextInput>>,
-    mut state: ResMut<GraphState>,
-    mut rebuild: ResMut<NeedsRebuild>,
-) {
-    for (editor_input, input) in input_q.iter() {
-        let Some(node) = state
-            .layout_graph
-            .find_node_graph_mut(&editor_input.node_id)
-            .and_then(|a| a.graph.nodes.get_mut(&editor_input.node_id))
-        else {
-            continue;
-        };
-        match editor_input.field {
-            NodeEditorField::SourceName => {
-                if let model::node::ENode::Source { name, .. } = node {
-                    if *name != input.value {
-                        *name = input.value.clone();
-                        // The name is written along the body, so it decides
-                        // how many cells that body claims — renaming reshapes
-                        // the node exactly the way retyping a value does.
-                        state.resettle();
-                        rebuild.0 = true;
-                    }
-                }
-            }
-            NodeEditorField::Value => {
-                let r#type = match node {
-                    model::node::ENode::Constant { r#type, .. }
-                    | model::node::ENode::TypeCast { r#type, .. }
-                    | model::node::ENode::Source { r#type, .. }
-                    | model::node::ENode::Pattern { r#type, .. } => r#type,
-                    _ => continue,
-                };
-                let choice = type_choice_of(r#type);
-                // Ignore the initial spawn's Added-tick: an empty input against
-                // a None value is not a user edit.
-                if input.value.is_empty() && value_of_etype(r#type).is_none() {
-                    continue;
-                }
-                let new_value = Some(input.value.clone());
-                if value_of_etype(r#type) != new_value {
-                    *r#type = make_etype(choice, new_value);
-                    // A literal reaches the branch through its BranchSource,
-                    // so the shapes downstream have to be refreshed too.
-                    state.resettle();
-                    rebuild.0 = true;
-                }
-            }
-        }
-    }
 }
 
 /// Switch the camera between bound and free.
@@ -3650,15 +3294,16 @@ fn spawn_controls_modal(commands: &mut Commands, font: &Handle<Font>) {
             "Ctrl + Shift + Up/Down",
             "NORMAL: move the selected node vertically",
         ),
-        ("i", "Enter INSERT mode"),
+        ("i", "INSERT: build here, or edit what stands here"),
         ("Up/Down", "INSERT: walk the suggestion list"),
+        ("Left/Right, Home/End", "INSERT: move the text cursor"),
         ("Space", "INSERT: open a cell behind the caret"),
         (
             "Return",
             "INSERT: commit the highlighted row, else open a column (X)",
         ),
         ("Shift + Return", "INSERT: open a row (Y)"),
-        ("Escape", "Unfocus text input, then leave INSERT"),
+        ("Escape", "Leave INSERT"),
     ];
 
     commands
@@ -5245,77 +4890,57 @@ fn text_input_focus(
     }
 }
 
-/// The name field's focus is not a property of the mouse but a function of the
-/// mode: in INSERT on a Source's body cell the keys go into the name, and
-/// nowhere else do they. So this writes `focused` **both** ways and is the last
-/// writer in the frame — what `text_input_focus` concluded from a click or an
-/// Escape does not hold for this one box.
+/// Keeps the prompt standing on the property the caret addresses: entering
+/// INSERT on a cell that already holds something opens on what it holds, so
+/// changing a value starts from the value instead of from nothing.
 ///
-/// Being total is the point. A click on something that does not move the caret
-/// — the panel's own background, the Evaluate button — would otherwise blur the
-/// field and leave INSERT with neither a field nor a prompt: a dead end. Here
-/// the focus simply comes back. And in NORMAL the box is never focused, so
-/// `keyboard_captured` is false there and `hjkl` keeps working.
+/// Re-seeds when the mode or the target changes and at no other time. A
+/// keystroke changes neither, so typing is safe from it; a mouse click can move
+/// the caret under INSERT, which is exactly the case a one-shot seed at the `i`
+/// keypress would miss.
 ///
-/// It never writes the mode; the other direction is `handle_source_name_click`.
-fn sync_source_name_focus(
+/// It stands where the Source name field's focus projection used to. That field
+/// is gone — every property is typed into the one prompt now — so what has to
+/// be projected from the mode is no longer a focus but the text itself.
+fn sync_prompt_seed(
     mode: Res<EditorMode>,
     state: Res<GraphState>,
     pick: Res<PickState>,
-    start_menu: Res<StartMenu>,
-    eval: Res<EvalState>,
-    mut input_q: Query<(&NodeEditorTextInput, &mut TextInput)>,
-) {
-    let wanted = if *mode == EditorMode::Insert && !start_menu.showing && !is_evaluating(&eval) {
-        match insert_target(&state, &pick) {
-            InsertTarget::Name(id) => Some(id),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    for (editor_input, mut input) in input_q.iter_mut() {
-        if editor_input.field != NodeEditorField::SourceName {
-            continue;
-        }
-        let want = wanted.as_ref() == Some(&editor_input.node_id);
-        // Guarded: `handle_node_editor_text_input` watches `Changed<TextInput>`,
-        // and a write marks the component whether or not it changed anything.
-        if input.focused != want {
-            input.focused = want;
-        }
-    }
-}
-
-/// Clicking into the name box is the same act as pressing `i` on the body cell
-/// it belongs to, so it means the same thing — exactly as the "Add" button
-/// means `i` on an empty one.
-///
-/// Edge-triggered, and that is what keeps it from fighting
-/// `sync_source_name_focus`: an Escape blurs the field without producing an
-/// interaction edge, so it cannot bounce straight back into INSERT.
-fn handle_source_name_click(
-    interaction_q: Query<(&Interaction, &NodeEditorTextInput), Changed<Interaction>>,
-    eval: Res<EvalState>,
-    mut mode: ResMut<EditorMode>,
     mut prompt: ResMut<InsertPrompt>,
-    mut rebuild: ResMut<NeedsRebuild>,
+    mut pending: ResMut<PendingNode>,
+    mut last: Local<Option<(EditorMode, InsertTarget)>>,
 ) {
-    if is_evaluating(&eval) {
+    let target = insert_target(&state, &pick);
+    let now = (*mode, target.clone());
+    if last.as_ref() == Some(&now) {
         return;
     }
-    for (interaction, editor_input) in interaction_q.iter() {
-        if *interaction != Interaction::Pressed || editor_input.field != NodeEditorField::SourceName
-        {
-            continue;
+    *last = Some(now);
+
+    // A node is only unfinished while the caret is still standing on it.
+    // Walking away is not a cancel — the node keeps what it has — but it does
+    // mean the next Escape is about something else, so the mark is dropped
+    // rather than carried around waiting to unmake a node nobody is looking at.
+    let pending_here = match (&pending.0, &target) {
+        (Some(edit), InsertTarget::Edit(id, _)) => edit.node == *id,
+        _ => false,
+    };
+    if !pending_here {
+        pending.0 = None;
+    }
+
+    match (*mode, &target) {
+        (EditorMode::Insert, InsertTarget::Edit(id, edit)) => {
+            // A node that was built a keystroke ago has nothing to open on, and
+            // this needs no special case to know it: the property it is being
+            // asked for is exactly the one it does not carry, and
+            // `property_text` spells an absent property as the empty string.
+            prompt.set_text(property_text(&state, id, edit));
+            reselect(&mut prompt, &state, &pick);
         }
-        // Guarded so a press doesn't mark `EditorMode` changed for nothing.
-        if *mode != EditorMode::Insert {
-            *mode = EditorMode::Insert;
-            prompt.clear();
-            // The caret is drawn per mode, and it is a scene entity.
-            rebuild.0 = true;
-        }
+        // A create prompt has nothing to open on, and NORMAL has no prompt at
+        // all — both start from empty.
+        _ => prompt.clear(),
     }
 }
 
@@ -5436,10 +5061,14 @@ fn trigger_camera_focus_on_selection_change(
     }
 }
 
-/// True while something other than the graph owns the keyboard: a focused
-/// text field, a modal, the start menu, or a running evaluation. Mode
-/// switching and the INSERT-mode inserts stay out of the way then — otherwise
-/// `i` would both type an `i` and change the mode.
+/// True while something other than the graph owns the keyboard: a modal's text
+/// field, a modal, the start menu, or a running evaluation. Mode switching and
+/// the INSERT-mode inserts stay out of the way then — otherwise `i` would both
+/// type an `i` and change the mode.
+///
+/// The editor itself never appears here any more: its one text field was the
+/// Source's name, and that is typed into the prompt now, which is deliberately
+/// not a `TextInput` precisely so it does not capture.
 fn keyboard_captured(
     text_inputs: &Query<&TextInput>,
     start_menu: &StartMenu,
@@ -5485,12 +5114,12 @@ fn apply_room_insert(
 /// coordinates, and the prompt, into which every other key writes.
 ///
 /// What the prompt is *for* is a question about the caret's cell, not about
-/// this system: on a free cell it names what to create, on a Source's output
-/// anchor it names a type (`insert_target`). The room-makers belong to the
-/// first case alone — where the prompt edits a property of a node that already
-/// stands there, making room is not an answer to anything. `Space` belongs to
-/// the prompt rather than to the room-makers for the length of an unclosed
-/// quote, and only then.
+/// this system: on a free cell it names what to create, on a cell that stands
+/// for a property it names that property's new value (`insert_target`). The
+/// room-makers belong to the first case alone — where the prompt edits
+/// something that already stands there, making room is not an answer to
+/// anything, and `Space` is simply a character. On a create prompt `Space`
+/// belongs to the prompt for the length of an unclosed quote, and only then.
 ///
 /// Mode switch and prompt have to be **one** system: the key that enters
 /// INSERT is consumed at the very point that flips the mode, so it cannot also
@@ -5508,12 +5137,9 @@ fn apply_room_insert(
 /// While something else owns the keyboard the batch is walked but ignored,
 /// rather than left standing: a message survives two updates, so keys struck
 /// under the guard would otherwise fire once it lifts — and a field's text
-/// would land in the prompt.
-///
-/// Two keys are the exception, and only while the guard means "a field is
-/// being typed into": `Esc` and `Enter` end the typing, and since that field
-/// *is* what INSERT means on a Source's body cell, leaving it is leaving the
-/// mode. One key, one thought.
+/// would land in the prompt. There are no exceptions left: the editor's own
+/// text field is gone, so whatever owns the keyboard is the start menu, a modal
+/// or an evaluation, and none of them are a mode to leave.
 fn handle_editor_keys(
     mut key_events: MessageReader<KeyboardInput>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -5522,15 +5148,12 @@ fn handle_editor_keys(
     eval: Res<EvalState>,
     mut mode: ResMut<EditorMode>,
     mut prompt: ResMut<InsertPrompt>,
+    mut pending: ResMut<PendingNode>,
     mut state: ResMut<GraphState>,
     mut pick: ResMut<PickState>,
     mut rebuild: ResMut<NeedsRebuild>,
 ) {
     let captured = keyboard_captured(&text_inputs, &start_menu, &eval);
-    // Of the four reasons the keyboard can be taken, only one is "the user is
-    // typing"; the start menu, a modal and a running evaluation do not belong
-    // to the editor at all.
-    let typing = captured && !start_menu.showing && !is_evaluating(&eval);
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     let target = insert_target(&state, &pick);
 
@@ -5539,30 +5162,36 @@ fn handle_editor_keys(
             continue;
         }
         if captured {
-            // One key gets through a field that is being typed into, and only
-            // to end the typing: the field is INSERT while it has the keys, so
-            // the way out of the field is the way out of the mode. Everything
-            // else belongs to the field — and the batch is walked rather than
-            // left standing, because a message survives two updates and would
-            // otherwise fire once the guard lifts.
-            if typing
-                && *mode == EditorMode::Insert
-                && matches!(
-                    ev.logical_key,
-                    bevy::input::keyboard::Key::Escape | bevy::input::keyboard::Key::Enter
-                )
-            {
-                prompt.clear();
-                *mode = EditorMode::Normal;
-                // The caret is drawn per mode, and it is a scene entity.
-                rebuild.0 = true;
-            }
+            // Nothing in the editor takes the keyboard any more — every
+            // property is typed into the prompt, which deliberately is not a
+            // text field — so what is left owning it is the start menu, a modal
+            // and a running evaluation, none of which belong to the editor at
+            // all. The batch is walked rather than left standing, because a
+            // message survives two updates and would otherwise fire once the
+            // guard lifts.
             continue;
         }
         match (*mode, &ev.logical_key) {
             (_, bevy::input::keyboard::Key::Escape) => {
                 // Escape leaves INSERT outright and drops what was typed —
                 // there is no half-written name worth keeping.
+                //
+                // And where what stands under the caret was built a moment ago
+                // and is still waiting for its one mandatory property, dropping
+                // what was typed means dropping the node: a cancelled insert
+                // leaves no placeholder behind, and the caret goes back to the
+                // cell it was standing on.
+                if let Some(edit) = pending.0.take() {
+                    if remove_node_at_caret(&mut state, &pick, &edit.node) {
+                        pick.selected_pos = state.root_graph().clamp_to_volume(edit.caret_before);
+                        prompt.clear();
+                        *mode = EditorMode::Normal;
+                        rebuild.0 = true;
+                        // The rest of the batch was struck against a graph that
+                        // no longer holds what those keys were about.
+                        break;
+                    }
+                }
                 prompt.clear();
                 if *mode != EditorMode::Normal {
                     *mode = EditorMode::Normal;
@@ -5582,25 +5211,43 @@ fn handle_editor_keys(
                     // A single press can carry more than one character when a
                     // dead key resolves; control characters are not a name.
                     if !s.is_empty() && !s.chars().any(|c| c.is_control()) {
-                        prompt.text.push_str(s.as_str());
-                        let selected = first_selection(
-                            &prompt.text,
-                            &prompt_candidates(&state, &pick, &prompt.text),
-                        );
-                        prompt.selected = selected;
+                        prompt.insert_str(s.as_str());
+                        reselect(&mut prompt, &state, &pick);
                     }
                 }
                 // Deleting back to an empty text drops the highlight with it,
-                // which is the other way out of the list: `Return` goes back to
-                // opening a column.
+                // which on a create prompt is the other way out of the list:
+                // `Return` goes back to opening a column.
                 bevy::input::keyboard::Key::Backspace => {
-                    prompt.text.pop();
-                    let selected = first_selection(
-                        &prompt.text,
-                        &prompt_candidates(&state, &pick, &prompt.text),
-                    );
-                    prompt.selected = selected;
+                    if let Some(prev) = prompt.prev_boundary() {
+                        prompt.text.remove(prev);
+                        prompt.cursor = prev;
+                        reselect(&mut prompt, &state, &pick);
+                    }
                 }
+                // Deletes forward, so the cursor does not move.
+                bevy::input::keyboard::Key::Delete => {
+                    if prompt.next_boundary().is_some() {
+                        let at = prompt.cursor;
+                        prompt.text.remove(at);
+                        reselect(&mut prompt, &state, &pick);
+                    }
+                }
+                // The list claims Up and Down; Left and Right are the text's,
+                // which is what makes the prompt usable when it opens on a
+                // value that is already there.
+                bevy::input::keyboard::Key::ArrowLeft => {
+                    if let Some(prev) = prompt.prev_boundary() {
+                        prompt.cursor = prev;
+                    }
+                }
+                bevy::input::keyboard::Key::ArrowRight => {
+                    if let Some(next) = prompt.next_boundary() {
+                        prompt.cursor = next;
+                    }
+                }
+                bevy::input::keyboard::Key::Home => prompt.cursor = 0,
+                bevy::input::keyboard::Key::End => prompt.cursor = prompt.text.len(),
                 bevy::input::keyboard::Key::ArrowDown | bevy::input::keyboard::Key::ArrowUp => {
                     let delta = if matches!(key, bevy::input::keyboard::Key::ArrowDown) {
                         1
@@ -5610,18 +5257,20 @@ fn handle_editor_keys(
                     let candidates = prompt_candidates(&state, &pick, &prompt.text);
                     prompt.selected = step_selection(&candidates, prompt.selected, delta);
                 }
-                // Inside an unclosed quote the space bar writes a space —
-                // `Key::Space` is its own variant, so the `Character` arm
+                // On a cell that names a property there is no room to make, so
+                // the space bar is simply a character — which is what keeps a
+                // Source name with a space in it typeable.
+                //
+                // Inside an unclosed quote it writes one on a create prompt
+                // too: `Key::Space` is its own variant, so the `Character` arm
                 // never sees one and a string could otherwise not hold one.
-                // The guard needs a non-empty text, the room-maker below an
+                // That guard needs a non-empty text and the room-maker below an
                 // empty one, so the two can never both fire.
-                bevy::input::keyboard::Key::Space if in_open_quote(&prompt.text) => {
-                    prompt.text.push(' ');
-                    let selected = first_selection(
-                        &prompt.text,
-                        &prompt_candidates(&state, &pick, &prompt.text),
-                    );
-                    prompt.selected = selected;
+                bevy::input::keyboard::Key::Space
+                    if target != InsertTarget::Create || in_open_quote(&prompt.text) =>
+                {
+                    prompt.insert_str(" ");
+                    reselect(&mut prompt, &state, &pick);
                 }
                 // The room-makers belong to the prompt that builds: where the
                 // prompt edits a property of a node that already stands there,
@@ -5675,13 +5324,13 @@ fn handle_editor_keys(
                 }
                 bevy::input::keyboard::Key::Enter if !ev.repeat => {
                     // Commit the highlighted row — and with no highlight,
-                    // nothing: an empty type prompt has not been answered yet,
-                    // and there is no second meaning for the key to fall back
-                    // on the way the create prompt has its column.
+                    // nothing: a prompt that nothing answers has not been
+                    // answered yet, and there is no second meaning for the key
+                    // to fall back on the way the create prompt has its column.
                     //
                     // After creating, the caret stays on the cell the node now
                     // fills and INSERT stays on, so the next one can be typed
-                    // straight away. Declaring a type is one answer to one
+                    // straight away. Changing a property is one answer to one
                     // question — it is finished, and staying would only offer
                     // to answer it again.
                     let candidates = prompt_candidates(&state, &pick, &prompt.text);
@@ -5690,12 +5339,15 @@ fn handle_editor_keys(
                         .filter(|suggestion| suggestion.allowed)
                         .map(|suggestion| suggestion.action.clone())
                     {
-                        if apply_prompt_action(&mut state, &pick, &action) {
-                            prompt.clear();
-                            rebuild.0 = true;
-                            if matches!(action, PromptAction::SetType(_)) {
-                                *mode = EditorMode::Normal;
-                            }
+                        if let Some(outcome) = apply_prompt_action(&mut state, &mut pick, &action) {
+                            commit_outcome(
+                                outcome,
+                                &action,
+                                &mut prompt,
+                                &mut pending,
+                                &mut mode,
+                                &mut rebuild,
+                            );
                         }
                     }
                     break;
@@ -6086,9 +5738,9 @@ fn main() {
         .init_resource::<DragState>()
         .init_resource::<EvalState>()
         .init_resource::<StartMenu>()
-        .init_resource::<DropdownState>()
         .init_resource::<EditorMode>()
         .init_resource::<InsertPrompt>()
+        .init_resource::<PendingNode>()
         .add_systems(
             Startup,
             (
@@ -6115,7 +5767,6 @@ fn main() {
                     (
                         handle_delete_node_button,
                         handle_add_button,
-                        handle_source_name_click,
                         handle_insert_prompt_click,
                         handle_hamburger_button,
                         handle_start_menu_new_button,
@@ -6126,26 +5777,26 @@ fn main() {
                     )
                         .chain()
                         // A click resolves before the keys of the same frame.
-                        // Both `handle_add_button` and
-                        // `handle_source_name_click` set the mode, and the
-                        // keyboard chain projects the mode onto the name box's
-                        // focus at its end — ambiguous, that projection could
-                        // run on the mode the click was about to change.
+                        // `handle_add_button` sets the mode and `pick_nodes`
+                        // moves the caret, and the keyboard chain projects both
+                        // onto the prompt's text at its end — ambiguous, that
+                        // projection could run on the state the click was about
+                        // to change.
                         .before(handle_editor_keys),
                     highlight_hovered,
                     update_selection_display,
                     update_grid_material,
                     update_cursor,
-                    // Mode before focus before keys before the projection of
-                    // the mode back onto the focus. The last link has to be
-                    // last: were the name box focused in the same frame that
-                    // `i` flips the mode, `text_input_keyboard` would type that
-                    // `i` into the name.
+                    // Mode and caret before keys before the projection of the
+                    // two back onto the prompt's text. The last link has to be
+                    // last: it re-seeds the prompt when the addressed property
+                    // changes, and running it before the keys would wipe what
+                    // was typed in the same frame the caret was moved.
                     (
                         handle_editor_keys,
                         text_input_focus,
                         text_input_keyboard,
-                        sync_source_name_focus,
+                        sync_prompt_seed,
                     )
                         .chain(),
                     handle_arrow_keys,
@@ -6199,19 +5850,13 @@ fn main() {
         )
         .add_systems(
             Update,
-            (
-                handle_dropdown_click,
-                handle_dropdown_option_click,
-                handle_value_enable_checkbox,
-                handle_node_editor_text_input,
-                sync_node_editor_ui,
-                sync_insert_prompt_ui,
-            )
+            (sync_node_editor_ui, sync_insert_prompt_ui)
                 .chain()
-                // Both panels now draw what was typed this frame, so they have
-                // to run after the keys landed — otherwise the type prompt
-                // shows the previous frame's text every other frame.
-                .after(text_input_keyboard),
+                // Both panels draw what was typed this frame, so they have to
+                // run after the keys landed and after the seed that follows
+                // them — otherwise a prompt shows the previous frame's text
+                // every other frame.
+                .after(sync_prompt_seed),
         )
         .run();
 }

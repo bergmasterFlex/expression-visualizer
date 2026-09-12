@@ -171,16 +171,6 @@ pub struct RenderObject {
     pub transform: Transform,
 }
 
-/// A wire-like band standing in for a node body. Carries an `EdgeMaterial`
-/// instead of a `StandardMaterial`, so the spawner handles it separately from
-/// `RenderObject`.
-pub struct RenderBand {
-    pub mesh: Mesh,
-    pub color: Color,
-    /// Which prebuilt marquee texture names the type (`edge::EdgeLabelTextures`).
-    pub kind: crate::edge::LeafKind,
-}
-
 /// A face of a body with text printed on it — the name a Source carries on its
 /// top face, rather than a label floating beside the node.
 ///
@@ -200,15 +190,18 @@ pub struct RenderTextFace {
 }
 
 pub struct RenderNode {
-    /// `None` for nodes drawn purely as bands or markers; the node entity is
-    /// still spawned so picking and selection keep working.
+    /// `None` for nodes drawn purely as markers or loose objects; the node
+    /// entity is still spawned so picking and selection keep working.
     pub node: Option<RenderObject>,
     pub anchors: std::collections::HashMap<crate::model::anchor::Id, RenderAnchor>,
     /// Type markers belonging to the node itself rather than to an anchor. A
     /// Pattern uses this: it declares the type its arm matches and is drawn as
     /// that type's band, but owns no anchor to hang it on.
     pub markers: Vec<RenderTypeMarker>,
-    pub bands: Vec<RenderBand>,
+    /// Meshes that are neither the node's own body nor an anchor's: the line
+    /// and the point a Constant is drawn as. They carry no identity — nothing
+    /// picks them and no edge ends on them.
+    pub objects: Vec<RenderObject>,
     pub labels: Vec<RenderLabel>,
     pub text_faces: Vec<RenderTextFace>,
 }
@@ -266,6 +259,10 @@ pub const ANCHOR_X: f32 = CELL * 0.075;
 /// Y-thickness of the gizmo line drawn in the far 2/3 of a value-carrying
 /// type marker.
 const VALUE_LINE_THICKNESS: f32 = CELL * 0.02;
+/// The point a Constant's value starts at, sitting at the centre of its body
+/// cell. A couple of times the line's own thickness, which is what makes it
+/// read as the end of the line rather than as a ball threaded onto it.
+const CONSTANT_DOT_RADIUS: f32 = CELL * 0.05;
 /// World-space padding between the tip of the gizmo line and the value
 /// label's projection point.
 const VALUE_LABEL_Z_PADDING: f32 = CELL / 30.0;
@@ -347,28 +344,6 @@ pub fn ordered_supported_leaves(t: &crate::infer::EType) -> Vec<crate::infer::ET
     let mut leaves = crate::infer::row_leaves(t);
     leaves.sort_by_key(|leaf| std::cmp::Reverse(type_marker_order(leaf).unwrap_or(u8::MAX)));
     leaves
-}
-
-/// Body of a Constant, rendered as a wire band rather than a solid slab: it
-/// *is* the start of the value's path, and the marquee names its type.
-///
-/// A Source used to be drawn this way too. It no longer is: it carries a name,
-/// and a name needs a face to be written on, so it got a solid body instead.
-///
-/// Reuses the edge ribbon (`edge::build_ribbon_mesh`) with a hand-built
-/// straight curve through the body cell — `EdgeCurve`'s control points are
-/// public precisely so a caller can bypass `from_endpoints`, whose ≥1.5-unit
-/// handles would bulge a same-cell span.
-pub fn source_body_curve(cell_center: Vec3) -> crate::edge::EdgeCurve {
-    let half = LAYOUT_SCALE.z.abs() * 0.5;
-    let front = cell_center + Vec3::new(0.0, 0.0, half);
-    let back = cell_center + Vec3::new(0.0, 0.0, -half);
-    crate::edge::EdgeCurve {
-        p0: front,
-        p1: front.lerp(back, 1.0 / 3.0),
-        p2: front.lerp(back, 2.0 / 3.0),
-        p3: back,
-    }
 }
 
 /// Build the stack of translucent type rectangles at an anchor.
@@ -501,6 +476,34 @@ fn typed_anchor(
     }
 }
 
+/// A declared type drawn on a cell the way an input anchor is drawn — the
+/// type's band and its letter, or its literal — and the neutral grey where no
+/// type has been chosen yet.
+///
+/// Two kinds hang a type on a cell of their own rather than on an anchor: a
+/// Pattern, whose cell is the arm it matches, and a TypeCast, whose cell is what
+/// it casts to. Both are input-side: what the cell names is what may *arrive*.
+///
+/// It returns two vectors because `RenderNode::markers` has no `plain_body` slot
+/// the way `RenderAnchor` does — an unchosen type has no leaves, so
+/// `build_type_markers` yields nothing and the grey goes into `objects`.
+fn declared_type_cell(
+    r#type: Option<&crate::model::r#type::EType>,
+    cell_center: Vec3,
+) -> (Vec<RenderTypeMarker>, Vec<RenderObject>) {
+    let eval_type = r#type
+        .map(crate::infer::graph_type_to_eval_type)
+        .unwrap_or(crate::infer::EType::Pending);
+    let literal = r#type.and_then(crate::layout::value_of_etype);
+    let markers = build_type_markers(&eval_type, literal.as_deref(), cell_center, true);
+    let objects = markers
+        .is_empty()
+        .then(|| plain_anchor_body(cell_center, true))
+        .into_iter()
+        .collect();
+    (markers, objects)
+}
+
 /// A neutral grey anchor cuboid for anchors that carry no type markers
 /// (unconstrained inputs, pending outputs), so they stay visible and pickable.
 /// `cell_center` is the anchor cell's centre; the cuboid fills that cell's
@@ -546,7 +549,6 @@ pub fn layoutnode_to_rendernode(
     extra_offset: Vec3,
 ) -> RenderNode {
     let graph = &layout_graph.graph;
-    let node_pos = cell_center_world(layout_node.pos + extra_offset);
     // World centre of a node-local cell. Every part of a node — each anchor
     // row, the body — lives in its own cell, so placement goes through this
     // rather than nudging sub-meshes around inside a single cell.
@@ -563,7 +565,7 @@ pub fn layoutnode_to_rendernode(
             r#type,
             output_anchor,
         } => {
-            let depth = crate::layout::source_body_cells(name);
+            let depth = crate::layout::name_body_cells(name);
             let output_world = cell(0, 0, depth);
             let output_eval_type = crate::infer::graph_type_to_eval_type(r#type);
             let output_value = crate::layout::value_of_etype(r#type);
@@ -679,7 +681,7 @@ pub fn layoutnode_to_rendernode(
                 // The drawn-only input anchor belongs to the node itself, not
                 // to an anchor of it — the same place a Pattern's band lives.
                 markers: input_markers,
-                bands: vec![],
+                objects: vec![],
                 // The name is on the body now, and the type is in the body's
                 // colour and at the output anchor — the index is the one thing
                 // left that has to be written beside the node.
@@ -687,8 +689,8 @@ pub fn layoutnode_to_rendernode(
                 text_faces: vec![name_face],
             }
         }
-        // A literal: body band at `0|0` naming the type, output anchor at
-        // `0|1`.
+        // A literal: the line its value travels on, starting at a point in the
+        // body cell `0|0` and leaving through the output anchor at `0|1`.
         crate::model::node::ENode::Constant {
             r#type,
             output_anchor,
@@ -697,19 +699,47 @@ pub fn layoutnode_to_rendernode(
             let output_world = cell(0, 0, 1);
             let output_eval_type = crate::infer::graph_type_to_eval_type(r#type);
             let output_value = crate::layout::value_of_etype(r#type);
-            let bands = crate::edge::leaf_kind_of(&output_eval_type)
-                .map(|kind| RenderBand {
-                    mesh: crate::edge::build_ribbon_mesh(
-                        &source_body_curve(body_world),
-                        body_world.y,
-                        body_world.y,
-                        crate::edge::RIBBON_HEIGHT,
-                    ),
-                    color: type_marker_color(&output_eval_type),
-                    kind,
-                })
-                .into_iter()
-                .collect();
+            let color = type_marker_color(&output_eval_type);
+            // The half of the body cell that faces the anchor, so the segment
+            // continues the value line the anchor draws into its own half
+            // (`build_type_markers`) and the two meet exactly at the cell
+            // boundary. Drawn whether or not the anchor has one: a `none`
+            // constant shows a band there instead, and the body still has to
+            // say where its value comes from.
+            let half_depth = LAYOUT_SCALE.z.abs() * 0.5;
+            let line_center = Vec3::new(
+                body_world.x,
+                body_world.y,
+                // Layout +Z is world −Z, so the anchor side of the cell is the
+                // one at the lower world Z.
+                body_world.z - half_depth * 0.5,
+            );
+            let line = RenderObject {
+                mesh: Cuboid::new(0.0, VALUE_LINE_THICKNESS, half_depth)
+                    .mesh()
+                    .build(),
+                material: StandardMaterial {
+                    base_color: color,
+                    alpha_mode: AlphaMode::Blend,
+                    cull_mode: None,
+                    unlit: true,
+                    ..default()
+                },
+                transform: Transform::from_translation(line_center),
+            };
+            // Where the value begins. White rather than the type's colour: the
+            // line already carries the type along its whole length, and what
+            // the point says is that this is the end of it — nothing is behind
+            // a constant.
+            let dot = RenderObject {
+                mesh: Sphere::new(CONSTANT_DOT_RADIUS).mesh().build(),
+                material: StandardMaterial {
+                    base_color: Color::WHITE,
+                    unlit: true,
+                    ..default()
+                },
+                transform: Transform::from_translation(body_world),
+            };
             RenderNode {
                 node: None,
                 anchors: std::collections::HashMap::from([(
@@ -726,47 +756,43 @@ pub fn layoutnode_to_rendernode(
                     },
                 )]),
                 markers: vec![],
-                bands,
+                objects: vec![line, dot],
                 // A literal draws itself: the value hangs off the output
                 // anchor, so there is nothing for a body label to add.
                 labels: vec![],
                 text_faces: vec![],
             }
         }
-        // Input anchor at `0|0`, body (the target type) at `0|1`, output at
-        // `0|2`.
+        // Input anchor at `0|0`, a gap at `0|1`, the target type at `0|2`,
+        // output at `0|3` — a Match's rhythm with one arm, which is what a cast
+        // is.
         crate::model::node::ENode::TypeCast {
             r#type,
             input_anchor,
             output_anchor,
         } => {
-            let color = Color::srgb(0.9, 0.0, 0.0);
             let input_world = cell(0, 0, 0);
-            let body_world = cell(0, 0, 1);
-            let output_world = cell(0, 0, 2);
+            let body_world = cell(0, 0, crate::layout::CAST_TYPE_Z);
+            let output_world = cell(0, 0, crate::layout::CAST_OUTPUT_Z);
             // The output reflects a possibly failed cast as `Sum(target, none)`
             // when a mismatched type flows in, and stays `Pending` while
-            // nothing flows in at all; that logic lives in `infer::anchor_type`.
+            // nothing flows in at all, or while nothing has been cast *to*;
+            // that logic lives in `infer::anchor_type`. Nothing falls back to
+            // the declared type here: what the cast will produce is a question
+            // about what arrives, not about what it aims at.
             let output_eval_type =
                 crate::infer::anchor_type(flat_graph, output_anchor, function_declarations)
-                    .unwrap_or_else(|| crate::infer::graph_type_to_eval_type(r#type));
+                    .unwrap_or(crate::infer::EType::Pending);
             let input_eval_type =
                 crate::infer::incoming_anchor_type(flat_graph, input_anchor, function_declarations);
-            let elim_value = crate::layout::value_of_etype(r#type);
+            let elim_value = r#type.as_ref().and_then(crate::layout::value_of_etype);
+            // Drawn as its arm's band, exactly as a Pattern is: a cast declares
+            // what may pass, and that is the same statement a pattern makes.
+            let (markers, objects) = declared_type_cell(r#type.as_ref(), body_world);
             RenderNode {
-                node: Some(RenderObject {
-                    mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, ANCHOR_X)
-                        .mesh()
-                        .build(),
-                    material: StandardMaterial {
-                        base_color: color,
-                        emissive: emissive_color(color),
-                        metallic: 0.3,
-                        perceptual_roughness: 0.6,
-                        ..default()
-                    },
-                    transform: Transform::from_translation(body_world),
-                }),
+                // No body of its own — the band *is* the node, the way a
+                // Pattern's is. The node entity is still spawned for picking.
+                node: None,
                 anchors: std::collections::HashMap::from([
                     (
                         input_anchor.clone(),
@@ -791,14 +817,14 @@ pub fn layoutnode_to_rendernode(
                         ),
                     ),
                 ]),
-                markers: vec![],
-                bands: vec![],
+                markers,
+                objects,
                 labels: vec![],
                 text_faces: vec![],
             }
         }
-        // Input anchors along `i|0`, body spanning the full width at `z=1..2`,
-        // output at `0|3`.
+        // Input anchors along `i|0`, body spanning the full width from `z=1` to
+        // as deep as the function's name needs, output one cell behind it.
         crate::model::node::ENode::FunctionCall {
             function_declaration_id,
             input_anchors,
@@ -808,6 +834,10 @@ pub fn layoutnode_to_rendernode(
                 .get(function_declaration_id)
                 .expect("function call refers to unknown function declaration");
             let width = input_anchors.len().max(1) as i32;
+            // The same rule the shape uses (`layout::node_shape`), read off the
+            // same name — the two are hand-written copies of one cell map and
+            // must not drift.
+            let depth = crate::layout::name_body_cells(&function_declaration.name);
             let cell_x = LAYOUT_SCALE.x.abs();
             let cell_y = LAYOUT_SCALE.y.abs();
             let cell_z = LAYOUT_SCALE.z.abs();
@@ -827,9 +857,9 @@ pub fn layoutnode_to_rendernode(
             let last_col = cell(width - 1, 0, 0);
             // Upper edge of row 0, shared by both faces.
             let top_y = first_col.y + cell_y * 0.5;
-            // Front face of body cell z=1 and back face of body cell z=2.
+            // Front face of the first body cell and back face of the last.
             let near_z = cell(0, 0, 1).z + cell_z * 0.5;
-            let far_z = cell(0, 0, 2).z - cell_z * 0.5;
+            let far_z = cell(0, 0, depth).z - cell_z * 0.5;
             let body_center = Vec3::new(
                 (first_col.x + last_col.x) * 0.5,
                 top_y - input_rows.max(output_rows) as f32 * cell_y * 0.5,
@@ -859,12 +889,42 @@ pub fn layoutnode_to_rendernode(
                 top_y - output_rows as f32 * cell_y,
                 far_z,
             );
-            let output_world = cell(0, 0, 3);
+            let output_world = cell(0, 0, depth + 1);
+            let body_color = Color::srgb(0.5, 0.9, 1.0);
+            // The function's name, printed along the body the way a Source's is
+            // — same rectangle, same rotation, same lift.
+            //
+            // Over column x=0 alone, and that is not only what "along the x=0
+            // row" asks for: the body is a frustum that tapers in X toward the
+            // output, so x=0 is the one column whose roof line both faces share
+            // at `top_y`. A face spanning the full input width would float over
+            // a sloped roof everywhere else.
+            let name_face = RenderTextFace {
+                mesh: Rectangle::new(depth as f32 * cell_z, cell_x).mesh().build(),
+                transform: Transform {
+                    translation: Vec3::new(
+                        first_col.x,
+                        top_y + BODY_FACE_LIFT,
+                        (near_z + far_z) * 0.5,
+                    ),
+                    rotation: Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)
+                        * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+                    scale: Vec3::ONE,
+                },
+                material: StandardMaterial {
+                    base_color: body_color,
+                    unlit: true,
+                    ..default()
+                },
+                text: function_declaration.name.clone(),
+                cells: depth as u32,
+                background: body_color,
+            };
             RenderNode {
                 node: Some(RenderObject {
                     mesh: crate::mesh::frustum_8pt_mesh(base_quad, top_quad),
                     material: StandardMaterial {
-                        base_color: Color::srgb(0.5, 0.9, 1.0),
+                        base_color: body_color,
                         emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
                         unlit: true,
                         ..default()
@@ -908,34 +968,28 @@ pub fn layoutnode_to_rendernode(
                     )])
                     .collect(),
                 markers: vec![],
-                bands: vec![],
-                labels: std::iter::once(RenderLabel {
-                    text: label_for_node(node, function_declarations),
-                    color: Color::WHITE,
-                    font_size: 18.0,
-                    world_pos: body_center,
-                    offset: Vec2::ZERO,
-                })
-                .chain(
-                    input_anchors
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i_anchor, _)| {
-                            let name = function_declaration.inputs.get(i_anchor)?.name.clone();
-                            Some(RenderLabel {
-                                text: name,
-                                // Neutral grey, subordinate to the node name and
-                                // the centred type-marker letter.
-                                color: Color::srgb(0.5, 0.5, 0.5),
-                                font_size: 12.0,
-                                world_pos: cell(i_anchor as i32, 0, 0),
-                                // Nudge down so the type-marker letter stays free.
-                                offset: Vec2::new(0.0, 14.0),
-                            })
-                        }),
-                )
-                .collect(),
-                text_faces: vec![],
+                objects: vec![],
+                // The function's name is printed on the body now, not floated
+                // over its centre — what is left beside the node is the name of
+                // each parameter, at the anchor it belongs to.
+                labels: input_anchors
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i_anchor, _)| {
+                        let name = function_declaration.inputs.get(i_anchor)?.name.clone();
+                        Some(RenderLabel {
+                            text: name,
+                            // Neutral grey, subordinate to the name on the body
+                            // and to the centred type-marker letter.
+                            color: Color::srgb(0.5, 0.5, 0.5),
+                            font_size: 12.0,
+                            world_pos: cell(i_anchor as i32, 0, 0),
+                            // Nudge down so the type-marker letter stays free.
+                            offset: Vec2::new(0.0, 14.0),
+                        })
+                    })
+                    .collect(),
+                text_faces: vec![name_face],
             }
         }
         // Nothing but an input anchor, sitting alone on the scope's last Z row.
@@ -959,29 +1013,30 @@ pub fn layoutnode_to_rendernode(
                     },
                 )]),
                 markers: vec![],
-                bands: vec![],
+                objects: vec![],
                 labels: vec![],
                 text_faces: vec![],
             }
         }
         // A Pattern declares the type its arm matches and fixes its branch's
         // row, but owns no anchor — the branch draws its value from its own
-        // BranchSource, one cell behind in the branch volume. It is drawn as
-        // that type's band, like an input anchor: the value it accepts is what
-        // the band names.
-        crate::model::node::ENode::Pattern { r#type, .. } => RenderNode {
-            node: None,
-            anchors: std::collections::HashMap::new(),
-            markers: build_type_markers(
-                &crate::infer::graph_type_to_eval_type(r#type),
-                crate::layout::value_of_etype(r#type).as_deref(),
-                node_pos,
-                true,
-            ),
-            bands: vec![],
-            labels: vec![],
-            text_faces: vec![],
-        },
+        // BranchSource, behind it in the branch volume. It is drawn as that
+        // type's band, like an input anchor: the value it accepts is what the
+        // band names. Its first cell is the gap it holds open and stays empty.
+        crate::model::node::ENode::Pattern { r#type, .. } => {
+            let (markers, objects) = declared_type_cell(
+                r#type.as_ref(),
+                cell(0, 0, crate::layout::PATTERN_TYPE_LOCAL_Z),
+            );
+            RenderNode {
+                node: None,
+                anchors: std::collections::HashMap::new(),
+                markers,
+                objects,
+                labels: vec![],
+                text_faces: vec![],
+            }
+        }
         // Mirror of the Sink: a single output anchor at the branch origin. Its
         // type is the owning Pattern's, resolved through `infer::anchor_type`.
         crate::model::node::ENode::BranchSource { output_anchor, .. } => {
@@ -1004,7 +1059,7 @@ pub fn layoutnode_to_rendernode(
                     ),
                 )]),
                 markers: vec![],
-                bands: vec![],
+                objects: vec![],
                 labels: vec![],
                 text_faces: vec![],
             }
@@ -1049,7 +1104,7 @@ pub fn layoutnode_to_rendernode(
                     ),
                 ]),
                 markers: vec![],
-                bands: vec![],
+                objects: vec![],
                 labels: vec![],
                 text_faces: vec![],
             }
@@ -1082,13 +1137,18 @@ pub fn label_for_node(
             .unwrap()
             .name
             .to_string(),
-        crate::model::node::ENode::Constant { r#type, .. }
-        | crate::model::node::ENode::TypeCast { r#type, .. } => r#type.to_string(),
+        crate::model::node::ENode::Constant { r#type, .. } => r#type.to_string(),
         crate::model::node::ENode::Source { name, r#type, .. } => {
             format!("{}: {}", name, r#type.to_string())
         }
         crate::model::node::ENode::Match { .. } => "match".to_string(),
-        crate::model::node::ENode::Pattern { r#type, .. } => r#type.to_string(),
+        // The two that may not have been typed yet. A question mark rather than
+        // a type name, because there is no type to name.
+        crate::model::node::ENode::TypeCast { r#type, .. }
+        | crate::model::node::ENode::Pattern { r#type, .. } => r#type
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "?".to_string()),
         crate::model::node::ENode::BranchSource { .. } => "branch source".to_string(),
         crate::model::node::ENode::Root { .. } => "root".to_string(),
     }

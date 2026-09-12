@@ -37,7 +37,12 @@ pub enum ENode {
         output_anchor: super::anchor::Id,
     },
     TypeCast {
-        r#type: super::r#type::EType,
+        /// The type to cast to, or the literal to produce — `None` until one is
+        /// chosen. A node is built before its type is typed, and until then it
+        /// has no type rather than a placeholder one: what it declares is
+        /// `Pending`, which is drawn grey, and an editor that cancels the entry
+        /// takes the node with it rather than leaving a default nobody picked.
+        r#type: Option<super::r#type::EType>,
         input_anchor: super::anchor::Id,
         output_anchor: super::anchor::Id,
     },
@@ -57,7 +62,11 @@ pub enum ENode {
     /// `BranchSource` instead, so no edge crosses the volume boundary.
     Pattern {
         parent_match: super::node::Id,
-        r#type: super::r#type::EType,
+        /// The type this arm matches — `None` until one is chosen, for the same
+        /// reason a `TypeCast`'s is. An arm that declares nothing matches
+        /// nothing, and its `BranchSource` carries `Pending` rather than a type
+        /// the branch would then be typed against.
+        r#type: Option<super::r#type::EType>,
         sink_node_id: super::node::Id,
     },
     /// The single entry point of a Match branch, at branch-local (0,0,0) —
