@@ -9,23 +9,33 @@
 //! depth buffer itself, in image space, where it touches neither the materials
 //! nor the colours.
 //!
-//! What the shader makes of it is two effects off the one buffer: depth
-//! darkening (Luft/Colditz/Deussen, SIGGRAPH 2006), which lays a soft shadow
-//! behind the nearer of two overlapping nodes, and a hard silhouette line at
-//! depth steps, which is worth more on flat unlit boxes than any amount of soft
-//! halo. Both come out as a multiplier on the painted colour, so a type's
-//! colour still means exactly what it meant.
+//! What the shader makes of it is depth darkening (Luft/Colditz/Deussen,
+//! SIGGRAPH 2006) at two scales: a broad reach for the shadow a nearer thing
+//! casts across whatever lies behind it, and a tight one for the dark rim at
+//! its edge, which is what gives an unlit box a readable outline. One mask,
+//! two radii — so both fall away outward on their own and both land outside
+//! the silhouette rather than on the nearer thing. It comes out as a
+//! multiplier on the painted colour, so a type's colour still means exactly
+//! what it meant.
 //!
 //! Two things about the depth it reads are worth keeping in mind:
 //!
 //! - It is the **main** depth texture, not a prepass copy. Order-independent
 //!   transparency already asks for `TEXTURE_BINDING` on it, so no depth prepass
 //!   is needed and the geometry is not walked a second time.
-//! - Only opaque geometry writes depth, so the cue is about the node bodies.
-//!   Edges, type markers, caret faces and the grid blend and stay out of it,
-//!   which is the right split: the bodies are what have to be told apart.
+//! - Only opaque geometry writes depth, so the cue reaches the node bodies and
+//!   the strands — the bands and lines that carry a type, whether they run
+//!   between two anchors or sit inside one. The strands were blended at first
+//!   and so invisible here, which had it exactly backwards: how high a strand
+//!   floats above the plane is the hardest thing in the picture to judge.
+//!   What still blends and stays out of it is the caret, the grid and the
+//!   Z-level planes, none of which are part of the scene the cue is about.
 
 use bevy::asset::{load_internal_asset, uuid_handle};
+// `Projection` derefs to `dyn CameraProjection`, so the trait has to be in
+// scope for `get_clip_from_view` — including on the custom projections the
+// bound camera is built from, which is the whole reason for asking the matrix.
+use bevy::camera::CameraProjection;
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
 use bevy::core_pipeline::FullscreenShader;
 use bevy::ecs::query::QueryItem;
@@ -56,21 +66,43 @@ pub const DEPTH_CUE_SHADER_HANDLE: Handle<Shader> =
 /// the view entity, where the node can reach it as a dynamic uniform.
 #[derive(Component, Clone, Copy, ExtractComponent, ShaderType)]
 pub struct DepthCue {
-    /// The bound projection's near plane. Normally negative — the projection
-    /// box reaches behind the camera on purpose; see `camera::depth_range`.
-    pub near: f32,
-    /// The bound projection's far plane.
-    pub far: f32,
-    /// Reach of the halo, in pixels.
+    /// The four entries of `clip_from_view` that carry depth, which is all it
+    /// takes to turn a stored depth back into a distance.
+    ///
+    /// A projection matrix sends a view-space `z` to `clip.z = a·z + b` and
+    /// `clip.w = c·z + d`, and the buffer holds `clip.z / clip.w`. Those four
+    /// numbers therefore invert it exactly, and — this is the point — they do
+    /// so for *any* projection: parallel, converging, or the blend between
+    /// them that the semi-orthographic camera actually hands over. The depth
+    /// shear does not disturb them either; it mixes X and Y out of Z and
+    /// leaves the Z and W rows alone.
+    ///
+    /// This used to be a near/far pair with a straight lerp between them. That
+    /// is right only while the projection is parallel. Under the converging
+    /// one the stored depth crowds into a thin band near zero, so a lerp read
+    /// a whole cell of separation as about four hundredths of one, and the cue
+    /// all but vanished exactly where the perspective had started to help.
+    pub clip_z_scale: f32,
+    pub clip_z_offset: f32,
+    pub clip_w_scale: f32,
+    pub clip_w_offset: f32,
+    /// Pixels one cell covers at the caret plane — the bridge between the
+    /// lengths below, which are all in cells, and the pixels a pass works in.
+    pub cell_pixels: f32,
+    /// Reach of the halo, in cells.
     pub halo_radius: f32,
     /// How dark the halo goes at full separation, `0.0..=1.0`.
     pub halo_strength: f32,
-    /// Separation, in cells, at which the halo reaches `halo_strength`.
+    /// Separation, in cells, at which a single neighbour counts as fully nearer.
+    /// Caps what any one of them can contribute, so the background — which sits
+    /// effectively at infinity — cannot saturate the whole kernel by itself.
     pub halo_depth: f32,
-    /// Depth step, in cells, that counts as a silhouette.
-    pub edge_threshold: f32,
-    /// How dark the silhouette line goes, `0.0..=1.0`.
+    /// Reach of the dark edge, in cells — the rim rather than the shadow.
+    pub edge_radius: f32,
+    /// How dark the edge goes at full separation, `0.0..=1.0`.
     pub edge_strength: f32,
+    /// Separation, in cells, at which a single neighbour counts as fully nearer.
+    pub edge_depth: f32,
     /// Which of [`MODE_OFF`], [`MODE_CUE`], [`MODE_DEPTH`] the pass draws.
     pub mode: u32,
 }
@@ -81,7 +113,7 @@ pub struct DepthCue {
 /// mode travels the same ping-pong path, so anything that changes in the
 /// picture when F9 is struck is the cue and never the plumbing.
 pub const MODE_OFF: u32 = 0;
-/// Depth darkening and the silhouette line — the cue proper.
+/// Depth darkening at both scales — the cue proper.
 pub const MODE_CUE: u32 = 1;
 /// The linearised depth itself, as one contour band per cell. Not a cue but a
 /// way to see what the cue is reading.
@@ -90,33 +122,48 @@ pub const MODE_DEPTH: u32 = 2;
 const MODES: [u32; 3] = [MODE_OFF, MODE_CUE, MODE_DEPTH];
 
 // Defaults, gathered here because they are the knobs worth turning and nothing
-// else in the module is. Lengths are in the units the shader reads them in:
-// `halo_radius` in pixels, because a halo is a thing of the picture and should
-// not grow when the camera zooms in; everything else in cells, because that is
-// what the scene is built out of.
+// else in the module is.
 //
-// A cell is `camera::DEFAULT_CELL_PIXELS` wide, so the radius below is a bit
-// under half a cell — enough to read as a shadow, short enough that two nodes a
-// cell apart still get their own.
-const HALO_RADIUS: f32 = 16.0;
+// **Every length is in cells, none in pixels.** The shader multiplies by
+// `cell_pixels` to get there. A cue measured in pixels holds its size while the
+// picture shrinks under it, so zooming out makes the same outline read as ever
+// heavier furniture around ever smaller nodes — which is exactly how it went
+// wrong the first time round. In cells it keeps its proportion, and when the
+// zoom drives it under a pixel the shader fades it instead of letting it sit
+// there at a stubborn pixel wide.
+//
+// `camera::DEFAULT_CELL_PIXELS` is 40, so the radius below is the sixteen
+// pixels it used to be at the default zoom, and the line a little over one.
+const HALO_RADIUS: f32 = 0.4;
 const HALO_STRENGTH: f32 = 0.55;
 const HALO_DEPTH: f32 = 2.0;
-const EDGE_THRESHOLD: f32 = 0.3;
+/// Two pixels at the default zoom — about the width of a strand, so the rim
+/// reads as the edge of a thing rather than as a second thing beside it.
+const EDGE_RADIUS: f32 = 0.05;
 const EDGE_STRENGTH: f32 = 0.45;
+/// Half a cell, so a rim is at full strength long before the separation the
+/// halo needs. The rim says *there is an edge here*; how deep the step goes is
+/// the halo's job to say.
+const EDGE_DEPTH: f32 = 0.5;
 
 impl Default for DepthCue {
-    /// Off, and with a depth range that will be overwritten on the first
-    /// update. `sync_depth_cue` owns the two planes; standing values here
-    /// would only be a second answer to the same question.
+    /// Off, and with a projection that will be overwritten on the first update.
+    /// `sync_depth_cue` owns those four numbers; standing values here would
+    /// only be a second answer to the same question. The identity-ish pair
+    /// below is merely something finite to divide by until it arrives.
     fn default() -> Self {
         Self {
-            near: 0.0,
-            far: 1.0,
+            clip_z_scale: 1.0,
+            clip_z_offset: 0.0,
+            clip_w_scale: 0.0,
+            clip_w_offset: 1.0,
+            cell_pixels: crate::camera::DEFAULT_CELL_PIXELS,
             halo_radius: HALO_RADIUS,
             halo_strength: HALO_STRENGTH,
             halo_depth: HALO_DEPTH,
-            edge_threshold: EDGE_THRESHOLD,
+            edge_radius: EDGE_RADIUS,
             edge_strength: EDGE_STRENGTH,
+            edge_depth: EDGE_DEPTH,
             mode: MODE_OFF,
         }
     }
@@ -133,18 +180,37 @@ impl Default for DepthCue {
 /// modal or an evaluation owns the keyboard.
 const TOGGLE_KEY: KeyCode = KeyCode::F9;
 
-/// Keep the depth range on the camera's component in step with the projection.
+/// Keep the cue's picture of the camera in step with the camera.
 ///
-/// The bound projection rebuilds its planes from the orbit radius every time
-/// the camera moves, so the pair has to be re-read rather than captured once.
-fn sync_depth_cue(orbit: Res<super::camera::OrbitCamera>, mut cues: Query<&mut DepthCue>) {
-    let (near, far) = super::camera::depth_range(orbit.radius);
-    for mut cue in &mut cues {
-        // Written through `Mut` only when it actually differs, so the change
-        // detection that drives extraction stays meaningful.
-        if cue.near != near || cue.far != far {
-            cue.near = near;
-            cue.far = far;
+/// Read off the projection matrix itself rather than rebuilt from the numbers
+/// that went into it. The bound projection is one of three things depending on
+/// how far the semi-orthographic blend has been pushed, and the only way to be
+/// right about all three — including the blend, which is neither of the other
+/// two — is to ask the matrix they all end up as.
+fn sync_depth_cue(
+    orbit: Res<super::camera::OrbitCamera>,
+    mut cues: Query<(&Projection, &mut DepthCue)>,
+) {
+    for (projection, mut cue) in &mut cues {
+        let clip_from_view = projection.get_clip_from_view();
+        // Column-major: the Z column scales view Z into clip, the W column is
+        // the constant added to it. `z_axis.w`/`w_axis.w` are what make the
+        // difference between a parallel projection and a converging one.
+        let z = clip_from_view.z_axis;
+        let w = clip_from_view.w_axis;
+        // Written through `Mut` only where something actually differs, so the
+        // change detection that drives extraction stays meaningful.
+        if cue.clip_z_scale != z.z
+            || cue.clip_z_offset != w.z
+            || cue.clip_w_scale != z.w
+            || cue.clip_w_offset != w.w
+            || cue.cell_pixels != orbit.cell_pixels
+        {
+            cue.clip_z_scale = z.z;
+            cue.clip_z_offset = w.z;
+            cue.clip_w_scale = z.w;
+            cue.clip_w_offset = w.w;
+            cue.cell_pixels = orbit.cell_pixels;
         }
     }
 }

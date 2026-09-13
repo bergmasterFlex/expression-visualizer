@@ -190,14 +190,14 @@ pub struct RenderTextFace {
 }
 
 pub struct RenderNode {
-    /// `None` for nodes drawn purely as markers or loose objects; the node
+    /// `None` for nodes drawn purely as strands or loose objects; the node
     /// entity is still spawned so picking and selection keep working.
     pub node: Option<RenderObject>,
     pub anchors: std::collections::HashMap<crate::model::anchor::Id, RenderAnchor>,
-    /// Type markers belonging to the node itself rather than to an anchor. A
+    /// Strands belonging to the node itself rather than to an anchor. A
     /// Pattern uses this: it declares the type its arm matches and is drawn as
     /// that type's band, but owns no anchor to hang it on.
-    pub markers: Vec<RenderTypeMarker>,
+    pub strands: Vec<RenderStrand>,
     /// Meshes that are neither the node's own body nor an anchor's: the line
     /// and the point a Constant is drawn as. They carry no identity — nothing
     /// picks them and no edge ends on them.
@@ -210,24 +210,36 @@ pub struct RenderAnchor {
     /// World point used for screen-space hover picking and as the edge
     /// endpoint. Sits at the centre of the anchor cuboid (or cuboid stack).
     pub pick_center: Vec3,
-    pub type_markers: Vec<RenderTypeMarker>,
-    /// Neutral cuboid for anchors that carry no type markers (Sink,
+    pub strands: Vec<RenderStrand>,
+    /// Neutral cuboid for anchors that carry no strands (Sink,
     /// Match), so they stay visible and pickable.
     pub plain_body: Option<RenderObject>,
 }
 
-pub struct RenderTypeMarker {
-    /// The type band and its letter. Absent when the leaf carries a literal:
-    /// the value line then replaces the band entirely, matching how a
-    /// value-carrying edge drops its band for a hairline.
-    pub rect: Option<RenderObject>,
-    pub label: Option<RenderLabel>,
-    /// Present iff this leaf's anchor carries an graph-level literal. A thin
-    /// coloured segment spanning the anchor's full depth, at its Y-middle.
-    pub value_line: Option<RenderObject>,
-    /// Present alongside `value_line`. Text is the literal itself, projected
-    /// into screen space past the line's tip.
-    pub value_label: Option<RenderLabel>,
+/// One leaf's strand where it passes through an anchor.
+///
+/// A strand is drawn one of two ways — as a band when it carries a type, as a
+/// line when it carries a literal — and it wears that shape for its whole
+/// length. This is the short stretch of it inside an anchor; the long curved
+/// stretch between two anchors is the same strand, built as a ribbon in
+/// `edge.rs`. The two ask the same question of the same leaf
+/// (`leaf_is_drawn_as_line`) and take their colour from the same place
+/// (`strand_color`), so they cannot meet each other wearing different shapes.
+///
+/// Exactly one of `band` and `line` is present, never both.
+pub struct RenderStrand {
+    /// The type band. Absent when the leaf carries a literal: the line replaces
+    /// it entirely, the same way a value-carrying ribbon drops its band for a
+    /// hairline.
+    pub band: Option<RenderObject>,
+    /// The type's letter, written across the band.
+    pub band_label: Option<RenderLabel>,
+    /// A thin coloured segment spanning the anchor's full depth, at its
+    /// Y-middle. Present iff this leaf's anchor carries a graph-level literal.
+    pub line: Option<RenderObject>,
+    /// Present alongside `line`. The literal itself, projected into screen
+    /// space past the line's tip.
+    pub line_label: Option<RenderLabel>,
 }
 
 pub struct RenderLabel {
@@ -238,13 +250,16 @@ pub struct RenderLabel {
     pub offset: Vec2,
 }
 
-const TYPE_MARKER_ALPHA: f32 = 0.6;
-/// Height of one anchor row: exactly one cell, since an anchor claims one
-/// cell per sum-type member. The marker mesh fills the cell in Y but stays
-/// slim in X and Z, so a sum type reads as an unbroken band while the graph
-/// keeps its airy look.
-pub const TYPE_MARKER_Y_STEP: f32 = CELL;
-const TYPE_MARKER_HALF_DEPTH: f32 = CELL / 4.0;
+/// Height of a strand drawn as a band, and so also the pitch of the anchor
+/// rows — a sum type's bands are stacked flush, which is what makes it read as
+/// one unbroken band rather than as a pile of separate ones.
+///
+/// Exactly one cell, since an anchor claims one cell per sum-type member. The
+/// band fills the cell in Y but stays slim in X and Z, so the graph keeps its
+/// airy look. The connecting strand is built to this same height, which is what
+/// lets a band leave an anchor without a step.
+pub const STRAND_BAND_HEIGHT: f32 = CELL;
+const ANCHOR_HALF_DEPTH: f32 = CELL / 4.0;
 /// Full Z-depth of an anchor cuboid: half its cell.
 ///
 /// An anchor occupies the half of its cell that faces the node body, so it
@@ -252,13 +267,23 @@ const TYPE_MARKER_HALF_DEPTH: f32 = CELL / 4.0;
 /// cell-local terms an input takes `0.5..1` and an output `0..0.5`; since
 /// layout +Z is world −Z, that is the −Z half for inputs and the +Z half for
 /// outputs. Both meet the cell centre, which is where their edges attach.
-const ANCHOR_DEPTH: f32 = 2.0 * TYPE_MARKER_HALF_DEPTH;
+const ANCHOR_DEPTH: f32 = 2.0 * ANCHOR_HALF_DEPTH;
 /// X-width of an anchor cuboid. Shared with the slab nodes so anchor and node
 /// line up exactly in X.
 pub const ANCHOR_X: f32 = CELL * 0.075;
-/// Y-thickness of the gizmo line drawn in the far 2/3 of a value-carrying
-/// type marker.
-const VALUE_LINE_THICKNESS: f32 = CELL * 0.02;
+/// Y-thickness of a strand drawn as a line — the shape a leaf takes when it
+/// carries a literal rather than a type.
+///
+/// The single source for that thickness. `edge::RIBBON_LINE_HALF_THICKNESS_UV`
+/// derives its own fraction from this rather than stating a number of its own,
+/// so the segment inside an anchor and the strand leaving it cannot come apart
+/// the way they had: this used to be a fiftieth of a cell here against a
+/// twentieth out there, and the two met at the anchor's outward face.
+///
+/// A twentieth of a cell is thin like a grid line, and at the default zoom it
+/// is two pixels — which is what a line drawn by an alpha cutout, with no
+/// multisampling to fall back on, needs to stay a closed line.
+pub const STRAND_LINE_THICKNESS: f32 = CELL / 20.0;
 /// The point a Constant's value starts at, sitting at the centre of its body
 /// cell. A couple of times the line's own thickness, which is what makes it
 /// read as the end of the line rather than as a ball threaded onto it.
@@ -295,7 +320,7 @@ const BODY_FACE_LIFT: f32 = CELL / 500.0;
 /// topmost — so the highest number is drawn at the top and `none`, lowest, at
 /// the bottom. That is where it belongs: a sum type reads as "one of these, or
 /// else nothing", and the "or else" is the last thing said, not the first.
-fn type_marker_order(t: &crate::infer::EType) -> Option<u8> {
+fn type_order(t: &crate::infer::EType) -> Option<u8> {
     match t {
         crate::infer::EType::None => Some(0),
         crate::infer::EType::Bool(..) => Some(1),
@@ -310,7 +335,7 @@ fn type_marker_order(t: &crate::infer::EType) -> Option<u8> {
 /// drawn as a line with its own word at the tip, the way a literal is, so its
 /// arm here is unreachable — kept only because a total function over the leaves
 /// is easier to trust than one with a hole in it.
-fn type_marker_letter(t: &crate::infer::EType) -> &'static str {
+fn type_letter(t: &crate::infer::EType) -> &'static str {
     match t {
         crate::infer::EType::Bool(..) => "b",
         crate::infer::EType::Char(..) => "c",
@@ -321,14 +346,24 @@ fn type_marker_letter(t: &crate::infer::EType) -> &'static str {
     }
 }
 
-pub fn type_marker_color(t: &crate::infer::EType) -> Color {
+/// The colour a strand of type `t` is drawn in, wherever it appears: the
+/// segment inside an anchor, the strand running between two of them, and the
+/// body of a node that declares it.
+///
+/// Opaque, and that is the whole of the choice. A strand used to blend at 0.6
+/// so the grid showed through it, but only opaque geometry writes depth, and a
+/// strand that writes no depth is invisible to the depth cue — which is exactly
+/// the wrong way round, since a strand's height above the plane is the hardest
+/// thing in the picture to judge by eye. The node bodies had already worked
+/// around the old alpha by forcing it back to 1.0 at the call site.
+pub fn strand_color(t: &crate::infer::EType) -> Color {
     match t {
-        crate::infer::EType::Bool(..) => Color::srgba(0.65, 0.30, 0.95, TYPE_MARKER_ALPHA),
-        crate::infer::EType::Char(..) => Color::srgba(0.30, 0.90, 0.40, TYPE_MARKER_ALPHA),
-        crate::infer::EType::Int(..) => Color::srgba(0.40, 0.70, 1.00, TYPE_MARKER_ALPHA),
-        crate::infer::EType::String(..) => Color::srgba(1.00, 0.90, 0.30, TYPE_MARKER_ALPHA),
-        crate::infer::EType::None => Color::srgba(0.95, 0.30, 0.30, TYPE_MARKER_ALPHA),
-        _ => Color::srgba(0.5, 0.5, 0.5, TYPE_MARKER_ALPHA),
+        crate::infer::EType::Bool(..) => Color::srgb(0.65, 0.30, 0.95),
+        crate::infer::EType::Char(..) => Color::srgb(0.30, 0.90, 0.40),
+        crate::infer::EType::Int(..) => Color::srgb(0.40, 0.70, 1.00),
+        crate::infer::EType::String(..) => Color::srgb(1.00, 0.90, 0.30),
+        crate::infer::EType::None => Color::srgb(0.95, 0.30, 0.30),
+        _ => Color::srgb(0.5, 0.5, 0.5),
     }
 }
 
@@ -339,21 +374,21 @@ pub fn type_marker_color(t: &crate::infer::EType) -> Color {
 /// leaves are no longer centred on the anchor: an anchor's address is its
 /// first row.
 ///
-/// Both the marker stack (`build_type_markers`) and the edge ribbons
+/// Both the strand stack (`build_anchor_strands`) and the edge ribbons
 /// (`spawn_graph_nodes`) go through this, so they cannot drift apart.
 pub fn leaf_row_offset(index: usize) -> f32 {
-    index as f32 * LAYOUT_SCALE.y.signum() * TYPE_MARKER_Y_STEP
+    index as f32 * LAYOUT_SCALE.y.signum() * STRAND_BAND_HEIGHT
 }
 /// The row-claiming leaves of `t`, in the order they are stacked: String at the
-/// top, then Int, Char, Bool, and `none` at the bottom (`type_marker_order`).
+/// top, then Int, Char, Bool, and `none` at the bottom (`type_order`).
 ///
 /// Which leaves claim a row is decided by `infer::row_leaves`, so the render
 /// stack and the cell addressing can never disagree about how tall an anchor
-/// is; this only fixes their order. Both the marker stack and the edge ribbons
+/// is; this only fixes their order. Both the strand stack and the edge ribbons
 /// read it, which is what keeps a strand meeting the row it belongs to.
 pub fn ordered_supported_leaves(t: &crate::infer::EType) -> Vec<crate::infer::EType> {
     let mut leaves = crate::infer::row_leaves(t);
-    leaves.sort_by_key(|leaf| std::cmp::Reverse(type_marker_order(leaf).unwrap_or(u8::MAX)));
+    leaves.sort_by_key(|leaf| std::cmp::Reverse(type_order(leaf).unwrap_or(u8::MAX)));
     leaves
 }
 
@@ -368,7 +403,7 @@ pub fn ordered_supported_leaves(t: &crate::infer::EType) -> Vec<crate::infer::ET
 ///
 /// The pair is returned top first, i.e. the larger world Y first.
 pub fn row_span_world_y(row_center_y: f32, span: &crate::infer::RowSpan) -> (f32, f32) {
-    let step = LAYOUT_SCALE.y.signum() * TYPE_MARKER_Y_STEP;
+    let step = LAYOUT_SCALE.y.signum() * STRAND_BAND_HEIGHT;
     let row_top = row_center_y - step * 0.5;
     (row_top + span.top * step, row_top + span.bottom * step)
 }
@@ -398,7 +433,7 @@ fn leaf_line_text(leaf: &crate::infer::EType, graph_value: Option<&str>) -> Opti
 /// True when a leaf is drawn as a thin line rather than as a band: it is
 /// `none`, whose value is its type, or a literal is pinned to it.
 ///
-/// Both the marker stack and every ribbon that meets it ask this, of the same
+/// Both the strand stack and every ribbon that meets it ask this, of the same
 /// leaf, so the two cannot disagree about what shape they are joining.
 pub fn leaf_is_drawn_as_line(leaf: &crate::infer::EType, graph_value: Option<&str>) -> bool {
     leaf_line_text(leaf, graph_value).is_some()
@@ -443,7 +478,7 @@ pub fn cast_band_world(layout_node: &crate::layout::LayoutNode, extra_offset: Ve
     )
 }
 
-/// Whether a marker stack writes in words what its shape already says.
+/// Whether a strand stack writes in words what its shape already says.
 ///
 /// The type is in the colour and the value is in the shape — a band for a type,
 /// a line for a value — so the writing is a convenience, not the statement. Once
@@ -473,7 +508,7 @@ enum Lettering {
 /// present the band is dropped entirely and the leaf is drawn as a single
 /// thin line plus the literal — a value is shown as the value, not as its
 /// type. In practice value-carrying nodes have a single leaf, so this only
-/// fires on one marker per anchor.
+/// fires on one strand per anchor.
 ///
 /// `none` takes that same line whether or not anything was pinned to the
 /// anchor, and it is the one leaf that does: it is the type whose value *is*
@@ -485,13 +520,13 @@ enum Lettering {
 /// bands for the same type stand within a cell or two of each other — a Match's
 /// input, its arm, the branch source behind it — only one of them needs the
 /// word, and the rest read better without it.
-fn build_type_markers(
+fn build_anchor_strands(
     t: &crate::infer::EType,
     graph_value: Option<&str>,
     anchor_world_pos: Vec3,
     is_input: bool,
     lettering: Lettering,
-) -> Vec<RenderTypeMarker> {
+) -> Vec<RenderStrand> {
     let leaves = ordered_supported_leaves(t);
     if leaves.is_empty() {
         return vec![];
@@ -502,7 +537,7 @@ fn build_type_markers(
     let full_depth = ANCHOR_DEPTH;
     // The cell centre is the anchor's outward face — the point its edge meets —
     // so every span is measured from there into the anchor's own half.
-    let full_rect_z_center = anchor_world_pos.z + sign * TYPE_MARKER_HALF_DEPTH;
+    let full_rect_z_center = anchor_world_pos.z + sign * ANCHOR_HALF_DEPTH;
     let line_tip_z = anchor_world_pos.z + sign * full_depth;
 
     leaves
@@ -510,8 +545,8 @@ fn build_type_markers(
         .enumerate()
         .map(|(k, leaf)| {
             let y_center = anchor_world_pos.y + leaf_row_offset(k);
-            let color = type_marker_color(&leaf);
-            let letter = type_marker_letter(&leaf).to_string();
+            let color = strand_color(&leaf);
+            let letter = type_letter(&leaf).to_string();
             let center = Vec3::new(anchor_world_pos.x, y_center, full_rect_z_center);
             // What this row is drawn as a line *of*, if it is drawn as one:
             // `leaf_line_text` is the single place that question is settled, so
@@ -528,23 +563,22 @@ fn build_type_markers(
                     y_center,
                     line_tip_z + sign * VALUE_LABEL_Z_PADDING,
                 );
-                RenderTypeMarker {
-                    rect: None,
-                    label: None,
-                    value_line: Some(RenderObject {
-                        mesh: Cuboid::new(0.0, VALUE_LINE_THICKNESS, full_depth)
+                RenderStrand {
+                    band: None,
+                    band_label: None,
+                    line: Some(RenderObject {
+                        mesh: Cuboid::new(0.0, STRAND_LINE_THICKNESS, full_depth)
                             .mesh()
                             .build(),
                         material: StandardMaterial {
                             base_color: color,
-                            alpha_mode: AlphaMode::Blend,
                             cull_mode: None,
                             unlit: true,
                             ..default()
                         },
                         transform: Transform::from_translation(center),
                     }),
-                    value_label: match lettering {
+                    line_label: match lettering {
                         Lettering::Spelled => Some(RenderLabel {
                             text: value,
                             color: Color::WHITE,
@@ -556,21 +590,20 @@ fn build_type_markers(
                     },
                 }
             } else {
-                RenderTypeMarker {
-                    rect: Some(RenderObject {
-                        mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, full_depth)
+                RenderStrand {
+                    band: Some(RenderObject {
+                        mesh: Cuboid::new(ANCHOR_X, STRAND_BAND_HEIGHT, full_depth)
                             .mesh()
                             .build(),
                         material: StandardMaterial {
                             base_color: color,
-                            alpha_mode: AlphaMode::Blend,
                             cull_mode: None,
                             unlit: true,
                             ..default()
                         },
                         transform: Transform::from_translation(center),
                     }),
-                    label: match lettering {
+                    band_label: match lettering {
                         Lettering::Spelled => Some(RenderLabel {
                             text: letter,
                             color: Color::WHITE,
@@ -580,15 +613,15 @@ fn build_type_markers(
                         }),
                         Lettering::Silent => None,
                     },
-                    value_line: None,
-                    value_label: None,
+                    line: None,
+                    line_label: None,
                 }
             }
         })
         .collect()
 }
 
-/// Anchor rendered from an inferred type: a type-marker stack when the type
+/// Anchor rendered from an inferred type: a strand stack when the type
 /// has renderable leaves, otherwise the neutral grey body. `Pending` has no
 /// leaves, so an output whose type the inferer cannot decide yet reads exactly
 /// like the typeless (unconstrained) inputs.
@@ -599,15 +632,15 @@ fn typed_anchor(
     is_input: bool,
     lettering: Lettering,
 ) -> RenderAnchor {
-    let type_markers = build_type_markers(t, graph_value, cell_center, is_input, lettering);
+    let strands = build_anchor_strands(t, graph_value, cell_center, is_input, lettering);
     RenderAnchor {
         // The cell centre is the anchor's outward face, so edges meet it there
         // no matter how many rows the anchor spans.
         pick_center: cell_center,
-        plain_body: type_markers
+        plain_body: strands
             .is_empty()
             .then(|| plain_anchor_body(cell_center, is_input)),
-        type_markers,
+        strands,
     }
 }
 
@@ -626,43 +659,46 @@ fn typed_anchor(
 /// whose input and output are both grey and whose target cell is then the only
 /// thing on screen that knows the type.
 ///
-/// It returns two vectors because `RenderNode::markers` has no `plain_body` slot
+/// It returns two vectors because `RenderNode::strands` has no `plain_body` slot
 /// the way `RenderAnchor` does — an unchosen type has no leaves, so
-/// `build_type_markers` yields nothing and the grey goes into `objects`.
+/// `build_anchor_strands` yields nothing and the grey goes into `objects`.
 fn declared_type_cell(
     r#type: Option<&crate::model::r#type::EType>,
     cell_center: Vec3,
     lettering: Lettering,
-) -> (Vec<RenderTypeMarker>, Vec<RenderObject>) {
+) -> (Vec<RenderStrand>, Vec<RenderObject>) {
     let eval_type = r#type
         .map(crate::infer::graph_type_to_eval_type)
         .unwrap_or(crate::infer::EType::Pending);
     let literal = r#type.and_then(crate::layout::value_of_etype);
-    let markers = build_type_markers(&eval_type, literal.as_deref(), cell_center, true, lettering);
-    let objects = markers
+    let strands =
+        build_anchor_strands(&eval_type, literal.as_deref(), cell_center, true, lettering);
+    let objects = strands
         .is_empty()
         .then(|| plain_anchor_body(cell_center, true))
         .into_iter()
         .collect();
-    (markers, objects)
+    (strands, objects)
 }
 
-/// A neutral grey anchor cuboid for anchors that carry no type markers
+/// A neutral grey anchor cuboid for anchors that carry no strands
 /// (unconstrained inputs, pending outputs), so they stay visible and pickable.
 /// `cell_center` is the anchor cell's centre; the cuboid fills that cell's
-/// body-facing half, like a type marker would.
+/// body-facing half, like a strand would.
 fn plain_anchor_body(cell_center: Vec3, is_input: bool) -> RenderObject {
-    // Same half of the cell a type marker would occupy, so a typeless anchor
+    // Same half of the cell a strand would occupy, so a typeless anchor
     // hangs off its node exactly like a typed one.
     let sign = if is_input { -1.0 } else { 1.0 };
     let center = cell_center + Vec3::new(0.0, 0.0, sign * ANCHOR_DEPTH * 0.5);
     RenderObject {
-        mesh: Cuboid::new(ANCHOR_X, TYPE_MARKER_Y_STEP, ANCHOR_DEPTH)
+        mesh: Cuboid::new(ANCHOR_X, STRAND_BAND_HEIGHT, ANCHOR_DEPTH)
             .mesh()
             .build(),
         material: StandardMaterial {
-            base_color: Color::srgba(0.5, 0.5, 0.5, TYPE_MARKER_ALPHA),
-            alpha_mode: AlphaMode::Blend,
+            // Through the same call the grey strands go through, so a typeless
+            // anchor and the undecided strand leaving it cannot end up wearing
+            // two different greys.
+            base_color: strand_color(&crate::infer::EType::Pending),
             cull_mode: None,
             unlit: true,
             ..default()
@@ -735,19 +771,19 @@ pub fn layoutnode_to_rendernode(
             // a literal: a literal on a Source is not the value it is evaluated
             // with — that one comes from the prompt — and the output anchor
             // already shows it. What arrives here is a value *of this type*.
-            let input_markers = build_type_markers(
+            let input_strands = build_anchor_strands(
                 &output_eval_type,
                 None,
                 input_world,
                 true,
                 Lettering::Spelled,
             );
-            // Where `build_type_markers` puts the first row's type letter: the
+            // Where `build_anchor_strands` puts the first row's type letter: the
             // label leans into the anchor's own half, toward the body.
             let index_label_world = Vec3::new(
                 input_world.x,
                 input_world.y,
-                input_world.z - TYPE_MARKER_HALF_DEPTH,
+                input_world.z - ANCHOR_HALF_DEPTH,
             );
             let index_label = layout_graph
                 .source_index(&layout_node.node_id)
@@ -761,10 +797,11 @@ pub fn layoutnode_to_rendernode(
                     world_pos: index_label_world,
                     offset: Vec2::new(SOURCE_INDEX_LABEL_OFFSET_X, 0.0),
                 });
-            // A body is a body: it stands in front of what is behind it.
-            // `type_marker_color` paints anchor *bands*, which are translucent
-            // so an edge behind one stays visible — hence the opaque override.
-            let body_color = type_marker_color(&output_eval_type).with_alpha(1.0);
+            // The body wears the type it declares, in the same colour every
+            // strand of that type wears. It used to have to force the alpha
+            // back to 1.0 here, because strands were translucent and a body is
+            // not; strands are opaque now, so the two agree by construction.
+            let body_color = strand_color(&output_eval_type);
             let cell_x = LAYOUT_SCALE.x.abs();
             let cell_y = LAYOUT_SCALE.y.abs();
             let cell_z = LAYOUT_SCALE.z.abs();
@@ -824,7 +861,7 @@ pub fn layoutnode_to_rendernode(
                     output_anchor.clone(),
                     RenderAnchor {
                         pick_center: output_world,
-                        type_markers: build_type_markers(
+                        strands: build_anchor_strands(
                             &output_eval_type,
                             output_value.as_deref(),
                             output_world,
@@ -836,7 +873,7 @@ pub fn layoutnode_to_rendernode(
                 )]),
                 // The drawn-only input anchor belongs to the node itself, not
                 // to an anchor of it — the same place a Pattern's band lives.
-                markers: input_markers,
+                strands: input_strands,
                 objects: vec![],
                 // The name is on the body now, and the type is in the body's
                 // colour and at the output anchor — the index is the one thing
@@ -855,10 +892,10 @@ pub fn layoutnode_to_rendernode(
             let output_world = cell(0, 0, 1);
             let output_eval_type = crate::infer::graph_type_to_eval_type(r#type);
             let output_value = crate::layout::value_of_etype(r#type);
-            let color = type_marker_color(&output_eval_type);
+            let color = strand_color(&output_eval_type);
             // The half of the body cell that faces the anchor, so the segment
             // continues the value line the anchor draws into its own half
-            // (`build_type_markers`) and the two meet exactly at the cell
+            // (`build_anchor_strands`) and the two meet exactly at the cell
             // boundary. Every constant has that line now, `none` included —
             // its value is its type, so the anchor draws it as a value like
             // any other.
@@ -871,12 +908,11 @@ pub fn layoutnode_to_rendernode(
                 body_world.z - half_depth * 0.5,
             );
             let line = RenderObject {
-                mesh: Cuboid::new(0.0, VALUE_LINE_THICKNESS, half_depth)
+                mesh: Cuboid::new(0.0, STRAND_LINE_THICKNESS, half_depth)
                     .mesh()
                     .build(),
                 material: StandardMaterial {
                     base_color: color,
-                    alpha_mode: AlphaMode::Blend,
                     cull_mode: None,
                     unlit: true,
                     ..default()
@@ -902,7 +938,7 @@ pub fn layoutnode_to_rendernode(
                     output_anchor.clone(),
                     RenderAnchor {
                         pick_center: output_world,
-                        type_markers: build_type_markers(
+                        strands: build_anchor_strands(
                             &output_eval_type,
                             output_value.as_deref(),
                             output_world,
@@ -912,7 +948,7 @@ pub fn layoutnode_to_rendernode(
                         plain_body: None,
                     },
                 )]),
-                markers: vec![],
+                strands: vec![],
                 objects: vec![line, dot],
                 // A literal draws itself: the value hangs off the output
                 // anchor, so there is nothing for a body label to add.
@@ -962,10 +998,10 @@ pub fn layoutnode_to_rendernode(
             // one thing on screen that knows the type would be the only thing
             // not saying it. So the target cell speaks exactly as long as
             // nothing downstream of it does.
-            let (markers, objects) = declared_type_cell(
+            let (strands, objects) = declared_type_cell(
                 r#type.as_ref(),
                 body_world,
-                if output_anchor_render.type_markers.is_empty() {
+                if output_anchor_render.strands.is_empty() {
                     Lettering::Spelled
                 } else {
                     Lettering::Silent
@@ -986,14 +1022,14 @@ pub fn layoutnode_to_rendernode(
                             }
                             None => RenderAnchor {
                                 pick_center: input_world,
-                                type_markers: vec![],
+                                strands: vec![],
                                 plain_body: Some(plain_anchor_body(input_world, true)),
                             },
                         },
                     ),
                     (output_anchor.clone(), output_anchor_render),
                 ]),
-                markers,
+                strands,
                 objects,
                 labels: vec![],
                 text_faces: vec![],
@@ -1134,7 +1170,7 @@ pub fn layoutnode_to_rendernode(
                                 }
                                 None => RenderAnchor {
                                     pick_center: input_world,
-                                    type_markers: vec![],
+                                    strands: vec![],
                                     plain_body: Some(plain_anchor_body(input_world, true)),
                                 },
                             },
@@ -1151,7 +1187,7 @@ pub fn layoutnode_to_rendernode(
                         ),
                     )])
                     .collect(),
-                markers: vec![],
+                strands: vec![],
                 objects: vec![],
                 // The function's name is printed on the body now, not floated
                 // over its centre — what is left beside the node is the name of
@@ -1164,11 +1200,11 @@ pub fn layoutnode_to_rendernode(
                         Some(RenderLabel {
                             text: name,
                             // Neutral grey, subordinate to the name on the body
-                            // and to the centred type-marker letter.
+                            // and to the centred type letter.
                             color: Color::srgb(0.5, 0.5, 0.5),
                             font_size: 12.0,
                             world_pos: cell(i_anchor as i32, 0, 0),
-                            // Nudge down so the type-marker letter stays free.
+                            // Nudge down so the type letter stays free.
                             offset: Vec2::new(0.0, 14.0),
                         })
                     })
@@ -1196,7 +1232,7 @@ pub fn layoutnode_to_rendernode(
             // Match's output, which names the same thing again.
             //
             // The program's Sink is the exception, and it says its piece on the
-            // far side instead. See `outgoing_markers`.
+            // far side instead. See `outgoing_strands`.
             let anchor = match incoming.as_ref() {
                 Some(t) => typed_anchor(
                     t,
@@ -1207,7 +1243,7 @@ pub fn layoutnode_to_rendernode(
                 ),
                 None => RenderAnchor {
                     pick_center: input_world,
-                    type_markers: vec![],
+                    strands: vec![],
                     plain_body: Some(plain_anchor_body(input_world, true)),
                 },
             };
@@ -1227,11 +1263,11 @@ pub fn layoutnode_to_rendernode(
             // and the cell right behind it belongs to that Match's envelope.
             let outgoing_world = cell(0, 0, 1);
             let is_program_sink = layout_node.node_id == flat_graph.sink_node_id;
-            let outgoing_markers = if is_program_sink {
+            let outgoing_strands = if is_program_sink {
                 incoming
                     .as_ref()
                     .map(|t| {
-                        build_type_markers(
+                        build_anchor_strands(
                             t,
                             incoming_value.as_deref(),
                             outgoing_world,
@@ -1251,18 +1287,18 @@ pub fn layoutnode_to_rendernode(
             //
             // Grey covers both ways of having nothing: no edge into the Sink,
             // and an edge whose type is still `Pending` — which claims no row,
-            // so it builds no markers either. Asking the markers rather than the
+            // so it builds no strands either. Asking the strands rather than the
             // type is what folds the two together, the same way
             // `declared_type_cell` folds them.
             let outgoing_objects: Vec<RenderObject> = (is_program_sink
-                && outgoing_markers.is_empty())
+                && outgoing_strands.is_empty())
             .then(|| plain_anchor_body(outgoing_world, false))
             .into_iter()
             .collect();
             RenderNode {
                 node: None,
                 anchors: std::collections::HashMap::from([(input_anchor.clone(), anchor)]),
-                markers: outgoing_markers,
+                strands: outgoing_strands,
                 objects: outgoing_objects,
                 labels: vec![],
                 text_faces: vec![],
@@ -1278,7 +1314,7 @@ pub fn layoutnode_to_rendernode(
         // one cell behind it wearing the same type and naming it, whatever the
         // Match's input happens to be.
         crate::model::node::ENode::Pattern { r#type, .. } => {
-            let (markers, objects) = declared_type_cell(
+            let (strands, objects) = declared_type_cell(
                 r#type.as_ref(),
                 pattern_band_world(layout_node, extra_offset),
                 Lettering::Silent,
@@ -1286,7 +1322,7 @@ pub fn layoutnode_to_rendernode(
             RenderNode {
                 node: None,
                 anchors: std::collections::HashMap::new(),
-                markers,
+                strands,
                 objects,
                 labels: vec![],
                 text_faces: vec![],
@@ -1314,7 +1350,7 @@ pub fn layoutnode_to_rendernode(
                         Lettering::Spelled,
                     ),
                 )]),
-                markers: vec![],
+                strands: vec![],
                 objects: vec![],
                 labels: vec![],
                 text_faces: vec![],
@@ -1361,7 +1397,7 @@ pub fn layoutnode_to_rendernode(
                             ),
                             None => RenderAnchor {
                                 pick_center: input_world,
-                                type_markers: vec![],
+                                strands: vec![],
                                 plain_body: Some(plain_anchor_body(input_world, true)),
                             },
                         },
@@ -1377,7 +1413,7 @@ pub fn layoutnode_to_rendernode(
                         ),
                     ),
                 ]),
-                markers: vec![],
+                strands: vec![],
                 objects: vec![],
                 labels: vec![],
                 text_faces: vec![],

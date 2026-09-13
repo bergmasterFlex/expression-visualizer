@@ -10,18 +10,31 @@ use bevy::shader::ShaderRef;
 
 use crate::infer::EType;
 
-/// Height of a solid edge band: one anchor row, so band and type marker line
-/// up exactly.
-pub const RIBBON_HEIGHT: f32 = crate::render::CELL;
 /// Mesh height of a ribbon drawn as a hairline. The band itself is invisible in
 /// that mode (see `edge_band.wgsl`), so this is not a height that is *seen* —
 /// it is the height the visible line is measured against, since
-/// `RIBBON_LINE_HALF_THICKNESS_UV` is a fraction of it. The line comes out
-/// `2 × 0.1 × CELL / 4`, i.e. a twentieth of a cell: thin like a grid line.
+/// `RIBBON_LINE_HALF_THICKNESS_UV` is a fraction of it.
+///
+/// A ribbon of no height would have no triangles to rasterise and a `uv.y`
+/// spanning nothing, so the carrier has to be taller than the line it carries.
+/// Four times over is comfortable; nothing else depends on the factor.
 pub const RIBBON_LINE_HEIGHT: f32 = crate::render::CELL / 4.0;
-/// Half-thickness of the value-edge hairline in `uv.y` space (i.e. as a
-/// fraction of `RIBBON_LINE_HEIGHT`).
-pub const RIBBON_LINE_HALF_THICKNESS_UV: f32 = 0.1;
+/// Half-thickness of the hairline in `uv.y` space, i.e. as a fraction of
+/// `RIBBON_LINE_HEIGHT`.
+///
+/// Derived rather than stated, so the line leaving an anchor is the same line
+/// that was inside it. These two used to carry separate numbers and had drifted
+/// apart by a factor of two and a half, with the seam falling exactly on the
+/// anchor's outward face.
+pub const RIBBON_LINE_HALF_THICKNESS_UV: f32 =
+    crate::render::STRAND_LINE_THICKNESS * 0.5 / RIBBON_LINE_HEIGHT;
+/// Coverage below which a ribbon fragment is cut away rather than drawn.
+///
+/// Half, so that the cut lands exactly where the shapes say it should: the
+/// hairline's smoothstep crosses 0.5 at `line_half_thickness`, and a dash flank
+/// at its true boundary. `edge_band.wgsl` repeats this number — the two have to
+/// agree, and a uniform for a constant would be a slot spent on nothing.
+pub const COVERAGE_CUTOFF: f32 = 0.5;
 pub const RIBBON_SEGMENTS: usize = 40;
 
 /// Length of one dash-plus-gap of a pending edge's band, in world units along
@@ -140,14 +153,14 @@ impl RibbonEnd {
 
 /// The end of a ribbon that meets leaf row `row_center_y`, claiming `span` of
 /// it. `as_line` says whether that row is itself drawn as a line rather than as
-/// a band — ask `render::leaf_is_drawn_as_line`, which is what the marker stack
+/// a band — ask `render::leaf_is_drawn_as_line`, which is what the strand stack
 /// asks.
 ///
 /// Where a hairline sits depends on *why* it is one, and the two reasons are
 /// not the same:
 ///
 /// - the row is drawn as a line, so there is no band for the span to take a
-///   share of. The ribbon meets the line where the marker stack draws it, on
+///   share of. The ribbon meets the line where the strand stack draws it, on
 ///   the row's middle.
 /// - the row is a band, but what claims it is a literal of an unbounded type,
 ///   which takes none of its height. It can then only attach at an edge, and
@@ -287,6 +300,10 @@ pub const EDGE_SHADER_HANDLE: Handle<Shader> = uuid_handle!("45444745-0000-4000-
 
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
 pub struct EdgeMaterial {
+    /// The strand's colour, from `render::strand_color`, so it matches the
+    /// stretch of itself inside the anchors it joins. Only the RGB is read —
+    /// the material cuts fragments away rather than blending them, so there is
+    /// no alpha left for the shader to do anything with.
     #[uniform(0)]
     pub band_color: LinearRgba,
     /// Seconds since app start, updated each frame by
@@ -334,8 +351,21 @@ impl Material for EdgeMaterial {
         EDGE_SHADER_HANDLE.into()
     }
 
+    /// Masked rather than blended, so a strand writes depth and the depth cue
+    /// can see it — a strand's height above the plane is the hardest thing in
+    /// the picture to judge, and a blended one got no help with it.
+    ///
+    /// Masked rather than plainly opaque, because the ribbon has real cut-outs
+    /// to make: a hairline's mesh is `RIBBON_LINE_HEIGHT` tall while the line
+    /// on it is `STRAND_LINE_THICKNESS`, so painting the carrier solid would
+    /// draw every hairline five times too thick, and a pending strand's dashes
+    /// would fill in.
+    ///
+    /// The cutting is the shader's own job — Bevy's automatic one lives in
+    /// `pbr_functions.wgsl`, which `edge_band.wgsl` does not import — so this
+    /// threshold only selects the pass. `edge_band.wgsl` cuts at the same 0.5.
     fn alpha_mode(&self) -> AlphaMode {
-        AlphaMode::Blend
+        AlphaMode::Mask(COVERAGE_CUTOFF)
     }
 
     fn specialize(

@@ -703,25 +703,6 @@ pub fn bound_projection(cell_pixels: f32, focal_distance: f32, semi: f32) -> Pro
     }
 }
 
-/// Near and far of the bound projection, for passes that have to read the
-/// depth buffer back into world units.
-///
-/// A post-process pass gets depth as the projection left it — reverse-Z, so
-/// near reads 1.0 and far reads 0.0 — and needs the pair to undo that. The
-/// parallel and the converging projection are built from the same two planes,
-/// so one function answers for both; only the parallel one is linear in
-/// between, which is what makes the inversion a single lerp there.
-///
-/// `near` comes out negative at the usual standoff (a twenty-unit radius
-/// against a two-hundred-unit half-depth). That is the same deliberate reach
-/// behind the camera `VIEW_HALF_DEPTH` documents, not an error to clamp away.
-pub fn depth_range(focal_distance: f32) -> (f32, f32) {
-    (
-        focal_distance - VIEW_HALF_DEPTH,
-        focal_distance + VIEW_HALF_DEPTH,
-    )
-}
-
 /// The free mode's projection.
 pub fn free_projection(fov: f32) -> Projection {
     Projection::Perspective(PerspectiveProjection { fov, ..default() })

@@ -1,8 +1,19 @@
+// A strand between two anchors.
+//
+// Cut out rather than blended: the material is `AlphaMode::Mask`, so coverage
+// decides whether a fragment is drawn at all and never how much of it shows
+// through. That is what puts a strand in the depth buffer, which is what lets
+// the depth cue lay a shadow under it and draw its silhouette.
+//
+// There is no OIT path here any more. Bevy only defines `OIT_ENABLED` for a
+// pass keyed `BLEND_ALPHA`, so for a masked material the branch could never be
+// taken.
+
 #import bevy_pbr::forward_io::VertexOutput
 
-#ifdef OIT_ENABLED
-#import bevy_core_pipeline::oit::oit_draw
-#endif
+// Must match `COVERAGE_CUTOFF` in `src/edge.rs`, which names the same number to
+// the material.
+const COVERAGE_CUTOFF: f32 = 0.5;
 
 struct EdgeParams {
     band_color: vec4<f32>,
@@ -58,12 +69,13 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let coverage = mix(1.0, line_coverage, line_mode) * dash;
 
-    let out_color = vec4<f32>(params.band_color.rgb, coverage * params.band_color.a);
+    // Coverage is purely geometric now — it says where the strand is, not how
+    // solid it is. Both of the smoothsteps above cross 0.5 exactly on the shape
+    // they describe, so cutting there draws the hairline at its stated
+    // thickness and a dash at its true flank.
+    if coverage < COVERAGE_CUTOFF {
+        discard;
+    }
 
-#ifdef OIT_ENABLED
-    oit_draw(in.position, out_color);
-    discard;
-#endif
-
-    return out_color;
+    return vec4<f32>(params.band_color.rgb, 1.0);
 }

@@ -1067,7 +1067,7 @@ fn spawn_graph_nodes(
             &state.function_declarations,
             walked.extra_offset,
         );
-        // A node drawn only as markers or loose objects has no mesh of its own;
+        // A node drawn only as strands or loose objects has no mesh of its own;
         // the entity is still spawned so picking and selection keep working.
         let node_entity = match render_node.node {
             Some(obj) => commands
@@ -1140,12 +1140,12 @@ fn spawn_graph_nodes(
 
         // Markers the node owns directly rather than through an anchor: a
         // Pattern is drawn as the band of the type its arm matches.
-        spawn_type_markers(
+        spawn_anchor_strands(
             &mut commands,
             &mut meshes,
             &mut materials,
             &ui_font.0,
-            render_node.markers,
+            render_node.strands,
         );
 
         render_node
@@ -1154,19 +1154,19 @@ fn spawn_graph_nodes(
             .for_each(|(anchor_id, render_anchor)| {
                 let render::RenderAnchor {
                     pick_center,
-                    type_markers,
+                    strands,
                     plain_body,
                 } = render_anchor;
 
-                spawn_type_markers(
+                spawn_anchor_strands(
                     &mut commands,
                     &mut meshes,
                     &mut materials,
                     &ui_font.0,
-                    type_markers,
+                    strands,
                 );
 
-                // Neutral cuboid for anchors without type markers.
+                // Neutral cuboid for anchors without strands.
                 if let Some(body) = plain_body {
                     commands.spawn((
                         Mesh3d(meshes.add(body.mesh)),
@@ -1275,12 +1275,12 @@ fn spawn_graph_nodes(
 
         // graph-level literal on the source anchor. When present, the sole
         // rendered leaf swaps to the thin "value line" style — same rule
-        // the anchor markers follow, via the same lookup.
+        // the anchor strands follow, via the same lookup.
         let src_graph_value = infer::anchor_literal(&flat_graph, src_id);
 
         for (k, leaf) in source_leaves.iter().enumerate() {
-            // Same row offsets the marker stack uses, so each ribbon meets
-            // its marker exactly.
+            // Same row offsets the anchor strands use, so each ribbon meets
+            // the strand it continues exactly.
             let y_src = render::leaf_row_offset(k);
             // Which row at the target will accept this strand: the one that
             // admits it. Asked as subsumption rather than by kind because a
@@ -1299,21 +1299,21 @@ fn spawn_graph_nodes(
                 continue;
             }
             // A strand carrying a value is a hairline, a strand carrying a type
-            // is a band. Literally the same question the anchor's markers ask,
+            // is a band. Literally the same question the anchor's own strands ask,
             // asked through the same function and of the same leaf, so a strand
             // and the row it lands on cannot end up wearing different shapes.
             let (height, line_mode) =
                 if render::leaf_is_drawn_as_line(leaf, src_graph_value.as_deref()) {
                     (edge::RIBBON_LINE_HEIGHT, 1.0)
                 } else {
-                    (edge::RIBBON_HEIGHT, 0.0)
+                    (render::STRAND_BAND_HEIGHT, 0.0)
                 };
             let mesh =
                 edge::build_ribbon_mesh(&curve, from_world.y + y_src, to_world.y + y_tgt, height);
             commands.spawn((
                 Mesh3d(meshes.add(mesh)),
                 MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
-                    band_color: render::type_marker_color(leaf).to_linear(),
+                    band_color: render::strand_color(leaf).to_linear(),
                     time: 0.0,
                     // Both ends of an ordinary edge wear the same shape, so
                     // there is nothing for the interpolation to do and
@@ -4641,7 +4641,7 @@ fn spawn_link_ribbon(
     commands.spawn((
         Mesh3d(meshes.add(mesh)),
         MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
-            band_color: render::type_marker_color(leaf).to_linear(),
+            band_color: render::strand_color(leaf).to_linear(),
             time: 0.0,
             line_mode_start: start.line_mode,
             line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
@@ -4684,7 +4684,7 @@ fn spawn_pending_ribbon(
             // Through the same call the coloured strands go through, of the
             // same type the grey anchor bodies are drawn from, so a band and
             // the two cells it joins cannot come apart.
-            band_color: render::type_marker_color(&infer::EType::Pending).to_linear(),
+            band_color: render::strand_color(&infer::EType::Pending).to_linear(),
             time: 0.0,
             line_mode_start: start.line_mode,
             line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
@@ -4704,7 +4704,7 @@ fn spawn_pending_ribbon(
 /// where nothing narrower has been said about it.
 ///
 /// The row an undecided anchor offers is its own — `plain_anchor_body` draws
-/// exactly one, a full `TYPE_MARKER_Y_STEP` tall — so a pending band meets it
+/// exactly one, a full `STRAND_BAND_HEIGHT` tall — so a pending band meets it
 /// by claiming all of it.
 fn whole_row_end(row_center_y: f32, as_line: bool) -> edge::RibbonEnd {
     edge::ribbon_end(row_center_y, &infer::RowSpan::FULL, as_line)
@@ -5130,46 +5130,37 @@ fn spawn_cast_links(
 
 /// Spawn a UI text label that tracks a world position.
 
-/// Spawn one type-marker stack: the coloured rect and its letter per leaf,
-/// plus the gizmo line and value label when the anchor carries a literal.
+/// Spawn one stack of strands: per leaf, the band and its type letter, or the
+/// line and its value when that leaf carries a literal.
 ///
-/// Shared by the per-anchor markers and the node-level ones a Pattern uses, so
-/// a Pattern's band is built exactly like an anchor's.
-fn spawn_type_markers(
+/// Shared by the per-anchor stacks and the node-level ones a Pattern uses, so a
+/// Pattern's band is built exactly like an anchor's.
+fn spawn_anchor_strands(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials: &mut Assets<StandardMaterial>,
     font: &Handle<Font>,
-    markers: Vec<render::RenderTypeMarker>,
+    strands: Vec<render::RenderStrand>,
 ) {
-    for marker in markers {
-        let render::RenderTypeMarker {
-            rect,
-            label,
-            value_line,
-            value_label,
-        } = marker;
-        if let Some(rect) = rect {
+    for strand in strands {
+        let render::RenderStrand {
+            band,
+            band_label,
+            line,
+            line_label,
+        } = strand;
+        // Exactly one of the two shapes stands per strand, but nothing here
+        // needs to know which: each is spawned if it is there.
+        for shape in [band, line].into_iter().flatten() {
             commands.spawn((
-                Mesh3d(meshes.add(rect.mesh)),
-                MeshMaterial3d(materials.add(rect.material)),
-                rect.transform,
+                Mesh3d(meshes.add(shape.mesh)),
+                MeshMaterial3d(materials.add(shape.material)),
+                shape.transform,
                 SceneEntity,
             ));
         }
-        if let Some(label) = label {
-            spawn_world_label(commands, font, label, SceneEntity);
-        }
-        if let Some(line) = value_line {
-            commands.spawn((
-                Mesh3d(meshes.add(line.mesh)),
-                MeshMaterial3d(materials.add(line.material)),
-                line.transform,
-                SceneEntity,
-            ));
-        }
-        if let Some(vlabel) = value_label {
-            spawn_world_label(commands, font, vlabel, SceneEntity);
+        for text in [band_label, line_label].into_iter().flatten() {
+            spawn_world_label(commands, font, text, SceneEntity);
         }
     }
 }
