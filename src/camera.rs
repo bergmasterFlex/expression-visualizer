@@ -98,9 +98,11 @@ pub const CAMERA_TWEEN_DURATION: f32 = 0.4;
 /// it has to.
 pub const RESET_THETA: f32 = std::f32::consts::FRAC_PI_2;
 pub const RESET_PHI: f32 = std::f32::consts::FRAC_PI_2;
-/// Distance the camera keeps in the bound mode. Fixed, because under the
-/// orthographic projection it changes nothing about apparent size — it only
-/// decides how the distance fog grades the depth.
+/// Distance the camera keeps in the bound mode.
+///
+/// Fixed, and under the orthographic projection it changes nothing about
+/// apparent size. What it still decides is where the projection's own two
+/// planes fall, since both are measured from it — see `VIEW_HALF_DEPTH`.
 pub const RESET_RADIUS: f32 = 20.0;
 
 /// Default and range of the scale setting, in pixels per cell.
@@ -145,9 +147,6 @@ const FREE_FOV: f32 = std::f32::consts::FRAC_PI_4;
 /// then differ *only* in whether they converge, so blending between them is a
 /// straight fade instead of a fade plus a move.
 const SEMI_ORTHO_DEPTH_RATIO: f32 = 4.5;
-
-/// How deep the fog grades, in world units either side of the caret's plane.
-const FOG_HALF_SPAN: f32 = 20.0;
 
 #[derive(Clone, Copy, Default)]
 struct OrbitState {
@@ -235,7 +234,6 @@ impl Plugin for OrbitCameraPlugin {
                     sync_bound_radius,
                     orbit_apply,
                     apply_projection,
-                    sync_fog,
                 )
                     .chain(),
             );
@@ -790,26 +788,6 @@ fn apply_projection(
                 t: blend,
                 focal_distance: orbit.radius,
             })
-        };
-    }
-}
-
-/// Grade the fog by depth around the caret's plane rather than by distance to
-/// the camera.
-///
-/// The camera's standoff is an implementation detail — it is twenty units in
-/// the parallel picture and ten times that in the semi-orthographic one — and a
-/// fog measured from the camera would be a different fog in each. Anchoring it
-/// to the focal plane keeps the haze telling the one thing it is here to tell:
-/// how far a cell is in front of or behind the one the caret is on.
-fn sync_fog(orbit: Res<OrbitCamera>, mut query: Query<&mut DistanceFog, With<OrbitCameraTag>>) {
-    if !orbit.is_changed() {
-        return;
-    }
-    for mut fog in query.iter_mut() {
-        fog.falloff = FogFalloff::Linear {
-            start: (orbit.radius - FOG_HALF_SPAN).max(0.0),
-            end: orbit.radius + FOG_HALF_SPAN,
         };
     }
 }

@@ -961,11 +961,6 @@ fn setup_scene(mut commands: Commands) {
         // Off until F9 says otherwise.
         depth_cue::DepthCue::default(),
         camera::OrbitCameraTag,
-        DistanceFog {
-            color: Color::srgba(0.02, 0.02, 0.36, 1.0),
-            falloff: FogFalloff::Exponential { density: 0.03 },
-            ..default()
-        },
         AmbientLight {
             color: Color::srgb(0.25, 0.25, 0.38),
             brightness: 200.0,

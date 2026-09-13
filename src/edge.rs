@@ -429,6 +429,13 @@ const FACE_TEX_CELL_PX: u32 = 128;
 /// is indistinguishable from the body under it. Straight alpha would also
 /// require painting the colour into fully transparent pixels, or bilinear
 /// filtering drags dark seams around every glyph.
+///
+/// Everything is stored divided by `render::DISPLAY_WHITE`, which
+/// `render::face_material` multiplies back out. Eight bits per channel cannot
+/// hold the overdriven white a glyph needs to survive the tonemapper, so the
+/// range is borrowed from the material instead. sRGB encoding spends most of
+/// its resolution down where the divided values land, so the round trip costs
+/// nothing that can be seen.
 pub fn rasterize_face_text(
     font: &FontRef<'_>,
     text: &str,
@@ -438,8 +445,24 @@ pub fn rasterize_face_text(
 ) -> Handle<Image> {
     let w = (cells.max(1) * FACE_TEX_CELL_PX) as usize;
     let h = FACE_TEX_CELL_PX as usize;
-    let bg = background.to_srgba().to_u8_array();
-    let mut buf: Vec<u8> = bg.iter().copied().cycle().take(w * h * 4).collect();
+
+    // The background as it is stored: the body's colour, scaled down by the
+    // gain the material will apply. Kept in linear form because that is where
+    // a glyph's coverage has to be mixed — mixing in sRGB, which is what this
+    // did before, bends the ramp and leaves the edge of every letter heavier
+    // than the coverage actually asked for.
+    let bg_linear = background.to_linear();
+    let stored_bg = LinearRgba::new(
+        bg_linear.red / crate::render::DISPLAY_WHITE,
+        bg_linear.green / crate::render::DISPLAY_WHITE,
+        bg_linear.blue / crate::render::DISPLAY_WHITE,
+        1.0,
+    );
+
+    // Coverage per pixel, resolved into colour in one pass at the end. A glyph
+    // is drawn span by span and letters can touch, so the strongest coverage
+    // any of them claims for a pixel is the one that counts.
+    let mut coverage = vec![0.0f32; w * h];
 
     let pitch = FACE_TEX_CELL_PX as f32 / crate::layout::NAME_CHARS_PER_CELL as f32;
     // `PxScale` is measured against the font's ascent-to-descent span, not
@@ -468,21 +491,33 @@ pub fn rasterize_face_text(
             .with_scale_and_position(px, ab_glyph::point(pen_x, baseline_y));
         if let Some(outline) = font.outline_glyph(glyph) {
             let bounds = outline.px_bounds();
-            outline.draw(|gx, gy, coverage| {
+            outline.draw(|gx, gy, ink| {
                 let px_x = gx as i32 + bounds.min.x as i32;
                 let px_y = gy as i32 + bounds.min.y as i32;
                 if px_x < 0 || px_y < 0 || px_x as usize >= w || px_y as usize >= h {
                     return;
                 }
-                let idx = (px_y as usize * w + px_x as usize) * 4;
-                for channel in 0..3 {
-                    let lit = bg[channel] as f32 + (255.0 - bg[channel] as f32) * coverage;
-                    buf[idx + channel] = buf[idx + channel].max(lit as u8);
-                }
+                let cell = &mut coverage[px_y as usize * w + px_x as usize];
+                *cell = cell.max(ink);
             });
         }
         // Fixed step: no accumulated advance, no stretch.
         pen_x += pitch;
+    }
+
+    // Resolve coverage into colour. Each channel runs from the stored
+    // background up to a stored 1.0, which the material's gain will carry to
+    // `DISPLAY_WHITE` — so a fully covered pixel arrives on screen as #FFFFFF
+    // and an uncovered one as the body's own colour, exactly.
+    let mut buf: Vec<u8> = Vec::with_capacity(w * h * 4);
+    for ink in coverage {
+        let lit = LinearRgba::new(
+            stored_bg.red + (1.0 - stored_bg.red) * ink,
+            stored_bg.green + (1.0 - stored_bg.green) * ink,
+            stored_bg.blue + (1.0 - stored_bg.blue) * ink,
+            1.0,
+        );
+        buf.extend_from_slice(&Color::LinearRgba(lit).to_srgba().to_u8_array());
     }
 
     let mut image = Image::new(

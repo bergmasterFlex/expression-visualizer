@@ -68,13 +68,19 @@ const CARET_EDGE_THICKNESS: f32 = CELL / 60.0;
 /// keeps the cell behind the caret readable, not the paint.
 const CARET_FACE_ALPHA: f32 = 0.8;
 
-/// Linear brightness the caret faces are painted with, well past white.
+/// The linear brightness that arrives on screen as #FFFFFF — well past white.
 ///
-/// The camera tonemaps (TonyMcMapface), which maps a linear 1.0 to roughly
-/// 0.8 on screen — plain white comes out grey. Overdriving the colour puts the
-/// caret back at #FFFFFF after the curve. It only works because the camera
-/// renders HDR; an 8-bit target would clamp this back to 1.0 first.
-const CARET_FACE_GAIN: f32 = 8.0;
+/// The camera tonemaps (TonyMcMapface), which maps a linear 1.0 to roughly 0.8
+/// on screen: anything painted plain white comes out grey. Overdriving it this
+/// far puts it back at #FFFFFF after the curve. It only works because the
+/// camera renders HDR; an 8-bit target would clamp this back to 1.0 first.
+///
+/// A property of the tonemapper rather than of any one thing drawn, so
+/// everything that has to read as white goes through it: the caret's faces and
+/// the names printed on a body. The floating labels do not — they are UI text
+/// and never meet the curve, which is exactly why a name on a body used to
+/// look grey beside a label that did not.
+pub const DISPLAY_WHITE: f32 = 8.0;
 
 /// The INSERT-mode caret: the two faces of the addressed cell that look back
 /// toward the scope origin — the YZ face at the cell's lower X, the XY face at
@@ -92,19 +98,14 @@ pub fn cell_caret_faces(cell: Vec3) -> Vec<RenderObject> {
     let span = hi - lo;
     let material = || StandardMaterial {
         base_color: Color::LinearRgba(LinearRgba::new(
-            CARET_FACE_GAIN,
-            CARET_FACE_GAIN,
-            CARET_FACE_GAIN,
+            DISPLAY_WHITE,
+            DISPLAY_WHITE,
+            DISPLAY_WHITE,
             CARET_FACE_ALPHA,
         )),
         alpha_mode: AlphaMode::Blend,
         cull_mode: None,
         unlit: true,
-        // The camera's distance fog reaches unlit materials too, and would
-        // mix a quarter of the background's dark blue into a caret ten cells
-        // out. The caret marks an address, not a place in the scene, so it is
-        // exempt from depth cues.
-        fog_enabled: false,
         ..default()
     };
     vec![
@@ -187,6 +188,33 @@ pub struct RenderTextFace {
     pub text: String,
     pub cells: u32,
     pub background: Color,
+}
+
+/// What a printed face is painted with: the gain that carries its texture up
+/// into the range the tonemapper turns back into real colour.
+///
+/// `base_color` *multiplies* `base_color_texture`, and that multiplication is
+/// doing a job here rather than being tolerated. The texture is eight-bit and
+/// so cannot hold a value past 1.0, but a name has to reach `DISPLAY_WHITE` to
+/// come out white on screen. So `edge::rasterize_face_text` stores everything
+/// divided by that gain and this puts it back — the body's colour lands on
+/// exactly the body's colour, and the glyphs land past white.
+///
+/// Painting this in the body's colour, which is what it did first, squared the
+/// background and pulled the glyphs down to the body's own colour; painting it
+/// plain white fixed the background but left the glyphs at a linear 1.0, which
+/// the curve delivers as grey.
+fn face_material() -> StandardMaterial {
+    StandardMaterial {
+        base_color: Color::LinearRgba(LinearRgba::new(
+            DISPLAY_WHITE,
+            DISPLAY_WHITE,
+            DISPLAY_WHITE,
+            1.0,
+        )),
+        unlit: true,
+        ..default()
+    }
 }
 
 pub struct RenderNode {
@@ -331,10 +359,13 @@ fn type_order(t: &crate::infer::EType) -> Option<u8> {
     }
 }
 
-/// The letter written across a type's band. `none` never asks for one: it is
-/// drawn as a line with its own word at the tip, the way a literal is, so its
-/// arm here is unreachable — kept only because a total function over the leaves
-/// is easier to trust than one with a hole in it.
+/// The letter a type is written with, on the middle of the strand carrying it.
+///
+/// `none` asks for one too, and its arm is the interesting one. It is the only
+/// leaf drawn as a *line* that still wears a letter rather than a value —
+/// because its value is its type, so the type is the only thing there is to
+/// write. That is what puts `n` flush with `i`, `s`, `c` and `b` instead of
+/// spelling the word out past the strand's tip the way a literal does.
 fn type_letter(t: &crate::infer::EType) -> &'static str {
     match t {
         crate::infer::EType::Bool(..) => "b",
@@ -360,7 +391,7 @@ pub fn strand_color(t: &crate::infer::EType) -> Color {
     match t {
         crate::infer::EType::Bool(..) => Color::srgb(0.65, 0.30, 0.95),
         crate::infer::EType::Char(..) => Color::srgb(0.30, 0.90, 0.40),
-        crate::infer::EType::Int(..) => Color::srgb(0.40, 0.70, 1.00),
+        crate::infer::EType::Int(..) => Color::srgb(0.28, 0.58, 1.00),
         crate::infer::EType::String(..) => Color::srgb(1.00, 0.90, 0.30),
         crate::infer::EType::None => Color::srgb(0.95, 0.30, 0.30),
         _ => Color::srgb(0.5, 0.5, 0.5),
@@ -408,9 +439,8 @@ pub fn row_span_world_y(row_center_y: f32, span: &crate::infer::RowSpan) -> (f32
     (row_top + span.top * step, row_top + span.bottom * step)
 }
 
-/// The word a leaf is drawn as a line *of*, when it is drawn as a line at all:
-/// the literal the leaf itself is pinned to, the one pinned to its anchor, or
-/// `none`, which needs nothing pinned to it.
+/// The literal a leaf carries, if it carries one: the one the leaf itself is
+/// pinned to, or the one pinned to its anchor.
 ///
 /// The leaf's own literal comes first and the anchor's is the fallback. A leaf
 /// carries a literal when the type says so — one row of a `1|2` — and the
@@ -418,16 +448,15 @@ pub fn row_span_world_y(row_center_y: f32, span: &crate::infer::RowSpan) -> (f32
 /// that names no value of its own. Where both speak they agree; where only one
 /// does, it is the one that knows.
 ///
-/// One function rather than two so the shape and the word can never disagree —
-/// there is no state in which something is drawn as a line with nothing written
-/// on it, or writes a value while wearing a band.
-fn leaf_line_text(leaf: &crate::infer::EType, graph_value: Option<&str>) -> Option<String> {
-    match leaf {
-        crate::infer::EType::None => Some(crate::model::r#type::NONE_LITERAL.to_string()),
-        _ => crate::infer::leaf_literal(leaf)
-            .or(graph_value)
-            .map(str::to_string),
-    }
+/// `none` is answered `None` here on purpose, and that is not a gap: it carries
+/// no literal because its *value is its type*. It is still drawn as a line —
+/// see `leaf_is_drawn_as_line` — but a line labelled with a type letter rather
+/// than with a word, which is the whole of what makes it read as the type it
+/// is.
+fn leaf_value_text(leaf: &crate::infer::EType, graph_value: Option<&str>) -> Option<String> {
+    crate::infer::leaf_literal(leaf)
+        .or(graph_value)
+        .map(str::to_string)
 }
 
 /// True when a leaf is drawn as a thin line rather than as a band: it is
@@ -436,7 +465,7 @@ fn leaf_line_text(leaf: &crate::infer::EType, graph_value: Option<&str>) -> Opti
 /// Both the strand stack and every ribbon that meets it ask this, of the same
 /// leaf, so the two cannot disagree about what shape they are joining.
 pub fn leaf_is_drawn_as_line(leaf: &crate::infer::EType, graph_value: Option<&str>) -> bool {
-    leaf_line_text(leaf, graph_value).is_some()
+    matches!(leaf, crate::infer::EType::None) || leaf_value_text(leaf, graph_value).is_some()
 }
 
 /// The face of an anchor's band that faces the node body — the far face of an
@@ -548,21 +577,33 @@ fn build_anchor_strands(
             let color = strand_color(&leaf);
             let letter = type_letter(&leaf).to_string();
             let center = Vec3::new(anchor_world_pos.x, y_center, full_rect_z_center);
-            // What this row is drawn as a line *of*, if it is drawn as one:
-            // `leaf_line_text` is the single place that question is settled, so
-            // a ribbon meeting this row joins the shape it actually finds.
-            let line_text = leaf_line_text(&leaf, graph_value);
-
-            if let Some(value) = line_text {
-                // A leaf that stands for a value is drawn as that value and
-                // nothing else: one thin line across the anchor's full depth,
-                // its colour carrying the type. No band, no type letter — the
-                // same choice the edge shader makes for value-carrying edges.
-                let label_world = Vec3::new(
-                    anchor_world_pos.x,
-                    y_center,
-                    line_tip_z + sign * VALUE_LABEL_Z_PADDING,
-                );
+            // Whether this row is drawn as a line at all — asked through the
+            // one function every ribbon meeting this row asks, so a strand
+            // joins the shape it actually finds.
+            if leaf_is_drawn_as_line(&leaf, graph_value) {
+                // A line across the anchor's full depth, its colour carrying
+                // the type. No band — the same choice the edge shader makes for
+                // value-carrying strands.
+                //
+                // What is written on it depends on *why* it is a line, and the
+                // two reasons want different places. A literal writes its value
+                // out past the tip, where a word of any length has room. `none`
+                // carries no literal — its value is its type — so it writes the
+                // type's own letter on the strand's middle, at the very
+                // `center` the band branch below gives `i`, `s`, `c` and `b`.
+                // That is the whole of what puts it flush with them: the same
+                // position, not a correction applied to a different one.
+                let (label_text, label_world) = match leaf_value_text(&leaf, graph_value) {
+                    Some(value) => (
+                        value,
+                        Vec3::new(
+                            anchor_world_pos.x,
+                            y_center,
+                            line_tip_z + sign * VALUE_LABEL_Z_PADDING,
+                        ),
+                    ),
+                    None => (letter, center),
+                };
                 RenderStrand {
                     band: None,
                     band_label: None,
@@ -580,7 +621,7 @@ fn build_anchor_strands(
                     }),
                     line_label: match lettering {
                         Lettering::Spelled => Some(RenderLabel {
-                            text: value,
+                            text: label_text,
                             color: Color::WHITE,
                             font_size: 14.0,
                             world_pos: label_world,
@@ -817,13 +858,13 @@ pub fn layoutnode_to_rendernode(
             // so the top face lies half a cell *above* the centre in world
             // terms.
             let top_y = body_center.y + cell_y * 0.5;
-            let body_material = || StandardMaterial {
+            // `emissive` would be dead weight here: for an unlit material the
+            // shader skips the lighting pass that would add it. Unlit also
+            // keeps the body and the name face lying on it identical by
+            // construction — a lit body would shade with its orientation while
+            // the face, being its own entity at its own angle, would not.
+            let body_material = StandardMaterial {
                 base_color: body_color,
-                // `emissive` would be dead weight: for an unlit material the
-                // shader skips the lighting pass that would add it. Unlit also
-                // keeps the name face and the body identical by construction —
-                // a lit body would glow on hover while the face, being its own
-                // entity, would not.
                 unlit: true,
                 ..default()
             };
@@ -844,7 +885,7 @@ pub fn layoutnode_to_rendernode(
                         * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
                     scale: Vec3::ONE,
                 },
-                material: body_material(),
+                material: face_material(),
                 text: name.clone(),
                 cells: depth as u32,
                 background: body_color,
@@ -854,7 +895,7 @@ pub fn layoutnode_to_rendernode(
                     mesh: Cuboid::new(body_size.x, body_size.y, body_size.z)
                         .mesh()
                         .build(),
-                    material: body_material(),
+                    material: body_material,
                     transform: Transform::from_translation(body_center),
                 }),
                 anchors: std::collections::HashMap::from([(
@@ -1123,11 +1164,7 @@ pub fn layoutnode_to_rendernode(
                         * Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
                     scale: Vec3::ONE,
                 },
-                material: StandardMaterial {
-                    base_color: body_color,
-                    unlit: true,
-                    ..default()
-                },
+                material: face_material(),
                 text: function_declaration.name.clone(),
                 cells: depth as u32,
                 background: body_color,
@@ -1137,7 +1174,6 @@ pub fn layoutnode_to_rendernode(
                     mesh: crate::mesh::frustum_8pt_mesh(base_quad, top_quad),
                     material: StandardMaterial {
                         base_color: body_color,
-                        emissive: LinearRgba::new(0.2, 0.5, 0.8, 1.0),
                         unlit: true,
                         ..default()
                     },
