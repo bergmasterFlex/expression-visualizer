@@ -7,6 +7,54 @@
   <script>
   (() => {
     const WASM_RE = /_bg\.wasm(\?|$)/;
+
+    // Whether this browser can actually render the app.
+    //
+    // Asked in two parts, because the first is not enough on its own: a
+    // browser can expose `navigator.gpu` and still hand back no adapter —
+    // behind a flag, on a blocked driver, in a headless context. Only an
+    // adapter in hand means WebGPU is really there.
+    //
+    // Started here rather than where it is read, so the round trip to the
+    // driver overlaps with parsing the page instead of following it.
+    const webgpuReady = (async () => {
+      if (!navigator.gpu) return false;
+      try {
+        return !!(await navigator.gpu.requestAdapter());
+      } catch {
+        return false;
+      }
+    })();
+
+    const showUnsupported = () => {
+      document.getElementById('boot-loader')?.remove();
+      const el = document.getElementById('no-webgpu');
+      if (!el) return;
+      // A browser withholds `navigator.gpu` altogether over a plain-HTTP
+      // origin, which from in here is indistinguishable from not having
+      // WebGPU at all. Blaming the browser for that would send someone
+      // looking in the wrong place, so swap to the reading that names the
+      // real reason. Both are already in the page; this only picks one.
+      if (!window.isSecureContext) {
+        document.getElementById('nw-unsupported').hidden = true;
+        document.getElementById('nw-insecure').hidden = false;
+      }
+      el.removeAttribute('hidden');
+    };
+
+    // Said as soon as the answer is in, rather than when the loader gets round
+    // to asking for the bundle: there is no reason to sit in front of a
+    // progress bar that is never going to move. It waits only for the elements
+    // to exist, since this script runs before the body does.
+    webgpuReady.then((ok) => {
+      if (ok) return;
+      if (document.readyState === 'loading') {
+        addEventListener('DOMContentLoaded', showUnsupported, { once: true });
+      } else {
+        showUnsupported();
+      }
+    });
+
     // Approximate gzipped WASM transfer size. nginx serves the bundle with
     // on-the-fly gzip + chunked transfer encoding, so the stream yields the
     // compressed bytes (~26 MB) and Content-Length is absent. The Math.max
@@ -30,7 +78,20 @@
     window.fetch = (input, init) => {
       const url = typeof input === 'string' ? input : input.url;
       if (!WASM_RE.test(url || '')) return origFetch(input, init);
-      return origFetch(input, init).then(async (res) => {
+      return webgpuReady.then((ok) => {
+        // Nothing to download into a browser that cannot draw it. The bundle
+        // is some twenty-six megabytes, and this is the one place it can still
+        // be called off — the request is never made rather than made and
+        // thrown away. The message is already up by now; this only stops the
+        // download.
+        //
+        // The promise is then left unsettled on purpose. The loader Trunk
+        // injects has no way of being told "never mind", so hanging it is
+        // quieter than letting it throw a stack trace across a page that is
+        // already explaining itself.
+        if (!ok) return new Promise(() => {});
+        return origFetch(input, init);
+      }).then(async (res) => {
         if (!res.ok || !res.body) return res;
         const reader = res.body.getReader();
         const chunks = [];
@@ -115,6 +176,45 @@
       font-variant-numeric: tabular-nums;
     }
     @keyframes boot-spin { to { transform: rotate(360deg); } }
+
+    /* ── Shown instead of the app when WebGPU is missing ──────── */
+    #no-webgpu {
+      position: fixed; inset: 0; z-index: 100;
+      background: #08081a;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 12px;
+      padding: 24px;
+      text-align: center;
+      color: #E8E4DE;
+    }
+    #no-webgpu[hidden] { display: none; }
+    #no-webgpu .nw-title {
+      font-size: 20px; font-weight: 700;
+      letter-spacing: -0.3px;
+    }
+    #no-webgpu .nw-case {
+      display: flex; flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+    #no-webgpu .nw-case[hidden] { display: none; }
+    /* No `max-width` on either: the lines are broken by hand, so a width
+       limit could only ever re-break them somewhere worse. */
+    #no-webgpu .nw-body {
+      font-size: 13px; line-height: 1.7;
+      color: #8A8AA0;
+    }
+    #no-webgpu .nw-hint {
+      font-size: 12px; line-height: 1.7;
+      color: #4A4A5E;
+    }
+    /* The page is already monospace, so a pref name needs picking out by
+       weight rather than by face. */
+    #no-webgpu .nw-hint code {
+      color: #6A6A82;
+      font-weight: 600;
+    }
   </style>
 </head>
 <body>
@@ -125,6 +225,39 @@
     <div class="boot-pct">0%</div>
     <div class="boot-bar"><div class="boot-bar-fill"></div></div>
     <div class="boot-stats">0.0 MB</div>
+  </div>
+
+  <!-- Takes the loader's place when there is no WebGPU to draw with.
+       Both readings are written out here rather than assembled in script, so
+       whoever comes to reword them finds the words. Each line is its own
+       element: the breaks are where the sense breaks, not where the window
+       happens to end. -->
+  <div id="no-webgpu" role="alert" hidden>
+    <div class="nw-title">WebGPU required</div>
+
+    <!-- The usual reading: the browser has no WebGPU. -->
+    <div class="nw-case" id="nw-unsupported">
+      <div class="nw-body">
+        <div>This app renders with WebGPU,</div>
+        <div>and this browser does not support it yet.</div>
+      </div>
+      <div class="nw-hint">
+        <div>A current Chrome or Edge will run it today.</div>
+        <div>Firefox may already have it in a Nightly build,</div>
+        <div>or behind <code>dom.webgpu.enabled</code> in <code>about:config</code>.</div>
+      </div>
+    </div>
+
+    <!-- The other one: WebGPU is withheld because the origin is not secure. -->
+    <div class="nw-case" id="nw-insecure" hidden>
+      <div class="nw-body">
+        <div>This app renders with WebGPU, which browsers</div>
+        <div>only offer over HTTPS or on localhost.</div>
+      </div>
+      <div class="nw-hint">
+        <div>This page was served over plain HTTP.</div>
+      </div>
+    </div>
   </div>
 
   <!-- Bevy renders into this canvas -->
