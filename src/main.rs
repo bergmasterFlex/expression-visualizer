@@ -1,6 +1,7 @@
 mod camera;
 mod colors;
 mod common;
+mod depth_cue;
 mod edge;
 mod eval;
 mod grid;
@@ -954,6 +955,11 @@ fn setup_scene(mut commands: Commands) {
         Transform::from_xyz(0.0, 5.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
         OrderIndependentTransparencySettings::default(),
         Msaa::Off,
+        // Reads the depth buffer back in a full-screen pass. OIT is what makes
+        // that possible without a depth prepass: it already marks the depth
+        // texture as bindable, so the cue samples the one the main pass wrote.
+        // Off until F9 says otherwise.
+        depth_cue::DepthCue::default(),
         camera::OrbitCameraTag,
         DistanceFog {
             color: Color::srgba(0.02, 0.02, 0.36, 1.0),
@@ -6572,6 +6578,7 @@ fn main() {
         ))
         .add_plugins(grid::GridPlugin)
         .add_plugins(edge::EdgePlugin)
+        .add_plugins(depth_cue::DepthCuePlugin)
         .init_resource::<GraphState>()
         .init_resource::<NeedsRebuild>()
         .init_resource::<PickState>()
