@@ -579,6 +579,22 @@ fn anchor_type_uncycled(
                 _ => None,
             }
         }
+        // A Tunnel declares nothing, so its output is simply whatever reached
+        // its input — the one node kind whose type is entirely borrowed. With
+        // nothing wired in it is `Pending`, and the branch behind it reads
+        // that, which is what draws the whole run grey until the enclosing
+        // graph connects something.
+        //
+        // The input answers `None`: it constrains nothing, so anything may be
+        // wired to it. `anchor_type_guarded` takes care of a Tunnel wired,
+        // however indirectly, back into itself.
+        crate::model::node::ENode::Tunnel {
+            input_anchor,
+            output_anchor,
+        } => (anchor_id == output_anchor).then(|| {
+            incoming_type(graph, input_anchor, function_declarations, visiting)
+                .unwrap_or(EType::Pending)
+        }),
         crate::model::node::ENode::FunctionCall {
             function_declaration_id,
             input_anchors,

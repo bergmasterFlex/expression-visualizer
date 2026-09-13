@@ -261,6 +261,7 @@ enum AddKind {
     Match,
     Pattern,
     TypeCast,
+    Tunnel,
 }
 
 /// The kinds that name themselves, in list order, each under its `ENode`
@@ -278,11 +279,12 @@ enum AddKind {
 /// `mod`, `max` and `min` — but a typed letter puts the highlight on the first
 /// committable row, so `m` still settles on `Match`. (The *empty* prompt
 /// highlights nothing at all; the letter is what starts the list answering.)
-const NODE_KINDS: [(AddKind, &str); 4] = [
+const NODE_KINDS: [(AddKind, &str); 5] = [
     (AddKind::Source, "Source"),
     (AddKind::Match, "Match"),
     (AddKind::Pattern, "Pattern"),
     (AddKind::TypeCast, "TypeCast"),
+    (AddKind::Tunnel, "Tunnel"),
 ];
 
 /// The three values that are written as a word instead of as a shape. They are
@@ -1927,6 +1929,15 @@ fn kind_allowed(
         AddKind::Source => {
             graph.node_at(local).is_none() && is_root_scope && local.z == 0 && local.y == 0
         }
+        // The mirror image, on the same row one scope in. A Tunnel is what a
+        // Source is to the root: where a value enters. The root has no
+        // enclosing graph to be tunnelled from, which is why this is the one
+        // kind refused *because* the scope is the root — and `node_at`
+        // refuses the branch's own (0,0,0), since the BranchSource already
+        // stands on it.
+        AddKind::Tunnel => {
+            graph.node_at(local).is_none() && !is_root_scope && local.z == 0 && local.y == 0
+        }
         _ => graph.node_at(local).is_none() && local.z != 0,
     }
 }
@@ -1962,6 +1973,7 @@ fn insert_node_kind(
             anchor_id_domain,
         ),
         AddKind::Source => scope_graph.plus_source(new_pos, node_id_domain, anchor_id_domain),
+        AddKind::Tunnel => scope_graph.plus_tunnel(new_pos, node_id_domain, anchor_id_domain),
         AddKind::FunctionCall(function_declaration_id) => {
             // The declaration decides the call's arity — `plus_function_call`
             // mints one input anchor per parameter — so a kind naming a
@@ -6472,7 +6484,23 @@ fn drag_update_system(
         // ohnehin als Duplikat verwirft.
         let is_duplicate =
             anchors_already_connected(state.root_graph(), &info.source_anchor_id, &target_id);
-        if !is_self && is_opposite_kind && !is_duplicate {
+        // Ein Ziel in einem fremden Scope schnappt nur ein, wenn es der Input
+        // eines Tunnels genau eine Ebene tiefer ist. Hier und nicht erst beim
+        // Drop, damit die Preview-Linie gelb bleibt statt eine Verbindung zu
+        // versprechen, die drag_end ohnehin verwirft.
+        //
+        // Vorher in die Richtung gebracht, in der die Kante gespeichert würde:
+        // `connection_allowed` spricht von Erzeuger -> Verbraucher, gezogen
+        // werden darf aber von beiden Enden aus. Ungedreht würde ein Zug, der
+        // am Tunnel-Input beginnt und beim Source endet, als Verbindung aus
+        // dem Branch heraus gelesen und abgelehnt.
+        let (from, to) = if info.source_is_output {
+            (&info.source_anchor_id, &target_id)
+        } else {
+            (&target_id, &info.source_anchor_id)
+        };
+        let is_permitted = connection_allowed(state.root_graph(), from, to);
+        if !is_self && is_opposite_kind && !is_duplicate && is_permitted {
             info.target_anchor_id = Some(target_id);
             info.current_end = tf.translation();
         }
@@ -6503,6 +6531,70 @@ fn anchors_already_connected(
     joined(a, b) || joined(b, a)
 }
 
+/// Whether an edge may join these two anchors at all.
+///
+/// A value enters a sub-graph through a Tunnel or it does not enter. Within
+/// one scope everything is as it was — that is the ordinary case and this says
+/// nothing about it — but the moment the two ends sit in different scopes,
+/// exactly one shape is admitted: an output of the immediately enclosing graph
+/// reaching the **input** of a Tunnel one level in.
+///
+/// Everything else that crosses a boundary is refused, and the refusals are
+/// the point rather than a side effect:
+///
+/// - onto an ordinary node of a branch, which is the hole this closes: a value
+///   could be wired straight onto whatever wanted it, and nothing in the
+///   branch recorded that it came from outside.
+/// - out of a branch into the enclosing graph. A branch's result leaves
+///   through its Sink and the owning Match's output; an edge doing it too
+///   would be a second way out that no arm accounts for.
+/// - from inside a branch into that branch's own Tunnel — a value entering
+///   from where it already is.
+/// - past a level. A Tunnel is reachable from its parent, not from its
+///   grandparent: a value that skipped a scope would cross that scope's
+///   volume without appearing anywhere in it.
+fn connection_allowed(
+    root: &layout::LayoutGraph,
+    source: &model::anchor::Id,
+    target: &model::anchor::Id,
+) -> bool {
+    let scope_of = |anchor: &model::anchor::Id| {
+        let la = root.try_layout_anchor(anchor)?;
+        let path = root.context_of_node(&la.node_id)?;
+        Some((path, la.node_id))
+    };
+    let (Some((source_path, _)), Some((target_path, target_node_id))) =
+        (scope_of(source), scope_of(target))
+    else {
+        return false;
+    };
+
+    // Asked of the target first, because it is the target that decides which
+    // of the two rules applies. A Tunnel's *input* is the only anchor in the
+    // program with its own — its output faces the branch like any other
+    // producer and is wired to from inside, as normal.
+    let target_is_tunnel_input = matches!(
+        root.find_node_graph(&target_node_id)
+            .and_then(|g| g.graph.nodes.get(&target_node_id)),
+        Some(model::node::ENode::Tunnel { input_anchor, .. }) if input_anchor == target
+    );
+
+    if target_is_tunnel_input {
+        // Fed from exactly one scope out, and from nowhere else — not from
+        // further out, which would skip a scope, and not from the branch it
+        // opens into, which would be a value entering from where it already
+        // is. Note this is the *only* way in, so the same-scope case below
+        // must not be allowed to answer for it first.
+        return target_path.len() == source_path.len() + 1
+            && target_path[..source_path.len()] == source_path[..];
+    }
+
+    // Everything else stays where it is. This is the ordinary case and the
+    // whole of the old behaviour; what has changed is that it is now the
+    // *only* other case.
+    source_path == target_path
+}
+
 fn drag_end_system(
     mouse: Res<ButtonInput<MouseButton>>,
     mut drag: ResMut<DragState>,
@@ -6529,7 +6621,16 @@ fn drag_end_system(
                 // Defensiv: eine Self-Edge kollabiert die Kurve zu einer
                 // Schlaufe am Anchor. drag_update lässt das nicht zu, aber die
                 // Invariante hier nochmal festnageln.
-                if from != to && !anchors_already_connected(state.root_graph(), &from, &to) {
+                // `connection_allowed` wird über die gespeicherte Richtung
+                // gefragt, nicht über die gezogene: die Regel spricht von
+                // Output -> Tunnel-Input, und genau dieses Paar ist `from`,
+                // `to`. Nochmal geprüft wie die beiden Invarianten daneben —
+                // drag_update lässt so ein Ziel nicht einschnappen, aber
+                // zwischen Snap und Drop kann ein Rebuild liegen.
+                if from != to
+                    && !anchors_already_connected(state.root_graph(), &from, &to)
+                    && connection_allowed(state.root_graph(), &from, &to)
+                {
                     let updated = state.root_graph().plus_edge(from, to);
                     *state.root_graph_mut() = updated;
                     // A new edge can grow the target's anchor, which changes

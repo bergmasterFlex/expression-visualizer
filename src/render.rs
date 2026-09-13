@@ -1392,6 +1392,59 @@ pub fn layoutnode_to_rendernode(
                 text_faces: vec![],
             }
         }
+        // The branch source's twin, and drawn like it — one anchor on the
+        // entry row, no body, because a Tunnel declares nothing either.
+        //
+        // What it has and the branch source has not is a second anchor, and it
+        // sits *outside*: one cell in front of the entry row, against the
+        // scope's front face, exactly where a Source draws the arrival it only
+        // mimes. Here it is the real thing — in `anchors`, so the pointer
+        // picks it and an edge from the enclosing graph ends on it. That is
+        // the whole difference between the two, and it is the whole point of
+        // the node.
+        crate::model::node::ENode::Tunnel {
+            input_anchor,
+            output_anchor,
+        } => {
+            let input_world = cell(0, 0, -1);
+            let output_world = cell(0, 0, 0);
+            // One type for both ends: a Tunnel borrows what arrives and hands
+            // it on unchanged, so drawing them from the same lookup is what
+            // makes the pass-through visible rather than merely true.
+            let eval_type =
+                crate::infer::anchor_type(flat_graph, output_anchor, function_declarations)
+                    .unwrap_or(crate::infer::EType::Pending);
+            let value = crate::infer::anchor_literal(flat_graph, output_anchor);
+            RenderNode {
+                node: None,
+                anchors: std::collections::HashMap::from([
+                    (
+                        input_anchor.clone(),
+                        typed_anchor(
+                            &eval_type,
+                            value.as_deref(),
+                            input_world,
+                            true,
+                            Lettering::Spelled,
+                        ),
+                    ),
+                    (
+                        output_anchor.clone(),
+                        typed_anchor(
+                            &eval_type,
+                            value.as_deref(),
+                            output_world,
+                            false,
+                            Lettering::Spelled,
+                        ),
+                    ),
+                ]),
+                strands: vec![],
+                objects: vec![],
+                labels: vec![],
+                text_faces: vec![],
+            }
+        }
         crate::model::node::ENode::Match {
             patterns,
             input_anchor,
@@ -1496,6 +1549,7 @@ pub fn label_for_node(
             .map(ToString::to_string)
             .unwrap_or_else(|| "?".to_string()),
         crate::model::node::ENode::BranchSource { .. } => "branch source".to_string(),
+        crate::model::node::ENode::Tunnel { .. } => "tunnel".to_string(),
         crate::model::node::ENode::Root { .. } => "root".to_string(),
     }
 }

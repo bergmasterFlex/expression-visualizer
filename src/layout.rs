@@ -694,6 +694,23 @@ impl LayoutGraph {
                     CellRole::Output { leaf }
                 }));
             }
+            // The same shape, and for the same reason: a Tunnel declares no
+            // type either, so it has no body to write one on.
+            //
+            // Its *input* claims no cell at all, and that is deliberate rather
+            // than forgotten. The input hangs one cell in front of the entry
+            // row, at local Z = −1, which is outside this scope's non-negative
+            // address space — the face the enclosing graph reaches, not a cell
+            // of this graph. `clamp_to_volume` therefore keeps the caret off
+            // it, which is right: nothing about a Tunnel is edited from
+            // inside the branch it opens into. It is still a real anchor in
+            // `ENode::anchors`, so an edge can end on it and the pointer can
+            // pick it; only addressing passes it by.
+            crate::model::node::ENode::Tunnel { output_anchor, .. } => {
+                cells.extend(anchor_cells(flat_graph, fds, output_anchor, 0, 0, |leaf| {
+                    CellRole::Output { leaf }
+                }));
+            }
             crate::model::node::ENode::TypeCast {
                 input_anchor,
                 output_anchor,
@@ -955,12 +972,15 @@ impl LayoutGraph {
         };
         let primary_origin = primary_ln.pos;
         // Sources are pinned to the source row (Y=0, Z=0) and may only be
-        // reordered along X. A BranchSource is pinned outright: it must stay
+        // reordered along X; a Tunnel is the same thing one scope in, so it
+        // takes the same pin. A BranchSource is pinned outright: it must stay
         // at branch-local (0,0,0). Every other node type has to stay beyond
         // the source row (Z >= 1). Layout space is non-negative, so X and Y
         // are clamped at 0 as well.
         let delta_pos = match self.graph.nodes.get(&node_id) {
-            Some(crate::model::node::ENode::Source { .. }) => Vec3::new(delta_pos.x, 0.0, 0.0),
+            Some(
+                crate::model::node::ENode::Source { .. } | crate::model::node::ENode::Tunnel { .. },
+            ) => Vec3::new(delta_pos.x, 0.0, 0.0),
             Some(crate::model::node::ENode::BranchSource { .. }) => Vec3::ZERO,
             _ => {
                 // Z=0 is the source row and the sink's Z is the sink's alone,
@@ -1215,10 +1235,17 @@ impl LayoutGraph {
                 };
                 let push_y = bbox.max.y + 1 - ipos.y;
                 let push_z = bbox.max.z + 1 - ipos.z;
-                // Sources are pinned to Y=0, Z=0 → only X-push can succeed.
+                // Both kinds that stand on an entry row are pinned to Y=0,
+                // Z=0, so only an X-push can succeed. Offering them any other
+                // direction would have `move_node_delta` refuse it and the
+                // loop retry until its iteration cap ran out, leaving the
+                // intruder sitting inside the footprint.
                 let is_source = matches!(
                     layout.graph.nodes.get(&intruder_id),
-                    Some(crate::model::node::ENode::Source { .. })
+                    Some(
+                        crate::model::node::ENode::Source { .. }
+                            | crate::model::node::ENode::Tunnel { .. }
+                    )
                 );
                 // `move_node_delta` refuses a move onto or past the Sink's row
                 // — that row is the Sink's alone — so a Z push aiming there
@@ -2028,6 +2055,40 @@ impl LayoutGraph {
         (layout, node_id_domain, anchor_id_domain)
     }
 
+    /// A Tunnel on this scope's entry row, opening it to the graph outside.
+    ///
+    /// Two anchors and no third thing to decide: a Tunnel declares no type and
+    /// carries no name, so unlike a Source it comes into the world finished
+    /// and the caret has nothing to be sent to afterwards.
+    pub fn plus_tunnel(
+        &self,
+        pos: Vec3,
+        node_id_domain: NodeIdDomain,
+        anchor_id_domain: AnchorIdDomain,
+    ) -> (Self, NodeIdDomain, AnchorIdDomain) {
+        // The entry row (Y=0, Z=0), the way a Source snaps to the root's.
+        // Defensive: `kind_allowed` has already refused every other cell.
+        let pos = Vec3::new(pos.x, 0.0, 0.0);
+        let (anchor_id_domain, input_anchor_id) = anchor_id_domain.next_id();
+        let (anchor_id_domain, output_anchor_id) = anchor_id_domain.next_id();
+        let (node_id_domain, node_id) = node_id_domain.next_id();
+        let graph = self.graph.plus_node(
+            node_id.clone(),
+            crate::model::node::ENode::Tunnel {
+                input_anchor: input_anchor_id,
+                output_anchor: output_anchor_id,
+            },
+        );
+        let layout = Self {
+            graph,
+            layout_nodes: self.layout_nodes.clone(),
+            reserved_max: self.reserved_max,
+            sub_layouts: self.sub_layouts.clone(),
+        }
+        ._plus_layout_node(&node_id, pos);
+        (layout, node_id_domain, anchor_id_domain)
+    }
+
     /// Grid-space origin of `owner_id`'s sub-layout, in this LayoutGraph's own
     /// coordinates.
     ///
@@ -2186,12 +2247,15 @@ impl LayoutGraph {
     /// Whether an insert along `axis` carries `id` along, or leaves it where
     /// it is.
     ///
-    /// Three node kinds are scope furniture rather than content in it. The
+    /// Four node kinds are scope furniture rather than content in it. The
     /// BranchSource marks its branch origin and never moves at all; a Source
     /// marks the root scope's wall, free to slide along X with the other
-    /// declarations but never off Y=0 or Z=0. The Sink is the mirror image at
-    /// the far end: it rides every depth insert, so the volume gains the cell
-    /// that was opened, and holds X=0 for the rest.
+    /// declarations but never off Y=0 or Z=0. A Tunnel stands on that same
+    /// wall one scope in, and takes the Source's rule for the Source's
+    /// reason — it is the branch's entry row, and an entry row that drifted
+    /// off Z=0 would no longer be one. The Sink is the mirror image at the far
+    /// end: it rides every depth insert, so the volume gains the cell that was
+    /// opened, and holds X=0 for the rest.
     ///
     /// None of them refuses an insert — the layer simply opens around them,
     /// which is what keeps the source row and the terminal where they belong.
@@ -2199,7 +2263,9 @@ impl LayoutGraph {
         match self.graph.nodes.get(id) {
             Some(crate::model::node::ENode::Sink { .. }) => axis == Axis::Z,
             Some(crate::model::node::ENode::BranchSource { .. }) => false,
-            Some(crate::model::node::ENode::Source { .. }) => axis == Axis::X,
+            Some(
+                crate::model::node::ENode::Source { .. } | crate::model::node::ENode::Tunnel { .. },
+            ) => axis == Axis::X,
             _ => true,
         }
     }
@@ -2332,7 +2398,10 @@ impl LayoutGraph {
         })
     }
 
-    fn try_layout_anchor(&self, anchor_id: &crate::model::anchor::Id) -> Option<LayoutAnchor> {
+    /// The non-panicking half of `layout_anchor`, for callers that are asking
+    /// *whether* an anchor is there rather than assuming it — the connection
+    /// rule has to answer about anchors it is in the middle of rejecting.
+    pub fn try_layout_anchor(&self, anchor_id: &crate::model::anchor::Id) -> Option<LayoutAnchor> {
         if let Some(anchor) = self.graph.anchors.get(anchor_id) {
             let node_id = self.graph.anchor_to_node.get(anchor_id).unwrap().clone();
             return Some(LayoutAnchor {

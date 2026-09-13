@@ -78,6 +78,24 @@ pub enum ENode {
         pattern: super::node::Id,
         output_anchor: super::anchor::Id,
     },
+    /// The declared way a value other than the matched one reaches a branch.
+    ///
+    /// A `BranchSource` carries what the Match narrowed and nothing else, so
+    /// everything else a branch needs would otherwise have to be wired in from
+    /// the outside straight onto whatever node wanted it. A Tunnel is the one
+    /// place that is allowed to happen: its input hangs outside the branch's
+    /// front face, where the enclosing graph can reach it, and its output
+    /// stands on the branch's entry row like any other source of a value.
+    ///
+    /// It declares nothing of its own — not a type, not a name, only a
+    /// position. Whatever arrives at the input leaves at the output, and with
+    /// nothing wired in it carries `Pending`, which is what the branch behind
+    /// it then reads. That is the whole of it: a Tunnel is a hole in a wall,
+    /// and a hole has no opinion about what goes through.
+    Tunnel {
+        input_anchor: super::anchor::Id,
+        output_anchor: super::anchor::Id,
+    },
 }
 
 impl ENode {
@@ -149,6 +167,23 @@ impl ENode {
             ENode::BranchSource { output_anchor, .. } => {
                 vec![(output_anchor.clone(), super::anchor::EAnchor::Output)]
             }
+            // Both are real anchors, unlike the input a Source only *draws*:
+            // the whole purpose of a Tunnel is that an edge can end on its
+            // input, so it has to be in the tables an edge is resolved
+            // through.
+            ENode::Tunnel {
+                input_anchor,
+                output_anchor,
+            } => vec![
+                (
+                    input_anchor.clone(),
+                    super::anchor::EAnchor::Input(super::anchor::InputAnchor {
+                        order_num: 0,
+                        name: None,
+                    }),
+                ),
+                (output_anchor.clone(), super::anchor::EAnchor::Output),
+            ],
             // A Pattern carries no anchor: the branch reads its value from
             // the branch's own BranchSource.
             ENode::Pattern { .. } | ENode::Root { .. } => vec![],

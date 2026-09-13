@@ -346,6 +346,17 @@ impl State {
                     None => Err(vec![format!("parent match {} not found", parent_match)]),
                 }
             }
+            // Hand through whatever the enclosing graph put on the input. The
+            // simpler cousin of the branch source above: that one has to find
+            // its way through its Pattern to the owning Match to learn what
+            // arrived, while a Tunnel is wired to its producer directly and
+            // need only ask its own anchor.
+            crate::model::node::ENode::Tunnel { input_anchor, .. } => graph
+                .get_connected_nodes_to_anchor(input_anchor.clone())
+                .into_iter()
+                .find_map(|source_node_id| self.node_ids_to_values.get(&source_node_id).cloned())
+                .map(|value| self.with_value(node_id, value))
+                .ok_or_else(|| vec![format!("nothing arrives at tunnel {}", node_id)]),
         }
     }
 
