@@ -105,9 +105,10 @@ pub const RESET_RADIUS: f32 = 20.0;
 
 /// Default and range of the scale setting, in pixels per cell.
 pub const DEFAULT_CELL_PIXELS: f32 = 40.0;
-/// The lower bound is not comfort but geometry: the base grid fades to nothing
-/// 34 cells from the origin, and an orthographic view zoomed out past that
-/// would show the fade end as a hard disc edge, which perspective used to hide.
+/// The lower bound is not comfort but geometry: a grid surface fades to nothing
+/// 34 cells from the origin (`GridMaterial::scope_surface`), and an orthographic
+/// view zoomed out past that would show the fade end as a hard disc edge, which
+/// perspective used to hide.
 const MIN_CELL_PIXELS: f32 = 20.0;
 const MAX_CELL_PIXELS: f32 = 160.0;
 
@@ -116,14 +117,15 @@ const MAX_CELL_PIXELS: f32 = 160.0;
 /// Measured from that plane rather than from the camera, because the camera's
 /// standoff follows the zoom: a fixed box would clip the whole graph away as
 /// soon as the camera stood further back than the box was deep. Wide enough to
-/// swallow the base grid, tight enough that the depth buffer is not spread over
-/// a kilometre of nothing — the transparent planes are coincident often enough
-/// to care.
+/// swallow a graph of any size the fade leaves visible, tight enough that the
+/// depth buffer is not spread over a kilometre of nothing — the transparent
+/// planes are coincident often enough to care.
 ///
 /// The near side comes out negative whenever the standoff is smaller than this,
-/// which is deliberate: an orthographic box has parallel sides, so the half of
-/// the base grid behind the camera would otherwise be sliced off along a hard
-/// straight line at the camera's own position.
+/// which is deliberate: an orthographic box has parallel sides, so whatever
+/// sits behind the camera — a scope's floor reaches that far under a wide
+/// graph — would otherwise be sliced off along a hard straight line at the
+/// camera's own position.
 const VIEW_HALF_DEPTH: f32 = 200.0;
 
 /// A field of view to stand in until a real one is worked out: Bevy's default

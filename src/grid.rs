@@ -98,17 +98,38 @@ pub struct GridMaterial {
     pub footprints: [Vec4; MAX_FOOTPRINTS],
 }
 
+/// How much of a surface's colour survives per volume boundary between the
+/// volume it frames and the one the caret stands in.
+///
+/// Multiplicative and unfloored: the drop is meant to read as distance, and a
+/// floor would flatten the far end of a deep nesting into one tone that says
+/// nothing about how far away it is. At 0.7 a volume four boundaries out still
+/// holds a quarter of its paint — enough to be seen without competing.
+pub const VOLUME_FADE_PER_BOUNDARY: f32 = 0.7;
+
+/// The factor a surface is painted with, `boundaries` volume walls away from
+/// the caret's own volume. `0` is the volume the caret is in, and keeps
+/// everything.
+pub fn volume_fade(boundaries: usize) -> f32 {
+    VOLUME_FADE_PER_BOUNDARY.powi(boundaries as i32)
+}
+
 impl GridMaterial {
-    /// The style every scope surface shares: the shaded Y plane a scope
-    /// sits on and the Z faces bounding the graph volume. `axis_u`/`axis_v`
+    /// The style every volume surface shares: the floor a volume stands on, the
+    /// back wall behind it, and the two Z faces closing it. `axis_u`/`axis_v`
     /// orient the grid on the plane.
     ///
-    /// Hover, border and footprints start off — only the interactive Y plane
-    /// fills them in, per frame.
-    pub fn scope_surface(axis_u: Vec3, axis_v: Vec3) -> Self {
+    /// `fade` is how far this volume sits from the one the caret is in, as a
+    /// factor from `volume_fade`. It takes the alpha of both colours and leaves
+    /// the hues alone: a volume further off is the same surface seen through
+    /// more walls, not a differently coloured one.
+    ///
+    /// Hover, border and footprints start off — only a scope's own floor fills
+    /// them in, per frame.
+    pub fn scope_surface(axis_u: Vec3, axis_v: Vec3, fade: f32) -> Self {
         Self {
-            plane_color: LinearRgba::new(0.07, 0.07, 0.1, 0.55),
-            line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.4),
+            plane_color: LinearRgba::new(0.07, 0.07, 0.1, 0.55 * fade),
+            line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.4 * fade),
             spacing: crate::render::CELL,
             fade_start: crate::render::CELL * 5.0,
             fade_end: crate::render::CELL * 34.0,
@@ -162,17 +183,34 @@ impl Plugin for GridPlugin {
             "../assets/shaders/grid.wgsl",
             Shader::from_wgsl
         );
+        // `spawn_grid` is deliberately not registered — see its own note. The
+        // resource and the material plugin stay: every scope surface is a
+        // `GridMaterial`, and `GridConfig` is what a returning base grid would
+        // read.
         app.init_resource::<GridConfig>()
-            .add_plugins(MaterialPlugin::<GridMaterial>::default())
-            .add_systems(Startup, spawn_grid);
+            .add_plugins(MaterialPlugin::<GridMaterial>::default());
     }
 }
 
 /// Marker for the base (Y=0) grid so hover/click systems can skip it — the
 /// base grid is a passive visual hint, not an interactive surface.
+///
+/// Nothing wears it at the moment: the base grid is not spawned. Kept with
+/// `spawn_grid`, which is the only thing that ever put it on.
+#[allow(dead_code)]
 #[derive(Component)]
 pub struct BaseGridEntity;
 
+/// The world-wide Y=0 grid, 400 cells on a side.
+///
+/// Not registered any more (see `GridPlugin::build`). The scope surfaces frame
+/// each volume themselves now — a floor, a back wall, and the graph's two Z
+/// faces — and a plane running out past all of them said nothing they do not
+/// say better, while lying under every one of them in the blend order.
+///
+/// Kept whole rather than deleted: it is a handful of lines, and wanting a
+/// ground back is the kind of thing that happens.
+#[allow(dead_code)]
 fn spawn_grid(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,

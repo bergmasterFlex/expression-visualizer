@@ -491,7 +491,100 @@ struct CaretScope {
     local: IVec3,
 }
 
+/// Which Match owns each Pattern, over every scope in the scene.
+///
+/// A scope's `context` names only the Patterns descended through, because a
+/// Match used to be nothing a walk could stop at. It is a volume of its own now,
+/// sitting between a scope and its arms, so the path a boundary count is taken
+/// over has to name it too — and this is what turns the one into the other.
+fn owning_matches(
+    root: &layout::LayoutGraph,
+) -> std::collections::HashMap<model::node::Id, model::node::Id> {
+    let mut owning = std::collections::HashMap::new();
+    for walked in root.walk_all_graphs() {
+        for (match_id, node) in &walked.layout_graph.graph.nodes {
+            let model::node::ENode::Match { patterns, .. } = node else {
+                continue;
+            };
+            for pattern_id in patterns {
+                owning.insert(pattern_id.clone(), match_id.clone());
+            }
+        }
+    }
+    owning
+}
+
+/// The volume path of the scope `context` names: every Pattern in it preceded by
+/// the Match it is an arm of.
+///
+/// A Pattern with no owner is skipped rather than passed through — a path is
+/// only good for counting boundaries against another path, and a rung that
+/// silently went missing would make two volumes look closer than they are.
+fn scope_volume_path(
+    context: &[model::node::Id],
+    owning: &std::collections::HashMap<model::node::Id, model::node::Id>,
+) -> Vec<model::node::Id> {
+    let mut path = Vec::with_capacity(context.len() * 2);
+    for pattern_id in context {
+        let Some(match_id) = owning.get(pattern_id) else {
+            continue;
+        };
+        path.push(match_id.clone());
+        path.push(pattern_id.clone());
+    }
+    path
+}
+
+/// Volume boundaries between two volumes: the walls crossed going from one to
+/// the other through their nearest common ancestor.
+///
+/// Siblings come out two apart, not one — there is a wall out of the first and a
+/// wall into the second, and no shortcut between them. That is what makes an arm
+/// and its sister arm read as exactly as far from each other as either is from
+/// the scope holding their Match.
+fn volume_boundaries(a: &[model::node::Id], b: &[model::node::Id]) -> usize {
+    let common = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    (a.len() - common) + (b.len() - common)
+}
+
 impl GraphState {
+    /// The volume the caret stands in, as a path `volume_boundaries` can measure
+    /// from.
+    ///
+    /// One step further than `scope_of_caret`: a Pattern's gap, the cell naming
+    /// its type, and the Match's own input and output belong to no branch, so
+    /// `scope_at` hands them to the enclosing scope — but they are the Match's
+    /// own cells, and standing on one of them is standing in the Match.
+    ///
+    /// At most one Match of a scope can hold the caret: a nested Match lives in
+    /// a branch's own sub-layout, which `scope_at` would have resolved to first.
+    ///
+    /// `None` where `scope_of_caret` is `None` — the caret outside every volume,
+    /// where editing is unavailable. Nothing is faded then: there is no volume
+    /// to measure from, and measuring anyway would be a fiction.
+    fn volume_of_caret(
+        &self,
+        pick: &PickState,
+        owning: &std::collections::HashMap<model::node::Id, model::node::Id>,
+    ) -> Option<Vec<model::node::Id>> {
+        let scope = self.scope_of_caret(pick)?;
+        let mut path = scope_volume_path(&scope.path, owning);
+        let graph = self.root_graph().resolve_context(&scope.path);
+        for (id, node) in &graph.graph.nodes {
+            if !matches!(node, model::node::ENode::Match { .. }) {
+                continue;
+            }
+            let Some(fp) = graph.match_footprint(id) else {
+                continue;
+            };
+            if scope.local.cmpge(fp.min).all() && scope.local.cmple(fp.max).all() {
+                path.push(id.clone());
+                break;
+            }
+        }
+        Some(path)
+    }
+
     /// Resolve the caret to its owning scope. `None` when the caret sits
     /// outside every scope volume — editing is then simply unavailable.
     fn scope_of_caret(&self, pick: &PickState) -> Option<CaretScope> {
@@ -1254,24 +1347,29 @@ fn spawn_graph_nodes(
         &declared_band_positions,
     );
 
+    // Which volume the caret is in, and the Pattern→Match table the boundary
+    // count needs. Both are fixed for the whole pass: every surface below is
+    // faded by how far its own volume sits from this one.
+    //
+    // Baked in at spawn rather than followed per frame, because a caret move
+    // already rebuilds the scene — the caret's own mesh is built from
+    // `pick.selected_pos` a few lines down, and would not move otherwise.
+    let owning = owning_matches(state.root_graph());
+    let caret_volume = state.volume_of_caret(&pick, &owning);
+    // Everything at full strength while the caret is outside every volume:
+    // there is nothing to measure a distance from, and measuring anyway would
+    // be a fiction.
+    let fade_of = |path: &[model::node::Id]| match &caret_volume {
+        Some(caret) => grid::volume_fade(volume_boundaries(path, caret)),
+        None => 1.0,
+    };
+
     for walked_graph in state.root_graph().walk_all_graphs() {
         let Some(bounds) = walked_graph.layout_graph.grid_bounds() else {
             continue;
         };
-        let width_cells = (bounds.max.x - bounds.min.x + 1) as f32;
-        let depth_cells = (bounds.max.z - bounds.min.z + 1) as f32;
-        let size_x = width_cells * render::LAYOUT_SCALE.x.abs();
-        let size_z = depth_cells * render::LAYOUT_SCALE.z.abs();
-        // Cells are corner-anchored, so the inclusive range spans [min, max+1]
-        // and its centre is (min + max + 1) / 2. Y stays on the address plane:
-        // the grid is the upper bounding plane of the row it belongs to.
-        let center_local = Vec3::new(
-            (bounds.min.x + bounds.max.x + 1) as f32 * 0.5,
-            0.0,
-            (bounds.min.z + bounds.max.z + 1) as f32 * 0.5,
-        );
-        let world_center = render::layout_to_world(center_local + walked_graph.extra_offset);
         let offset = walked_graph.extra_offset;
+        let scope_path = scope_volume_path(&walked_graph.context, &owning);
         // `layout_range_to_world` re-normalises min/max: LAYOUT_SCALE negates
         // Z, so scaling the corners individually would yield an inverted rect
         // and the shader would draw no border at all.
@@ -1280,8 +1378,6 @@ fn spawn_graph_nodes(
             bounds.max.as_vec3() + offset,
             0.0,
         );
-        let border_min = Vec2::new(border_lo.x, border_lo.z);
-        let border_max = Vec2::new(border_hi.x, border_hi.z);
         // Collect multi-cell node footprints in this LayoutGraph and convert
         // to world-space XZ rects. Fed to the grid shader to suppress
         // interior grid lines inside merged fields.
@@ -1309,66 +1405,55 @@ fn spawn_graph_nodes(
             footprints[footprint_count as usize] = Vec4::new(fp_lo.x, fp_lo.z, fp_hi.x, fp_hi.z);
             footprint_count += 1;
         }
-        commands.spawn((
-            Mesh3d(meshes.add(Plane3d::default().mesh().size(size_x, size_z).build())),
-            MeshMaterial3d(materials_grid.add(grid::GridMaterial {
-                border_min,
-                border_max,
-                footprint_count,
-                footprints,
-                ..grid::GridMaterial::scope_surface(Vec3::X, Vec3::Z)
-            })),
-            Transform::from_translation(world_center),
-            ScopeGridEntity {
-                context: walked_graph.context.clone(),
-                origin_offset: walked_graph.extra_offset,
-                min: bounds.min,
-                max: bounds.max,
-            },
-            SceneEntity,
-        ));
 
-        // root scope: the graph volume's two Z faces, drawn in the same
-        // style as the Y plane the scope sits on. The front face is the Z=0
-        // plane — the face of the source row that looks toward the origin,
-        // where the removed wall used to stand — and the back face is the far
-        // side of the Sink's cell, the volume's last Z edge. Both span the
-        // graph's bounding box in X and Y, so the three surfaces together frame
-        // the volume the graph grows in.
-        if walked_graph.context.is_empty() {
-            let height_cells = (bounds.max.y - bounds.min.y + 1) as f32;
-            let size_y = height_cells * render::LAYOUT_SCALE.y.abs();
-            // Cells are corner-anchored on Y too, so the face is centred on
-            // the inclusive row range [min, max+1] like the X range above.
-            let face_center = render::layout_to_world(
-                Vec3::new(
-                    (bounds.min.x + bounds.max.x + 1) as f32 * 0.5,
-                    (bounds.min.y + bounds.max.y + 1) as f32 * 0.5,
-                    0.0,
-                ) + walked_graph.extra_offset,
-            );
-            // Front at the near corner of the first row, back at the far
-            // corner of the Sink's row — hence `max.z + 1`.
-            for z_cell in [bounds.min.z, bounds.max.z + 1] {
-                let face_z = render::layout_to_world(
-                    Vec3::new(0.0, 0.0, z_cell as f32) + walked_graph.extra_offset,
-                )
-                .z;
-                commands.spawn((
-                    Mesh3d(
-                        meshes.add(
-                            Plane3d::new(Vec3::Z, Vec2::new(size_x * 0.5, size_y * 0.5))
-                                .mesh()
-                                .build(),
-                        ),
-                    ),
-                    MeshMaterial3d(
-                        materials_grid.add(grid::GridMaterial::scope_surface(Vec3::X, Vec3::Y)),
-                    ),
-                    Transform::from_xyz(face_center.x, face_center.y, face_z),
-                    SceneEntity,
-                ));
+        spawn_volume_surfaces(
+            &mut commands,
+            &mut meshes,
+            &mut materials_grid,
+            bounds.min,
+            bounds.max,
+            offset,
+            fade_of(&scope_path),
+            Some(InteractiveFloor {
+                scope: ScopeGridEntity {
+                    context: walked_graph.context.clone(),
+                    origin_offset: offset,
+                    min: bounds.min,
+                    max: bounds.max,
+                },
+                border_min: Vec2::new(border_lo.x, border_lo.z),
+                border_max: Vec2::new(border_hi.x, border_hi.z),
+                footprints,
+                footprint_count,
+            }),
+        );
+
+        // Every Match in this scope is a volume in its own right: its own cells
+        // and every arm hanging off them, which is what `match_footprint`
+        // measures. It owns no `LayoutGraph`, so no walk reaches it — it has to
+        // be asked for here, from the scope that holds it.
+        for (id, node) in &walked_graph.layout_graph.graph.nodes {
+            if !matches!(node, model::node::ENode::Match { .. }) {
+                continue;
             }
+            let Some(fp) = walked_graph.layout_graph.match_footprint(id) else {
+                continue;
+            };
+            let mut match_path = scope_path.clone();
+            match_path.push(id.clone());
+            spawn_volume_surfaces(
+                &mut commands,
+                &mut meshes,
+                &mut materials_grid,
+                fp.min,
+                fp.max,
+                offset,
+                fade_of(&match_path),
+                // No `InteractiveFloor`: a Match is not a scope. Nothing
+                // addresses a cell *in* it, and its footprint is already
+                // flattened on the floor of the scope it stands in.
+                None,
+            );
         }
     }
 
@@ -4391,6 +4476,137 @@ pub struct WorldLabel {
     pub offset: Vec2, // screen-space pixel offset
 }
 
+/// What a scope's floor carries beyond the plain surface: the component that
+/// makes it the mouse's pick target, the border rect marking the caret's own
+/// scope, and the footprint rects that flatten multi-cell nodes.
+///
+/// A Match's floor carries none of it, which is why this is an `Option` at the
+/// spawner rather than four more parameters. A Match is not a scope — nothing
+/// addresses a cell *in* one, and its own footprint is already flattened on the
+/// floor of the scope it stands in.
+struct InteractiveFloor {
+    scope: ScopeGridEntity,
+    border_min: Vec2,
+    border_max: Vec2,
+    footprints: [Vec4; grid::MAX_FOOTPRINTS],
+    footprint_count: u32,
+}
+
+/// Spawn the four grid surfaces that frame one volume: the floor it stands on,
+/// the back wall on its lesser-X side, and the two Z faces closing it front and
+/// back.
+///
+/// Four for every volume there is — the program's scope, every Match, every
+/// branch of every Match — so that a volume is recognisable as one whatever kind
+/// it happens to be. What tells them apart is `fade`, which says how many volume
+/// walls stand between this one and the one the caret is in.
+///
+/// `min`/`max` are the volume's inclusive cell bounds in coordinates `offset`
+/// carries to global: `grid_bounds()` for a scope, `match_footprint()` for a
+/// Match. Cells are corner-anchored, so every far edge is `max + 1`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_volume_surfaces(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials_grid: &mut Assets<grid::GridMaterial>,
+    min: IVec3,
+    max: IVec3,
+    offset: Vec3,
+    fade: f32,
+    floor: Option<InteractiveFloor>,
+) {
+    let size_x = (max.x - min.x + 1) as f32 * render::LAYOUT_SCALE.x.abs();
+    let size_y = (max.y - min.y + 1) as f32 * render::LAYOUT_SCALE.y.abs();
+    let size_z = (max.z - min.z + 1) as f32 * render::LAYOUT_SCALE.z.abs();
+    // The inclusive range spans [min, max+1], so its centre is (min+max+1)/2 on
+    // every axis. Where a surface pins one of the three, it takes an edge
+    // instead — and which edge is the whole of what that surface says.
+    let centre = |x: f32, y: f32, z: f32| render::layout_to_world(Vec3::new(x, y, z) + offset);
+    let mid_x = (min.x + max.x + 1) as f32 * 0.5;
+    let mid_y = (min.y + max.y + 1) as f32 * 0.5;
+    let mid_z = (min.z + max.z + 1) as f32 * 0.5;
+
+    // ── The floor: the lower bounding edge of the volume's last row, so what
+    // stands in it stands *on* it rather than hanging under it.
+    let floor_center = centre(mid_x, (max.y + 1) as f32, mid_z);
+    let mut floor_entity = commands.spawn((
+        Mesh3d(meshes.add(Plane3d::default().mesh().size(size_x, size_z).build())),
+        Transform::from_translation(floor_center),
+        SceneEntity,
+    ));
+    match floor {
+        Some(f) => {
+            floor_entity.insert((
+                MeshMaterial3d(materials_grid.add(grid::GridMaterial {
+                    border_min: f.border_min,
+                    border_max: f.border_max,
+                    footprint_count: f.footprint_count,
+                    footprints: f.footprints,
+                    ..grid::GridMaterial::scope_surface(Vec3::X, Vec3::Z, fade)
+                })),
+                f.scope,
+            ));
+        }
+        None => {
+            floor_entity.insert(MeshMaterial3d(
+                materials_grid.add(grid::GridMaterial::scope_surface(Vec3::X, Vec3::Z, fade)),
+            ));
+        }
+    }
+
+    // ── The back wall, on the lesser-X side. The bound camera's depth axis is
+    // world X, so this is the surface the volume is seen *against* — the one
+    // that says where it ends behind everything in it.
+    let wall_center = centre(min.x as f32, mid_y, mid_z);
+    commands.spawn((
+        Mesh3d(
+            meshes.add(
+                // `Plane3d::new` takes half sizes and rotates a Y-up plane onto
+                // the normal, so which world axis each one lands on depends on
+                // that normal: for +X the first goes to Y and the second to Z,
+                // where the Z faces' first goes to X and second to Y.
+                Plane3d::new(Vec3::X, Vec2::new(size_y * 0.5, size_z * 0.5))
+                    .mesh()
+                    .build(),
+            ),
+        ),
+        // `u` runs the way the volume does, `v` is its rows — the same reading
+        // the Z faces' `(X, Y)` gives.
+        MeshMaterial3d(materials_grid.add(grid::GridMaterial::scope_surface(
+            Vec3::Z,
+            Vec3::Y,
+            fade,
+        ))),
+        Transform::from_xyz(wall_center.x, wall_center.y, wall_center.z),
+        SceneEntity,
+    ));
+
+    // ── The two Z faces. The front one is where the volume opens — the source
+    // row's face, looking toward the origin — and the back one the far side of
+    // its last cell. Both span its X and Y, so the four surfaces together frame
+    // the volume without closing it off.
+    let face_center = centre(mid_x, mid_y, 0.0);
+    for z_cell in [min.z, max.z + 1] {
+        let face_z = centre(0.0, 0.0, z_cell as f32).z;
+        commands.spawn((
+            Mesh3d(
+                meshes.add(
+                    Plane3d::new(Vec3::Z, Vec2::new(size_x * 0.5, size_y * 0.5))
+                        .mesh()
+                        .build(),
+                ),
+            ),
+            MeshMaterial3d(materials_grid.add(grid::GridMaterial::scope_surface(
+                Vec3::X,
+                Vec3::Y,
+                fade,
+            ))),
+            Transform::from_xyz(face_center.x, face_center.y, face_z),
+            SceneEntity,
+        ));
+    }
+}
+
 /// Spawn one structural link: a ribbon from `from` to `to` whose two ends may
 /// wear different shapes.
 ///
@@ -5219,9 +5435,9 @@ fn pick_nodes(
     }
     pick.hovered_node = closest.as_ref().map(|(id, _)| id.clone());
 
-    // Ray-plane test against each spawned graph grid. Each graph grid sits at
-    // its own Y (root scope Y=0; Pattern sub-graph at Pattern's world Y) and
-    // spans a rectangle in local grid coords. Pick the closest rect hit.
+    // Ray-plane test against each spawned graph grid. Each graph grid is its
+    // scope's floor — one row-edge below the scope's last row, at its own Y —
+    // and spans a rectangle in local grid coords. Pick the closest rect hit.
     //
     // Every conversion goes through `render::layout_to_world` /
     // `world_to_layout` because LAYOUT_SCALE negates Y and Z — dividing by a
@@ -5235,13 +5451,25 @@ fn pick_nodes(
             if denom.abs() < 1e-4 {
                 continue;
             }
-            let t = (origin_world.y - ray.origin.y) / denom;
+            // The plane the user can see is the floor, not the address plane
+            // the scope's origin sits on, and the ray has to meet the surface
+            // that is actually there. Derived from `max` rather than carried on
+            // the component, so it cannot drift from where the mesh is spawned.
+            let floor_world_y = render::layout_to_world(
+                ag.origin_offset + Vec3::new(0.0, (ag.max.y + 1) as f32, 0.0),
+            )
+            .y;
+            let t = (floor_world_y - ray.origin.y) / denom;
             if t <= 0.0 || t >= best_t {
                 continue;
             }
             let hit = ray.origin + *ray.direction * t;
             // Cells are corner-anchored — cell N covers [N, N+1) — so the
             // containing cell is the floor, not the nearest address.
+            //
+            // Read off the scope's origin and not off the plane: the plane's Y
+            // says *which* grid was hit, the origin says which cell of it. Only
+            // X and Z are taken, so the Y this leaves behind is never read.
             let local = render::world_to_layout(hit - origin_world);
             let local_x = local.x.floor() as i32;
             let local_z = local.z.floor() as i32;
@@ -5251,7 +5479,9 @@ fn pick_nodes(
             if local_z < ag.min.z || local_z > ag.max.z {
                 continue;
             }
-            let cell_local = IVec3::new(local_x, 0, local_z);
+            // The cell a floor belongs to is the one standing on it: the
+            // volume's last row, which is the row the plane bounds from below.
+            let cell_local = IVec3::new(local_x, ag.max.y, local_z);
             let center_world = render::cell_center_world(cell_local.as_vec3() + ag.origin_offset);
             best_t = t;
             grid_hit = Some(HoveredGrid {

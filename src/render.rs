@@ -274,11 +274,12 @@ const VALUE_LABEL_Z_PADDING: f32 = CELL / 30.0;
 const SOURCE_INDEX_LABEL_OFFSET_X: f32 = 18.0;
 /// How far a text face floats above the body face it prints on.
 ///
-/// Coplanar is not an option, and for two reasons rather than one. The obvious
-/// one is that both surfaces would land in the same depth bucket. The other is
-/// that a scope's grid plane lies at world Y=0 — exactly the plane a body's top
-/// face lies in — and washes its 55% veil over every top face in the scene. An
-/// opaque quad in front of it fails that plane's depth test instead.
+/// Coplanar is not an option: both surfaces would land in the same depth
+/// bucket. It used to be two reasons — a scope's grid plane lay at world Y=0,
+/// exactly the plane a body's top face lies in, and washed its 55% veil over
+/// every top face in the scene. The plane is the volume's floor now and meets
+/// the *bottom* faces of the last row instead, so only the depth argument is
+/// left. It carries the constant on its own.
 ///
 /// The bound camera's depth axis is world X and its elevation is a shear, not
 /// a tilt, so a lift of `l` in Y buys about `1.6 · l` of depth separation. The
