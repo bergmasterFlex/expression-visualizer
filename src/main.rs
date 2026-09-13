@@ -1,5 +1,4 @@
 mod camera;
-mod colors;
 mod common;
 mod depth_cue;
 mod edge;

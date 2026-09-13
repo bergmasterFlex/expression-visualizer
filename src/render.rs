@@ -381,19 +381,41 @@ fn type_letter(t: &crate::infer::EType) -> &'static str {
 /// segment inside an anchor, the strand running between two of them, and the
 /// body of a node that declares it.
 ///
-/// Opaque, and that is the whole of the choice. A strand used to blend at 0.6
-/// so the grid showed through it, but only opaque geometry writes depth, and a
-/// strand that writes no depth is invisible to the depth cue — which is exactly
-/// the wrong way round, since a strand's height above the plane is the hardest
-/// thing in the picture to judge by eye. The node bodies had already worked
-/// around the old alpha by forcing it back to 1.0 at the call site.
+/// The palette is Okabe–Ito, and it is not a matter of taste. Colour is the
+/// only thing that says which type a strand carries — there is no second
+/// channel saying it again — so a reader who cannot separate two of these
+/// cannot read the graph at all. Okabe–Ito is chosen for exactly that: its
+/// hues stay apart under the common forms of colour blindness, which an
+/// ad-hoc red/green/blue set does not.
+///
+/// Written as bytes rather than as floats so that what stands here is the
+/// palette as it is published, and a value can be checked against the source
+/// without converting anything first.
+///
+/// Opaque, and that is the whole of the other choice. A strand used to blend
+/// at 0.6 so the grid showed through it, but only opaque geometry writes
+/// depth, and a strand that writes no depth is invisible to the depth cue —
+/// which is exactly the wrong way round, since a strand's height above the
+/// plane is the hardest thing in the picture to judge by eye. The node bodies
+/// had already worked around the old alpha by forcing it back to 1.0 at the
+/// call site.
 pub fn strand_color(t: &crate::infer::EType) -> Color {
     match t {
-        crate::infer::EType::Bool(..) => Color::srgb(0.65, 0.30, 0.95),
-        crate::infer::EType::Char(..) => Color::srgb(0.30, 0.90, 0.40),
-        crate::infer::EType::Int(..) => Color::srgb(0.28, 0.58, 1.00),
-        crate::infer::EType::String(..) => Color::srgb(1.00, 0.90, 0.30),
-        crate::infer::EType::None => Color::srgb(0.95, 0.30, 0.30),
+        // reddish purple, #CC79A7
+        crate::infer::EType::Bool(..) => Color::srgb_u8(204, 121, 167),
+        // bluish green, #009E73
+        crate::infer::EType::Char(..) => Color::srgb_u8(0, 158, 115),
+        // blue, #0072B2
+        crate::infer::EType::Int(..) => Color::srgb_u8(0, 114, 178),
+        // orange, #E69F00
+        crate::infer::EType::String(..) => Color::srgb_u8(230, 159, 0),
+        // vermillion, #D55E00 — the palette's nearest neighbour to the orange
+        // above, and deliberately so: `none` is the sad path of a type, not a
+        // type of its own, and reads as a darker, redder cousin of one.
+        crate::infer::EType::None => Color::srgb_u8(213, 94, 0),
+        // Pending, and whatever else has not been decided. Outside the palette
+        // on purpose: neutral grey is the absence of a hue, which is the
+        // absence of a type.
         _ => Color::srgb(0.5, 0.5, 0.5),
     }
 }
