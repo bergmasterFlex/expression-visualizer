@@ -4726,11 +4726,20 @@ fn whole_row_end(row_center_y: f32, as_line: bool) -> edge::RibbonEnd {
 /// The two ways a row can end up with no coloured strand are not the same thing
 /// and are not drawn the same way.
 ///
-/// A row the cell **can never describe** gets nothing. Note the deliberate
-/// divergence from the edge pass, which aims an unmatched leaf at row 0:
-/// docking a `Bool` arm onto an `Integer` band would draw the lie that it
-/// consumes it. Here the gap *is* the statement — a Match reads as
-/// non-exhaustive, a cast as able to fail.
+/// A row the cell **can never describe** gets nothing *when the cell selects*.
+/// Note the deliberate divergence from the edge pass, which aims an unmatched
+/// leaf at row 0: docking a `Bool` arm onto an `Integer` band would draw the
+/// lie that it consumes it. There the gap *is* the statement — the Match reads
+/// as non-exhaustive.
+///
+/// `converts` is what separates the two owners, and they are not alike. A
+/// Match arm **selects**: it takes the values it already describes, so a row
+/// it does not describe is a row it does not touch. A cast target
+/// **converts**: it takes whatever arrives and makes what it can of it, so
+/// there is no such thing as a row it does not touch. `String` and `Integer`
+/// describe disjoint sets and `"42"` still casts to `42` — asking subsumption
+/// of a cast left every everyday cast with no strand into its target at all,
+/// and only the `none` leg arriving anywhere.
 ///
 /// A cell that has **not said yet** what it describes — `declared` is `None`,
 /// an arm or a cast target the user has not typed — makes no such statement,
@@ -4747,6 +4756,7 @@ fn spawn_declared_cell_links(
     in_value: Option<&str>,
     band_pos: Vec3,
     declared: Option<&model::r#type::EType>,
+    converts: bool,
 ) {
     let declared_leaf = declared.map(infer::graph_type_to_eval_type);
     let declared_value = declared.and_then(layout::value_of_etype);
@@ -4790,8 +4800,14 @@ fn spawn_declared_cell_links(
             );
             continue;
         };
-        let Some(span) = infer::claimed_span(anchor_leaf, declared_leaf) else {
-            continue;
+        // A converting cell takes the whole row where subsumption has nothing
+        // to say: there is no share to work out, because the value is not
+        // being divided up — it is being handed over entire, to come back as
+        // the target or as `none`.
+        let span = match infer::claimed_span(anchor_leaf, declared_leaf) {
+            Some(span) => span,
+            Option::None if converts => infer::RowSpan::FULL,
+            Option::None => continue,
         };
         spawn_link_ribbon(
             commands,
@@ -4886,6 +4902,10 @@ fn spawn_match_links(
                     in_value.as_deref(),
                     band_pos,
                     arm_type.as_ref(),
+                    // An arm selects. A row it does not describe is a row it
+                    // does not take, and the gap left behind is the Match
+                    // reading as non-exhaustive.
+                    false,
                 );
             }
         }
@@ -5026,9 +5046,17 @@ fn spawn_match_links(
 /// every complement is empty, and no strand is drawn — which is also exactly
 /// when the output has no `none` row to draw one to.
 ///
-/// The reverse leg a Match has, target cell → output anchor, is deliberately
-/// absent. On success the target cell and the output say the same thing, one
-/// cell apart; a strand between them would only spell it twice.
+/// A partial cast then gets a third leg, the reverse one a Match has: target
+/// cell → output anchor, the path taken when the cast succeeds. A **total**
+/// cast is the one that does without it, and for a reason that holds only
+/// there: its target cell and its output say the same thing one cell apart, so
+/// a strand between them would spell it twice.
+///
+/// The moment a `none` row appears that stops being true. The output is two
+/// rows now, no longer one statement repeated, and with the success leg
+/// missing the only strand arriving anywhere on it was the one reaching
+/// `none` — so a cast that could perfectly well succeed was drawn as a cast
+/// that always fails.
 fn spawn_cast_links(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -5071,13 +5099,17 @@ fn spawn_cast_links(
             in_value.as_deref(),
             band_pos,
             r#type.as_ref(),
+            // A cast converts, so every row reaches the target — whether it
+            // arrives as the target or as `none` is what the legs below say.
+            true,
         );
 
-        // ── What the target cannot take, reaching the `none` ──
+        // ── The two legs a partial cast fans into ──
         //
-        // A cast with no target chosen declares nothing, so nothing can fail
-        // against it and its output is `Pending` either way. The leg above is
-        // the whole of what such a cast is drawn as, and it is drawn pending.
+        // A cast with no target chosen declares nothing, so nothing can
+        // succeed or fail against it and its output is `Pending` either way.
+        // The leg above is the whole of what such a cast is drawn as, and it
+        // is drawn pending.
         let Some(target) = r#type else {
             continue;
         };
@@ -5093,6 +5125,63 @@ fn spawn_cast_links(
             continue;
         };
         let target_leaf = infer::graph_type_to_eval_type(target);
+
+        // ── What the target does take, reaching the output ──
+        //
+        // Only a partial cast draws this leg, which is why it sits behind the
+        // `none_row` guard above. A total cast leaves its target cell and its
+        // output saying the same thing one cell apart, and a strand between
+        // them would only spell it twice.
+        //
+        // A partial cast is the opposite case: its output has grown a second
+        // row, so the two are no longer one statement a cell apart, and
+        // without this the *only* strand arriving at the output is the one
+        // reaching `none`. A cast that can perfectly well succeed then reads
+        // as a cast that always fails.
+        //
+        // Unconditional, and the condition it does *not* have is worth naming.
+        // `claimed_span` — the question the failure leg below asks — is about
+        // subsumption: which values of the arriving row the target also
+        // describes. That is the right question for a Match arm, which selects
+        // values it already describes, and the wrong one for a cast, which
+        // *converts*. `String` and `Integer` describe disjoint sets and
+        // `"42"` casts to `42` regardless. Guarding this leg on subsumption
+        // left exactly the everyday casts — String to Integer among them —
+        // drawn as though they could only fail.
+        //
+        // Being here at all is the condition: `type_cast_output_type` grows a
+        // `none` row precisely when the cast is not total, and a cast that is
+        // not total is one that can go either way.
+        let target_value = layout::value_of_etype(target);
+        let cell_is_line = render::leaf_is_drawn_as_line(&target_leaf, target_value.as_deref());
+        let out_value = infer::anchor_literal(flat_graph, output_anchor);
+        // Leave by the band's far face and arrive at the output's near one,
+        // the way every leg between two cells is drawn here.
+        let from = render::anchor_body_face_world(band_pos, true);
+        let to = render::anchor_body_face_world(out_pos, false);
+        for (row, out_leaf) in out_leaves.iter().enumerate() {
+            // Every row but the sad one: what the target produces may itself
+            // be more than a single leaf, and each of those rows is reached on
+            // success.
+            if matches!(out_leaf, infer::EType::None) {
+                continue;
+            }
+            spawn_link_ribbon(
+                commands,
+                meshes,
+                materials_edge,
+                out_leaf,
+                from,
+                to,
+                whole_row_end(band_pos.y, cell_is_line),
+                whole_row_end(
+                    out_pos.y + render::leaf_row_offset(row),
+                    render::leaf_is_drawn_as_line(out_leaf, out_value.as_deref()),
+                ),
+            );
+        }
+
+        // ── What the target cannot take, reaching the `none` ──
         for (row, anchor_leaf) in in_leaves.iter().enumerate() {
             // No claim at all means the whole row fails; a partial claim leaves
             // its complement. `None` from `complement` means nothing is left,
