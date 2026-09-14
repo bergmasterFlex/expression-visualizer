@@ -4393,14 +4393,52 @@ fn sync_value_labels(
         }
     }
 
-    for (id, value) in snapshot.node_ids_to_values.iter() {
-        if kept.contains(id) {
-            continue;
-        }
-        let Some(layout_node) = state.root_graph().layout_nodes.get(id) else {
+    // Where the new labels go, asked of every scope rather than of the root's
+    // own map.
+    //
+    // The step driver runs on `flattened_graph()` (see the `Next` handler),
+    // which holds the nodes of every branch alongside the root's: a
+    // `BranchSource`, a `Tunnel`, a branch's own Sink, anything built inside
+    // an arm. Those live one `LayoutGraph` further in, under
+    // `sub_layouts[pattern_id]`, and asking `root_graph().layout_nodes` for
+    // them found nothing and said nothing about it. So a step that resolved a
+    // node inside a branch grew the snapshot, advanced the history and drew
+    // exactly nothing — several presses of `Next` that read as a dead button,
+    // and then the answer appearing at the Sink as if from nowhere.
+    //
+    // `walk_all` is the walk `spawn_graph_nodes` already takes, and
+    // `extra_offset` is what carries a branch-local position out into the
+    // world — composed exactly as `render::layoutnode_to_rendernode` composes
+    // it, so a value stands over the node it belongs to whichever scope that
+    // node lives in.
+    //
+    // Taken only when there is something new to place. This runs every frame
+    // and the walk allocates; with every label already standing there is
+    // nothing for it to answer.
+    let missing: Vec<(&model::node::Id, &eval::EValue)> = snapshot
+        .node_ids_to_values
+        .iter()
+        .filter(|(id, _)| !kept.contains(*id))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let positions: std::collections::HashMap<model::node::Id, Vec3> = state
+        .layout_graph
+        .walk_all()
+        .into_iter()
+        .map(|walked| {
+            (
+                walked.layout_node.node_id.clone(),
+                render::cell_center_world(walked.layout_node.pos + walked.extra_offset),
+            )
+        })
+        .collect();
+
+    for (id, value) in missing {
+        let Some(&world_pos) = positions.get(id) else {
             continue;
         };
-        let world_pos = render::cell_center_world(layout_node.pos);
         commands.spawn((
             Text::new(value.to_string()),
             text_font(&ui_font.0, 28.0),
