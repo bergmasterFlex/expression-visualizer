@@ -23,8 +23,9 @@ pub enum CellRole {
     /// A cell the node claims without it naming a property: room held open.
     ///
     /// It is what gives a Match its rhythm — input anchor, gap, arm — and a
-    /// TypeCast the same one, which is how a cast reads as the one-armed match
-    /// it is rather than as a node kind of its own.
+    /// TypeCast the same one, so a cast reads as a one-armed Match rather than
+    /// as a node kind of its own. A resemblance of *shape*: what the two do
+    /// with that arm is opposite, and `infer::cast_kind` says how.
     ///
     /// A Pattern's gap does a second job: it is the address the *next* arm is
     /// added at, which is why the Pattern has to **own** it rather than leave it
@@ -120,6 +121,9 @@ const BRANCH_LOCAL_Z: i32 = PATTERN_TYPE_LOCAL_Z + 1;
 /// A `TypeCast` borrows the Match's rhythm — input anchor, gap, arm — with one
 /// arm and no branch behind it. These are its node-local Z addresses, named
 /// once so its cell layout and the mesh drawn on it cannot drift apart.
+///
+/// Borrowed for the eye alone. What the two nodes do with that middle cell is
+/// opposite, and `infer::cast_kind` is where the difference is stated.
 pub const CAST_TYPE_Z: i32 = 2;
 /// One cell behind the arm, where a Match would start its branch.
 pub const CAST_OUTPUT_Z: i32 = CAST_TYPE_Z + 1;
@@ -720,8 +724,11 @@ impl LayoutGraph {
                     CellRole::Input { index: 0, leaf }
                 }));
                 // The same rhythm a Match has — input anchor, gap, arm — one
-                // arm wide. A cast *is* a match with a single arm and no
-                // alternatives, and standing it in that rhythm is what says so.
+                // arm wide. Borrowed, not inherited: the two read alike
+                // because a target cell and an arm occupy the same place in
+                // the eye, while what they *do* there is opposite (an arm
+                // selects, a cast converts — `infer::cast_kind`). The rhythm
+                // is a matter of layout and stops at the layout.
                 cells.push((IVec3::new(0, 0, CAST_TYPE_Z - 1), CellRole::Gap));
                 cells.push((IVec3::new(0, 0, CAST_TYPE_Z), CellRole::Body));
                 cells.extend(anchor_cells(

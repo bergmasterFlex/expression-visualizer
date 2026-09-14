@@ -557,85 +557,197 @@ impl State {
         )
     }
 
+    /// Cast one value, by the table the picture is drawn from.
+    ///
+    /// The rules are normative and live in the thesis this program
+    /// illustrates — `91-appendix.tex`, "Type casting rules", summarised as a
+    /// matrix in `03-concept-design.tex`. `infer::cast_kind` states which of
+    /// them are total and which can fail; this is the same table one level
+    /// down, at the values. Neither may be changed without the other: what the
+    /// strands show is what happens here.
+    ///
+    /// Three steps, and the order of the first two is the whole of a bug that
+    /// used to live here.
+    ///
+    /// **The sad path passes through, without exception.** `none` arrives as
+    /// `none` whatever the target says, and it says so first, before anything
+    /// else is looked at. The literal-target branch used to jump this queue,
+    /// so a `none` cast to `42` came out as `42` — the one rule the appendix
+    /// states *without exception* broken by the one branch that never asked.
+    /// The reason stays where it was produced: this node did not fail, it
+    /// forwarded.
+    ///
+    /// **Then the table**, on the target's base type alone.
+    ///
+    /// **Then, for a literal target, a comparison.** A cast to `42` does not
+    /// author a `42` — that would be a Constant with an input anchor bolted
+    /// on, which is no kind of node. It converts what arrives and then checks
+    /// whether it landed on the value named, handing back `none` when it did
+    /// not. The check is `value_matches_type`, the same function a one-armed
+    /// Match on that literal asks, so the two cannot answer differently.
+    ///
+    /// That comparison is what a cast to a literal is *for*, and it is worth
+    /// stating against the `=` function it resembles: `=` compares any two
+    /// values, of any two types, and yields a `Bool`. A cast makes the same
+    /// comparison and types the answer as `literal | none` — the value itself
+    /// on the happy path, nothing on the sad one. It is a `Result` where `=`
+    /// is a predicate, and that difference is the whole of the node.
     fn eval_value_for_type_cast(
         input_value: EValue,
         target_type: crate::model::r#type::EType,
     ) -> Produced {
-        match &target_type {
-            crate::model::r#type::EType::Bool { value: Some(_) }
-            | crate::model::r#type::EType::Int { value: Some(_) }
-            | crate::model::r#type::EType::String { value: Some(_) }
-            | crate::model::r#type::EType::Char { value: Some(_) } => {
-                // A literal target type: the cast node authors the value
-                // itself, so a value that does not parse is this node's own
-                // failure and belongs in its trace entry.
-                return Self::eval_value_for_type(target_type)
-                    .unwrap_or_else(Produced::none_because);
-            }
-            _ => {}
-        }
-
-        // `none` passes through every cast, String included: the sad path is
-        // handed on, never turned into an ordinary value that a match would no
-        // longer have to open. The reason stays where it was produced — this
-        // node did not fail, it forwarded.
         if matches!(input_value, EValue::None) {
             return EValue::None.into();
         }
+        let produced = Self::cast_to_base_type(input_value, &target_type);
+        // A target naming no literal is the whole of the cast: the base type
+        // is what was asked for and the base type is what arrived.
+        if crate::layout::value_of_etype(&target_type).is_none() {
+            return produced;
+        }
+        // A conversion that already failed keeps its own reason. Saying the
+        // value is not the literal on top of it would name the second of two
+        // failures and hide the first.
+        if matches!(produced.value, EValue::None) {
+            return produced;
+        }
+        if Self::value_matches_type(&produced.value, &target_type) {
+            produced
+        } else {
+            Produced::none_because(format!(
+                "cast produced {} which is not {}",
+                produced.value, target_type
+            ))
+        }
+    }
 
-        let input_type = input_value.type_name();
+    /// The casting table itself, on the target's base type. A literal on the
+    /// target is ignored here and settled by the comparison in
+    /// `eval_value_for_type_cast`; `none` never arrives, having been forwarded
+    /// there before this is called.
+    ///
+    /// Two rules are worth naming because the obvious implementation gets them
+    /// wrong. A Char casts to the Integer it *spells*, not to its code point:
+    /// `'3'` is `3` and never `51`, because the five types are disjoint sets
+    /// and a Char is a symbol rather than a number wearing one. And a Bool is
+    /// `0`/`1` and `'0'`/`'1'` in both directions, which makes every other
+    /// Integer and every other Char no Bool at all — not `true` by virtue of
+    /// being non-zero.
+    fn cast_to_base_type(
+        input_value: EValue,
+        target_type: &crate::model::r#type::EType,
+    ) -> Produced {
         match target_type {
             crate::model::r#type::EType::Bool { .. } => match input_value {
                 EValue::Bool(b) => EValue::Bool(b).into(),
-                EValue::Int(i) => EValue::Bool(i != 0).into(),
-                EValue::String(s) => s
-                    .parse::<bool>()
-                    .map(|b| EValue::Bool(b).into())
-                    .unwrap_or_else(|_| {
-                        Produced::none_because(format!("cannot cast String \"{}\" to Bool", s))
-                    }),
-                _ => Produced::none_because(format!("cannot cast {} to Bool", input_type)),
+                EValue::Int(0) => EValue::Bool(false).into(),
+                EValue::Int(1) => EValue::Bool(true).into(),
+                EValue::Int(i) => {
+                    Produced::none_because(format!("cannot cast Integer {} to Bool", i))
+                }
+                EValue::Char('0') => EValue::Bool(false).into(),
+                EValue::Char('1') => EValue::Bool(true).into(),
+                EValue::Char(c) => {
+                    Produced::none_because(format!("cannot cast Char '{}' to Bool", c))
+                }
+                // The two words are spelled either way round, which is the one
+                // place the table is deliberately lenient — text is what a
+                // human typed and `TRUE` is not a different claim from `true`.
+                // The digits are not: `"0"` is the digit, and there is no case
+                // to fold.
+                EValue::String(s) => match s.as_str() {
+                    "0" => EValue::Bool(false).into(),
+                    "1" => EValue::Bool(true).into(),
+                    other if other.eq_ignore_ascii_case("false") => EValue::Bool(false).into(),
+                    other if other.eq_ignore_ascii_case("true") => EValue::Bool(true).into(),
+                    other => {
+                        Produced::none_because(format!("cannot cast String \"{}\" to Bool", other))
+                    }
+                },
+                EValue::None => unreachable!("`none` is forwarded before the table is consulted"),
             },
             crate::model::r#type::EType::Int { .. } => match input_value {
                 EValue::Bool(b) => EValue::Int(if b { 1 } else { 0 }).into(),
                 EValue::Int(i) => EValue::Int(i).into(),
-                EValue::Char(c) => EValue::Int(c as i32).into(),
-                EValue::String(s) => s
-                    .parse::<i32>()
+                EValue::Char(c) if c.is_ascii_digit() => {
+                    EValue::Int(i32::from(c as u8 - b'0')).into()
+                }
+                EValue::Char(c) => {
+                    Produced::none_because(format!("cannot cast Char '{}' to Integer", c))
+                }
+                EValue::String(s) => Self::parse_cast_integer(&s)
                     .map(|i| EValue::Int(i).into())
-                    .unwrap_or_else(|_| {
+                    .unwrap_or_else(|| {
                         Produced::none_because(format!("cannot cast String \"{}\" to Integer", s))
                     }),
-                _ => Produced::none_because(format!("cannot cast {} to Integer", input_type)),
+                EValue::None => unreachable!("`none` is forwarded before the table is consulted"),
             },
-            // Every remaining kind has a text form, so this cast is total.
-            crate::model::r#type::EType::String { .. } => EValue::String(match input_value {
-                EValue::Bool(b) => b.to_string(),
-                EValue::Int(i) => i.to_string(),
-                EValue::String(s) => s,
-                EValue::Char(c) => c.to_string(),
-                EValue::None => "none".to_string(),
-            })
-            .into(),
             crate::model::r#type::EType::Char { .. } => match input_value {
+                EValue::Bool(b) => EValue::Char(if b { '1' } else { '0' }).into(),
+                EValue::Int(i) if (0..=9).contains(&i) => {
+                    EValue::Char(char::from(b'0' + i as u8)).into()
+                }
+                EValue::Int(i) => {
+                    Produced::none_because(format!("cannot cast Integer {} to Char", i))
+                }
                 EValue::Char(c) => EValue::Char(c).into(),
-                EValue::Int(i) => u32::try_from(i)
-                    .ok()
-                    .and_then(char::from_u32)
-                    .map(|c| EValue::Char(c).into())
-                    .unwrap_or_else(|| {
-                        Produced::none_because(format!("cannot cast Integer {} to Char", i))
-                    }),
+                // `FromStr for char` succeeds on exactly one scalar value and
+                // errors on anything else, which is the rule as written.
                 EValue::String(s) => s
                     .parse::<char>()
                     .map(|c| EValue::Char(c).into())
                     .unwrap_or_else(|_| {
                         Produced::none_because(format!("cannot cast String \"{}\" to Char", s))
                     }),
-                _ => Produced::none_because(format!("cannot cast {} to Char", input_type)),
+                EValue::None => unreachable!("`none` is forwarded before the table is consulted"),
             },
-            crate::model::r#type::EType::None {} => EValue::None.into(),
+            // Every kind has a canonical textual form, so this cast is total.
+            crate::model::r#type::EType::String { .. } => EValue::String(match input_value {
+                EValue::Bool(b) => b.to_string(),
+                EValue::Int(i) => i.to_string(),
+                EValue::String(s) => s,
+                EValue::Char(c) => c.to_string(),
+                // Forwarded by `eval_value_for_type_cast` before it could get
+                // here. Written out rather than folded into a catch-all so
+                // that a `none` reaching this arm is a crash and not a cast
+                // rule quietly contradicting the appendix.
+                EValue::None => unreachable!("`none` is forwarded before the table is consulted"),
+            })
+            .into(),
+            // A cast to `none` would ignore whatever flows in and hand back a
+            // fixed `none`, which is a Constant spelled the long way round.
+            // `refuse_none_cast` greys it out at the prompt, so there is no
+            // way to build one.
+            crate::model::r#type::EType::None {} => {
+                unreachable!("a cast to `none` is refused at the prompt")
+            }
         }
+    }
+
+    /// Decimal integer text as a cast reads it: an optional sign, decimal
+    /// digits, no leading zeros, and nothing else at all.
+    ///
+    /// A shape guard in front of `i32::from_str` rather than a second parser.
+    /// `from_str` already refuses whitespace, thousands separators, a decimal
+    /// point, `10e2`, and anything outside the representable range, and it
+    /// already accepts `+`/`-` and reads `"-0"`, `"0"` and `"+0"` as zero —
+    /// all of which the appendix asks for. The one thing it does *not* refuse
+    /// is a leading zero.
+    ///
+    /// Which is the thing worth refusing. `i32::to_string` never writes one,
+    /// so refusing to read one is exactly what makes `Integer → String →
+    /// Integer` the identity, and what keeps `7` and `07` from being two ways
+    /// of writing one value. A number has one spelling here, the way `none`
+    /// has one symbol.
+    fn parse_cast_integer(text: &str) -> Option<i32> {
+        let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if digits.len() > 1 && digits.starts_with('0') {
+            return None;
+        }
+        text.parse::<i32>().ok()
     }
 
     /// True once the sink node carries a value, i.e. evaluation has reached the

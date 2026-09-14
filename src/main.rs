@@ -1304,20 +1304,25 @@ fn spawn_graph_nodes(
                 } else {
                     (render::STRAND_BAND_HEIGHT, 0.0)
                 };
-            let mesh =
+            let (mesh, arc_total) =
                 edge::build_ribbon_mesh(&curve, from_world.y + y_src, to_world.y + y_tgt, height);
             commands.spawn((
                 Mesh3d(meshes.add(mesh)),
                 MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
-                    band_color: render::strand_color(leaf).to_linear(),
+                    // An edge carries one type from end to end, so both
+                    // colours are the one colour.
+                    band_color_start: render::strand_color(leaf).to_linear(),
+                    band_color_end: render::strand_color(leaf).to_linear(),
                     time: 0.0,
                     // Both ends of an ordinary edge wear the same shape, so
-                    // there is nothing for the interpolation to do and
-                    // `arc_total` only has to be non-zero.
+                    // there is nothing for the two line modes to interpolate
+                    // between. The arc length is the real one all the same —
+                    // it is where a fragment *is*, not merely what the modes
+                    // are read against.
                     line_mode_start: line_mode,
                     line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
                     line_mode_end: line_mode,
-                    arc_total: 1.0,
+                    arc_total,
                     dash_period: 0.0,
                     dash_duty: 0.0,
                 })),
@@ -4620,7 +4625,15 @@ fn spawn_volume_surfaces(
 }
 
 /// Spawn one structural link: a ribbon from `from` to `to` whose two ends may
-/// wear different shapes.
+/// wear different shapes — and, since a strand may be a conversion rather
+/// than a carriage, different colours.
+///
+/// Two leaves and not one. Almost every link has the same type at both ends
+/// and passes the same leaf twice; a cast is where they part, because what
+/// leaves an input row is not what arrives at its target. Both are looked up
+/// through `render::strand_color`, which is also what paints the flat anchor
+/// segments the ribbon meets, so each seam falls on an exact match.
+///
 ///
 /// No `Edge` component and no parent entity. `Edge` holds an `Entity` for each
 /// end, and a Pattern's band is no anchor — there is nothing to point at. A
@@ -4631,15 +4644,17 @@ fn spawn_link_ribbon(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials_edge: &mut Assets<edge::EdgeMaterial>,
-    leaf: &infer::EType,
+    start_leaf: &infer::EType,
+    end_leaf: &infer::EType,
     from: Vec3,
     to: Vec3,
     start: edge::RibbonEnd,
     end: edge::RibbonEnd,
 ) {
     // A leaf that claims no row of its own — a sum type, or `Pending` — has no
-    // strand to draw.
-    if edge::leaf_kind_of(leaf).is_none() {
+    // strand to draw, and a strand has to know what it is at *both* ends
+    // before it can be coloured at either.
+    if edge::leaf_kind_of(start_leaf).is_none() || edge::leaf_kind_of(end_leaf).is_none() {
         return;
     }
     let curve = edge::EdgeCurve::from_endpoints(from, to);
@@ -4647,7 +4662,8 @@ fn spawn_link_ribbon(
     commands.spawn((
         Mesh3d(meshes.add(mesh)),
         MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
-            band_color: render::strand_color(leaf).to_linear(),
+            band_color_start: render::strand_color(start_leaf).to_linear(),
+            band_color_end: render::strand_color(end_leaf).to_linear(),
             time: 0.0,
             line_mode_start: start.line_mode,
             line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
@@ -4684,13 +4700,17 @@ fn spawn_pending_ribbon(
 ) {
     let curve = edge::EdgeCurve::from_endpoints(from, to);
     let (mesh, arc_total) = edge::build_tapered_ribbon_mesh(&curve, &start, &end);
+    // Through the same call the coloured strands go through, of the same type
+    // the grey anchor bodies are drawn from, so a band and the two cells it
+    // joins cannot come apart. Bound once and used at both ends: an undecided
+    // strand is undecided along its whole length, and two greys read from two
+    // places could drift.
+    let grey = render::strand_color(&infer::EType::Pending).to_linear();
     let mut spawned = commands.spawn((
         Mesh3d(meshes.add(mesh)),
         MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
-            // Through the same call the coloured strands go through, of the
-            // same type the grey anchor bodies are drawn from, so a band and
-            // the two cells it joins cannot come apart.
-            band_color: render::strand_color(&infer::EType::Pending).to_linear(),
+            band_color_start: grey,
+            band_color_end: grey,
             time: 0.0,
             line_mode_start: start.line_mode,
             line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
@@ -4716,36 +4736,31 @@ fn whole_row_end(row_center_y: f32, as_line: bool) -> edge::RibbonEnd {
     edge::ribbon_end(row_center_y, &infer::RowSpan::FULL, as_line)
 }
 
-/// Fan an anchor's rows out onto one declared-type cell: every row that cell
-/// can describe gets a strand, claiming the share of the row it takes.
+/// Fan a Match input's rows out onto one arm's declared-type cell: every row
+/// that arm can describe gets a strand, claiming the share of the row it takes.
 ///
-/// Two kinds own such a cell — a Match's arm and a TypeCast's target — and they
-/// make the same statement with it, so they are drawn by the same code. The
-/// caller supplies the anchor side once and calls this per cell.
+/// The Match's alone. A TypeCast used to borrow it, on the grounds that an arm
+/// and a cast target make the same statement with their cell — they do not. An
+/// arm **selects**, and a selection has one destination per row: the arm, or
+/// nothing. A cast **converts**, and a conversion has two, the target and
+/// `none`, which between them are a partition of the row. One destination
+/// cannot describe two, so the cast has its own pass (`spawn_cast_links`) and
+/// this one is free to say the simple thing again.
 ///
 /// The two ways a row can end up with no coloured strand are not the same thing
 /// and are not drawn the same way.
 ///
-/// A row the cell **can never describe** gets nothing *when the cell selects*.
-/// Note the deliberate divergence from the edge pass, which aims an unmatched
-/// leaf at row 0: docking a `Bool` arm onto an `Integer` band would draw the
-/// lie that it consumes it. There the gap *is* the statement — the Match reads
-/// as non-exhaustive.
-///
-/// `converts` is what separates the two owners, and they are not alike. A
-/// Match arm **selects**: it takes the values it already describes, so a row
-/// it does not describe is a row it does not touch. A cast target
-/// **converts**: it takes whatever arrives and makes what it can of it, so
-/// there is no such thing as a row it does not touch. `String` and `Integer`
-/// describe disjoint sets and `"42"` still casts to `42` — asking subsumption
-/// of a cast left every everyday cast with no strand into its target at all,
-/// and only the `none` leg arriving anywhere.
+/// A row the arm **can never describe** gets nothing. Note the deliberate
+/// divergence from the edge pass, which aims an unmatched leaf at row 0:
+/// docking a `Bool` arm onto an `Integer` band would draw the lie that it
+/// consumes it. Here the gap *is* the statement — the Match reads as
+/// non-exhaustive.
 ///
 /// A cell that has **not said yet** what it describes — `declared` is `None`,
-/// an arm or a cast target the user has not typed — makes no such statement,
-/// and neither does a row that is not there because what arrives is still
-/// `Pending`. Those get a pending band: the cell is wired to the anchor either
-/// way, and only what travels between them is open.
+/// an arm the user has not typed — makes no such statement, and neither does a
+/// row that is not there because what arrives is still `Pending`. Those get a
+/// pending band: the cell is wired to the anchor either way, and only what
+/// travels between them is open.
 #[allow(clippy::too_many_arguments)]
 fn spawn_declared_cell_links(
     commands: &mut Commands,
@@ -4756,7 +4771,6 @@ fn spawn_declared_cell_links(
     in_value: Option<&str>,
     band_pos: Vec3,
     declared: Option<&model::r#type::EType>,
-    converts: bool,
 ) {
     let declared_leaf = declared.map(infer::graph_type_to_eval_type);
     let declared_value = declared.and_then(layout::value_of_etype);
@@ -4800,19 +4814,14 @@ fn spawn_declared_cell_links(
             );
             continue;
         };
-        // A converting cell takes the whole row where subsumption has nothing
-        // to say: there is no share to work out, because the value is not
-        // being divided up — it is being handed over entire, to come back as
-        // the target or as `none`.
-        let span = match infer::claimed_span(anchor_leaf, declared_leaf) {
-            Some(span) => span,
-            Option::None if converts => infer::RowSpan::FULL,
-            Option::None => continue,
+        let Some(span) = infer::claimed_span(anchor_leaf, declared_leaf) else {
+            continue;
         };
         spawn_link_ribbon(
             commands,
             meshes,
             materials_edge,
+            anchor_leaf,
             anchor_leaf,
             from,
             band_pos,
@@ -4902,10 +4911,6 @@ fn spawn_match_links(
                     in_value.as_deref(),
                     band_pos,
                     arm_type.as_ref(),
-                    // An arm selects. A row it does not describe is a row it
-                    // does not take, and the gap left behind is the Match
-                    // reading as non-exhaustive.
-                    false,
                 );
             }
         }
@@ -4987,6 +4992,7 @@ fn spawn_match_links(
                         meshes,
                         materials_edge,
                         leaf,
+                        leaf,
                         from,
                         to,
                         whole_row_end(sink_pos.y + render::leaf_row_offset(k), as_line),
@@ -5019,7 +5025,17 @@ fn spawn_match_links(
                         &span,
                         render::leaf_is_drawn_as_line(out_leaf, None),
                     );
-                    spawn_link_ribbon(commands, meshes, materials_edge, leaf, from, to, start, end);
+                    spawn_link_ribbon(
+                        commands,
+                        meshes,
+                        materials_edge,
+                        leaf,
+                        leaf,
+                        from,
+                        to,
+                        start,
+                        end,
+                    );
                 }
             }
         }
@@ -5027,36 +5043,46 @@ fn spawn_match_links(
 }
 
 /// Draw the connections a TypeCast is made of: what arrives at its input
-/// reaching its target cell, and what the target cannot take reaching the
-/// `none` its output carries.
+/// reaching its target cell, and what cannot get there reaching the `none` its
+/// output carries.
 ///
-/// A cast borrows the Match's rhythm with one arm, so the first half is
-/// literally the Match's — `spawn_declared_cell_links`, called once.
+/// These are not edges. No `Edge` ever runs between a cast's own cells — the
+/// node *is* the connection — so the edge table says nothing about them and
+/// they have to be drawn from the structure itself, the way a Match's are.
 ///
-/// The second half is the cast's own, and it is the thing a cast is *about*.
-/// `infer::type_cast_output_type` calls a cast total exactly when its target
-/// subsumes everything arriving, and hangs a `none` off it otherwise. Until now
-/// that `none` appeared at the output with nothing to say where it came from.
-/// It comes from whatever the target does not claim: `RowSpan::complement` of
-/// each row's claimed share, drawn as a strand that runs past the target cell
-/// straight to the `none` row. Past it, not through it — a cast that fails
-/// never reaches its target.
+/// What they show is a **partition**. One input row leaves in two pieces and
+/// the two pieces are the whole of it: the share that converts goes to the
+/// target cell, the share that cannot goes past the cell to `none`. Past it,
+/// not through it — a cast that fails never reaches its target. Which share is
+/// which is `infer::cast_row_split`'s answer and nothing here re-decides it;
+/// this places geometry and no more.
 ///
-/// The two halves agree by construction: a total cast claims every row whole,
-/// every complement is empty, and no strand is drawn — which is also exactly
-/// when the output has no `none` row to draw one to.
+/// That both pieces come out of one call, in one pass over the row, is the
+/// point and not an accident of style. They used to be worked out in two
+/// places — the target leg through `spawn_declared_cell_links`, the `none` leg
+/// here — and two places agreeing by convention is exactly how a `String`
+/// cast to `Integer` came to be drawn twice at full height, once into the
+/// target and once into `none`, as though the same values did both.
 ///
-/// A partial cast then gets a third leg, the reverse one a Match has: target
-/// cell → output anchor, the path taken when the cast succeeds. A **total**
-/// cast is the one that does without it, and for a reason that holds only
-/// there: its target cell and its output say the same thing one cell apart, so
-/// a strand between them would spell it twice.
+/// The third leg is the reverse one a Match has: target cell → output anchor,
+/// the path taken when the cast succeeds. It is drawn when the output has a
+/// `none` row **and** at least one input row actually arrived at the cell, and
+/// both halves of that condition earn their place.
 ///
-/// The moment a `none` row appears that stops being true. The output is two
-/// rows now, no longer one statement repeated, and with the success leg
-/// missing the only strand arriving anywhere on it was the one reaching
-/// `none` — so a cast that could perfectly well succeed was drawn as a cast
-/// that always fails.
+/// A **total** cast does without it because its target cell and its output say
+/// the same thing one cell apart, and a strand between them would only spell
+/// it twice. The moment a `none` row appears that stops being true: the output
+/// is two rows now, no longer one statement repeated, and without this leg the
+/// only strand arriving anywhere on it is the one reaching `none` — a cast
+/// that could perfectly well succeed, drawn as a cast that always fails.
+///
+/// And a cast nothing can get through — `none` alone arriving at a cast to
+/// `Integer` — has a `none` row all the same, so the first half would draw a
+/// leg out of a cell that nothing ever reaches. `reaches_target` is set by the
+/// loop that draws the strands rather than worked out a second time, so the
+/// condition *is* the drawing and the two cannot drift apart.
+///
+/// A plain `fn` and not a system, for the reason `spawn_match_links` gives.
 fn spawn_cast_links(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
@@ -5090,71 +5116,125 @@ fn spawn_cast_links(
             .unwrap_or_default();
         let in_value = infer::incoming_anchor_literal(flat_graph, input_anchor);
 
-        spawn_declared_cell_links(
-            commands,
-            meshes,
-            materials_edge,
-            in_pos,
-            &in_leaves,
-            in_value.as_deref(),
-            band_pos,
-            r#type.as_ref(),
-            // A cast converts, so every row reaches the target — whether it
-            // arrives as the target or as `none` is what the legs below say.
-            true,
-        );
+        let target_leaf = r#type.as_ref().map(infer::graph_type_to_eval_type);
+        let target_value = r#type.as_ref().and_then(layout::value_of_etype);
+        // The cell fills its own row whatever it declares — or fails to
+        // declare — so the taper happens entirely at the anchor end.
+        let cell_is_line = target_leaf
+            .as_ref()
+            .is_some_and(|leaf| render::leaf_is_drawn_as_line(leaf, target_value.as_deref()));
 
-        // ── The two legs a partial cast fans into ──
-        //
-        // A cast with no target chosen declares nothing, so nothing can
-        // succeed or fail against it and its output is `Pending` either way.
-        // The leg above is the whole of what such a cast is drawn as, and it
-        // is drawn pending.
-        let Some(target) = r#type else {
-            continue;
-        };
+        // Held as options rather than behind a `continue`: a total cast has no
+        // `none` row and still has strands to draw, and an output that has not
+        // been placed must not take the target leg down with it.
+        let out_pos = anchor_world_positions.get(output_anchor).copied();
         let out_leaves = render::ordered_supported_leaves(
             &infer::anchor_type(flat_graph, output_anchor, decls).unwrap_or(infer::EType::Pending),
         );
-        let (Some(&out_pos), Some(none_row)) = (
-            anchor_world_positions.get(output_anchor),
-            out_leaves
-                .iter()
-                .position(|leaf| matches!(leaf, infer::EType::None)),
-        ) else {
-            continue;
-        };
-        let target_leaf = infer::graph_type_to_eval_type(target);
+        let out_value = infer::anchor_literal(flat_graph, output_anchor);
+        let none_row = out_leaves
+            .iter()
+            .position(|leaf| matches!(leaf, infer::EType::None));
+
+        // Leave by the band's far face. The cell centre is the outward face,
+        // where the *incoming* edge already ends.
+        let from = render::anchor_body_face_world(in_pos, true);
+        let mut reaches_target = false;
+
+        // `max(1)` rather than the leaf count alone: an anchor whose type is
+        // undecided has no leaf rows, but it still has the one row its grey
+        // `plain_anchor_body` is drawn on, and that is where its band leaves
+        // from.
+        for row in 0..in_leaves.len().max(1) {
+            let anchor_leaf = in_leaves.get(row);
+            let row_y = in_pos.y + render::leaf_row_offset(row);
+            let row_is_line = anchor_leaf
+                .is_some_and(|leaf| render::leaf_is_drawn_as_line(leaf, in_value.as_deref()));
+
+            // Both sides have to have spoken before the row can be divided:
+            // nothing arriving, or no target chosen, and there is a connection
+            // to draw with nothing yet to say about what travels along it.
+            let (Some(anchor_leaf), Some(target_leaf)) = (anchor_leaf, target_leaf.as_ref()) else {
+                spawn_pending_ribbon(
+                    commands,
+                    meshes,
+                    materials_edge,
+                    from,
+                    // A declared-type cell is drawn input-side, so its near
+                    // face is the cell centre — which is the face this meets.
+                    band_pos,
+                    whole_row_end(row_y, row_is_line),
+                    whole_row_end(band_pos.y, cell_is_line),
+                    None,
+                );
+                continue;
+            };
+            let (to_target, to_none) = infer::cast_row_split(anchor_leaf, target_leaf);
+
+            // ── The share that converts, reaching the target cell ──
+            if let Some(span) = to_target {
+                reaches_target = true;
+                spawn_link_ribbon(
+                    commands,
+                    meshes,
+                    materials_edge,
+                    anchor_leaf,
+                    target_leaf,
+                    from,
+                    band_pos,
+                    edge::ribbon_end(row_y, &span, row_is_line),
+                    whole_row_end(band_pos.y, cell_is_line),
+                );
+            }
+
+            // ── The share that cannot, reaching the `none` ──
+            //
+            // There is no `none` row to reach when the cast is total, and then
+            // there is no share to send there either — the two are the same
+            // fact, stated once by `cast_row_split` and once by
+            // `infer::type_cast_output_type`, which reads the same function.
+            let (Some(span), Some(none_row), Some(out_pos)) = (to_none, none_row, out_pos) else {
+                continue;
+            };
+            spawn_link_ribbon(
+                commands,
+                meshes,
+                materials_edge,
+                // It leaves as the value it was and arrives as the absence of
+                // one. The strand used to be `none` along its whole length,
+                // on the grounds that the colour should say where a strand
+                // ends up; it can say both now, and what it shows is the
+                // conversion rather than the destination claimed from the
+                // start.
+                anchor_leaf,
+                &infer::EType::None,
+                from,
+                // Arrive at the output band's near face, in front of it.
+                render::anchor_body_face_world(out_pos, false),
+                edge::ribbon_end(row_y, &span, row_is_line),
+                // `none` is always a line, so the strand tapers into one
+                // however much of the band it left with.
+                edge::ribbon_end(
+                    out_pos.y + render::leaf_row_offset(none_row),
+                    &infer::RowSpan::FULL,
+                    true,
+                ),
+            );
+        }
 
         // ── What the target does take, reaching the output ──
-        //
-        // Only a partial cast draws this leg, which is why it sits behind the
-        // `none_row` guard above. A total cast leaves its target cell and its
-        // output saying the same thing one cell apart, and a strand between
-        // them would only spell it twice.
-        //
-        // A partial cast is the opposite case: its output has grown a second
-        // row, so the two are no longer one statement a cell apart, and
-        // without this the *only* strand arriving at the output is the one
-        // reaching `none`. A cast that can perfectly well succeed then reads
-        // as a cast that always fails.
-        //
-        // Unconditional, and the condition it does *not* have is worth naming.
-        // `claimed_span` — the question the failure leg below asks — is about
-        // subsumption: which values of the arriving row the target also
-        // describes. That is the right question for a Match arm, which selects
-        // values it already describes, and the wrong one for a cast, which
-        // *converts*. `String` and `Integer` describe disjoint sets and
-        // `"42"` casts to `42` regardless. Guarding this leg on subsumption
-        // left exactly the everyday casts — String to Integer among them —
-        // drawn as though they could only fail.
-        //
-        // Being here at all is the condition: `type_cast_output_type` grows a
-        // `none` row precisely when the cast is not total, and a cast that is
-        // not total is one that can go either way.
-        let target_value = layout::value_of_etype(target);
-        let cell_is_line = render::leaf_is_drawn_as_line(&target_leaf, target_value.as_deref());
-        let out_value = infer::anchor_literal(flat_graph, output_anchor);
+        if none_row.is_none() || !reaches_target {
+            continue;
+        }
+        let Some(out_pos) = out_pos else {
+            continue;
+        };
+        // `reaches_target` cannot be set without a target, so this holds
+        // wherever the two guards above did — asked outright rather than
+        // unwrapped, because a picture is not worth a panic.
+        let Some(target_leaf) = target_leaf.as_ref() else {
+            continue;
+        };
         // Leave by the band's far face and arrive at the output's near one,
         // the way every leg between two cells is drawn here.
         let from = render::anchor_body_face_world(band_pos, true);
@@ -5170,6 +5250,11 @@ fn spawn_cast_links(
                 commands,
                 meshes,
                 materials_edge,
+                // The same type at both ends in practice, and passed twice
+                // all the same: if the output ever grows a row the target
+                // does not name, the leg should show it rather than assert
+                // the target's colour over it.
+                target_leaf,
                 out_leaf,
                 from,
                 to,
@@ -5178,46 +5263,6 @@ fn spawn_cast_links(
                     out_pos.y + render::leaf_row_offset(row),
                     render::leaf_is_drawn_as_line(out_leaf, out_value.as_deref()),
                 ),
-            );
-        }
-
-        // ── What the target cannot take, reaching the `none` ──
-        for (row, anchor_leaf) in in_leaves.iter().enumerate() {
-            // No claim at all means the whole row fails; a partial claim leaves
-            // its complement. `None` from `complement` means nothing is left,
-            // so this row always succeeds and needs no strand.
-            let failing = match infer::claimed_span(anchor_leaf, &target_leaf) {
-                Option::None => Some(infer::RowSpan::FULL),
-                Some(claimed) => claimed.complement(),
-            };
-            let Some(failing) = failing else {
-                continue;
-            };
-            let start = edge::ribbon_end(
-                in_pos.y + render::leaf_row_offset(row),
-                &failing,
-                render::leaf_is_drawn_as_line(anchor_leaf, in_value.as_deref()),
-            );
-            // `none` is always a line, so the strand tapers into one however
-            // much of the band it left with.
-            let end = edge::ribbon_end(
-                out_pos.y + render::leaf_row_offset(none_row),
-                &infer::RowSpan::FULL,
-                true,
-            );
-            spawn_link_ribbon(
-                commands,
-                meshes,
-                materials_edge,
-                // Coloured as `none` rather than as the row it leaves: what
-                // travels here is not a value of that type, it is the absence
-                // of one, and the colour should say where the strand ends up.
-                &infer::EType::None,
-                render::anchor_body_face_world(in_pos, true),
-                // Arrive at the output band's near face, in front of it.
-                render::anchor_body_face_world(out_pos, false),
-                start,
-                end,
             );
         }
     }

@@ -133,6 +133,15 @@ impl RowSpan {
     /// What `true` claims of a Bool band. Bool is the only type small enough
     /// that naming one of its values is worth a share of the band rather than a
     /// line on it.
+    ///
+    /// A cast borrows the same two halves for a second reading:
+    /// `cast_row_split` divides a row it cannot divide exactly into a half
+    /// that always converts and a half that always becomes `none`. That
+    /// division is a *drawing* and not arithmetic — it is arbitrary, and
+    /// nothing reasoning about value sets may read it. `spans_cover_band` and
+    /// `normalize_leaves` stay safe because no cast span ever reaches them,
+    /// and the exhaustiveness linter these numbers are meant for has to keep
+    /// it that way.
     pub const TOP_HALF: RowSpan = RowSpan {
         top: 0.0,
         bottom: 0.5,
@@ -140,6 +149,8 @@ impl RowSpan {
     /// What `false` claims. Together with `TOP_HALF` the band is covered
     /// exactly once, which is what makes a two-armed Bool match read as
     /// exhaustive without anything having to say so.
+    ///
+    /// It carries the cast's second reading too — see `TOP_HALF`.
     pub const BOTTOM_HALF: RowSpan = RowSpan {
         top: 0.5,
         bottom: 1.0,
@@ -398,6 +409,194 @@ pub fn claimed_span(row: &EType, claimant: &EType) -> Option<RowSpan> {
     }
 }
 
+/// What becomes of the values arriving on one row of a cast's input.
+///
+/// Three answers and not two, because a cast has two ways of not being total
+/// and they are not the same thing: a row that mostly converts and sometimes
+/// does not, and a row that never converts at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastKind {
+    /// Every value of the row arrives as the target.
+    Total,
+    /// Some values arrive and the rest become `none`. Which is which is a
+    /// question about values, and the type level does not ask it.
+    Partial,
+    /// No value arrives. Only a `none` row reaches this, and it reaches it for
+    /// every target there is.
+    AlwaysNone,
+}
+
+/// Whether a cast from the leaf row `source` to `target` can fail, and whether
+/// it can succeed at all.
+///
+/// This is the question `claimed_span` just above cannot answer, and the two
+/// stand side by side because mistaking one for the other is the easiest
+/// error to make about this model. Subsumption asks *may this value travel
+/// here*, which is exactly right for a Match arm: an arm **selects**, taking
+/// the values it already describes and leaving the rest. A cast **converts**.
+/// It takes whatever arrives and makes what it can of it, and whether two
+/// types describe the same values has nothing to do with whether one can be
+/// turned into the other. `String` and `Integer` are disjoint sets and `"42"`
+/// casts to `42` all the same.
+///
+/// The table is normative and belongs to the thesis this program illustrates —
+/// `03-concept-design.tex`, "Type casting", with the value-level rules in
+/// `91-appendix.tex`. It is reproduced here so a reader never has to leave the
+/// file to check a cell:
+///
+/// ```text
+///  from \ to | Bool     Integer  Char     String
+/// -----------+----------------------------------
+///  Bool      | id       total    total    total
+///  Integer   | partial  id       partial  total
+///  Char      | partial  partial  id       total
+///  String    | partial  partial  partial  id
+///  None      | -------- always none --------------
+/// ```
+///
+/// The thesis writes `id` on the diagonal rather than `total`. That is the
+/// stronger claim — the identity, not merely a conversion that cannot fail —
+/// and it is information this model has no use for, so both fold into `Total`.
+///
+/// `None` as a source is the whole of the third answer. No cell anywhere reads
+/// *impossible*: a cast that can go wrong goes to `none`, and the one row that
+/// can go nowhere else is `none` itself, which every cast hands on untouched.
+/// The sad path passes through, without exception.
+///
+/// A cast *to* `none` is not offered, which is why that column is missing
+/// above; `refuse_none_cast` refuses it at the prompt. It is answered anyway,
+/// for the reason `literal_row_span` gives for its own unreachable arms: a
+/// total function is easier to trust than one with a hole in it.
+///
+/// ## Literals
+///
+/// Two halves, and they differ because they are two different questions.
+///
+/// Where both sides are the same kind, a literal is a question of *subtyping*
+/// and is answered exactly: `1` casts to `1` and cannot fail, `1` casts to `2`
+/// and cannot succeed. It is settled by the same text comparison
+/// `leaf_subsumes_leaf` makes, so the two cannot come apart.
+///
+/// Where a literal stands on the **target** otherwise, the cast is a
+/// conversion *followed by a comparison*, and the comparison is what can fail.
+/// So `Total` is downgraded to `Partial` and `Partial` stays one. That is the
+/// whole of what a cast to a literal is worth over the `=` function: the same
+/// check, typed as `literal | none` rather than as `Bool`.
+///
+/// A literal standing on the **source** alone is only a narrower starting
+/// point, and it is deliberately not looked at. Answering `1 -> Bool` would
+/// mean running the cast at inference time, which is constant folding under
+/// another name. The model declines, and calls it `Partial` though it always
+/// succeeds: a type may be wider than the truth, never narrower.
+pub fn cast_kind(source: &EType, target: &EType) -> CastKind {
+    // The sad path first, because it outranks every other rule. `none` arrives
+    // as `none` whatever the target says, and `none` to `none` is the thesis
+    // `id` — the only cell of a column nothing may ask for.
+    if matches!(source, EType::None) {
+        return if matches!(target, EType::None) {
+            CastKind::Total
+        } else {
+            CastKind::AlwaysNone
+        };
+    }
+    if matches!(target, EType::None) {
+        return CastKind::AlwaysNone;
+    }
+    // Same kind and both pinned: subtyping, and exactly decidable.
+    if types_match(source, target) {
+        match (leaf_literal(source), leaf_literal(target)) {
+            (Some(from), Some(to)) if from == to => return CastKind::Total,
+            (Some(_), Some(_)) => return CastKind::AlwaysNone,
+            _ => {}
+        }
+    }
+    // A literal target that rule did not settle: convert, then compare. The
+    // comparison can fail whatever the conversion does, so the table's answer
+    // cannot survive it whole.
+    if leaf_literal(target).is_some() {
+        return CastKind::Partial;
+    }
+    base_cast_kind(source, target)
+}
+
+/// How a cast between two *kinds* turns out, literals already settled by
+/// `cast_kind` and `none` already handled there.
+fn base_cast_kind(source: &EType, target: &EType) -> CastKind {
+    match (source, target) {
+        // The String column: every kind has one canonical textual form, so
+        // nothing can fail on the way to text.
+        (_, EType::String(_))
+        // The Bool row: two inhabitants, and every target has somewhere to put
+        // both of them.
+        | (EType::Bool(_), _)
+        // The diagonal, which the thesis writes `id`.
+        | (EType::Int(_), EType::Int(_))
+        | (EType::Char(_), EType::Char(_)) => CastKind::Total,
+
+        // The rest of the four-by-four. A number that is neither 0 nor 1 is no
+        // Bool, a Char that is not a digit is no Integer, an Integer outside
+        // `0..=9` is no single digit, and most text is none of the three.
+        (EType::Int(_), EType::Bool(_) | EType::Char(_))
+        | (EType::Char(_), EType::Bool(_) | EType::Int(_))
+        | (EType::String(_), EType::Bool(_) | EType::Int(_) | EType::Char(_)) => CastKind::Partial,
+
+        // `Pending` and `SumType` claim no row of their own (`row_leaves`), so
+        // nothing ever asks about them. Answered anyway, and answered with the
+        // least committal of the three, for the reason given above.
+        _ => CastKind::Partial,
+    }
+}
+
+/// The two shares of one input row: what reaches the cast's target, and what
+/// reaches its `none`.
+///
+/// A partition, not two independent claims. Together the two spans are the
+/// whole of what becomes of the row, which is why they are worked out in one
+/// place and handed back as a pair — two separate passes over the same row is
+/// exactly how the drawing used to send one band to both destinations at full
+/// height.
+///
+/// `cast_kind` decides. This only turns the decision into geometry.
+///
+/// `Option::None` means **no strand at all**, and it is not the same as a span
+/// of no height. `ribbon_end` draws a degenerate span as a hairline, so
+/// collapsing the two would put a strand into the target for a row that can
+/// never arrive there.
+///
+/// Where there is arithmetic, the arithmetic is kept. A base type cast to a
+/// literal of its own kind is the one case the model divides exactly:
+/// `Bool -> false` takes the `false` half of the band and leaves the `true`
+/// half, `Integer -> 42` takes a line and leaves the whole band. That is
+/// `literal_row_span`'s own answer, and trading it for a flat half would throw
+/// away the one place the picture is telling the exact truth.
+///
+/// Everywhere else a `Partial` is drawn as half and half. The halves are
+/// **arbitrary** and claim nothing about how likely the cast is — how many
+/// Strings parse as an Integer is not a question a type can answer. What they
+/// do say, and say plainly, is that a fixed part of the band always makes it
+/// across and a fixed part never does.
+///
+/// Where the row is drawn as a line the two legs leave from the same point:
+/// `ribbon_end` puts a hairline on the row's centre and ignores the span
+/// entirely. They overlap for a stretch before diverging, which is honest
+/// enough — one point is where a single value decides which way it goes.
+pub fn cast_row_split(source: &EType, target: &EType) -> (Option<RowSpan>, Option<RowSpan>) {
+    match cast_kind(source, target) {
+        CastKind::Total => (Some(RowSpan::FULL), Option::None),
+        CastKind::AlwaysNone => (Option::None, Some(RowSpan::FULL)),
+        // Both sides pinned is already `Total` or `AlwaysNone` above, so what
+        // reaches the exact case here is a base type meeting a literal of its
+        // own kind — and that is the only shape `literal_row_span` can divide.
+        CastKind::Partial => match (types_match(source, target), leaf_literal(target)) {
+            (true, Some(literal)) => {
+                let claimed = literal_row_span(source, Some(literal));
+                (Some(claimed), claimed.complement())
+            }
+            _ => (Some(RowSpan::TOP_HALF), Some(RowSpan::BOTTOM_HALF)),
+        },
+    }
+}
+
 /// How many cells an anchor occupies along Y: one per sum-type member, never
 /// fewer than one.
 ///
@@ -642,7 +841,7 @@ fn anchor_type_uncycled(
     }
 }
 
-/// A cast to `target` is total when the incoming type already matches, and
+/// A cast is total when every row arriving at it converts without fail, and
 /// partial otherwise — a partial cast can fail, which is modelled as
 /// `Sum(target, none)`. Which of the two applies cannot be decided before an
 /// incoming type is known, so an unconnected (or itself pending) input makes
@@ -650,6 +849,31 @@ fn anchor_type_uncycled(
 ///
 /// A cast with no target chosen yet is pending before the input is even looked
 /// at: there is nothing to be total or partial *to*.
+///
+/// It decides nothing of its own. `cast_kind` is the whole of the rule and
+/// this only counts up its answers, because the picture asks the same function
+/// row by row and a second opinion here is exactly how the two came to
+/// disagree: `subsumes` used to be asked instead, and it called `Integer` to
+/// `String` partial — hanging a `none` off a cast that cannot fail — while the
+/// drawing sent the whole band to the target.
+///
+/// It reads `row_leaves` for the same reason, that being the function the
+/// drawing counts rows with. Reading `flatten_type` here and `row_leaves`
+/// there would leave the two seeing different rows even while they asked the
+/// same question of each.
+///
+/// An input carrying an undecided member is undecided: total-vs-partial cannot
+/// be settled over a row that is still open. `subsumes` gave that for free,
+/// since `leaf_subsumes_leaf` refuses `Pending` outright; asking `cast_kind`
+/// instead means asking it here, and `row_leaves` has already dropped the
+/// `Pending` leaf by the time it could be counted.
+///
+/// An input of nothing but `none` still yields `target | none`, with no
+/// special case written anywhere: `AlwaysNone` is not `Total`, so the sum
+/// stands. The cast can in fact never succeed and the type still offers the
+/// happy path — a sound over-approximation, and a deliberate one. The picture
+/// says the sharper thing by leaving the target cell with nothing arriving at
+/// it.
 fn type_cast_output_type(
     graph: &crate::model::term_graph::TermGraph,
     target: Option<&crate::model::r#type::EType>,
@@ -661,16 +885,23 @@ fn type_cast_output_type(
         return EType::Pending;
     };
     let target = graph_type_to_eval_type(target);
-    match incoming_type(graph, input_anchor, function_declarations, visiting) {
-        None | Some(EType::Pending) => EType::Pending,
-        // Total exactly when the target already admits everything that arrives.
-        // Asked as subsumption rather than as equality because widening is the
-        // ordinary use of a cast: `1|2` cast to `Integer` cannot fail, and a
-        // `none` hung off it would claim a sad path that does not exist.
-        Some(incoming) if !subsumes(&target, &incoming) => {
-            EType::SumType(vec![target, EType::None])
-        }
-        Some(_) => target,
+    let incoming = match incoming_type(graph, input_anchor, function_declarations, visiting) {
+        None | Some(EType::Pending) => return EType::Pending,
+        Some(incoming) => incoming,
+    };
+    if flatten_type(&incoming)
+        .iter()
+        .any(|leaf| matches!(leaf, EType::Pending))
+    {
+        return EType::Pending;
+    }
+    if row_leaves(&incoming)
+        .iter()
+        .all(|leaf| matches!(cast_kind(leaf, &target), CastKind::Total))
+    {
+        target
+    } else {
+        EType::SumType(vec![target, EType::None])
     }
 }
 

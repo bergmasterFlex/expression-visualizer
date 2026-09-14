@@ -16,7 +16,10 @@
 const COVERAGE_CUTOFF: f32 = 0.5;
 
 struct EdgeParams {
-    band_color: vec4<f32>,
+    // Where the strand leaves, and where it arrives. Equal for every strand
+    // whose two ends carry the same type; a cast is where they part.
+    band_color_start: vec4<f32>,
+    band_color_end: vec4<f32>,
     // Seconds since app start. Nothing reads it yet — it is kept against a
     // coming edge animation, and a uniform slot is cheaper to leave standing
     // than to take out and put back.
@@ -77,5 +80,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    return vec4<f32>(params.band_color.rgb, 1.0);
+    // Along the length and nothing else. `uv.x` is constant across the
+    // ribbon's height — both vertices of a column carry the same value — so
+    // the ramp is exactly linear in the along-curve parameter with no
+    // cross-talk from `uv.y`, the same property the `line_mode` mix above
+    // relies on. At `along = 0` this is exactly the start colour and at
+    // `along = 1` exactly the end one, which is what lets it meet the flat
+    // anchor segment at either end without a seam.
+    let rgb = mix(params.band_color_start.rgb, params.band_color_end.rgb, along);
+
+    return vec4<f32>(rgb, 1.0);
 }

@@ -286,26 +286,47 @@ pub fn build_tapered_ribbon_mesh(
 
 /// Ribbon of constant `height`, centred on a `y_start` → `y_end` ramp. What an
 /// ordinary graph edge is drawn as, where both ends wear the same shape.
-pub fn build_ribbon_mesh(curve: &EdgeCurve, y_start: f32, y_end: f32, height: f32) -> Mesh {
+///
+/// Hands back the arc length alongside the mesh, exactly as
+/// `build_tapered_ribbon_mesh` does. It used to drop it, on the grounds that
+/// an edge whose two ends agree has nothing to interpolate — but `uv.x` is
+/// measured in world units and the shader divides by this to know where along
+/// the ribbon it is, so a stand-in number is a stand-in position, and the
+/// moment anything else reads `along` the lie is drawn.
+pub fn build_ribbon_mesh(curve: &EdgeCurve, y_start: f32, y_end: f32, height: f32) -> (Mesh, f32) {
     let half = height * 0.5;
     let end_at = |y: f32| RibbonEnd {
         y_top: y + half,
         y_bottom: y - half,
         line_mode: 0.0,
     };
-    build_tapered_ribbon_mesh(curve, &end_at(y_start), &end_at(y_end)).0
+    build_tapered_ribbon_mesh(curve, &end_at(y_start), &end_at(y_end))
 }
 
 pub const EDGE_SHADER_HANDLE: Handle<Shader> = uuid_handle!("45444745-0000-4000-8000-000000000001");
 
 #[derive(Asset, TypePath, AsBindGroup, Clone)]
 pub struct EdgeMaterial {
-    /// The strand's colour, from `render::strand_color`, so it matches the
-    /// stretch of itself inside the anchors it joins. Only the RGB is read —
-    /// the material cuts fragments away rather than blending them, so there is
-    /// no alpha left for the shader to do anything with.
+    /// The strand's colour where it leaves, from `render::strand_color`, so it
+    /// matches the stretch of itself inside the anchor it leaves from. Only the
+    /// RGB is read — the material cuts fragments away rather than blending
+    /// them, so there is no alpha left for the shader to do anything with.
     #[uniform(0)]
-    pub band_color: LinearRgba,
+    pub band_color_start: LinearRgba,
+    /// The colour where it arrives, interpolated toward from
+    /// `band_color_start` along the ribbon.
+    ///
+    /// Equal to it for every strand whose two ends carry the same type, which
+    /// is almost all of them. A cast is where the two part: what leaves an
+    /// input row as a String arrives at the target cell as an Integer, or at
+    /// the output as the absence of a value, and the strand is the conversion
+    /// rather than a claim staked on one end of it.
+    ///
+    /// Both go through `render::strand_color`, the same call the flat anchor
+    /// segments at either end are painted with, so each seam falls on an exact
+    /// match.
+    #[uniform(0)]
+    pub band_color_end: LinearRgba,
     /// Seconds since app start, updated each frame by
     /// `update_edge_material_time`. Nothing reads it yet — it is kept against a
     /// coming edge animation.
@@ -331,8 +352,9 @@ pub struct EdgeMaterial {
     #[uniform(0)]
     pub line_mode_end: f32,
     /// Total arc length of the ribbon in world units — what `uv.x` is divided
-    /// by to place a fragment between the two line modes. `build_tapered_ribbon_mesh`
-    /// returns it; anything non-zero will do where both modes agree.
+    /// by to place a fragment along the ribbon. Always the real length the
+    /// mesh builder returned: it decides where the two line modes meet, and
+    /// where the two colours do.
     #[uniform(0)]
     pub arc_total: f32,
     /// World length of one dash-plus-gap along the ribbon's arc. `0.0` means a

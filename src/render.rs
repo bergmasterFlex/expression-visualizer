@@ -713,7 +713,10 @@ fn typed_anchor(
 ///
 /// Two kinds hang a type on a cell of their own rather than on an anchor: a
 /// Pattern, whose cell is the arm it matches, and a TypeCast, whose cell is what
-/// it casts to. Both are input-side: what the cell names is what may *arrive*.
+/// it converts to. Both are drawn input-side — the cell centre is the near face
+/// the incoming strands meet — and there the likeness ends. A Pattern's cell
+/// names what may *arrive* at it; a cast's names what *leaves* it, which is a
+/// different sentence about the same shape.
 ///
 /// Usually neither writes anything: a declared type stands between an anchor
 /// that names the same type and one that names what it narrows to, so it is
@@ -1020,8 +1023,10 @@ pub fn layoutnode_to_rendernode(
             }
         }
         // Input anchor at `0|0`, a gap at `0|1`, the target type at `0|2`,
-        // output at `0|3` — a Match's rhythm with one arm, which is what a cast
-        // is.
+        // output at `0|3` — a Match's rhythm with one arm, which is how a cast
+        // reads. Reads, and no more than that: an arm takes a share of the
+        // band and leaves the rest, a cast turns the whole band into one of
+        // two things.
         crate::model::node::ENode::TypeCast {
             r#type,
             input_anchor,
@@ -1030,10 +1035,12 @@ pub fn layoutnode_to_rendernode(
             let input_world = cell(0, 0, 0);
             let body_world = cast_band_world(layout_node, extra_offset);
             let output_world = cell(0, 0, crate::layout::CAST_OUTPUT_Z);
-            // The output reflects a possibly failed cast as `Sum(target, none)`
-            // when a mismatched type flows in, and stays `Pending` while
-            // nothing flows in at all, or while nothing has been cast *to*;
-            // that logic lives in `infer::anchor_type`. Nothing falls back to
+            // The output reflects a cast that can fail as `Sum(target, none)`,
+            // and stays `Pending` while nothing flows in at all, or while
+            // nothing has been cast *to*; that logic lives in
+            // `infer::type_cast_output_type`, which counts up `cast_kind` row
+            // by row — the same call the strands are drawn from, so the row
+            // this anchor grows is the row a strand is aimed at. Nothing falls back to
             // the declared type here: what the cast will produce is a question
             // about what arrives, not about what it aims at.
             let output_eval_type =
@@ -1051,8 +1058,9 @@ pub fn layoutnode_to_rendernode(
                 false,
                 Lettering::Spelled,
             );
-            // Drawn as its arm's band, exactly as a Pattern is: a cast declares
-            // what may pass, and that is the same statement a pattern makes.
+            // Drawn as its arm's band, exactly as a Pattern is — the shape is
+            // shared, the statement is not. A pattern names what it takes out
+            // of the band; a cast names what it turns the whole band into.
             //
             // A Pattern can stay silent because its BranchSource stands right
             // behind it wearing the same type and saying so. A cast has no such
