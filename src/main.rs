@@ -6284,7 +6284,16 @@ fn handle_editor_keys(
                         apply_room_insert(
                             &mut state,
                             &mut pick,
-                            |graph, scope| graph.plus_empty_slab(layout::Axis::Y, scope.local.y),
+                            // Inside a Match a row belongs to the arm stack:
+                            // it opens between two arms and the scope keeps
+                            // its height, because the space is the Match's own
+                            // and grows its footprint rather than the volume.
+                            // Outside one, the row is the scope's and every
+                            // node behind it steps back.
+                            |graph, scope| match graph.match_containing(scope.local) {
+                                Some(match_id) => graph.plus_arm_row(&match_id, scope.local.y),
+                                None => graph.plus_empty_slab(layout::Axis::Y, scope.local.y),
+                            },
                             IVec3::Y,
                         )
                     } else {

@@ -91,6 +91,26 @@ pub struct LayoutNode {
     /// Cell layout, refreshed by `LayoutGraph::with_shapes` whenever types or
     /// wiring change. Independent of `pos`, so it survives the settle pass.
     pub shape: NodeShape,
+    /// Empty rows held open above this node, in cells. A Pattern's alone, and
+    /// zero on everything else.
+    ///
+    /// Layout and not model: how far apart two arms stand says nothing about
+    /// what the program means, and a `Match` that reads differently because
+    /// its branches were spaced out would be a `Match` whose picture had
+    /// started deciding things.
+    ///
+    /// It has to be *held* rather than read back out of `pos.y`, and that is
+    /// the whole reason it exists. `respace_match_patterns` derives every
+    /// arm's row from the arms above it, so a row is an answer and never a
+    /// question: space inferred from the gap between two rows would be eaten
+    /// the moment a branch grew into it, and would not come back when the
+    /// branch shrank again. Stated outright, it survives both.
+    ///
+    /// The topmost arm's is never read. There is no arm above it for the
+    /// space to be between, and giving it one would move the Match's own
+    /// origin — see `recompute_match_pos`, which pins the Match to its lowest
+    /// arm.
+    pub gap_above: i32,
 }
 
 impl LayoutNode {
@@ -101,6 +121,7 @@ impl LayoutNode {
             node_id,
             pos,
             shape: NodeShape::placeholder(),
+            gap_above: 0,
         }
     }
 }
@@ -614,6 +635,7 @@ impl LayoutGraph {
                         node_id: ln.node_id.clone(),
                         pos: ln.pos,
                         shape,
+                        gap_above: ln.gap_above,
                     },
                 )
             })
@@ -875,7 +897,8 @@ impl LayoutGraph {
             .unwrap_or(1)
     }
 
-    /// Re-space a Match's Patterns so each arm clears the branch above it.
+    /// Re-space a Match's Patterns so each arm clears the branch above it, plus
+    /// whatever empty rows the user has asked to stand between them.
     ///
     /// Patterns are only ever *inserted* one row apart, so a branch that grew
     /// — because something nested inside it grew — would overlap its lower
@@ -887,7 +910,13 @@ impl LayoutGraph {
     /// makes growth cascade out of arbitrarily deep nesting.
     ///
     /// The lowest Pattern keeps its row, so the Match's origin stays put and
-    /// the stack only ever grows in +Y.
+    /// the stack only ever grows in +Y. Its `gap_above` is therefore never
+    /// read: there is no arm above it for the space to be between.
+    ///
+    /// Packing by height alone is what this used to do, and it is why a
+    /// Pattern could be moved down and would spring straight back. The space
+    /// between two arms is now a thing the user may state, and stating it is
+    /// the only way it survives a branch growing beneath it.
     fn respace_match_patterns(&self, match_id: &crate::model::node::Id) -> Self {
         let mut ordered: Vec<(crate::model::node::Id, f32)> = self
             .match_pattern_ids(match_id)
@@ -900,7 +929,10 @@ impl LayoutGraph {
         ordered.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let mut layout_nodes = self.layout_nodes.clone();
         let mut row = ordered[0].1;
-        for (pid, _) in &ordered {
+        for (index, (pid, _)) in ordered.iter().enumerate() {
+            if index > 0 {
+                row += layout_nodes.get(pid).map_or(0, |ln| ln.gap_above.max(0)) as f32;
+            }
             if let Some(ln) = layout_nodes.get_mut(pid) {
                 ln.pos.y = row;
             }
@@ -912,6 +944,120 @@ impl LayoutGraph {
             reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         }
+    }
+
+    /// Arms of `match_id`, lowest row first.
+    ///
+    /// The order `respace_match_patterns` stacks them in, and the order the
+    /// space between them is counted in — so anything reasoning about that
+    /// space asks the same question the packing does.
+    fn ordered_pattern_ids(
+        &self,
+        match_id: &crate::model::node::Id,
+    ) -> Vec<crate::model::node::Id> {
+        let mut ordered: Vec<(crate::model::node::Id, f32)> = self
+            .match_pattern_ids(match_id)
+            .into_iter()
+            .filter_map(|pid| self.layout_nodes.get(&pid).map(|ln| (pid, ln.pos.y)))
+            .collect();
+        ordered.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ordered.into_iter().map(|(pid, _)| pid).collect()
+    }
+
+    /// Change the empty space above one arm by `delta` rows, never below none.
+    ///
+    /// Returns the layout and the row the arm will stand on once the settle
+    /// pass has run, because that is what the caret follows. The row is not
+    /// written here: `respace_match_patterns` owns every arm's row and would
+    /// overwrite it, so what is written is the space it reads.
+    ///
+    /// The topmost arm refuses: its row is the Match's own origin
+    /// (`recompute_match_pos`), and space above it would move the node rather
+    /// than open a row inside it. Whoever wants the Match lower moves the
+    /// Match.
+    fn with_arm_gap_delta(&self, pattern_id: &crate::model::node::Id, delta: i32) -> (Self, IVec3) {
+        let here = self
+            .layout_nodes
+            .get(pattern_id)
+            .map(|ln| ln.pos.round().as_ivec3())
+            .unwrap_or(IVec3::ZERO);
+        let Some(match_id) = self.parent_match_of(pattern_id) else {
+            return (self.clone_shape(), here);
+        };
+        if self.ordered_pattern_ids(&match_id).first() == Some(pattern_id) {
+            return (self.clone_shape(), here);
+        }
+        let mut layout_nodes = self.layout_nodes.clone();
+        let Some(ln) = layout_nodes.get_mut(pattern_id) else {
+            return (self.clone_shape(), here);
+        };
+        let was = ln.gap_above.max(0);
+        ln.gap_above = (was + delta).max(0);
+        let moved = ln.gap_above - was;
+        (
+            Self {
+                graph: self.graph.clone(),
+                layout_nodes,
+                reserved_max: self.reserved_max,
+                sub_layouts: self.sub_layouts.clone(),
+            },
+            here + IVec3::new(0, moved, 0),
+        )
+    }
+
+    /// Hold one more empty row open above the arm standing at or below `cut`.
+    ///
+    /// INSERT mode's `Shift+Return` inside a Match. Outside one the same key
+    /// opens a row across the whole scope (`plus_empty_slab`); inside, a row
+    /// belongs to the arm stack and the scope keeps its height — the Match's
+    /// footprint grows to cover the new row, which is what makes it the
+    /// Match's whitespace rather than free space anything could be built on.
+    ///
+    /// `None` where there is no arm to open above: below the last arm there is
+    /// nothing left to push down, and the topmost arm refuses for the reason
+    /// `with_arm_gap_delta` gives.
+    pub fn plus_arm_row(&self, match_id: &crate::model::node::Id, cut: i32) -> Option<Self> {
+        let ordered = self.ordered_pattern_ids(match_id);
+        let target = ordered
+            .iter()
+            .find(|pid| {
+                self.layout_nodes
+                    .get(*pid)
+                    .is_some_and(|ln| ln.pos.y.round() as i32 >= cut)
+            })?
+            .clone();
+        if ordered.first() == Some(&target) {
+            return None;
+        }
+        let mut layout_nodes = self.layout_nodes.clone();
+        layout_nodes.get_mut(&target)?.gap_above += 1;
+        Some(Self {
+            graph: self.graph.clone(),
+            layout_nodes,
+            reserved_max: self.reserved_max,
+            sub_layouts: self.sub_layouts.clone(),
+        })
+    }
+
+    /// The Match whose footprint covers `cell`, if one does.
+    ///
+    /// What `Shift+Return` asks to know whether the row it is about to open
+    /// belongs to an arm stack or to the scope. The footprint and not the
+    /// arms themselves, so the answer is the same on an arm, on the Match's
+    /// input band, and on the empty rows already held between two arms —
+    /// everywhere, that is, that reads as being *inside* the Match.
+    ///
+    /// At most one can answer: `settle_footprints` pushes every intruder out
+    /// of a footprint, and two Matches cannot overlap.
+    pub fn match_containing(&self, cell: IVec3) -> Option<crate::model::node::Id> {
+        self.layout_nodes
+            .keys()
+            .filter(|id| self.is_match(id))
+            .find(|id| {
+                self.match_footprint(id)
+                    .is_some_and(|footprint| footprint.contains(cell))
+            })
+            .cloned()
     }
 
     /// Grid-space AABB (in this LayoutGraph's local coords) that a Match
@@ -978,6 +1124,18 @@ impl LayoutGraph {
             return (self.clone_shape(), IVec3::ZERO);
         };
         let primary_origin = primary_ln.pos;
+        // An arm's row is not its own to set. `respace_match_patterns` derives
+        // every arm's row from the arms above it, so writing one here would be
+        // overwritten by the next settle — which is exactly what used to
+        // happen, and why a Pattern moved up or down sprang straight back.
+        //
+        // What a vertical move means for an arm is therefore the space above
+        // it, not its position, and that is what is edited. Only for a move
+        // that is purely vertical: an arm travelling in X or Z is moving the
+        // whole stack (see `move_group`) and has nothing to do with spacing.
+        if self.is_pattern(&node_id) && delta_pos.x.abs() < 0.5 && delta_pos.z.abs() < 0.5 {
+            return self.with_arm_gap_delta(&node_id, delta_pos.y.round() as i32);
+        }
         // Sources are pinned to the source row (Y=0, Z=0) and may only be
         // reordered along X; a Tunnel is the same thing one scope in, so it
         // takes the same pin. A BranchSource is pinned outright: it must stay
@@ -1097,6 +1255,7 @@ impl LayoutGraph {
                             node_id: id.clone(),
                             pos: new_pos,
                             shape: ln.shape.clone(),
+                            gap_above: ln.gap_above,
                         },
                     )
                 })
@@ -1192,8 +1351,13 @@ impl LayoutGraph {
             .cloned()
             .collect();
         for owner_id in &owner_ids {
-            // Patterns of a Match ride along with their parent; skip them
-            // as intruders. For non-match owners there are no related ids.
+            // Patterns of a Match ride along with their parent, so they are
+            // never intruders — not in their own Match's footprint and not in
+            // anyone else's. `move_node_delta` reads a vertical move of an arm
+            // as a change to the space above it rather than to its row, so an
+            // arm offered a push would absorb it as spacing and sit exactly
+            // where it was, and the loop below would spin to its cap. For
+            // non-match owners there are no other related ids.
             let related: Vec<crate::model::node::Id> = if layout.is_match(owner_id) {
                 layout.match_pattern_ids(owner_id)
             } else {
@@ -1204,7 +1368,7 @@ impl LayoutGraph {
                     break;
                 };
                 let intruder = layout.layout_nodes.iter().find_map(|(id, ln)| {
-                    if id == owner_id || related.contains(id) {
+                    if id == owner_id || related.contains(id) || layout.is_pattern(id) {
                         return None;
                     }
                     // Neither of these can be displaced, so picking one only
@@ -1798,6 +1962,7 @@ impl LayoutGraph {
                             node_id: id.clone(),
                             pos: ln.pos + Vec3::new(0.0, 1.0, 0.0),
                             shape: ln.shape.clone(),
+                            gap_above: ln.gap_above,
                         },
                     )
                 } else {
@@ -1940,6 +2105,7 @@ impl LayoutGraph {
                                 node_id: id.clone(),
                                 pos: new_pos,
                                 shape: ln.shape.clone(),
+                                gap_above: ln.gap_above,
                             },
                         )
                     } else {
@@ -2294,6 +2460,9 @@ impl LayoutGraph {
     /// everything at or beyond it one cell outward. This is INSERT mode's
     /// `Return` (X) and `Shift+Return` (Y): a whole new column resp. row, so
     /// the scope volume grows by one cell on that axis.
+    ///
+    /// `Shift+Return` reaches here only outside a Match. Inside one the row
+    /// belongs to the arm stack instead — see `plus_arm_row`.
     pub fn plus_empty_slab(&self, axis: Axis, cut: i32) -> Option<Self> {
         self.plus_empty_layer(axis, cut, |_| true)
     }
@@ -2315,6 +2484,10 @@ impl LayoutGraph {
     /// graph, but the owning Match's footprint already covers them, and a
     /// Pattern moving alone would tear its branch off the arm it belongs to.
     /// They ride along with the Match instead.
+    ///
+    /// Which is why opening a row *between* two arms is a different call —
+    /// `plus_arm_row`, reached when the caret stands inside a Match. A slab
+    /// insert grows the scope; an arm row grows the Match.
     ///
     /// The nodes that mark the scope itself — the source row, the Sink — stay
     /// put instead of riding along; `shifts_with` has the rules.
