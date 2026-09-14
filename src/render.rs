@@ -470,12 +470,23 @@ pub fn row_span_world_y(row_center_y: f32, span: &crate::infer::RowSpan) -> (f32
 /// that names no value of its own. Where both speak they agree; where only one
 /// does, it is the one that knows.
 ///
-/// `none` is answered `None` here on purpose, and that is not a gap: it carries
-/// no literal because its *value is its type*. It is still drawn as a line —
-/// see `leaf_is_drawn_as_line` — but a line labelled with a type letter rather
-/// than with a word, which is the whole of what makes it read as the type it
-/// is.
+/// `none` is answered `None` outright, before either of them is asked, and
+/// that is not a gap: it carries no literal because its *value is its type*.
+/// It is still drawn as a line — see `leaf_is_drawn_as_line` — but a line
+/// labelled with a type letter rather than with a word, which is the whole of
+/// what makes it read as the type it is.
+///
+/// Asked outright rather than left to `leaf_literal`, which answers `None` for
+/// it too and would then hand the question straight to the fallback. The
+/// fallback is the *node's* word, and `none` is not a value of the node: a
+/// partial cast to `42` has an output of `42|none` and an anchor that carries
+/// `42`, so its sad row wore the target's literal instead of its own letter —
+/// the one row in the picture that says the cast failed, spelled as the value
+/// it failed to produce.
 fn leaf_value_text(leaf: &crate::infer::EType, graph_value: Option<&str>) -> Option<String> {
+    if matches!(leaf, crate::infer::EType::None) {
+        return None;
+    }
     crate::infer::leaf_literal(leaf)
         .or(graph_value)
         .map(str::to_string)
