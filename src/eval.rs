@@ -374,6 +374,14 @@ impl State {
         }
     }
 
+    /// The arm a value goes down: the first one whose declared type admits it.
+    ///
+    /// First and not best. Arm types may overlap — the language says so
+    /// outright — and `patterns` is the order that settles it, which is the
+    /// order the arms are drawn in, top to bottom
+    /// (`model::node::ENode::Match`). Reading the list is therefore reading
+    /// the picture, and there is no second order anywhere for the two to
+    /// differ by.
     fn eval_pattern_match(
         patterns: Vec<crate::model::node::Id>,
         graph: &crate::model::term_graph::TermGraph,

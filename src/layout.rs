@@ -909,7 +909,17 @@ impl LayoutGraph {
     /// the enclosing arm, which re-spaces the outer Match. That chain is what
     /// makes growth cascade out of arbitrarily deep nesting.
     ///
-    /// The lowest Pattern keeps its row, so the Match's origin stays put and
+    /// The order is `ENode::Match.patterns` and nothing else. That list is the
+    /// arm order in the only sense the language has one — a Match takes the
+    /// first arm that matches (`eval::eval_pattern_match`) — and reading it
+    /// here is what makes the order on screen the order that decides. It used
+    /// to sort by the rows it was about to overwrite, which is circular: two
+    /// orders then existed, the list's and the picture's, and they drifted
+    /// apart the moment an arm was inserted between two others, since
+    /// `plus_pattern_below` drew it in the middle and appended it to the end.
+    /// A Match could then take an arm other than the topmost one that matched.
+    ///
+    /// The first Pattern keeps its row, so the Match's origin stays put and
     /// the stack only ever grows in +Y. Its `gap_above` is therefore never
     /// read: there is no arm above it for the space to be between.
     ///
@@ -918,18 +928,19 @@ impl LayoutGraph {
     /// between two arms is now a thing the user may state, and stating it is
     /// the only way it survives a branch growing beneath it.
     fn respace_match_patterns(&self, match_id: &crate::model::node::Id) -> Self {
-        let mut ordered: Vec<(crate::model::node::Id, f32)> = self
-            .match_pattern_ids(match_id)
-            .into_iter()
-            .filter_map(|pid| self.layout_nodes.get(&pid).map(|ln| (pid, ln.pos.y)))
-            .collect();
-        if ordered.is_empty() {
+        let ordered = self.match_pattern_ids(match_id);
+        // The row the stack starts on, taken from the topmost arm that has
+        // one. An arm listed without a layout node cannot be placed and is
+        // stepped over, exactly as it was when this filtered them out first.
+        let Some(first_row) = ordered
+            .iter()
+            .find_map(|pid| self.layout_nodes.get(pid).map(|ln| ln.pos.y))
+        else {
             return self.clone_shape();
-        }
-        ordered.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        };
         let mut layout_nodes = self.layout_nodes.clone();
-        let mut row = ordered[0].1;
-        for (index, (pid, _)) in ordered.iter().enumerate() {
+        let mut row = first_row;
+        for (index, pid) in ordered.iter().enumerate() {
             if index > 0 {
                 row += layout_nodes.get(pid).map_or(0, |ln| ln.gap_above.max(0)) as f32;
             }
@@ -944,24 +955,6 @@ impl LayoutGraph {
             reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
         }
-    }
-
-    /// Arms of `match_id`, lowest row first.
-    ///
-    /// The order `respace_match_patterns` stacks them in, and the order the
-    /// space between them is counted in — so anything reasoning about that
-    /// space asks the same question the packing does.
-    fn ordered_pattern_ids(
-        &self,
-        match_id: &crate::model::node::Id,
-    ) -> Vec<crate::model::node::Id> {
-        let mut ordered: Vec<(crate::model::node::Id, f32)> = self
-            .match_pattern_ids(match_id)
-            .into_iter()
-            .filter_map(|pid| self.layout_nodes.get(&pid).map(|ln| (pid, ln.pos.y)))
-            .collect();
-        ordered.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        ordered.into_iter().map(|(pid, _)| pid).collect()
     }
 
     /// Change the empty space above one arm by `delta` rows, never below none.
@@ -984,7 +977,7 @@ impl LayoutGraph {
         let Some(match_id) = self.parent_match_of(pattern_id) else {
             return (self.clone_shape(), here);
         };
-        if self.ordered_pattern_ids(&match_id).first() == Some(pattern_id) {
+        if self.match_pattern_ids(&match_id).first() == Some(pattern_id) {
             return (self.clone_shape(), here);
         }
         let mut layout_nodes = self.layout_nodes.clone();
@@ -1017,7 +1010,7 @@ impl LayoutGraph {
     /// nothing left to push down, and the topmost arm refuses for the reason
     /// `with_arm_gap_delta` gives.
     pub fn plus_arm_row(&self, match_id: &crate::model::node::Id, cut: i32) -> Option<Self> {
-        let ordered = self.ordered_pattern_ids(match_id);
+        let ordered = self.match_pattern_ids(match_id);
         let target = ordered
             .iter()
             .find(|pid| {
@@ -2029,11 +2022,20 @@ impl LayoutGraph {
             &new_sub_sink_id,
             &new_branch_source_id,
         );
-        let new_patterns: Vec<crate::model::node::Id> = sibling_ids
+        // Directly behind the selected arm, which is where it is drawn.
+        // Appending to the end is what this used to do, and this list is the
+        // arm order a Match decides by (`eval::eval_pattern_match`), so an arm
+        // inserted between two others gave the picture one order and the
+        // evaluation another. With overlapping arm types, which the language
+        // allows, a Match then took an arm other than the topmost one that
+        // matched. `respace_match_patterns` lays the rows out from this list,
+        // so placing the id here is the whole of placing the arm.
+        let insert_at = sibling_ids
             .iter()
-            .cloned()
-            .chain([new_pattern_id.clone()])
-            .collect();
+            .position(|pid| pid == selected_pattern_id)
+            .map_or(sibling_ids.len(), |index| index + 1);
+        let mut new_patterns = sibling_ids;
+        new_patterns.insert(insert_at, new_pattern_id.clone());
         let (match_input_anchor, match_output_anchor) = match graph.nodes.get(&parent_id) {
             Some(crate::model::node::ENode::Match {
                 input_anchor,

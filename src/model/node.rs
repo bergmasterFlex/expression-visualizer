@@ -52,6 +52,17 @@ pub enum ENode {
         output_anchor: super::anchor::Id,
     },
     Match {
+        /// The arms, in the order they are checked — and therefore in the
+        /// order they are drawn, top to bottom.
+        ///
+        /// One list and not two. Arm types may overlap, and a Match takes the
+        /// value down the *first* arm that matches
+        /// (`eval::eval_pattern_match`), so their order is a decision the
+        /// program makes rather than an arrangement of it. That is why it is
+        /// stated here and why the layout reads it rather than keeping an
+        /// order of its own: `layout::LayoutGraph::respace_match_patterns`
+        /// hands out the rows from this list, so what stands higher on screen
+        /// is what is asked first, always.
         patterns: Vec<super::node::Id>,
         input_anchor: super::anchor::Id,
         output_anchor: super::anchor::Id,
