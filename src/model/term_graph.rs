@@ -118,6 +118,48 @@ impl TermGraph {
         }
     }
 
+    /// Every edge arriving at `anchor`, gone.
+    ///
+    /// An input anchor carries *at most one* incoming edge. That is a
+    /// structural invariant of the language and not a convention of this
+    /// editor, and the graph has to satisfy it at every moment rather than
+    /// once the user is finished. So there is no way to *add* a second one:
+    /// `LayoutGraph::plus_edge` clears the target first, and this is what it
+    /// clears with.
+    ///
+    /// The stored direction alone, which is output → input — what
+    /// `drag_end_system` normalises to and the only direction
+    /// `get_connected_nodes_to_anchor` reads. An anchor standing on the `from`
+    /// side is a producer, and a producer may feed as many consumers as it
+    /// likes; nothing here touches those.
+    ///
+    /// An entry left with no edges is dropped rather than kept empty, the way
+    /// `minus_node` drops it: an anchor with an empty edge list and an anchor
+    /// with no entry are the same statement, and only one of them should be
+    /// writable.
+    pub fn minus_edges_into(&self, anchor: &super::anchor::Id) -> Self {
+        Self {
+            nodes: self.nodes.clone(),
+            anchors: self.anchors.clone(),
+            anchor_to_node: self.anchor_to_node.clone(),
+            sink_node_id: self.sink_node_id.clone(),
+            edges: self
+                .edges
+                .clone()
+                .into_iter()
+                .filter_map(|(from, edges)| {
+                    let kept: Vec<super::edge::Edge> =
+                        edges.into_iter().filter(|e| e.to != *anchor).collect();
+                    if kept.is_empty() {
+                        None
+                    } else {
+                        Some((from, kept))
+                    }
+                })
+                .collect(),
+        }
+    }
+
     pub fn plus_node(&self, node_id: super::node::Id, n: super::node::ENode) -> Self {
         let anchors = n.anchors();
         Self {

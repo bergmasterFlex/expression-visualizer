@@ -107,6 +107,20 @@ impl State {
                         .map(|value| (anchor_id.clone(), value.clone()))
                 })
                 .collect::<std::collections::HashMap<_, _>>();
+            // Every connected input has arrived: a count of edges on the left
+            // and a count of anchors on the right, and they may be compared
+            // because an input anchor carries at most one incoming edge.
+            // That is a structural invariant of the language rather than an
+            // assumption made here, and `LayoutGraph::plus_edge` is where it
+            // is kept — a new edge onto an occupied input replaces what was
+            // there instead of joining it.
+            //
+            // Stated rather than defended. A graph that broke the invariant
+            // would leave this comparison unsatisfiable and the node
+            // unevaluated, so `Next` would go quiet — which is the failure
+            // direction to want, since counting anchors on both sides would
+            // instead pick one of two arriving values by hash order and
+            // answer with it.
             if input_anchor_ids_to_node_ids.len() == input_anchor_ids_to_values.len() {
                 self.eval_value_for_node(
                     &visitor_node_id,

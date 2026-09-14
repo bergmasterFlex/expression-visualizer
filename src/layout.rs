@@ -1677,9 +1677,29 @@ impl LayoutGraph {
         group
     }
 
+    /// Wire `from` into `to`, `to` being an input anchor.
+    ///
+    /// *Wire*, not *add*. An input anchor takes at most one incoming edge —
+    /// a structural invariant of the language, which the graph has to satisfy
+    /// at every moment and not merely when the user stops editing — so
+    /// whatever already arrives at `to` is dropped first and the new edge
+    /// wins.
+    ///
+    /// Refusing the drag would satisfy the same invariant and strand the
+    /// user: an edge cannot be deleted on its own, only along with one of the
+    /// nodes it joins (`TermGraph::minus_node`), so a wired input could never
+    /// be re-aimed at anything. Replacing keeps the invariant true throughout,
+    /// which is what the invariant asks for.
+    ///
+    /// It happens here rather than at the drag, because this is the one door
+    /// an edge comes through and a rule kept at the door cannot be walked
+    /// past. What used to be allowed through it — a second producer on one
+    /// input — left `eval_next_step` comparing a count of edges against a
+    /// count of anchors and never finding them equal, so `Next` went dead
+    /// with nothing said.
     pub fn plus_edge(&self, from: crate::model::anchor::Id, to: crate::model::anchor::Id) -> Self {
         Self {
-            graph: self.graph.plus_edge(from, to),
+            graph: self.graph.minus_edges_into(&to).plus_edge(from, to),
             layout_nodes: self.layout_nodes.clone(),
             reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),

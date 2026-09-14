@@ -6690,12 +6690,16 @@ fn drag_update_system(
 /// True if `a` and `b` are already joined by an edge, in either stored
 /// direction.
 ///
-/// `TermGraph::plus_edge` appends unconditionally, so without this guard reconnecting
-/// the same pair stacks a second, perfectly coincident ribbon on the first —
-/// invisible until one of them is deleted. The reverse direction is checked too
-/// because edges recorded before drag-end started normalising to output → input
-/// may still sit the other way around, and `eval::neighbours_of_anchor` treats
-/// both orientations as connected.
+/// Not what keeps a pair from being doubled any more — `LayoutGraph::plus_edge`
+/// clears the target input before wiring, so a second edge onto it is not a
+/// thing that can exist. What this still answers is whether there is anything
+/// to do: re-dragging a connection that already stands would drop it and put
+/// the identical one back, and a rebuild for that is a flicker in exchange for
+/// nothing.
+///
+/// The reverse direction is checked too because edges recorded before drag-end
+/// started normalising to output → input may still sit the other way around,
+/// and `eval::neighbours_of_anchor` treats both orientations as connected.
 fn anchors_already_connected(
     layout_graph: &layout::LayoutGraph,
     a: &model::anchor::Id,
