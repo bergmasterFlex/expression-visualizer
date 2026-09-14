@@ -133,6 +133,17 @@ pub struct RibbonEnd {
 }
 
 impl RibbonEnd {
+    /// World height of this end — what `uv.y` spans here.
+    ///
+    /// The shader needs both ends' to widen a strand evenly: `uv.y` is a
+    /// share of a height that is itself changing along the ribbon, so a share
+    /// held steady would not be a steady width. Absolute because the two
+    /// values arrive in whichever order the layout's Y axis points, and a
+    /// height has no direction.
+    pub fn height(&self) -> f32 {
+        (self.y_top - self.y_bottom).abs()
+    }
+
     /// A hairline centred on `y`.
     ///
     /// The mesh is `RIBBON_LINE_HEIGHT` tall rather than flat, and that is not
@@ -341,16 +352,36 @@ pub struct EdgeMaterial {
     /// a value flowing into a Match arrives as a line and leaves the arm that
     /// accepts its whole type as a band. The two ends genuinely wear different
     /// shapes, and the strand between them has to become one from the other.
+    ///
+    /// *Become*, over the whole length. The shader reads this as the width to
+    /// draw rather than as a choice between two of them — see `half_height` in
+    /// `edge_band.wgsl`, which it interpolates between the hairline and half
+    /// the ribbon. Read as a choice, every value between 0 and 1 rounded to
+    /// one end or the other and a strand opened in one step halfway along.
     #[uniform(0)]
     pub line_mode_start: f32,
-    /// Half-thickness of the hairline in `uv.y` space, where the interpolated
-    /// line mode is 1.0.
+    /// Half-thickness of the hairline in `uv.y` space — one end of the ramp
+    /// the shader draws, reached where the interpolated line mode is 1.0. The
+    /// other end is half the ribbon, which is the whole of it.
     #[uniform(0)]
     pub line_half_thickness: f32,
     /// Coverage style at the ribbon's end. Equal to `line_mode_start` for an
     /// ordinary edge, whose two ends are the same shape.
     #[uniform(0)]
     pub line_mode_end: f32,
+    /// World height of the ribbon at its start, from `RibbonEnd::height`.
+    ///
+    /// With its twin below, this is what lets the shader widen a strand
+    /// evenly. `uv.y` is a share of the local height and the local height
+    /// ramps, so a share held steady draws a width that is not: two ramps
+    /// multiplied, which opens slowly and finishes fast. Knowing both heights,
+    /// the shader can ask for a *world* width and divide it back out.
+    #[uniform(0)]
+    pub height_start: f32,
+    /// World height of the ribbon at its end. Equal to `height_start` for an
+    /// ordinary edge, which is built at a constant height.
+    #[uniform(0)]
+    pub height_end: f32,
     /// Total arc length of the ribbon in world units — what `uv.x` is divided
     /// by to place a fragment along the ribbon. Always the real length the
     /// mesh builder returned: it decides where the two line modes meet, and

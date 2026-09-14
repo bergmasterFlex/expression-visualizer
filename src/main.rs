@@ -1322,6 +1322,10 @@ fn spawn_graph_nodes(
                     line_mode_start: line_mode,
                     line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
                     line_mode_end: line_mode,
+                    // Built at a constant height, so the width has nothing to
+                    // ramp between.
+                    height_start: height,
+                    height_end: height,
                     arc_total,
                     dash_period: 0.0,
                     dash_duty: 0.0,
@@ -4706,6 +4710,8 @@ fn spawn_link_ribbon(
             line_mode_start: start.line_mode,
             line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
             line_mode_end: end.line_mode,
+            height_start: start.height(),
+            height_end: end.height(),
             arc_total,
             dash_period: 0.0,
             dash_duty: 0.0,
@@ -4753,6 +4759,8 @@ fn spawn_pending_ribbon(
             line_mode_start: start.line_mode,
             line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
             line_mode_end: end.line_mode,
+            height_start: start.height(),
+            height_end: end.height(),
             arc_total,
             dash_period: edge::RIBBON_DASH_PERIOD,
             dash_duty: edge::RIBBON_DASH_DUTY,
