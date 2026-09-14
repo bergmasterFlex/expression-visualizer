@@ -236,10 +236,10 @@ pub struct RenderNode {
 
 pub struct RenderAnchor {
     /// World point used for screen-space hover picking and as the edge
-    /// endpoint. Sits at the centre of the anchor cuboid (or cuboid stack).
+    /// endpoint. Sits at the centre of the anchor sheet (or sheet stack).
     pub pick_center: Vec3,
     pub strands: Vec<RenderStrand>,
-    /// Neutral cuboid for anchors that carry no strands (Sink,
+    /// Neutral sheet for anchors that carry no strands (Sink,
     /// Match), so they stay visible and pickable.
     pub plain_body: Option<RenderObject>,
 }
@@ -288,7 +288,7 @@ pub struct RenderLabel {
 /// lets a band leave an anchor without a step.
 pub const STRAND_BAND_HEIGHT: f32 = CELL;
 const ANCHOR_HALF_DEPTH: f32 = CELL / 4.0;
-/// Full Z-depth of an anchor cuboid: half its cell.
+/// Full Z-depth of an anchor sheet: half its cell.
 ///
 /// An anchor occupies the half of its cell that faces the node body, so it
 /// visibly hangs off the thing it belongs to instead of floating mid-cell. In
@@ -296,9 +296,6 @@ const ANCHOR_HALF_DEPTH: f32 = CELL / 4.0;
 /// layout +Z is world −Z, that is the −Z half for inputs and the +Z half for
 /// outputs. Both meet the cell centre, which is where their edges attach.
 const ANCHOR_DEPTH: f32 = 2.0 * ANCHOR_HALF_DEPTH;
-/// X-width of an anchor cuboid. Shared with the slab nodes so anchor and node
-/// line up exactly in X.
-pub const ANCHOR_X: f32 = CELL * 0.075;
 /// Y-thickness of a strand drawn as a line — the shape a leaf takes when it
 /// carries a literal rather than a type.
 ///
@@ -666,7 +663,12 @@ fn build_anchor_strands(
             } else {
                 RenderStrand {
                     band: Some(RenderObject {
-                        mesh: Cuboid::new(ANCHOR_X, STRAND_BAND_HEIGHT, full_depth)
+                        // Flat in X, exactly as the ribbon leaving it is.
+                        // An anchor's segment and the strand that continues
+                        // it are one surface running along Z, and a segment
+                        // carrying a thickness the strand has no way to match
+                        // reads as a second thing wearing the same colour.
+                        mesh: Cuboid::new(0.0, STRAND_BAND_HEIGHT, full_depth)
                             .mesh()
                             .build(),
                         material: StandardMaterial {
@@ -758,9 +760,9 @@ fn declared_type_cell(
     (strands, objects)
 }
 
-/// A neutral grey anchor cuboid for anchors that carry no strands
+/// A neutral grey anchor sheet for anchors that carry no strands
 /// (unconstrained inputs, pending outputs), so they stay visible and pickable.
-/// `cell_center` is the anchor cell's centre; the cuboid fills that cell's
+/// `cell_center` is the anchor cell's centre; the sheet fills that cell's
 /// body-facing half, like a strand would.
 fn plain_anchor_body(cell_center: Vec3, is_input: bool) -> RenderObject {
     // Same half of the cell a strand would occupy, so a typeless anchor
@@ -768,7 +770,10 @@ fn plain_anchor_body(cell_center: Vec3, is_input: bool) -> RenderObject {
     let sign = if is_input { -1.0 } else { 1.0 };
     let center = cell_center + Vec3::new(0.0, 0.0, sign * ANCHOR_DEPTH * 0.5);
     RenderObject {
-        mesh: Cuboid::new(ANCHOR_X, STRAND_BAND_HEIGHT, ANCHOR_DEPTH)
+        // Flat in X for the reason the typed bands are — see
+        // `build_anchor_strands`. A grey anchor is the same shape as a
+        // coloured one, undecided rather than different.
+        mesh: Cuboid::new(0.0, STRAND_BAND_HEIGHT, ANCHOR_DEPTH)
             .mesh()
             .build(),
         material: StandardMaterial {
