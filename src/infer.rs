@@ -691,9 +691,14 @@ type FunctionDeclarations = std::collections::HashMap<
 /// Output anchors always answer `Some(..)` — a finished graph gives every
 /// output a concrete type, an unfinished one gives `Pending`. Input anchors
 /// answer `Some(..)` only where the node constrains what may flow in
-/// (FunctionCall parameters); `None` means *no constraint* — Sink, Match and
-/// TypeCast inputs accept any value. There is no supertype: `None` is the
-/// absence of a constraint, not a type that subsumes the others.
+/// (FunctionCall parameters, and a Tunnel's input); `None` means *no
+/// constraint* — Sink, Match and TypeCast inputs accept any value. There is no
+/// supertype: `None` is the absence of a constraint, not a type that subsumes
+/// the others.
+///
+/// A constraint is a statement and not a gate: nothing refuses an edge that
+/// disagrees with one. What it decides is what the anchor *says* — its rows,
+/// its colour, and what everything downstream reads.
 ///
 /// `graph` must be the flattened graph (`LayoutGraph::flattened_graph`): every edge —
 /// including those inside Pattern branches — lives in the program-level edge
@@ -787,20 +792,33 @@ fn anchor_type_uncycled(
                 _ => None,
             }
         }
-        // A Tunnel declares nothing, so its output is simply whatever reached
-        // its input — the one node kind whose type is entirely borrowed. With
-        // nothing wired in it is `Pending`, and the branch behind it reads
-        // that, which is what draws the whole run grey until the enclosing
-        // graph connects something.
+        // Both ends of a Tunnel answer with the type it declares, and that is
+        // the whole of the node: the input says what may be wired to it, the
+        // output says what comes out, and they are the same sentence read from
+        // either side.
         //
-        // The input answers `None`: it constrains nothing, so anything may be
-        // wired to it. `anchor_type_guarded` takes care of a Tunnel wired,
-        // however indirectly, back into itself.
+        // The input answering `Some` makes this the second kind that
+        // constrains an input at all, after a FunctionCall's parameters.
+        //
+        // Nothing is asked of what is actually wired in. The type used to be
+        // borrowed from there, which made a Tunnel the one node whose type was
+        // entirely someone else's — so an unwired one handed `Pending` to
+        // everything behind it and a branch could not be built until the
+        // outside was. Reading the declaration instead is what lets the two
+        // sides of the wall be worked on independently, and it is also why a
+        // Tunnel no longer recurses: it cannot be part of a cycle, and the
+        // guard `anchor_type_guarded` keeps is now for the TypeCast and the
+        // Match alone.
         crate::model::node::ENode::Tunnel {
+            r#type,
             input_anchor,
             output_anchor,
-        } => (anchor_id == output_anchor).then(|| {
-            incoming_type(graph, input_anchor, function_declarations, visiting)
+        } => (anchor_id == input_anchor || anchor_id == output_anchor).then(|| {
+            // No `base_type_of`: what a Tunnel is given is a base type — the
+            // prompt offers it nothing else — so there is no literal to strip.
+            r#type
+                .as_ref()
+                .map(graph_type_to_eval_type)
                 .unwrap_or(EType::Pending)
         }),
         crate::model::node::ENode::FunctionCall {

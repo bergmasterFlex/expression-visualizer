@@ -109,14 +109,26 @@ pub enum ENode {
     /// the outside straight onto whatever node wanted it. A Tunnel is the one
     /// place that is allowed to happen: its input hangs outside the branch's
     /// front face, where the enclosing graph can reach it, and its output
-    /// stands on the branch's entry row like any other source of a value.
+    /// stands at the front of the branch like any other source of a value.
     ///
-    /// It declares nothing of its own — not a type, not a name, only a
-    /// position. Whatever arrives at the input leaves at the output, and with
-    /// nothing wired in it carries `Pending`, which is what the branch behind
-    /// it then reads. That is the whole of it: a Tunnel is a hole in a wall,
-    /// and a hole has no opinion about what goes through.
+    /// What it lets through is one type, and it says which. That is the whole
+    /// of what it declares — no name, no conversion, no opinion about the
+    /// *value*: whatever arrives leaves unchanged, and a value the declaration
+    /// does not cover is a mismatch in the picture rather than something the
+    /// Tunnel does anything about.
+    ///
+    /// Declaring it is what lets a branch be *built* before it is fed. The
+    /// type used to be borrowed from whatever happened to be wired to the
+    /// input, so an unwired Tunnel handed `Pending` to everything behind it
+    /// and there was nothing to build against until the outside was finished.
+    /// A wall with a hole of a stated size can be worked on from either side.
     Tunnel {
+        /// The type this Tunnel lets through — `None` until one is chosen, for
+        /// the reason a `Source`'s is: a node is built before its type is
+        /// typed, and a default would be a declaration nobody made. It is
+        /// never left that way — the editor keeps a fresh Tunnel marked
+        /// unfinished until a type is given or an Escape takes it away again.
+        r#type: Option<super::r#type::EType>,
         input_anchor: super::anchor::Id,
         output_anchor: super::anchor::Id,
     },
@@ -198,6 +210,7 @@ impl ENode {
             ENode::Tunnel {
                 input_anchor,
                 output_anchor,
+                ..
             } => vec![
                 (
                     input_anchor.clone(),

@@ -173,6 +173,19 @@ pub const CAST_OUTPUT_Z: i32 = CAST_TYPE_Z + 1;
 pub const SOURCE_TYPE_Z: i32 = 0;
 /// Where the name begins: directly behind the declared type.
 pub const SOURCE_NAME_Z: i32 = SOURCE_TYPE_Z + 1;
+
+/// Node-local Z of the cell a `Tunnel` declares its type on, and of the output
+/// behind it. The same arrangement a Source has, and for the same reason: the
+/// declaration comes first, and the anchor behind it says nothing but "an edge
+/// starts here".
+///
+/// The input is not in this list because it claims no cell — it hangs at local
+/// Z = −1, outside the scope, against the face the enclosing graph reaches.
+/// Read along +Z a Tunnel therefore goes: what arrives, what it must be, what
+/// leaves.
+pub const TUNNEL_TYPE_Z: i32 = 0;
+/// Directly behind the declared type.
+pub const TUNNEL_OUTPUT_Z: i32 = TUNNEL_TYPE_Z + 1;
 /// Monospace characters that fit across one cell along the axis a name is
 /// written on. The rasteriser steps by `1/N` of a cell, which is what makes a
 /// body's length *a count of characters* rather than a guess.
@@ -740,6 +753,7 @@ impl LayoutGraph {
     /// | Match | `0\|0` input, output directly behind the deepest branch |
     /// | Pattern | `0\|0` gap, `0\|1` body |
     /// | BranchSource | `0\|0` output |
+    /// | Tunnel | `0\|0` body, `0\|1` output — its input claims no cell, at Z = −1 |
     ///
     /// The two depths the node kind does not fix are the ones that carry a name
     /// written along the body: a Source's own and a FunctionCall's function.
@@ -808,22 +822,30 @@ impl LayoutGraph {
                     CellRole::Output { leaf }
                 }));
             }
-            // The same shape, and for the same reason: a Tunnel declares no
-            // type either, so it has no body to write one on.
+            // A declared type and the output behind it, the way a Source has
+            // them. What a Tunnel does *not* have is a name, so there is one
+            // body cell and not a run of them.
             //
             // Its *input* claims no cell at all, and that is deliberate rather
             // than forgotten. The input hangs one cell in front of the entry
             // row, at local Z = −1, which is outside this scope's non-negative
             // address space — the face the enclosing graph reaches, not a cell
             // of this graph. `clamp_to_volume` therefore keeps the caret off
-            // it, which is right: nothing about a Tunnel is edited from
-            // inside the branch it opens into. It is still a real anchor in
+            // it, which is right: what a Tunnel declares is edited on the cell
+            // behind the input, from inside the branch, and the input itself
+            // is only where an edge lands. It is still a real anchor in
             // `ENode::anchors`, so an edge can end on it and the pointer can
             // pick it; only addressing passes it by.
             crate::model::node::ENode::Tunnel { output_anchor, .. } => {
-                cells.extend(anchor_cells(flat_graph, fds, output_anchor, 0, 0, |leaf| {
-                    CellRole::Output { leaf }
-                }));
+                cells.push((IVec3::new(0, 0, TUNNEL_TYPE_Z), CellRole::Body));
+                cells.extend(anchor_cells(
+                    flat_graph,
+                    fds,
+                    output_anchor,
+                    0,
+                    TUNNEL_OUTPUT_Z,
+                    |leaf| CellRole::Output { leaf },
+                ));
             }
             crate::model::node::ENode::TypeCast {
                 input_anchor,
@@ -2346,9 +2368,9 @@ impl LayoutGraph {
 
     /// A Tunnel on this scope's entry row, opening it to the graph outside.
     ///
-    /// Two anchors and no third thing to decide: a Tunnel declares no type and
-    /// carries no name, so unlike a Source it comes into the world finished
-    /// and the caret has nothing to be sent to afterwards.
+    /// Untyped, the way a Source arrives: the type it lets through is the one
+    /// thing it has to be told, and it is told in the keystrokes after this —
+    /// the caret is built standing on the cell that declares it.
     pub fn plus_tunnel(
         &self,
         pos: Vec3,
@@ -2364,6 +2386,7 @@ impl LayoutGraph {
         let graph = self.graph.plus_node(
             node_id.clone(),
             crate::model::node::ENode::Tunnel {
+                r#type: None,
                 input_anchor: input_anchor_id,
                 output_anchor: output_anchor_id,
             },

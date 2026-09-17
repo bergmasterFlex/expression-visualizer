@@ -1680,29 +1680,55 @@ pub fn layoutnode_to_rendernode(
                 text_faces: vec![],
             }
         }
-        // The branch source's twin, and drawn like it — one anchor on the
-        // entry row, no body, because a Tunnel declares nothing either.
+        // Three segments in a row and no body: what arrives, what it must be,
+        // what leaves. The middle one is the declaration and the only one of
+        // the three that is a cell of this scope at all.
         //
-        // What it has and the branch source has not is a second anchor, and it
-        // sits *outside*: one cell in front of the entry row, against the
-        // scope's front face, exactly where a Source draws the arrival it only
-        // mimes. Here it is the real thing — in `anchors`, so the pointer
-        // picks it and an edge from the enclosing graph ends on it. That is
-        // the whole difference between the two, and it is the whole point of
-        // the node.
+        // The first sits *outside*: one cell in front of the entry row,
+        // against the scope's front face, exactly where a Source draws the
+        // arrival it only mimes. Here it is the real thing — in `anchors`, so
+        // the pointer picks it and an edge from the enclosing graph ends on
+        // it. That is the whole difference between a Tunnel and the branch
+        // source beside it, and it is the whole point of the node.
         crate::model::node::ENode::Tunnel {
+            r#type,
             input_anchor,
             output_anchor,
         } => {
             let input_world = cell(0, 0, -1);
-            let output_world = cell(0, 0, 0);
-            // One type for both ends: a Tunnel borrows what arrives and hands
-            // it on unchanged, so drawing them from the same lookup is what
-            // makes the pass-through visible rather than merely true.
-            let eval_type =
-                crate::infer::anchor_type(flat_graph, output_anchor, function_declarations)
-                    .unwrap_or(crate::infer::EType::Pending);
-            let value = crate::infer::anchor_literal(flat_graph, output_anchor, known);
+            let type_world = cell(0, 0, crate::layout::TUNNEL_TYPE_Z);
+            let output_world = cell(0, 0, crate::layout::TUNNEL_OUTPUT_Z);
+            // One type for all three, read off the node rather than inferred:
+            // both anchors answer with the declaration now (`infer::anchor_type`),
+            // so asking the graph would be the long way round to the field
+            // that is right here. `Pending` while nothing is declared, drawn
+            // grey the way an unchosen cast target is.
+            let eval_type = r#type
+                .as_ref()
+                .map(crate::infer::graph_type_to_eval_type)
+                .unwrap_or(crate::infer::EType::Pending);
+            // Two questions and not one, now that the two bands stand for two
+            // moments: what is waiting at the input, and what has left the
+            // output. A Tunnel's own declaration pins no literal — it is
+            // always a base type — so both stay empty until a run fills them,
+            // and then they fill one step apart.
+            let incoming_value =
+                crate::infer::incoming_anchor_literal(flat_graph, input_anchor, known);
+            let outgoing_value = crate::infer::anchor_literal(flat_graph, output_anchor, known);
+            // The declared type on the cell that declares it, filling the
+            // cell's whole depth: this one is not an anchor hanging off a
+            // body, it is the stretch the value crosses on its way in. It
+            // meets the input band in front and the output band behind, and
+            // the three read as one run.
+            //
+            // `Silent` for exactly that reason — three bands of one colour
+            // end to end need the word once, and the input says it first.
+            let (type_strands, type_objects) = declared_type_cell(
+                r#type.as_ref(),
+                type_world,
+                Span::WholeCell,
+                Lettering::Silent,
+            );
             RenderNode {
                 node: None,
                 anchors: std::collections::HashMap::from([
@@ -1710,8 +1736,12 @@ pub fn layoutnode_to_rendernode(
                         input_anchor.clone(),
                         typed_anchor(
                             &eval_type,
-                            value.as_deref(),
-                            known.at_output(flat_graph, output_anchor),
+                            incoming_value.as_deref(),
+                            // What *arrives*, which is one step ahead of what
+                            // the Tunnel has handed on — and the step between
+                            // the two is the one this node performs. The same
+                            // split a Source's two bands make.
+                            known.at_input(flat_graph, input_anchor),
                             input_world,
                             true,
                             Lettering::Spelled,
@@ -1721,16 +1751,16 @@ pub fn layoutnode_to_rendernode(
                         output_anchor.clone(),
                         typed_anchor(
                             &eval_type,
-                            value.as_deref(),
+                            outgoing_value.as_deref(),
                             known.at_output(flat_graph, output_anchor),
                             output_world,
                             false,
-                            Lettering::Spelled,
+                            Lettering::Silent,
                         ),
                     ),
                 ]),
-                strands: vec![],
-                objects: vec![],
+                strands: type_strands,
+                objects: type_objects,
                 labels: vec![],
                 text_faces: vec![],
             }
@@ -1849,7 +1879,13 @@ pub fn label_for_node(
             .map(ToString::to_string)
             .unwrap_or_else(|| "?".to_string()),
         crate::model::node::ENode::BranchSource { .. } => "branch source".to_string(),
-        crate::model::node::ENode::Tunnel { .. } => "tunnel".to_string(),
+        crate::model::node::ENode::Tunnel { r#type, .. } => format!(
+            "tunnel: {}",
+            r#type
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "?".to_string())
+        ),
         crate::model::node::ENode::Root { .. } => "root".to_string(),
     }
 }

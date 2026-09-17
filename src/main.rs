@@ -326,15 +326,16 @@ enum PromptAction {
 ///
 /// It stands in the graph while it is being answered, so what is being built
 /// can be seen — but it is not finished, and Escape unmakes it rather than
-/// leaving behind a placeholder nobody chose. Four kinds need this: a
-/// `TypeCast`, a `Pattern`, a `Match` and a `Source`, whose property is not
-/// part of the name that was typed to create it. A `Constant` carries its
-/// literal and a `FunctionCall` its function already, so both arrive finished.
+/// leaving behind a placeholder nobody chose. Five kinds need this: a
+/// `TypeCast`, a `Pattern`, a `Match`, a `Source` and a `Tunnel`, whose
+/// property is not part of the name that was typed to create it. A `Constant`
+/// carries its literal and a `FunctionCall` its function already, so both
+/// arrive finished.
 ///
 /// A Source's *name* is not that property — it may be empty, and a Source is
-/// told apart by its index. Its declared type is: there is no such thing as a
-/// Source that declares nothing, because every value handed in at one has to be
-/// a value of something.
+/// told apart by its index. Its declared type is, and a Tunnel's is for the
+/// same reason: every value that arrives at one from outside has to be a value
+/// of something, so neither may stand there declaring nothing.
 #[derive(Clone, PartialEq, Eq)]
 struct PendingEdit {
     /// Removed whole on Escape. For a Match this is its one `Pattern`, not the
@@ -656,6 +657,10 @@ enum EditTarget {
     CastType,
     /// The type a Pattern's arm matches, on the Pattern's one cell.
     PatternType,
+    /// The type a Tunnel lets through, on the cell between its two anchors —
+    /// the only one of the three that is a cell of the branch at all, its
+    /// input being outside the volume and its output an anchor like any other.
+    TunnelType,
     // A FunctionCall is deliberately absent. Which function a call calls is
     // fixed when it is built: a different function has a different arity, so
     // re-pointing a call is re-wiring it, and every edge into it would have to
@@ -699,6 +704,7 @@ fn insert_target(state: &GraphState, pick: &PickState) -> InsertTarget {
         (model::node::ENode::Constant { .. }, layout::CellRole::Body) => EditTarget::ConstantValue,
         (model::node::ENode::TypeCast { .. }, layout::CellRole::Body) => EditTarget::CastType,
         (model::node::ENode::Pattern { .. }, layout::CellRole::Body) => EditTarget::PatternType,
+        (model::node::ENode::Tunnel { .. }, layout::CellRole::Body) => EditTarget::TunnelType,
         // A FunctionCall's body cells fall through with everything else: the
         // function is not changeable, so they name nothing. See `EditTarget`.
         _ => return InsertTarget::Create,
@@ -721,10 +727,11 @@ fn property_text(state: &GraphState, node_id: &model::node::Id, target: &EditTar
     };
     match (target, node) {
         (EditTarget::SourceName, model::node::ENode::Source { name, .. }) => name.clone(),
-        // The type's name and never a literal's spelling: what a Source
-        // declares is a base type, so that is what the prompt opens on.
+        // The type's name and never a literal's spelling: what a Source and a
+        // Tunnel declare is a base type, so that is what the prompt opens on.
         // Nothing declared yet is nothing to open on, the same as below.
-        (EditTarget::SourceType, model::node::ENode::Source { r#type, .. }) => r#type
+        (EditTarget::SourceType, model::node::ENode::Source { r#type, .. })
+        | (EditTarget::TunnelType, model::node::ENode::Tunnel { r#type, .. }) => r#type
             .as_ref()
             .map(|t| type_choice_label(type_choice_of(t)).to_string())
             .unwrap_or_default(),
@@ -2025,11 +2032,12 @@ fn kind_allowed(
 /// Create a node of this kind at the caret. `None` when nothing was built.
 ///
 /// For most kinds the caret does not follow: it keeps addressing the cell,
-/// which now holds the new node. The four kinds that come into the world
+/// which now holds the new node. The five kinds that come into the world
 /// unfinished are the exception — there the caret ends up on the cell that
 /// names the missing property, because that is where it has to be answered, and
 /// the `PendingEdit` that comes back is what an Escape undoes. For three of
-/// them that means moving; a Source is built on that cell already.
+/// them that means moving; a Source and a Tunnel are built on that cell
+/// already.
 fn insert_node_kind(
     state: &mut GraphState,
     pick: &mut PickState,
@@ -2099,13 +2107,13 @@ fn insert_node_kind(
     // Match hold a gap open after their input anchor, so what names the type is
     // the second cell behind it, not the first. A new Pattern goes one row
     // below the gap the caret was standing on, and one cell further back again
-    // to reach its own type. A Source needs no step at all: it is built on the
-    // very cell that declares its type, so the caret is already standing on the
-    // question.
+    // to reach its own type. A Source and a Tunnel need no step at all: each is
+    // built on the very cell that declares its type, so the caret is already
+    // standing on the question.
     let step = match kind {
         AddKind::TypeCast | AddKind::Match => IVec3::Z * 2,
         AddKind::Pattern => IVec3::Y + IVec3::Z,
-        AddKind::Source => IVec3::ZERO,
+        AddKind::Source | AddKind::Tunnel => IVec3::ZERO,
         _ => return Some(Inserted::Done),
     };
     pick.selected_pos = state.root_graph().clamp_to_volume(caret_before + step);
@@ -2159,7 +2167,8 @@ fn set_node_type(
         }
         Some(model::node::ENode::Source { r#type, .. })
         | Some(model::node::ENode::TypeCast { r#type, .. })
-        | Some(model::node::ENode::Pattern { r#type, .. }) => {
+        | Some(model::node::ENode::Pattern { r#type, .. })
+        | Some(model::node::ENode::Tunnel { r#type, .. }) => {
             *r#type = Some(make_etype(choice, value));
             state.resettle();
             true
@@ -2213,7 +2222,8 @@ fn apply_prompt_action(
                 EditTarget::SourceType
                 | EditTarget::ConstantValue
                 | EditTarget::CastType
-                | EditTarget::PatternType,
+                | EditTarget::PatternType
+                | EditTarget::TunnelType,
             ),
         ) => set_node_type(state, &id, *choice, value.clone()),
         _ => false,
@@ -2414,9 +2424,10 @@ fn prompt_candidates(state: &GraphState, pick: &PickState, text: &str) -> Vec<Su
         }],
         // A declared type is a closed set of five, all of them always legal —
         // the node already stands there, so nothing about the caret can forbid
-        // one. No literal: what a Source declares is a type, and the value
-        // arrives from outside.
-        InsertTarget::Edit(_, EditTarget::SourceType) => type_rows(text),
+        // one. No literal, and for the same reason on both: what a Source and
+        // a Tunnel declare is the *shape* of a value that arrives from
+        // somewhere else, never the value.
+        InsertTarget::Edit(_, EditTarget::SourceType | EditTarget::TunnelType) => type_rows(text),
         // A Constant *is* its literal, so only literals are offered. Naming a
         // bare type here would build a constant with nothing in it, which
         // `eval_value_for_type` refuses anyway.
@@ -3028,6 +3039,7 @@ fn target_labels(target: &EditTarget) -> (&'static str, &'static str) {
         EditTarget::ConstantValue => ("Constant", "Value"),
         EditTarget::CastType => ("TypeCast", "Type"),
         EditTarget::PatternType => ("Pattern", "Type"),
+        EditTarget::TunnelType => ("Tunnel", "Type"),
     }
 }
 
