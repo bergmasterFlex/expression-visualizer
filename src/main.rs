@@ -498,100 +498,23 @@ struct CaretScope {
     local: IVec3,
 }
 
-/// Which Match owns each Pattern, over every scope in the scene.
-///
-/// A scope's `context` names only the Patterns descended through, because a
-/// Match used to be nothing a walk could stop at. It is a volume of its own now,
-/// sitting between a scope and its arms, so the path a boundary count is taken
-/// over has to name it too — and this is what turns the one into the other.
-fn owning_matches(
-    root: &layout::LayoutGraph,
-) -> std::collections::HashMap<model::node::Id, model::node::Id> {
-    let mut owning = std::collections::HashMap::new();
-    for walked in root.walk_all_graphs() {
-        for (match_id, node) in &walked.layout_graph.graph.nodes {
-            let model::node::ENode::Match { patterns, .. } = node else {
-                continue;
-            };
-            for pattern_id in patterns {
-                owning.insert(pattern_id.clone(), match_id.clone());
-            }
-        }
-    }
-    owning
-}
-
-/// The volume path of the scope `context` names: every Pattern in it preceded by
-/// the Match it is an arm of.
-///
-/// A Pattern with no owner is skipped rather than passed through — a path is
-/// only good for counting boundaries against another path, and a rung that
-/// silently went missing would make two volumes look closer than they are.
-fn scope_volume_path(
-    context: &[model::node::Id],
-    owning: &std::collections::HashMap<model::node::Id, model::node::Id>,
-) -> Vec<model::node::Id> {
-    let mut path = Vec::with_capacity(context.len() * 2);
-    for pattern_id in context {
-        let Some(match_id) = owning.get(pattern_id) else {
-            continue;
-        };
-        path.push(match_id.clone());
-        path.push(pattern_id.clone());
-    }
-    path
-}
-
 /// Volume boundaries between two volumes: the walls crossed going from one to
 /// the other through their nearest common ancestor.
 ///
+/// Both paths are scope `context`s, which is all a volume path is — a Match used
+/// to be a rung between a scope and its arms, and is not any more: it is drawn
+/// as the node it is, so there is no wall there to cross.
+///
 /// Siblings come out two apart, not one — there is a wall out of the first and a
-/// wall into the second, and no shortcut between them. That is what makes an arm
-/// and its sister arm read as exactly as far from each other as either is from
-/// the scope holding their Match.
+/// wall into the second, and no shortcut between them. Going out to the scope
+/// that holds their Match is one, because that is one wall and there is nothing
+/// standing behind it.
 fn volume_boundaries(a: &[model::node::Id], b: &[model::node::Id]) -> usize {
     let common = a.iter().zip(b).take_while(|(x, y)| x == y).count();
     (a.len() - common) + (b.len() - common)
 }
 
 impl GraphState {
-    /// The volume the caret stands in, as a path `volume_boundaries` can measure
-    /// from.
-    ///
-    /// One step further than `scope_of_caret`: a Pattern's gap, the cell naming
-    /// its type, and the Match's own input and output belong to no branch, so
-    /// `scope_at` hands them to the enclosing scope — but they are the Match's
-    /// own cells, and standing on one of them is standing in the Match.
-    ///
-    /// At most one Match of a scope can hold the caret: a nested Match lives in
-    /// a branch's own sub-layout, which `scope_at` would have resolved to first.
-    ///
-    /// `None` where `scope_of_caret` is `None` — the caret outside every volume,
-    /// where editing is unavailable. Nothing is faded then: there is no volume
-    /// to measure from, and measuring anyway would be a fiction.
-    fn volume_of_caret(
-        &self,
-        pick: &PickState,
-        owning: &std::collections::HashMap<model::node::Id, model::node::Id>,
-    ) -> Option<Vec<model::node::Id>> {
-        let scope = self.scope_of_caret(pick)?;
-        let mut path = scope_volume_path(&scope.path, owning);
-        let graph = self.root_graph().resolve_context(&scope.path);
-        for (id, node) in &graph.graph.nodes {
-            if !matches!(node, model::node::ENode::Match { .. }) {
-                continue;
-            }
-            let Some(fp) = graph.match_footprint(id) else {
-                continue;
-            };
-            if scope.local.cmpge(fp.min).all() && scope.local.cmple(fp.max).all() {
-                path.push(id.clone());
-                break;
-            }
-        }
-        Some(path)
-    }
-
     /// Resolve the caret to its owning scope. `None` when the caret sits
     /// outside every scope volume — editing is then simply unavailable.
     fn scope_of_caret(&self, pick: &PickState) -> Option<CaretScope> {
@@ -1429,15 +1352,14 @@ fn spawn_graph_nodes(
         &declared_band_positions,
     );
 
-    // Which volume the caret is in, and the Pattern→Match table the boundary
-    // count needs. Both are fixed for the whole pass: every surface below is
-    // faded by how far its own volume sits from this one.
+    // Which volume the caret is in — which is to say which scope, the two being
+    // the same question. Fixed for the whole pass: every surface below is faded
+    // by how far its own volume sits from this one.
     //
     // Baked in at spawn rather than followed per frame, because a caret move
     // already rebuilds the scene — the caret's own mesh is built from
     // `pick.selected_pos` a few lines down, and would not move otherwise.
-    let owning = owning_matches(state.root_graph());
-    let caret_volume = state.volume_of_caret(&pick, &owning);
+    let caret_volume = state.scope_of_caret(&pick).map(|scope| scope.path);
     // Everything at full strength while the caret is outside every volume:
     // there is nothing to measure a distance from, and measuring anyway would
     // be a fiction.
@@ -1451,7 +1373,6 @@ fn spawn_graph_nodes(
             continue;
         };
         let offset = walked_graph.extra_offset;
-        let scope_path = scope_volume_path(&walked_graph.context, &owning);
         // `layout_range_to_world` re-normalises min/max: LAYOUT_SCALE negates
         // Z, so scaling the corners individually would yield an inverted rect
         // and the shader would draw no border at all.
@@ -1463,9 +1384,22 @@ fn spawn_graph_nodes(
         // Collect multi-cell node footprints in this LayoutGraph and convert
         // to world-space XZ rects. Fed to the grid shader to suppress
         // interior grid lines inside merged fields.
+        //
+        // A Match is not one of those. Its footprint is an envelope and not a
+        // field — the arms standing in it have their own volumes and the space
+        // between them is the scope's own floor — so flattening it would leave
+        // a blank rectangle with boxes floating in it. It is the one node whose
+        // `node_footprint` reaches past its own cells, and this is the one
+        // place that has to say so.
         let mut footprints = [Vec4::ZERO; grid::MAX_FOOTPRINTS];
         let mut footprint_count: u32 = 0;
         for id in walked_graph.layout_graph.layout_nodes.keys() {
+            if matches!(
+                walked_graph.layout_graph.graph.nodes.get(id),
+                Some(model::node::ENode::Match { .. })
+            ) {
+                continue;
+            }
             let Some(fp) = walked_graph.layout_graph.node_footprint(id) else {
                 continue;
             };
@@ -1495,8 +1429,8 @@ fn spawn_graph_nodes(
             bounds.min,
             bounds.max,
             offset,
-            fade_of(&scope_path),
-            Some(InteractiveFloor {
+            fade_of(&walked_graph.context),
+            InteractiveFloor {
                 scope: ScopeGridEntity {
                     context: walked_graph.context.clone(),
                     origin_offset: offset,
@@ -1507,36 +1441,8 @@ fn spawn_graph_nodes(
                 border_max: Vec2::new(border_hi.x, border_hi.z),
                 footprints,
                 footprint_count,
-            }),
+            },
         );
-
-        // Every Match in this scope is a volume in its own right: its own cells
-        // and every arm hanging off them, which is what `match_footprint`
-        // measures. It owns no `LayoutGraph`, so no walk reaches it — it has to
-        // be asked for here, from the scope that holds it.
-        for (id, node) in &walked_graph.layout_graph.graph.nodes {
-            if !matches!(node, model::node::ENode::Match { .. }) {
-                continue;
-            }
-            let Some(fp) = walked_graph.layout_graph.match_footprint(id) else {
-                continue;
-            };
-            let mut match_path = scope_path.clone();
-            match_path.push(id.clone());
-            spawn_volume_surfaces(
-                &mut commands,
-                &mut meshes,
-                &mut materials_grid,
-                fp.min,
-                fp.max,
-                offset,
-                fade_of(&match_path),
-                // No `InteractiveFloor`: a Match is not a scope. Nothing
-                // addresses a cell *in* it, and its footprint is already
-                // flattened on the floor of the scope it stands in.
-                None,
-            );
-        }
     }
 
     // Selection caret, enclosing the addressed cell volume from the caret
@@ -4725,10 +4631,8 @@ pub struct WorldLabel {
 /// makes it the mouse's pick target, the border rect marking the caret's own
 /// scope, and the footprint rects that flatten multi-cell nodes.
 ///
-/// A Match's floor carries none of it, which is why this is an `Option` at the
-/// spawner rather than four more parameters. A Match is not a scope — nothing
-/// addresses a cell *in* one, and its own footprint is already flattened on the
-/// floor of the scope it stands in.
+/// One struct rather than four more parameters on the spawner, which is the
+/// whole of why it exists.
 struct InteractiveFloor {
     scope: ScopeGridEntity,
     border_min: Vec2,
@@ -4741,14 +4645,21 @@ struct InteractiveFloor {
 /// the back wall on its lesser-X side, and the two Z faces closing it front and
 /// back.
 ///
-/// Four for every volume there is — the program's scope, every Match, every
-/// branch of every Match — so that a volume is recognisable as one whatever kind
-/// it happens to be. What tells them apart is `fade`, which says how many volume
-/// walls stand between this one and the one the caret is in.
+/// Four for every volume there is — the program's scope and every branch of
+/// every Match — so that a volume is recognisable as one wherever it sits. What
+/// tells them apart is `fade`, which says how many volume walls stand between
+/// this one and the one the caret is in.
+///
+/// A volume *is* a scope, and that is why this takes an `InteractiveFloor`
+/// rather than an optional one. A Match used to be drawn as a volume too,
+/// without one, which put two nested rooms on screen for something that is one
+/// node: it owns no `LayoutGraph`, nothing addresses a cell in it, and its arms
+/// are the volumes. It gets what a TypeCast gets now — its anchors, its links,
+/// and no room.
 ///
 /// `min`/`max` are the volume's inclusive cell bounds in coordinates `offset`
-/// carries to global: `grid_bounds()` for a scope, `match_footprint()` for a
-/// Match. Cells are corner-anchored, so every far edge is `max + 1`.
+/// carries to global, always `grid_bounds()`. Cells are corner-anchored, so
+/// every far edge is `max + 1`.
 #[allow(clippy::too_many_arguments)]
 fn spawn_volume_surfaces(
     commands: &mut Commands,
@@ -4758,7 +4669,7 @@ fn spawn_volume_surfaces(
     max: IVec3,
     offset: Vec3,
     fade: f32,
-    floor: Option<InteractiveFloor>,
+    floor: InteractiveFloor,
 ) {
     let size_x = (max.x - min.x + 1) as f32 * render::LAYOUT_SCALE.x.abs();
     let size_y = (max.y - min.y + 1) as f32 * render::LAYOUT_SCALE.y.abs();
@@ -4774,30 +4685,19 @@ fn spawn_volume_surfaces(
     // ── The floor: the lower bounding edge of the volume's last row, so what
     // stands in it stands *on* it rather than hanging under it.
     let floor_center = centre(mid_x, (max.y + 1) as f32, mid_z);
-    let mut floor_entity = commands.spawn((
+    commands.spawn((
         Mesh3d(meshes.add(Plane3d::default().mesh().size(size_x, size_z).build())),
+        MeshMaterial3d(materials_grid.add(grid::GridMaterial {
+            border_min: floor.border_min,
+            border_max: floor.border_max,
+            footprint_count: floor.footprint_count,
+            footprints: floor.footprints,
+            ..grid::GridMaterial::scope_surface(Vec3::X, Vec3::Z, fade)
+        })),
         Transform::from_translation(floor_center),
+        floor.scope,
         SceneEntity,
     ));
-    match floor {
-        Some(f) => {
-            floor_entity.insert((
-                MeshMaterial3d(materials_grid.add(grid::GridMaterial {
-                    border_min: f.border_min,
-                    border_max: f.border_max,
-                    footprint_count: f.footprint_count,
-                    footprints: f.footprints,
-                    ..grid::GridMaterial::scope_surface(Vec3::X, Vec3::Z, fade)
-                })),
-                f.scope,
-            ));
-        }
-        None => {
-            floor_entity.insert(MeshMaterial3d(
-                materials_grid.add(grid::GridMaterial::scope_surface(Vec3::X, Vec3::Z, fade)),
-            ));
-        }
-    }
 
     // ── The back wall, on the lesser-X side. The bound camera's depth axis is
     // world X, so this is the surface the volume is seen *against* — the one

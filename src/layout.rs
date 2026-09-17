@@ -2405,10 +2405,11 @@ impl LayoutGraph {
     /// coordinates.
     ///
     /// A Pattern's branch volume starts behind the Pattern's own cells (+Z):
-    /// the Pattern itself belongs to the Match volume, not to the branch, so
-    /// branch-local (0,0,0) — where the `BranchSource` sits — lands at
-    /// `BRANCH_LOCAL_Z`, just past the cell that names the arm's type. Every
-    /// other owner (the Root wrapper) contributes no shift.
+    /// the Pattern itself stands beside its Match in the enclosing scope and is
+    /// no part of the branch, so branch-local (0,0,0) — where the
+    /// `BranchSource` sits — lands at `BRANCH_LOCAL_Z`, just past the cell that
+    /// names the arm's type. Every other owner (the Root wrapper) contributes
+    /// no shift.
     fn sub_layout_origin(&self, owner_id: &crate::model::node::Id) -> Vec3 {
         let base = self
             .layout_nodes

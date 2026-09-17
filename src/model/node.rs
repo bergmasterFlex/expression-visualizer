@@ -80,7 +80,7 @@ pub enum ENode {
         input_anchor: super::anchor::Id,
         output_anchor: super::anchor::Id,
     },
-    /// One arm of a Match. Lives in the Match's volume, not in its branch:
+    /// One arm of a Match. Lives beside the Match, not in its branch:
     /// it declares the type the arm matches and fixes the branch's Y row, but
     /// carries no anchor. The branch reads the matched value from its own
     /// `BranchSource` instead, so no edge crosses the volume boundary.
