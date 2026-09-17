@@ -326,11 +326,15 @@ enum PromptAction {
 ///
 /// It stands in the graph while it is being answered, so what is being built
 /// can be seen — but it is not finished, and Escape unmakes it rather than
-/// leaving behind a placeholder nobody chose. Three kinds need this: a
-/// `TypeCast`, a `Pattern` and a `Match`, whose property is not part of the
-/// name that was typed to create it. A `Constant` carries its literal and a
-/// `FunctionCall` its function already, and a `Source` has nothing mandatory —
-/// its name may be empty and its type is settled on a second cell.
+/// leaving behind a placeholder nobody chose. Four kinds need this: a
+/// `TypeCast`, a `Pattern`, a `Match` and a `Source`, whose property is not
+/// part of the name that was typed to create it. A `Constant` carries its
+/// literal and a `FunctionCall` its function already, so both arrive finished.
+///
+/// A Source's *name* is not that property — it may be empty, and a Source is
+/// told apart by its index. Its declared type is: there is no such thing as a
+/// Source that declares nothing, because every value handed in at one has to be
+/// a value of something.
 #[derive(Clone, PartialEq, Eq)]
 struct PendingEdit {
     /// Removed whole on Escape. For a Match this is its one `Pattern`, not the
@@ -635,11 +639,17 @@ fn addressed_cell(
 enum EditTarget {
     /// Printed along the body, so the body is where it is typed.
     SourceName,
-    /// Hangs off the output anchor, so that is where it is declared.
+    /// Declared on the Source's first cell, in front of the name — the cell of
+    /// its own that every declared type gets, a TypeCast's and a Pattern's
+    /// included. It used to hang off the output anchor; an anchor is where an
+    /// edge begins and has no room for a second job.
     SourceType,
-    /// Both of a Constant's cells answer for its literal: the value *is* the
-    /// node, so there is no second thing either cell could mean. The type is
-    /// not carried separately — it is whatever the literal spells.
+    /// A Constant's body cell. The value *is* the node, so the type is not
+    /// carried separately — it is whatever the literal spells.
+    ///
+    /// Its output anchor used to answer for the literal too, saying the same
+    /// thing twice. Only the body says it now, and the anchor is free for the
+    /// edge that starts there.
     ConstantValue,
     /// The cell between a TypeCast's two anchors: a base type to cast to, or a
     /// literal to produce. Its anchors name nothing.
@@ -678,17 +688,15 @@ fn insert_target(state: &GraphState, pick: &PickState) -> InsertTarget {
     let Some(node) = layout.graph.nodes.get(&id) else {
         return InsertTarget::Create;
     };
+    // Every row here names a `Body` or a `Name` cell, and none of them an
+    // anchor. That is the rule rather than how it happens to have come out: an
+    // anchor is where an edge begins, so it cannot also be where a property is
+    // answered, and a cell that names one property is what makes standing on it
+    // and choosing what to change the same act.
     let property = match (node, &role) {
-        (model::node::ENode::Source { .. }, layout::CellRole::Body) => EditTarget::SourceName,
-        (model::node::ENode::Source { .. }, layout::CellRole::Output { .. }) => {
-            EditTarget::SourceType
-        }
-        // The one kind whose two cells say the same thing, because it only has
-        // the one thing to say.
-        (
-            model::node::ENode::Constant { .. },
-            layout::CellRole::Body | layout::CellRole::Output { .. },
-        ) => EditTarget::ConstantValue,
+        (model::node::ENode::Source { .. }, layout::CellRole::Body) => EditTarget::SourceType,
+        (model::node::ENode::Source { .. }, layout::CellRole::Name) => EditTarget::SourceName,
+        (model::node::ENode::Constant { .. }, layout::CellRole::Body) => EditTarget::ConstantValue,
         (model::node::ENode::TypeCast { .. }, layout::CellRole::Body) => EditTarget::CastType,
         (model::node::ENode::Pattern { .. }, layout::CellRole::Body) => EditTarget::PatternType,
         // A FunctionCall's body cells fall through with everything else: the
@@ -713,9 +721,13 @@ fn property_text(state: &GraphState, node_id: &model::node::Id, target: &EditTar
     };
     match (target, node) {
         (EditTarget::SourceName, model::node::ENode::Source { name, .. }) => name.clone(),
-        (EditTarget::SourceType, model::node::ENode::Source { r#type, .. }) => {
-            type_choice_label(type_choice_of(r#type)).to_string()
-        }
+        // The type's name and never a literal's spelling: what a Source
+        // declares is a base type, so that is what the prompt opens on.
+        // Nothing declared yet is nothing to open on, the same as below.
+        (EditTarget::SourceType, model::node::ENode::Source { r#type, .. }) => r#type
+            .as_ref()
+            .map(|t| type_choice_label(type_choice_of(t)).to_string())
+            .unwrap_or_default(),
         (EditTarget::ConstantValue, model::node::ENode::Constant { r#type, .. }) => {
             r#type.to_string()
         }
@@ -1921,31 +1933,32 @@ fn handle_delete_node_button(
         if is_fixture {
             continue;
         }
-        if remove_node_at_caret(&mut state, &pick, &selected_node_id) {
+        if remove_node(&mut state, &selected_node_id) {
             rebuild.0 = true;
         }
     }
 }
 
-/// Take a node out of the scope the caret stands in. Returns whether the graph
-/// changed, so the caller knows whether to flag a rebuild.
+/// Take a node out of the graph it lives in, wherever that is. Returns whether
+/// the graph changed, so the caller knows whether to flag a rebuild.
 ///
-/// Caret-relative rather than by a global search, because both callers are:
-/// the delete button acts on what the caret selects, and the rollback of an
-/// unfinished node acts on the node the caret was put on to finish it.
-fn remove_node_at_caret(
-    state: &mut GraphState,
-    pick: &PickState,
-    node_id: &model::node::Id,
-) -> bool {
-    let Some((caret_graph, _)) = state.caret_graph(pick) else {
+/// Found through the node's own scope rather than through the caret's. The
+/// caret is where two of the three callers got the node from, but it is not
+/// where the third one is: walking away from an unfinished node is what unmakes
+/// it, and by the time that is noticed the caret is already standing somewhere
+/// else — possibly in another scope entirely.
+fn remove_node(state: &mut GraphState, node_id: &model::node::Id) -> bool {
+    let Some(context) = state.root_graph().context_of_node(node_id) else {
         return false;
     };
-    let updated = caret_graph.minus_node(node_id);
-    let Some((caret_graph_mut, _)) = state.caret_graph_mut(pick) else {
+    let updated = state
+        .root_graph()
+        .resolve_context(&context)
+        .minus_node(node_id);
+    let Some(owning_graph) = state.root_graph_mut().resolve_context_mut(&context) else {
         return false;
     };
-    *caret_graph_mut = updated;
+    *owning_graph = updated;
     // `minus_node` took the edges its own graph held. Every other edge in the
     // scene is the root's — `plus_edge` is only ever called there — so a node
     // removed from a branch leaves its wiring behind, pointing at anchors that
@@ -2012,10 +2025,11 @@ fn kind_allowed(
 /// Create a node of this kind at the caret. `None` when nothing was built.
 ///
 /// For most kinds the caret does not follow: it keeps addressing the cell,
-/// which now holds the new node. The three kinds that come into the world
-/// unfinished are the exception — there the caret moves onto the cell that
+/// which now holds the new node. The four kinds that come into the world
+/// unfinished are the exception — there the caret ends up on the cell that
 /// names the missing property, because that is where it has to be answered, and
-/// the `PendingEdit` that comes back is what an Escape undoes.
+/// the `PendingEdit` that comes back is what an Escape undoes. For three of
+/// them that means moving; a Source is built on that cell already.
 fn insert_node_kind(
     state: &mut GraphState,
     pick: &mut PickState,
@@ -2078,17 +2092,20 @@ fn insert_node_kind(
     state.resettle();
 
     // Where the property that is still missing is edited, relative to the cell
-    // the node was built on. All three sit in the scope it was built in, so no
+    // the node was built on. All four sit in the scope it was built in, so no
     // descent into a branch is needed.
     //
     // Two of the steps are `2 * Z` for the same reason: both a TypeCast and a
     // Match hold a gap open after their input anchor, so what names the type is
     // the second cell behind it, not the first. A new Pattern goes one row
     // below the gap the caret was standing on, and one cell further back again
-    // to reach its own type.
+    // to reach its own type. A Source needs no step at all: it is built on the
+    // very cell that declares its type, so the caret is already standing on the
+    // question.
     let step = match kind {
         AddKind::TypeCast | AddKind::Match => IVec3::Z * 2,
         AddKind::Pattern => IVec3::Y + IVec3::Z,
+        AddKind::Source => IVec3::ZERO,
         _ => return Some(Inserted::Done),
     };
     pick.selected_pos = state.root_graph().clamp_to_volume(caret_before + step);
@@ -2128,19 +2145,20 @@ fn set_node_type(
         .layout_graph
         .find_node_graph_mut(node_id)
         .and_then(|a| a.graph.nodes.get_mut(node_id));
-    // Two shapes of the same field: a Constant and a Source always carry a
-    // type, a TypeCast and a Pattern carry one only once it has been chosen.
-    // Committing a row is exactly the act that makes the second into the first.
+    // Two shapes of the same field: a Constant always carries a type, because
+    // the literal that built it *is* one, while a Source, a TypeCast and a
+    // Pattern carry one only once it has been chosen. Committing a row is
+    // exactly the act that makes the second into the first.
     match node {
-        Some(model::node::ENode::Constant { r#type, .. })
-        | Some(model::node::ENode::Source { r#type, .. }) => {
+        Some(model::node::ENode::Constant { r#type, .. }) => {
             *r#type = make_etype(choice, value);
             // Anchor heights follow declared types, so a type change reshapes
             // the node and its neighbours.
             state.resettle();
             true
         }
-        Some(model::node::ENode::TypeCast { r#type, .. })
+        Some(model::node::ENode::Source { r#type, .. })
+        | Some(model::node::ENode::TypeCast { r#type, .. })
         | Some(model::node::ENode::Pattern { r#type, .. }) => {
             *r#type = Some(make_etype(choice, value));
             state.resettle();
@@ -2329,14 +2347,7 @@ fn handle_insert_prompt_click(
             continue;
         }
         if let Some(outcome) = apply_prompt_action(&mut state, &mut pick, &option.0) {
-            commit_outcome(
-                outcome,
-                &option.0,
-                &mut prompt,
-                &mut pending,
-                &mut mode,
-                &mut rebuild,
-            );
+            commit_outcome(outcome, &mut prompt, &mut pending, &mut mode, &mut rebuild);
         }
     }
 }
@@ -2349,7 +2360,6 @@ fn handle_insert_prompt_click(
 /// that built it.
 fn commit_outcome(
     outcome: Inserted,
-    action: &PromptAction,
     prompt: &mut InsertPrompt,
     pending: &mut PendingNode,
     mode: &mut EditorMode,
@@ -2357,21 +2367,17 @@ fn commit_outcome(
 ) {
     prompt.clear();
     rebuild.0 = true;
-    let stay = match (&outcome, action) {
-        // Its one mandatory property is still missing, and the caret has been
-        // put on the cell that names it.
-        (Inserted::Pending(_), _) => true,
-        // A Source arrives nameless, and the caret is left standing on the body
-        // its name is written along — so the keystrokes after it are the name.
-        (Inserted::Done, PromptAction::Create(AddKind::Source)) => true,
-        // Everything else is complete the moment it appears. A Constant *is*
-        // its literal and a call *is* its function, and both were typed to
-        // reach the row that built them — so the cell the caret is left on
-        // holds the answer that was just given, and staying would do nothing
-        // but offer to give it again. Changing a property is finished for the
-        // same reason.
-        _ => false,
-    };
+    // The outcome alone decides it, and which row was committed says nothing
+    // about it: INSERT stays on exactly while the node that was just built
+    // still owes its one mandatory property, and the caret is standing on the
+    // cell that names it.
+    //
+    // Everything else is complete the moment it appears. A Constant *is* its
+    // literal and a call *is* its function, and both were typed to reach the
+    // row that built them — so the cell the caret is left on holds the answer
+    // that was just given, and staying would do nothing but offer to give it
+    // again. Changing a property is finished for the same reason.
+    let stay = matches!(outcome, Inserted::Pending(_));
     // Answering a property is what finishes a node, so any commit clears the
     // mark — and a new one only ever comes from a `Create`.
     pending.0 = match outcome {
@@ -4206,6 +4212,14 @@ fn handle_modal_evaluate_button(
                     if let Some(model::node::ENode::Source { r#type, name, .. }) =
                         graph.nodes.get(&m.node_id)
                     {
+                        // A Source that declares nothing has nothing to parse
+                        // the answer as. Like a cast with no target, that is a
+                        // half-built node and so an error of the graph, not a
+                        // `none` travelling along an edge.
+                        let Some(r#type) = r#type else {
+                            parse_errors.push(format!("{}: no type declared", name));
+                            continue;
+                        };
                         match eval::EValue::parse(r#type, &input.value) {
                             Ok(value) => {
                                 user_source_values.insert(m.node_id.clone(), value);
@@ -6115,40 +6129,65 @@ fn text_input_focus(
 /// INSERT on a cell that already holds something opens on what it holds, so
 /// changing a value starts from the value instead of from nothing.
 ///
+/// And where the caret has moved *off* a node that was still owing its one
+/// mandatory property, it unmakes that node — the mouse's half of what Escape
+/// does for the keyboard. The two jobs are one system because they are one
+/// question asked once: what does the caret address now, and what did it
+/// address before.
+///
 /// Re-seeds when the mode or the target changes and at no other time. A
 /// keystroke changes neither, so typing is safe from it; a mouse click can move
 /// the caret under INSERT, which is exactly the case a one-shot seed at the `i`
-/// keypress would miss.
+/// keypress would miss — and the only way to walk away from an unfinished node,
+/// since INSERT takes the arrow keys away.
 ///
 /// It stands where the Source name field's focus projection used to. That field
 /// is gone — every property is typed into the one prompt now — so what has to
 /// be projected from the mode is no longer a focus but the text itself.
 fn sync_prompt_seed(
     mode: Res<EditorMode>,
-    state: Res<GraphState>,
+    mut state: ResMut<GraphState>,
     pick: Res<PickState>,
     mut prompt: ResMut<InsertPrompt>,
     mut pending: ResMut<PendingNode>,
+    mut rebuild: ResMut<NeedsRebuild>,
     mut last: Local<Option<(EditorMode, InsertTarget)>>,
 ) {
-    let target = insert_target(&state, &pick);
-    let now = (*mode, target.clone());
-    if last.as_ref() == Some(&now) {
+    let mut target = insert_target(&state, &pick);
+    if last.as_ref() == Some(&(*mode, target.clone())) {
         return;
     }
-    *last = Some(now);
 
-    // A node is only unfinished while the caret is still standing on it.
-    // Walking away is not a cancel — the node keeps what it has — but it does
-    // mean the next Escape is about something else, so the mark is dropped
-    // rather than carried around waiting to unmake a node nobody is looking at.
-    let pending_here = match (&pending.0, &target) {
-        (Some(edit), InsertTarget::Edit(id, _)) => edit.node == *id,
-        _ => false,
+    // A node is only unfinished while the caret is still standing on it, and
+    // leaving it is the same act as cancelling it: an insert that was walked
+    // away from leaves no placeholder behind, exactly as an Escape leaves
+    // none. Only the caret differs — Escape puts it back where the insert
+    // started, while a click is itself a statement about where it should be,
+    // so it stays where it was put.
+    //
+    // A click is the only way to get here, since INSERT takes the arrow keys
+    // away. That is why this is not the same rule said twice: Escape is what
+    // the keyboard has, this is what the mouse has, and they agree.
+    //
+    // "Still standing on it" asks after the node and not after its property
+    // cell: a pending node may have cells that name nothing — an anchor, a gap
+    // — and stepping onto one of those is not walking away from anything.
+    let pending_here = match &pending.0 {
+        Some(edit) => addressed_cell(&state, &pick).is_some_and(|(id, _)| id == edit.node),
+        None => false,
     };
     if !pending_here {
-        pending.0 = None;
+        if let Some(edit) = pending.0.take() {
+            if remove_node(&mut state, &edit.node) {
+                rebuild.0 = true;
+                // Removing a node re-settles the layout, so what the caret
+                // addresses has to be asked again before the prompt opens on
+                // it.
+                target = insert_target(&state, &pick);
+            }
+        }
     }
+    *last = Some((*mode, target.clone()));
 
     match (*mode, &target) {
         (EditorMode::Insert, InsertTarget::Edit(id, edit)) => {
@@ -6403,7 +6442,7 @@ fn handle_editor_keys(
                 // leaves no placeholder behind, and the caret goes back to the
                 // cell it was standing on.
                 if let Some(edit) = pending.0.take() {
-                    if remove_node_at_caret(&mut state, &pick, &edit.node) {
+                    if remove_node(&mut state, &edit.node) {
                         pick.selected_pos = state.root_graph().clamp_to_volume(edit.caret_before);
                         prompt.clear();
                         *mode = EditorMode::Normal;
@@ -6571,7 +6610,6 @@ fn handle_editor_keys(
                         if let Some(outcome) = apply_prompt_action(&mut state, &mut pick, &action) {
                             commit_outcome(
                                 outcome,
-                                &action,
                                 &mut prompt,
                                 &mut pending,
                                 &mut mode,

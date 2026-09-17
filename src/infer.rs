@@ -750,11 +750,20 @@ fn anchor_type_uncycled(
         // prompt; a literal written on it is the shape of that answer, not the
         // answer. Letting it through would type the graph on a value that may
         // never arrive.
+        //
+        // A Source that declares nothing yet types nothing: it carries
+        // `Pending`, the way an arm that declares nothing does, and everything
+        // downstream of it reads that.
         crate::model::node::ENode::Source {
             r#type,
             output_anchor,
             ..
-        } => (anchor_id == output_anchor).then(|| base_type_of(&graph_type_to_eval_type(r#type))),
+        } => (anchor_id == output_anchor).then(|| {
+            r#type
+                .as_ref()
+                .map(|t| base_type_of(&graph_type_to_eval_type(t)))
+                .unwrap_or(EType::Pending)
+        }),
         // A branch source hands the matched value into its branch, so it
         // carries its Pattern's declared type — the narrowing the Match
         // performs. It has no type of its own to declare.
@@ -1163,13 +1172,17 @@ pub fn anchor_literal(
         crate::model::node::ENode::Constant {
             r#type,
             output_anchor,
-        }
-        | crate::model::node::ENode::Source {
+        } => (anchor_id == output_anchor)
+            .then(|| crate::layout::value_of_etype(r#type))
+            .flatten(),
+        // The two that may carry no type at all. Nothing declared is nothing
+        // pinned, so there is no literal to hand back.
+        crate::model::node::ENode::Source {
             r#type,
             output_anchor,
             ..
         } => (anchor_id == output_anchor)
-            .then(|| crate::layout::value_of_etype(r#type))
+            .then(|| r#type.as_ref().and_then(crate::layout::value_of_etype))
             .flatten(),
         crate::model::node::ENode::TypeCast {
             r#type,

@@ -19,7 +19,19 @@ pub enum CellRole {
     /// Row `leaf` of the output anchor.
     Output { leaf: usize },
     /// The node's own property: the type it declares, or the function it calls.
+    ///
+    /// Without exception, now that a Source's declared type stands on a cell of
+    /// its own: what used to make the Source the one kind whose `Body` meant
+    /// something else is `Name` below.
     Body,
+    /// The name written along a node's body.
+    ///
+    /// Only a Source has it as a role of its own, because only a Source lets it
+    /// be typed. A FunctionCall writes a name along its body too, but that name
+    /// belongs to the declaration it calls and re-pointing a call is not on
+    /// offer (see `EditTarget`), so its cells stay `Body` — naming the function
+    /// the way every other `Body` names what its node declares.
+    Name,
     /// A cell the node claims without it naming a property: room held open.
     ///
     /// It is what gives a Match its rhythm — input anchor, gap, arm — and a
@@ -148,6 +160,19 @@ const BRANCH_LOCAL_Z: i32 = PATTERN_TYPE_LOCAL_Z + 1;
 pub const CAST_TYPE_Z: i32 = 2;
 /// One cell behind the arm, where a Match would start its branch.
 pub const CAST_OUTPUT_Z: i32 = CAST_TYPE_Z + 1;
+
+/// Node-local Z of the cell a `Source` declares its type on, and of the first
+/// cell of the name behind it. Named once so the cell layout and the bands
+/// drawn on it cannot drift apart, the way a TypeCast's are.
+///
+/// The type comes *first*, in front of the name, because it is what the value
+/// arriving from outside is a value of: read along +Z the node says what it
+/// carries, then what it is called, then hands it on. It also leaves the output
+/// anchor saying nothing but "an edge starts here", which is the whole reason
+/// the cell exists — an anchor is for wiring and for nothing else.
+pub const SOURCE_TYPE_Z: i32 = 0;
+/// Where the name begins: directly behind the declared type.
+pub const SOURCE_NAME_Z: i32 = SOURCE_TYPE_Z + 1;
 /// Monospace characters that fit across one cell along the axis a name is
 /// written on. The rasteriser steps by `1/N` of a cell, which is what makes a
 /// body's length *a count of characters* rather than a guess.
@@ -709,7 +734,7 @@ impl LayoutGraph {
     /// |---|---|
     /// | Sink | `0\|0` input |
     /// | Constant | `0\|0` body, `0\|1` output |
-    /// | Source (name of n chars) | `0\|0..k-1` body, `0\|k` output, `k = ceil(n/3)` |
+    /// | Source (name of n chars) | `0\|0` body, `0\|1..k` name, `0\|k+1` output, `k = ceil(n/3)` |
     /// | TypeCast | `0\|0` input, `0\|1` gap, `0\|2` body, `0\|3` output |
     /// | FunctionCall (n inputs, name of m chars) | `i\|0` input i, `(0..n)\|1..k` body, `0\|k+1` output, `k = ceil(m/3)` |
     /// | Match | `0\|0` input, output directly behind the deepest branch |
@@ -741,23 +766,32 @@ impl LayoutGraph {
                     CellRole::Input { index: 0, leaf }
                 }));
             }
-            // A Source writes its name along its body, so the body is as long
-            // as the name needs and the output sits one cell behind its end.
+            // Three things in a row, and the first of them is the type: a
+            // Source declares one the way a TypeCast and a Pattern do, so it
+            // gets the cell of its own that every declared type gets. Behind it
+            // the name, which is written along the body and therefore as long
+            // as it needs, and behind that the output.
+            //
+            // Which leaves the output anchor naming nothing but itself. That is
+            // the point of the arrangement rather than a side effect of it — an
+            // anchor is where an edge begins, and an anchor that also edited a
+            // property could not be both.
             crate::model::node::ENode::Source {
                 name,
                 output_anchor,
                 ..
             } => {
+                cells.push((IVec3::new(0, 0, SOURCE_TYPE_Z), CellRole::Body));
                 let depth = name_body_cells(name);
                 for z in 0..depth {
-                    cells.push((IVec3::new(0, 0, z), CellRole::Body));
+                    cells.push((IVec3::new(0, 0, SOURCE_NAME_Z + z), CellRole::Name));
                 }
                 cells.extend(anchor_cells(
                     flat_graph,
                     fds,
                     output_anchor,
                     0,
-                    depth,
+                    SOURCE_NAME_Z + depth,
                     |leaf| CellRole::Output { leaf },
                 ));
             }
@@ -2283,14 +2317,20 @@ impl LayoutGraph {
         let graph = self.graph.plus_node(
             node_id.clone(),
             crate::model::node::ENode::Source {
-                // Unnamed, not named `v`: the name is printed along the body,
-                // so a default would put a word on the node that nobody wrote
-                // — and one that has to be cleared before the real name can be
-                // typed. An empty name still claims a cell, because
-                // `name_body_cells` floors at one, so there is a body to
-                // stand on and type into.
+                // Unnamed and untyped, and both for the same reason: a
+                // default would put on the node something nobody said. A name
+                // like `v` would have to be cleared before the real one could
+                // be typed, and a type like `Integer` would stand there as a
+                // declaration that was never made — and the prompt, which
+                // opens on what a cell already holds, would offer it back as
+                // though it were an answer.
+                //
+                // An empty name still claims a cell, because `name_body_cells`
+                // floors at one, so there is a `Name` cell to stand on and type
+                // into. The type cell is there whether or not a type is, the
+                // way a TypeCast's is.
                 name: String::new(),
-                r#type: crate::model::r#type::EType::Int { value: None },
+                r#type: None,
                 output_anchor: output_anchor_id,
             },
         );

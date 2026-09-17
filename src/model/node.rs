@@ -48,7 +48,20 @@ pub enum ENode {
     },
     Source {
         name: String,
-        r#type: super::r#type::EType,
+        /// The type every value handed in at this Source will be one of.
+        ///
+        /// `None` only while the node is still being built. A Source is built
+        /// before its type is typed, and a default written here would put a
+        /// declaration on the node that nobody made — so it carries none, is
+        /// drawn grey, and the editor keeps it marked as unfinished until a
+        /// type is given or an Escape takes the whole node away again. A
+        /// Source that declares nothing is never left standing: every value
+        /// handed in at one has to be a value of *something*, and the
+        /// evaluation prompt would have nothing to parse an answer as.
+        ///
+        /// Optional for the same reason a `TypeCast`'s is, then, but not for
+        /// as long: a cast with no target may stay in the graph and fail there.
+        r#type: Option<super::r#type::EType>,
         output_anchor: super::anchor::Id,
     },
     Match {

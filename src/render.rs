@@ -592,6 +592,74 @@ enum Lettering {
     Silent,
 }
 
+/// How much of its cell a strand stack fills along Z, and on which side.
+///
+/// An anchor takes the half of its cell that faces the node body, so it hangs
+/// off the thing it belongs to instead of floating mid-cell — which is what
+/// makes the cell centre its outward face, the point an edge meets. A cell that
+/// *is* the connection takes the whole of its cell instead: nothing hangs off
+/// anything there, and a half-cell band would read as a stub with a gap behind
+/// it rather than as a value running through.
+#[derive(Clone, Copy)]
+enum Span {
+    /// The half facing the node body: cell-local `0.5..1` for an input,
+    /// `0..0.5` for an output. Since layout +Z is world −Z that is the world
+    /// −Z half for an input and the +Z half for an output, and both meet the
+    /// cell centre.
+    AnchorHalf { is_input: bool },
+    /// The whole cell, centred on it. What a Source's declared type takes —
+    /// the value runs through that cell on its way into the body rather than
+    /// stopping inside it.
+    WholeCell,
+}
+
+impl Span {
+    /// The half an input takes: the one behind it, where its node's body is.
+    const fn input() -> Self {
+        Span::AnchorHalf { is_input: true }
+    }
+
+    /// The half an output takes: the one in front of it, for the same reason.
+    const fn output() -> Self {
+        Span::AnchorHalf { is_input: false }
+    }
+
+    /// Depth of the sheet along Z.
+    fn depth(self) -> f32 {
+        match self {
+            Span::AnchorHalf { .. } => ANCHOR_DEPTH,
+            Span::WholeCell => CELL,
+        }
+    }
+
+    /// Direction from the sheet's centre toward its far end — the tip a
+    /// literal's label is written past.
+    fn sign(self) -> f32 {
+        match self {
+            Span::AnchorHalf { is_input } => {
+                if is_input {
+                    -1.0
+                } else {
+                    1.0
+                }
+            }
+            // The same direction an input's points, and for the same reason:
+            // layout +Z is world −Z, so this is the end the body lies behind.
+            Span::WholeCell => -1.0,
+        }
+    }
+
+    /// World Z of the sheet's centre, given the world Z of its cell's centre.
+    fn z_center(self, cell_center_z: f32) -> f32 {
+        match self {
+            // The cell centre is the anchor's outward face, so the sheet lies
+            // wholly within its own half, starting there.
+            Span::AnchorHalf { .. } => cell_center_z + self.sign() * ANCHOR_HALF_DEPTH,
+            Span::WholeCell => cell_center_z,
+        }
+    }
+}
+
 /// Build the stack of translucent type rectangles at an anchor.
 ///
 /// `anchor_world_pos` is the world centre of the anchor's **first row** cell.
@@ -599,9 +667,9 @@ enum Lettering {
 /// `leaf_row_offset`), so the stack grows downward from the anchor's address
 /// rather than being centred on it.
 ///
-/// In Z each rect fills the half of its cell facing the node body — the far
-/// half for an input, the near half for an output — so the stack hangs off the
-/// node rather than floating mid-cell. `is_input` picks the side.
+/// In Z each rect fills whatever `span` says of its cell — the half facing the
+/// node body for an anchor, the whole of it for a cell that is itself the
+/// connection.
 ///
 /// `graph_value` is the graph-level literal on the anchor's type, if any. When
 /// present the band is dropped entirely and the leaf is drawn as a single
@@ -629,21 +697,19 @@ fn build_anchor_strands(
     graph_value: Option<&str>,
     taken: Option<&crate::infer::EType>,
     anchor_world_pos: Vec3,
-    is_input: bool,
+    span: Span,
     lettering: Lettering,
 ) -> Vec<RenderStrand> {
     let rows = drawn_rows(t, taken);
     if rows.is_empty() {
         return vec![];
     }
-    // Direction the anchor body extends from the cell centre: toward the node,
-    // i.e. −Z for an input (cell-local 0.5..1) and +Z for an output (0..0.5).
-    let sign = if is_input { -1.0 } else { 1.0 };
-    let full_depth = ANCHOR_DEPTH;
-    // The cell centre is the anchor's outward face — the point its edge meets —
-    // so every span is measured from there into the anchor's own half.
-    let full_rect_z_center = anchor_world_pos.z + sign * ANCHOR_HALF_DEPTH;
-    let line_tip_z = anchor_world_pos.z + sign * full_depth;
+    // Where the sheet lies within its cell and which way its far end points —
+    // see `Span`, which is the one place that decides both.
+    let sign = span.sign();
+    let full_depth = span.depth();
+    let full_rect_z_center = span.z_center(anchor_world_pos.z);
+    let line_tip_z = full_rect_z_center + sign * full_depth * 0.5;
 
     rows.into_iter()
         .map(|(k, leaf)| {
@@ -753,14 +819,21 @@ fn typed_anchor(
     is_input: bool,
     lettering: Lettering,
 ) -> RenderAnchor {
-    let strands = build_anchor_strands(t, graph_value, taken, cell_center, is_input, lettering);
+    let strands = build_anchor_strands(
+        t,
+        graph_value,
+        taken,
+        cell_center,
+        Span::AnchorHalf { is_input },
+        lettering,
+    );
     RenderAnchor {
         // The cell centre is the anchor's outward face, so edges meet it there
         // no matter how many rows the anchor spans.
         pick_center: cell_center,
         plain_body: strands
             .is_empty()
-            .then(|| plain_anchor_body(cell_center, is_input)),
+            .then(|| plain_anchor_body(cell_center, Span::AnchorHalf { is_input })),
         strands,
     }
 }
@@ -789,6 +862,7 @@ fn typed_anchor(
 fn declared_type_cell(
     r#type: Option<&crate::model::r#type::EType>,
     cell_center: Vec3,
+    span: Span,
     lettering: Lettering,
 ) -> (Vec<RenderStrand>, Vec<RenderObject>) {
     let eval_type = r#type
@@ -802,12 +876,12 @@ fn declared_type_cell(
         literal.as_deref(),
         None,
         cell_center,
-        true,
+        span,
         lettering,
     );
     let objects = strands
         .is_empty()
-        .then(|| plain_anchor_body(cell_center, true))
+        .then(|| plain_anchor_body(cell_center, span))
         .into_iter()
         .collect();
     (strands, objects)
@@ -817,16 +891,16 @@ fn declared_type_cell(
 /// (unconstrained inputs, pending outputs), so they stay visible and pickable.
 /// `cell_center` is the anchor cell's centre; the sheet fills that cell's
 /// body-facing half, like a strand would.
-fn plain_anchor_body(cell_center: Vec3, is_input: bool) -> RenderObject {
-    // Same half of the cell a strand would occupy, so a typeless anchor
-    // hangs off its node exactly like a typed one.
-    let sign = if is_input { -1.0 } else { 1.0 };
-    let center = cell_center + Vec3::new(0.0, 0.0, sign * ANCHOR_DEPTH * 0.5);
+fn plain_anchor_body(cell_center: Vec3, span: Span) -> RenderObject {
+    // Exactly the stretch of cell a strand would occupy, so a typeless anchor
+    // hangs off its node like a typed one and a typeless connection runs its
+    // cell's whole length like a typed one.
+    let center = Vec3::new(cell_center.x, cell_center.y, span.z_center(cell_center.z));
     RenderObject {
         // Flat in X for the reason the typed bands are — see
         // `build_anchor_strands`. A grey anchor is the same shape as a
         // coloured one, undecided rather than different.
-        mesh: Cuboid::new(0.0, STRAND_BAND_HEIGHT, ANCHOR_DEPTH)
+        mesh: Cuboid::new(0.0, STRAND_BAND_HEIGHT, span.depth())
             .mesh()
             .build(),
         material: StandardMaterial {
@@ -875,16 +949,18 @@ pub fn layoutnode_to_rendernode(
     };
     let node = graph.nodes.get(&layout_node.node_id).unwrap();
     match node {
-        // A named declaration: an opaque body in the colour of its type, as
-        // long as its name needs, with the name printed on the top face and
-        // the output anchor one cell behind the body's end.
+        // Three things in a row: the type it declares, drawn as a band on a
+        // cell of its own the way every declared type is; behind that an opaque
+        // body in the colour of that type, as long as its name needs and with
+        // the name printed on the top face; behind that the output anchor.
         crate::model::node::ENode::Source {
             name,
             r#type,
             output_anchor,
         } => {
-            let depth = crate::layout::name_body_cells(name);
-            let output_world = cell(0, 0, depth);
+            let name_depth = crate::layout::name_body_cells(name);
+            let type_world = cell(0, 0, crate::layout::SOURCE_TYPE_Z);
+            let output_world = cell(0, 0, crate::layout::SOURCE_NAME_Z + name_depth);
             // Base type, literal stripped: what a Source produces comes from
             // the evaluation prompt, so a literal written on it types nothing
             // (see `infer::anchor_type`). The literal is still *shown* — it
@@ -895,18 +971,30 @@ pub fn layoutnode_to_rendernode(
             // because this is the one node whose written literal was never the
             // value: what a run hands on is the prompt's answer, and that is
             // what a Source shows once it has actually handed it on. Not
-            // before — the cell in front of the body carries what is waiting,
+            // before — the cell in front of the node carries what is waiting,
             // and this one carries what left.
-            let output_eval_type =
-                crate::infer::base_type_of(&crate::infer::graph_type_to_eval_type(r#type));
+            //
+            // `Pending` while nothing is declared, the way an unchosen arm or
+            // cast target is: the node is drawn grey and says so rather than
+            // wearing a type nobody gave it.
+            let output_eval_type = r#type
+                .as_ref()
+                .map(|t| crate::infer::base_type_of(&crate::infer::graph_type_to_eval_type(t)))
+                .unwrap_or(crate::infer::EType::Pending);
             let output_value = crate::infer::anchor_literal(flat_graph, output_anchor, known);
             // A Source has no input in the graph — it *is* where a value comes
             // in from outside — but the value has to be seen arriving
             // somewhere, so one is drawn all the same, one cell in front of the
-            // body. It says the type the Source declares and carries the index
+            // node. It says the type the Source declares and carries the index
             // the evaluation prompt asks by, which is otherwise written down
             // nowhere: the index is the lateral order, so it is read off the
             // node's place rather than off the node.
+            //
+            // It says the same type the cell behind it does, and that is not a
+            // repetition: this one is what the world offers, that one what the
+            // program asks for. While nothing is running they agree and the
+            // pair reads as one statement made twice; a run is exactly when
+            // they come apart.
             //
             // Visual only. It is not in `anchors`, so no edge can end here and
             // the pointer cannot pick it, and it claims no cell: layout Z=0 is
@@ -923,9 +1011,9 @@ pub fn layoutnode_to_rendernode(
             // volume, in front of the node: what stands on it is the world's
             // and not the program's, so it may carry the answer from the moment
             // it is typed — which is the whole of what step 0 shows. The output
-            // anchor a body's length behind stays a band until the Source is
-            // actually evaluated, and the distance between the two is the step
-            // that carries the value across.
+            // anchor at the far end of the node stays a band until the Source
+            // is actually evaluated, and the distance between the two is the
+            // step that carries the value across.
             //
             // Read off the node, `offered_at`, and not off an anchor: this cell
             // has none. That is why a value may stand on it without the program
@@ -936,7 +1024,7 @@ pub fn layoutnode_to_rendernode(
                 offered.and_then(crate::infer::leaf_literal),
                 offered,
                 input_world,
-                true,
+                Span::input(),
                 Lettering::Spelled,
             );
             // Where `build_anchor_strands` puts the first row's type letter: the
@@ -963,17 +1051,41 @@ pub fn layoutnode_to_rendernode(
             // back to 1.0 here, because strands were translucent and a body is
             // not; strands are opaque now, so the two agree by construction.
             let body_color = strand_color(&output_eval_type);
+            // The type the Source declares, on the cell that declares it — the
+            // same band a Pattern's arm and a TypeCast's target wear, drawn by
+            // the same helper, because it is the same act: a type hung on a
+            // cell the node owns rather than on an anchor.
+            //
+            // `WholeCell`: this cell is not an anchor hanging off a body, it
+            // is the length the value travels before it reaches the name, so
+            // the band runs the cell's whole depth. It meets the drawn-only
+            // band in front of it and the body's face behind it, and the three
+            // read as one run rather than as a stub with a gap either side.
+            //
+            // `Silent` for that same reason: the band it runs out of has
+            // already spelled the type, and one word along a single run is
+            // enough.
+            let (type_strands, type_objects) = declared_type_cell(
+                r#type.as_ref(),
+                type_world,
+                Span::WholeCell,
+                Lettering::Silent,
+            );
             let cell_x = LAYOUT_SCALE.x.abs();
             let cell_y = LAYOUT_SCALE.y.abs();
             let cell_z = LAYOUT_SCALE.z.abs();
             // Midpoint of the first and last body cell — no sign juggling, and
-            // it stays right whichever way `LAYOUT_SCALE` points.
-            let body_center = (cell(0, 0, 0) + cell(0, 0, depth - 1)) * 0.5;
+            // it stays right whichever way `LAYOUT_SCALE` points. The body
+            // begins behind the type cell, so what this spans is the name's
+            // cells and not the node's whole length.
+            let body_center = (cell(0, 0, crate::layout::SOURCE_NAME_Z)
+                + cell(0, 0, crate::layout::SOURCE_NAME_Z + name_depth - 1))
+                * 0.5;
             // One cell tall: a Source declares a leaf type, never a sum, so
             // its output is always a single row. Were that ever to change, the
             // body would follow `anchor_rows` the way a FunctionCall's far
             // face does.
-            let body_size = Vec3::new(cell_x, cell_y, depth as f32 * cell_z);
+            let body_size = Vec3::new(cell_x, cell_y, name_depth as f32 * cell_z);
             // Layout Y=0 is the body's upper bound and layout +Y is world −Y,
             // so the top face lies half a cell *above* the centre in world
             // terms.
@@ -991,7 +1103,9 @@ pub fn layoutnode_to_rendernode(
             let name_face = RenderTextFace {
                 // Width runs along local +X, height along local +Y; the
                 // rotation below maps those onto world −Z and −X.
-                mesh: Rectangle::new(depth as f32 * cell_z, cell_x).mesh().build(),
+                mesh: Rectangle::new(name_depth as f32 * cell_z, cell_x)
+                    .mesh()
+                    .build(),
                 transform: Transform {
                     translation: Vec3::new(body_center.x, top_y + BODY_FACE_LIFT, body_center.z),
                     // A `Rectangle` is built in the XY plane. Laying it flat
@@ -1007,7 +1121,7 @@ pub fn layoutnode_to_rendernode(
                 },
                 material: face_material(),
                 text: name.clone(),
-                cells: depth as u32,
+                cells: name_depth as u32,
                 background: body_color,
             };
             RenderNode {
@@ -1030,19 +1144,21 @@ pub fn layoutnode_to_rendernode(
                             // already turns the one it has into a line.
                             None,
                             output_world,
-                            false,
+                            Span::output(),
                             Lettering::Spelled,
                         ),
                         plain_body: None,
                     },
                 )]),
-                // The drawn-only input anchor belongs to the node itself, not
-                // to an anchor of it — the same place a Pattern's band lives.
-                strands: input_strands,
-                objects: vec![],
-                // The name is on the body now, and the type is in the body's
-                // colour and at the output anchor — the index is the one thing
-                // left that has to be written beside the node.
+                // Neither band hangs off an anchor, so both belong to the node
+                // itself — the same place a Pattern's band lives. The one in
+                // front says what arrives from outside, the one behind it what
+                // the Source declares it will be.
+                strands: input_strands.into_iter().chain(type_strands).collect(),
+                objects: type_objects,
+                // The name is on the body, and the type is on the cell in
+                // front of it and in the body's colour — the index is the one
+                // thing left that has to be written beside the node.
                 labels: index_label.into_iter().collect(),
                 text_faces: vec![name_face],
             }
@@ -1111,7 +1227,7 @@ pub fn layoutnode_to_rendernode(
                             // narrows one: it has always been the line it is.
                             None,
                             output_world,
-                            false,
+                            Span::output(),
                             Lettering::Spelled,
                         ),
                         plain_body: None,
@@ -1176,6 +1292,7 @@ pub fn layoutnode_to_rendernode(
             let (strands, objects) = declared_type_cell(
                 r#type.as_ref(),
                 body_world,
+                Span::input(),
                 if output_anchor_render.strands.is_empty() {
                     Lettering::Spelled
                 } else {
@@ -1211,7 +1328,7 @@ pub fn layoutnode_to_rendernode(
                             None => RenderAnchor {
                                 pick_center: input_world,
                                 strands: vec![],
-                                plain_body: Some(plain_anchor_body(input_world, true)),
+                                plain_body: Some(plain_anchor_body(input_world, Span::input())),
                             },
                         },
                     ),
@@ -1366,7 +1483,7 @@ pub fn layoutnode_to_rendernode(
                                 None => RenderAnchor {
                                     pick_center: input_world,
                                     strands: vec![],
-                                    plain_body: Some(plain_anchor_body(input_world, true)),
+                                    plain_body: Some(plain_anchor_body(input_world, Span::input())),
                                 },
                             },
                         )
@@ -1448,7 +1565,7 @@ pub fn layoutnode_to_rendernode(
                 None => RenderAnchor {
                     pick_center: input_world,
                     strands: vec![],
-                    plain_body: Some(plain_anchor_body(input_world, true)),
+                    plain_body: Some(plain_anchor_body(input_world, Span::input())),
                 },
             };
             // Mirror of the drawn-only input a Source hangs against the front
@@ -1476,7 +1593,7 @@ pub fn layoutnode_to_rendernode(
                             incoming_value.as_deref(),
                             known.at_input(flat_graph, input_anchor),
                             outgoing_world,
-                            false,
+                            Span::output(),
                             Lettering::Spelled,
                         )
                     })
@@ -1497,7 +1614,7 @@ pub fn layoutnode_to_rendernode(
             // `declared_type_cell` folds them.
             let outgoing_objects: Vec<RenderObject> = (is_program_sink
                 && outgoing_strands.is_empty())
-            .then(|| plain_anchor_body(outgoing_world, false))
+            .then(|| plain_anchor_body(outgoing_world, Span::output()))
             .into_iter()
             .collect();
             RenderNode {
@@ -1522,6 +1639,7 @@ pub fn layoutnode_to_rendernode(
             let (strands, objects) = declared_type_cell(
                 r#type.as_ref(),
                 pattern_band_world(layout_node, extra_offset),
+                Span::input(),
                 Lettering::Silent,
             );
             RenderNode {
@@ -1661,7 +1779,7 @@ pub fn layoutnode_to_rendernode(
                             None => RenderAnchor {
                                 pick_center: input_world,
                                 strands: vec![],
-                                plain_body: Some(plain_anchor_body(input_world, true)),
+                                plain_body: Some(plain_anchor_body(input_world, Span::input())),
                             },
                         },
                     ),
@@ -1713,12 +1831,18 @@ pub fn label_for_node(
             .name
             .to_string(),
         crate::model::node::ENode::Constant { r#type, .. } => r#type.to_string(),
-        crate::model::node::ENode::Source { name, r#type, .. } => {
-            format!("{}: {}", name, r#type.to_string())
-        }
+        crate::model::node::ENode::Source { name, r#type, .. } => format!(
+            "{}: {}",
+            name,
+            r#type
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "?".to_string())
+        ),
         crate::model::node::ENode::Match { .. } => "match".to_string(),
-        // The two that may not have been typed yet. A question mark rather than
-        // a type name, because there is no type to name.
+        // The other two that may not have been typed yet — a Source is the
+        // third, above. A question mark rather than a type name, because there
+        // is no type to name.
         crate::model::node::ENode::TypeCast { r#type, .. }
         | crate::model::node::ENode::Pattern { r#type, .. } => r#type
             .as_ref()
