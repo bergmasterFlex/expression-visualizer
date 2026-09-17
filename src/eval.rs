@@ -61,27 +61,28 @@ impl State {
         }
     }
 
-    pub fn new(
-        graph: &crate::model::term_graph::TermGraph,
-        user_source_values: &std::collections::HashMap<crate::model::node::Id, EValue>,
-        function_declarations: &std::collections::HashMap<
-            crate::model::function_declaration::FunctionDeclarationId,
-            crate::model::function_declaration::FunctionDeclaration,
-        >,
-    ) -> Result<Self, Vec<String>> {
-        graph
-            .nodes
-            .get(&graph.sink_node_id)
-            .cloned()
-            .ok_or(vec![format!("sink node {} not found", graph.sink_node_id)])
-            .and_then(|sink_node| {
-                Self::empty().eval_next_step(
-                    graph,
-                    user_source_values,
-                    (graph.sink_node_id.clone(), sink_node),
-                    function_declarations,
-                )
-            })
+    /// The step before the first: the answers to the prompt waiting at the
+    /// program's edges, and nothing read yet.
+    ///
+    /// A run used to open on its own first step, with the leaves already
+    /// resolved — which put the answers on screen in the same breath as the
+    /// first thing computed from them, and there was no moment at which the
+    /// program merely stood there with its inputs in place. This is that
+    /// moment.
+    ///
+    /// And it is empty, which is the point. The values are *outside* the
+    /// program here: a Source hands its value on by being evaluated, and it has
+    /// not been. They live in `EvalPhase::Running::user_source_values`, which
+    /// is where the drawing reads them to stand them against the front of each
+    /// Source (`infer::Known::offered_at`) — waiting at the door rather than
+    /// through it. Step 1 is what carries them across, and only for the Sources
+    /// the Sink actually asks for: `eval_next_step` walks back from the Sink,
+    /// so a Source nothing demands is answered at the prompt and never read.
+    ///
+    /// A named state and not simply `empty()` because the distinction is worth
+    /// a name: this is not the absence of a run, it is a run at rest.
+    pub fn nothing_yet() -> Self {
+        Self::empty()
     }
 
     pub fn eval_next_step(
@@ -778,6 +779,36 @@ impl State {
     pub fn is_evaluated(&self, graph: &crate::model::term_graph::TermGraph) -> bool {
         self.node_ids_to_values.contains_key(&graph.sink_node_id)
     }
+
+    /// This snapshot in the terms the drawing reads: every node that has
+    /// produced a value, with the literal type that value *is*.
+    ///
+    /// Produced, and so nothing at step 0: a value waiting at a Source has not
+    /// been handed on, and nothing downstream of it is narrowed by it. What is
+    /// waiting travels the other channel — `infer::Known::offering`.
+    ///
+    /// The whole snapshot and not the step's own frontier — evaluation
+    /// accumulates literals, and a value already read off does not stop being
+    /// the value. What *just* happened is said elsewhere, by the step counter
+    /// and by the labels beside the nodes the last press resolved.
+    ///
+    /// The trace is left behind: it says why a `none` happened, which is a fact
+    /// about the run rather than about the value, and nothing narrows by it.
+    pub fn known(&self) -> crate::infer::Known {
+        crate::infer::Known::of(literal_types(&self.node_ids_to_values))
+    }
+}
+
+/// Values as the types they are, which is the only form the drawing reads them
+/// in. Shared by the two channels into `infer::Known` — what a run has proved,
+/// and what is merely waiting at a Source — so the two cannot come to disagree
+/// about what a value's type is.
+pub fn literal_types(
+    values: &std::collections::HashMap<crate::model::node::Id, EValue>,
+) -> impl Iterator<Item = (crate::model::node::Id, crate::infer::EType)> + '_ {
+    values
+        .iter()
+        .map(|(node_id, value)| (node_id.clone(), value.literal_type()))
 }
 
 impl std::fmt::Display for EValue {
@@ -821,6 +852,24 @@ impl EValue {
             // A Source declared `none` has exactly one possible value, so
             // whatever was typed there says nothing and is dropped.
             crate::model::r#type::EType::None { .. } => Ok(EValue::None),
+        }
+    }
+
+    /// The type this value *is*: its kind, pinned to its own spelling.
+    ///
+    /// The inverse of `parse`, and the reason evaluation can be drawn at all —
+    /// a value narrows the anchor it stands on from a type to itself, which is
+    /// the difference between a band and a line (`render::leaf_is_drawn_as_line`).
+    ///
+    /// `none` pins nothing: its value is its type, so there is no spelling to
+    /// attach that the type does not already carry.
+    pub fn literal_type(&self) -> crate::infer::EType {
+        match self {
+            EValue::Bool(value) => crate::infer::EType::Bool(Some(value.to_string())),
+            EValue::Int(value) => crate::infer::EType::Int(Some(value.to_string())),
+            EValue::String(value) => crate::infer::EType::String(Some(value.clone())),
+            EValue::Char(value) => crate::infer::EType::Char(Some(value.to_string())),
+            EValue::None => crate::infer::EType::None,
         }
     }
 

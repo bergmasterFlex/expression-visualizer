@@ -442,6 +442,46 @@ pub fn ordered_supported_leaves(t: &crate::infer::EType) -> Vec<crate::infer::ET
     leaves
 }
 
+/// The rows an anchor draws, each paired with the row index it owns.
+///
+/// Without a run this is `ordered_supported_leaves` and its own indices: every
+/// leaf of the declared type, in stacking order.
+///
+/// A run that has reached this anchor drops the rows it did not take. A
+/// `Char|None` that produced `'b'` never went down the `none` row, and drawing
+/// that row would say the outcome is still open when it has been settled. What
+/// stays is the row the value landed on — narrowed to the value, so it is drawn
+/// as a line rather than as a band.
+///
+/// The index travels with it rather than being recounted, and that is the whole
+/// point of returning pairs. The layout reserved cells from the *declared* type
+/// (`infer::anchor_rows`, deliberately blind to any run — see `infer::Known`),
+/// so a surviving row that slid up to position 0 would leave its strand hanging
+/// off the node and miss every ribbon aimed at it.
+///
+/// Which row the value landed on is asked with `infer::types_match`, the
+/// comparison that ignores literals and asks only what *kind* of thing this is
+/// — `30` lands on the `Integer` row. A value matching no declared row can only
+/// come of a graph edited between two steps; the run is then talking about a
+/// node that no longer exists as it was, and the written type is the better
+/// answer than an empty cell, so every row is kept.
+pub fn drawn_rows(
+    declared: &crate::infer::EType,
+    taken: Option<&crate::infer::EType>,
+) -> Vec<(usize, crate::infer::EType)> {
+    let rows = ordered_supported_leaves(declared);
+    let Some(taken) = taken else {
+        return rows.into_iter().enumerate().collect();
+    };
+    match rows
+        .iter()
+        .position(|row| crate::infer::types_match(row, taken))
+    {
+        Some(index) => vec![(index, taken.clone())],
+        None => rows.into_iter().enumerate().collect(),
+    }
+}
+
 /// World-space Y of the top and bottom edge of `span` within the leaf row
 /// centred at `row_center_y`.
 ///
@@ -579,15 +619,21 @@ enum Lettering {
 /// bands for the same type stand within a cell or two of each other — a Match's
 /// input, its arm, the branch source behind it — only one of them needs the
 /// word, and the rest read better without it.
+///
+/// `taken` is the row a run settled on, `None` where none has. It drops the
+/// rows the run did not take while leaving the taken one on the index it always
+/// had — see `drawn_rows`, which both this and the ribbons meeting it go
+/// through.
 fn build_anchor_strands(
     t: &crate::infer::EType,
     graph_value: Option<&str>,
+    taken: Option<&crate::infer::EType>,
     anchor_world_pos: Vec3,
     is_input: bool,
     lettering: Lettering,
 ) -> Vec<RenderStrand> {
-    let leaves = ordered_supported_leaves(t);
-    if leaves.is_empty() {
+    let rows = drawn_rows(t, taken);
+    if rows.is_empty() {
         return vec![];
     }
     // Direction the anchor body extends from the cell centre: toward the node,
@@ -599,9 +645,8 @@ fn build_anchor_strands(
     let full_rect_z_center = anchor_world_pos.z + sign * ANCHOR_HALF_DEPTH;
     let line_tip_z = anchor_world_pos.z + sign * full_depth;
 
-    leaves
+    rows
         .into_iter()
-        .enumerate()
         .map(|(k, leaf)| {
             let y_center = anchor_world_pos.y + leaf_row_offset(k);
             let color = strand_color(&leaf);
@@ -704,11 +749,12 @@ fn build_anchor_strands(
 fn typed_anchor(
     t: &crate::infer::EType,
     graph_value: Option<&str>,
+    taken: Option<&crate::infer::EType>,
     cell_center: Vec3,
     is_input: bool,
     lettering: Lettering,
 ) -> RenderAnchor {
-    let strands = build_anchor_strands(t, graph_value, cell_center, is_input, lettering);
+    let strands = build_anchor_strands(t, graph_value, taken, cell_center, is_input, lettering);
     RenderAnchor {
         // The cell centre is the anchor's outward face, so edges meet it there
         // no matter how many rows the anchor spans.
@@ -750,8 +796,16 @@ fn declared_type_cell(
         .map(crate::infer::graph_type_to_eval_type)
         .unwrap_or(crate::infer::EType::Pending);
     let literal = r#type.and_then(crate::layout::value_of_etype);
-    let strands =
-        build_anchor_strands(&eval_type, literal.as_deref(), cell_center, true, lettering);
+    // No `taken`: a declared cell says what the program asks for, and a run
+    // narrows what *arrives*, never what was asked.
+    let strands = build_anchor_strands(
+        &eval_type,
+        literal.as_deref(),
+        None,
+        cell_center,
+        true,
+        lettering,
+    );
     let objects = strands
         .is_empty()
         .then(|| plain_anchor_body(cell_center, true))
@@ -807,6 +861,10 @@ pub fn layoutnode_to_rendernode(
         crate::model::function_declaration::FunctionDeclarationId,
         crate::model::function_declaration::FunctionDeclaration,
     >,
+    // What a run has narrowed, `Known::nothing()` while none is going. Only
+    // the literals are read from it: an anchor's rows are the ones its declared
+    // type reserved, evaluated or not, so the node keeps its footprint.
+    known: &crate::infer::Known,
     extra_offset: Vec3,
 ) -> RenderNode {
     let graph = &layout_graph.graph;
@@ -833,9 +891,16 @@ pub fn layoutnode_to_rendernode(
             // (see `infer::anchor_type`). The literal is still *shown* — it
             // travels beside the type as `output_value` and the output anchor
             // draws it as a line, the way any pinned value is drawn.
+            //
+            // Asked of the anchor rather than read off the declaration,
+            // because this is the one node whose written literal was never the
+            // value: what a run hands on is the prompt's answer, and that is
+            // what a Source shows once it has actually handed it on. Not
+            // before — the cell in front of the body carries what is waiting,
+            // and this one carries what left.
             let output_eval_type =
                 crate::infer::base_type_of(&crate::infer::graph_type_to_eval_type(r#type));
-            let output_value = crate::layout::value_of_etype(r#type);
+            let output_value = crate::infer::anchor_literal(flat_graph, output_anchor, known);
             // A Source has no input in the graph — it *is* where a value comes
             // in from outside — but the value has to be seen arriving
             // somewhere, so one is drawn all the same, one cell in front of the
@@ -849,13 +914,28 @@ pub fn layoutnode_to_rendernode(
             // the scope's first row, so this hangs outside the volume, against
             // its front face.
             let input_world = cell(0, 0, -1);
-            // The declared type and nothing else, even where the Source carries
-            // a literal: a literal on a Source is not the value it is evaluated
-            // with — that one comes from the prompt — and the output anchor
-            // already shows it. What arrives here is a value *of this type*.
+            // The declared type and nothing else while the program is only
+            // written: a literal on a Source is not the value it is evaluated
+            // with — that one comes from the prompt — so what arrives here is
+            // a value *of this type* and nothing narrower can be said.
+            //
+            // A run answered at the prompt says something narrower, and says it
+            // *here* before it says it anywhere. This cell is outside the
+            // volume, in front of the node: what stands on it is the world's
+            // and not the program's, so it may carry the answer from the moment
+            // it is typed — which is the whole of what step 0 shows. The output
+            // anchor a body's length behind stays a band until the Source is
+            // actually evaluated, and the distance between the two is the step
+            // that carries the value across.
+            //
+            // Read off the node, `offered_at`, and not off an anchor: this cell
+            // has none. That is why a value may stand on it without the program
+            // having read it — there is nothing here for an edge to reach.
+            let offered = known.offered_at(&layout_node.node_id);
             let input_strands = build_anchor_strands(
                 &output_eval_type,
-                None,
+                offered.and_then(crate::infer::leaf_literal),
+                offered,
                 input_world,
                 true,
                 Lettering::Spelled,
@@ -946,6 +1026,10 @@ pub fn layoutnode_to_rendernode(
                         strands: build_anchor_strands(
                             &output_eval_type,
                             output_value.as_deref(),
+                            // A Source declares one leaf, so there is no second
+                            // row a run could drop — and the literal beside it
+                            // already turns the one it has into a line.
+                            None,
                             output_world,
                             false,
                             Lettering::Spelled,
@@ -1023,6 +1107,10 @@ pub fn layoutnode_to_rendernode(
                         strands: build_anchor_strands(
                             &output_eval_type,
                             output_value.as_deref(),
+                            // A Constant declares one leaf and is its own
+                            // value, so a run neither drops a row here nor
+                            // narrows one: it has always been the line it is.
+                            None,
                             output_world,
                             false,
                             Lettering::Spelled,
@@ -1070,6 +1158,7 @@ pub fn layoutnode_to_rendernode(
             let output_anchor_render = typed_anchor(
                 &output_eval_type,
                 elim_value.as_deref(),
+                known.at_output(flat_graph, output_anchor),
                 output_world,
                 false,
                 Lettering::Spelled,
@@ -1105,7 +1194,20 @@ pub fn layoutnode_to_rendernode(
                             // A typecast constrains nothing, so its input shows
                             // whatever arrives — and a neutral body when idle.
                             Some(t) => {
-                                typed_anchor(&t, None, input_world, true, Lettering::Spelled)
+                                // The row a run settled on, and its word read
+                                // off that row rather than fetched upstream: an
+                                // unevaluated cast input shows the type that
+                                // arrives and never the literal behind it, and
+                                // that is not a run's business to change.
+                                let taken = known.at_input(flat_graph, input_anchor);
+                                typed_anchor(
+                                    &t,
+                                    taken.and_then(crate::infer::leaf_literal),
+                                    taken,
+                                    input_world,
+                                    true,
+                                    Lettering::Spelled,
+                                )
                             }
                             None => RenderAnchor {
                                 pick_center: input_world,
@@ -1244,12 +1346,24 @@ pub fn layoutnode_to_rendernode(
                                 function_declarations,
                             )
                         });
+                        // A parameter owns no literal — a declaration says
+                        // what may arrive, never what does — and a written
+                        // graph leaves it at that. A run does not: what arrived
+                        // is settled, so the row it arrived on carries its
+                        // word, read off that row and fetched from nowhere
+                        // else.
+                        let arriving = known.at_input(flat_graph, anchor_id);
                         (
                             anchor_id.clone(),
                             match shown {
-                                Some(t) => {
-                                    typed_anchor(&t, None, input_world, true, Lettering::Spelled)
-                                }
+                                Some(t) => typed_anchor(
+                                    &t,
+                                    arriving.and_then(crate::infer::leaf_literal),
+                                    arriving,
+                                    input_world,
+                                    true,
+                                    Lettering::Spelled,
+                                ),
                                 None => RenderAnchor {
                                     pick_center: input_world,
                                     strands: vec![],
@@ -1262,7 +1376,14 @@ pub fn layoutnode_to_rendernode(
                         output_anchor.clone(),
                         typed_anchor(
                             &function_declaration.output_type,
-                            None,
+                            // A call as written carries no literal: its output
+                            // is whatever the declaration promises. A call that
+                            // has *run* carries one, and then the promise is
+                            // beside the point — `*` that produced `30` is a
+                            // `30` and draws as the line one is.
+                            crate::infer::anchor_literal(flat_graph, output_anchor, known)
+                                .as_deref(),
+                            known.at_output(flat_graph, output_anchor),
                             output_world,
                             false,
                             Lettering::Spelled,
@@ -1307,7 +1428,8 @@ pub fn layoutnode_to_rendernode(
             // is drawn as the value. So the literal is read off the anchor
             // upstream, the one that does own it, and the Sink shows what
             // actually arrived rather than the shape of what might have.
-            let incoming_value = crate::infer::incoming_anchor_literal(flat_graph, input_anchor);
+            let incoming_value =
+                crate::infer::incoming_anchor_literal(flat_graph, input_anchor, known);
             // The Sink's own anchor says nothing in words. Whatever reaches it
             // was already named by the anchor it left — a Sink adds no step, it
             // only ends one — and inside a branch it stands two cells from the
@@ -1319,6 +1441,7 @@ pub fn layoutnode_to_rendernode(
                 Some(t) => typed_anchor(
                     t,
                     incoming_value.as_deref(),
+                    known.at_input(flat_graph, input_anchor),
                     input_world,
                     true,
                     Lettering::Silent,
@@ -1352,6 +1475,7 @@ pub fn layoutnode_to_rendernode(
                         build_anchor_strands(
                             t,
                             incoming_value.as_deref(),
+                            known.at_input(flat_graph, input_anchor),
                             outgoing_world,
                             false,
                             Lettering::Spelled,
@@ -1419,7 +1543,7 @@ pub fn layoutnode_to_rendernode(
             let output_eval_type =
                 crate::infer::anchor_type(flat_graph, output_anchor, function_declarations)
                     .unwrap_or(crate::infer::EType::Pending);
-            let output_value = crate::infer::anchor_literal(flat_graph, output_anchor);
+            let output_value = crate::infer::anchor_literal(flat_graph, output_anchor, known);
             RenderNode {
                 node: None,
                 anchors: std::collections::HashMap::from([(
@@ -1427,6 +1551,7 @@ pub fn layoutnode_to_rendernode(
                     typed_anchor(
                         &output_eval_type,
                         output_value.as_deref(),
+                        known.at_output(flat_graph, output_anchor),
                         output_world,
                         false,
                         Lettering::Spelled,
@@ -1460,7 +1585,7 @@ pub fn layoutnode_to_rendernode(
             let eval_type =
                 crate::infer::anchor_type(flat_graph, output_anchor, function_declarations)
                     .unwrap_or(crate::infer::EType::Pending);
-            let value = crate::infer::anchor_literal(flat_graph, output_anchor);
+            let value = crate::infer::anchor_literal(flat_graph, output_anchor, known);
             RenderNode {
                 node: None,
                 anchors: std::collections::HashMap::from([
@@ -1469,6 +1594,7 @@ pub fn layoutnode_to_rendernode(
                         typed_anchor(
                             &eval_type,
                             value.as_deref(),
+                            known.at_output(flat_graph, output_anchor),
                             input_world,
                             true,
                             Lettering::Spelled,
@@ -1479,6 +1605,7 @@ pub fn layoutnode_to_rendernode(
                         typed_anchor(
                             &eval_type,
                             value.as_deref(),
+                            known.at_output(flat_graph, output_anchor),
                             output_world,
                             false,
                             Lettering::Spelled,
@@ -1509,7 +1636,8 @@ pub fn layoutnode_to_rendernode(
             // decides the shape the arms are joined to: a value arriving at a
             // Match is a line, and an arm that accepts a whole type is a band,
             // which is what makes the link between them widen along its length.
-            let incoming_value = crate::infer::incoming_anchor_literal(flat_graph, input_anchor);
+            let incoming_value =
+                crate::infer::incoming_anchor_literal(flat_graph, input_anchor, known);
             // The output owns its own cell directly behind the deepest branch;
             // `match_output_z` decides which one. Its type is the union of the
             // branch types, or `Pending` while the inferer cannot decide it.
@@ -1526,6 +1654,7 @@ pub fn layoutnode_to_rendernode(
                             Some(t) => typed_anchor(
                                 &t,
                                 incoming_value.as_deref(),
+                                known.at_input(flat_graph, input_anchor),
                                 input_world,
                                 true,
                                 Lettering::Spelled,
@@ -1541,7 +1670,9 @@ pub fn layoutnode_to_rendernode(
                         output_anchor.clone(),
                         typed_anchor(
                             &output_eval_type,
-                            None,
+                            crate::infer::anchor_literal(flat_graph, output_anchor, known)
+                                .as_deref(),
+                            known.at_output(flat_graph, output_anchor),
                             out_world,
                             false,
                             Lettering::Spelled,

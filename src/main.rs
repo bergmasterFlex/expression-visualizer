@@ -849,6 +849,12 @@ struct NextStepButton;
 #[derive(Component)]
 struct ExitEvaluationButton;
 
+/// The step the bar is standing on, written out beside the buttons that move
+/// it. A snapshot carries no number of its own — `current` indexes the history
+/// — so this is the one place the run says where in itself it is.
+#[derive(Component)]
+struct StepCounterText;
+
 /// World-space text node showing a node's current evaluated value.
 #[derive(Component)]
 struct ValueLabel {
@@ -1009,6 +1015,7 @@ fn spawn_graph_nodes(
     mut materials_edge: ResMut<Assets<edge::EdgeMaterial>>,
     mut images: ResMut<Assets<Image>>,
     state: Res<GraphState>,
+    eval: Res<EvalState>,
     ui_font: Res<UiFont>,
     pick: Res<PickState>,
     editor_mode: Res<EditorMode>,
@@ -1026,6 +1033,20 @@ fn spawn_graph_nodes(
     // lives in the program-level edge table — so flatten once here instead of
     // per anchor, and hand the same view to the renderer and the edge pass.
     let flat_graph = state.root_graph().flattened_graph();
+    // What the run standing on screen has narrowed, and nothing while none is.
+    // Asked once here and handed down, for the same reason the flattened graph
+    // is: every anchor and every ribbon has to read the same answer or the two
+    // ends of a strand disagree about their shape.
+    let known = match &eval.phase {
+        EvalPhase::Running {
+            states,
+            current,
+            user_source_values,
+        } => states[*current]
+            .known()
+            .offering(eval::literal_types(user_source_values)),
+        _ => infer::Known::nothing(),
+    };
     // Rasterising the names printed on body faces needs a font synchronously —
     // see `edge::FONT_BYTES` for why that one bypasses the asset server.
     let glyph_font =
@@ -1061,6 +1082,7 @@ fn spawn_graph_nodes(
             walked.layout_graph,
             &flat_graph,
             &state.function_declarations,
+            &known,
             walked.extra_offset,
         );
         // A node drawn only as strands or loose objects has no mesh of its own;
@@ -1213,7 +1235,12 @@ fn spawn_graph_nodes(
 
         let src_type = infer::anchor_type(&flat_graph, src_id, &state.function_declarations)
             .unwrap_or(infer::EType::Pending);
-        let source_leaves = render::ordered_supported_leaves(&src_type);
+        // The row a run settled this edge's source on, if one has. Read once
+        // and used at both ends: the same narrowing has to reach the target's
+        // rows, or a ribbon would leave a row that is no longer drawn or land
+        // on one that is not there.
+        let taken = known.at_output(&flat_graph, src_id);
+        let source_rows = render::drawn_rows(&src_type, taken);
 
         let curve = edge::EdgeCurve::from_endpoints(from_world, to_world);
 
@@ -1240,7 +1267,7 @@ fn spawn_graph_nodes(
         // and an edge left out reads as an edge never made. One band on the
         // anchors' own row, wearing the grey `plain_anchor_body` gives either
         // end, cut across by the pattern that says the type is still open.
-        if source_leaves.is_empty() {
+        if source_rows.is_empty() {
             spawn_pending_ribbon(
                 &mut commands,
                 &mut meshes,
@@ -1264,31 +1291,34 @@ fn spawn_graph_nodes(
             .or_else(|| {
                 infer::incoming_anchor_type(&flat_graph, tgt_id, &state.function_declarations)
             });
-        let target_leaves = tgt_type
+        let target_rows = tgt_type
             .as_ref()
-            .map(|t| render::ordered_supported_leaves(t))
+            .map(|t| render::drawn_rows(t, taken))
             .unwrap_or_default();
 
         // graph-level literal on the source anchor. When present, the sole
         // rendered leaf swaps to the thin "value line" style — same rule
         // the anchor strands follow, via the same lookup.
-        let src_graph_value = infer::anchor_literal(&flat_graph, src_id);
+        let src_graph_value = infer::anchor_literal(&flat_graph, src_id, &known);
 
-        for (k, leaf) in source_leaves.iter().enumerate() {
+        for (k, leaf) in source_rows.iter() {
             // Same row offsets the anchor strands use, so each ribbon meets
-            // the strand it continues exactly.
-            let y_src = render::leaf_row_offset(k);
+            // the strand it continues exactly — the index comes from
+            // `drawn_rows` rather than from the loop, so a narrowed row is met
+            // where the layout still keeps it.
+            let y_src = render::leaf_row_offset(*k);
             // Which row at the target will accept this strand: the one that
             // admits it. Asked as subsumption rather than by kind because a
             // row may be a literal now — a `1` strand belongs on the `1`
             // row of a `1|2` anchor, not merely on some Integer row.
-            let y_tgt =
-                if let Some(idx) = target_leaves.iter().position(|l| infer::subsumes(l, leaf)) {
-                    render::leaf_row_offset(idx)
-                } else {
-                    // No matching leaf at the target: aim at its first row.
-                    0.0
-                };
+            let y_tgt = match target_rows
+                .iter()
+                .find(|(_, target_leaf)| infer::subsumes(target_leaf, leaf))
+            {
+                Some((idx, _)) => render::leaf_row_offset(*idx),
+                // No matching leaf at the target: aim at its first row.
+                None => 0.0,
+            };
             // A leaf that claims no row of its own — a sum type, or `Pending` —
             // has no strand to draw.
             if edge::leaf_kind_of(leaf).is_none() {
@@ -1345,6 +1375,7 @@ fn spawn_graph_nodes(
         &mut materials_edge,
         &state,
         &flat_graph,
+        &known,
         &anchor_world_positions,
         &declared_band_positions,
     );
@@ -1354,6 +1385,7 @@ fn spawn_graph_nodes(
         &mut materials_edge,
         &state,
         &flat_graph,
+        &known,
         &anchor_world_positions,
         &declared_band_positions,
     );
@@ -3316,23 +3348,21 @@ fn handle_evaluate_button(
                             .collect(),
                     };
                 } else {
-                    let user_source_values = std::collections::HashMap::new();
-                    match eval::State::new(
-                        &graph,
-                        &user_source_values,
-                        &state.function_declarations,
-                    ) {
-                        Ok(initial) => {
-                            eval.phase = EvalPhase::Running {
-                                states: vec![initial],
-                                current: 0,
-                                user_source_values,
-                            };
-                        }
-                        Err(errors) => {
-                            eval.phase = EvalPhase::ErrorModal(errors.join("\n"));
-                        }
-                    }
+                    // A program with no Sources still opens on step 0. There is
+                    // nothing waiting at its edges to look at, which is what a
+                    // program given nothing looks like — and the alternative is
+                    // starting such a run one step in while every other run
+                    // starts at zero, so that the number on screen would mean
+                    // two things.
+                    let user_source_values: std::collections::HashMap<
+                        model::node::Id,
+                        eval::EValue,
+                    > = std::collections::HashMap::new();
+                    eval.phase = EvalPhase::Running {
+                        states: vec![eval::State::nothing_yet()],
+                        current: 0,
+                        user_source_values,
+                    };
                 }
             }
             Interaction::Hovered => {
@@ -4160,22 +4190,11 @@ fn handle_modal_evaluate_button(
                 if !parse_errors.is_empty() {
                     eval.phase = EvalPhase::ErrorModal(parse_errors.join("\n"));
                 } else {
-                    match eval::State::new(
-                        &graph,
-                        &user_source_values,
-                        &state.function_declarations,
-                    ) {
-                        Ok(initial) => {
-                            eval.phase = EvalPhase::Running {
-                                states: vec![initial],
-                                current: 0,
-                                user_source_values,
-                            };
-                        }
-                        Err(errors) => {
-                            eval.phase = EvalPhase::ErrorModal(errors.join("\n"));
-                        }
-                    }
+                    eval.phase = EvalPhase::Running {
+                        states: vec![eval::State::nothing_yet()],
+                        current: 0,
+                        user_source_values,
+                    };
                 }
             }
             Interaction::Hovered => {
@@ -4208,7 +4227,9 @@ fn sync_eval_step_bar(
     if !running_now {
         return;
     }
-    // Spawn Prev / Next / Exit, right-aligned bottom.
+    // Exit / Prev / Next / the count, from the bottom-left corner rightward —
+    // the corner the `Evaluate` button they replace sits in. Prev before Next,
+    // because that is the direction the two of them move along.
     spawn_corner_button(
         &mut commands,
         &ui_font.0,
@@ -4220,19 +4241,37 @@ fn sync_eval_step_bar(
     spawn_corner_button(
         &mut commands,
         &ui_font.0,
-        "Next",
-        (NextStepButton, EvalStepBarEntity),
+        "Prev",
+        (PrevStepButton, EvalStepBarEntity),
         Val::Px(170.0),
         Val::Px(12.0),
     );
     spawn_corner_button(
         &mut commands,
         &ui_font.0,
-        "Prev",
-        (PrevStepButton, EvalStepBarEntity),
+        "Next",
+        (NextStepButton, EvalStepBarEntity),
         Val::Px(240.0),
         Val::Px(12.0),
     );
+    // Spawned empty: `update_step_button_visuals` writes it every frame, and it
+    // is the only thing that knows which step the bar has moved to since.
+    commands.spawn((
+        Text::new(""),
+        text_font(&ui_font.0, 14.0),
+        TextColor(Color::srgb(0.6, 0.6, 0.7)),
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(310.0),
+            // Not the buttons' 12: they carry 8px of padding around a 14px
+            // line, so sitting the bare text 8 higher puts it on their middle.
+            bottom: Val::Px(20.0),
+            ..default()
+        },
+        StepCounterText,
+        EvalStepBarEntity,
+        HideDuringStartMenu,
+    ));
 }
 
 fn handle_eval_step_buttons(
@@ -4315,6 +4354,7 @@ fn update_step_button_visuals(
         (With<NextStepButton>, Without<PrevStepButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
+    mut counter_q: Query<&mut Text, With<StepCounterText>>,
 ) {
     let (prev_enabled, next_enabled) = match &eval.phase {
         EvalPhase::Running {
@@ -4325,6 +4365,22 @@ fn update_step_button_visuals(
         }
         _ => (false, false),
     };
+    // The index itself: snapshot 0 is a run at rest
+    // (`eval::State::nothing_yet`), with the prompt's answers waiting at the
+    // Sources and nothing read yet, so step 0 is where a run honestly starts.
+    //
+    // A number and no total. The history grows one press at a time and its
+    // length is how far the run has been stepped, not how long it is — a
+    // denominator here would move as the numerator did and mean nothing.
+    let counted = match &eval.phase {
+        EvalPhase::Running { current, .. } => format!("Step {}", current),
+        _ => String::new(),
+    };
+    for mut text in counter_q.iter_mut() {
+        if text.0 != counted {
+            text.0 = counted.clone();
+        }
+    }
     let apply = |enabled: bool, bg: &mut BackgroundColor, text_color: &mut TextColor| {
         if enabled {
             bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
@@ -4371,22 +4427,49 @@ fn sync_value_labels(
     ui_font: Res<UiFont>,
     mut existing_q: Query<(Entity, &ValueLabel, &mut Text)>,
 ) {
-    let snapshot: Option<&eval::State> = match &eval.phase {
+    let Some((states, current)) = (match &eval.phase {
         EvalPhase::Running {
             states, current, ..
-        } => Some(&states[*current]),
+        } => Some((states, *current)),
         _ => None,
-    };
-    let Some(snapshot) = snapshot else {
+    }) else {
         for (entity, _, _) in existing_q.iter() {
             commands.entity(entity).despawn();
         }
         return;
     };
 
+    // What *this* step resolved, rather than everything the run knows by now.
+    //
+    // A snapshot is cumulative — `eval_next_step` folds the state it started
+    // from into the one it hands back (`eval::State::merged_with`) — so the
+    // whole history stands in every entry, and a label per entry says nothing
+    // about the press that produced it. The difference to the snapshot behind
+    // does: it is exactly the frontier that press resolved. Snapshot 0 has
+    // nothing behind it, and there the difference is the whole of it — which
+    // is nothing at all, step 0 having produced nothing. What it shows instead
+    // stands on the Sources' own front cells (`infer::Known::offered_at`), and
+    // that is the right place for it: those values were not produced here, they
+    // were handed in.
+    //
+    // The values a step is no longer the news of are not lost with their
+    // label: they are written on the anchors themselves, as the literals the
+    // run narrowed them to.
+    let resolved_now: std::collections::HashMap<&model::node::Id, &eval::EValue> = match current {
+        0 => states[0].node_ids_to_values.iter().collect(),
+        n => {
+            let before = &states[n - 1].node_ids_to_values;
+            states[n]
+                .node_ids_to_values
+                .iter()
+                .filter(|(node_id, _)| !before.contains_key(*node_id))
+                .collect()
+        }
+    };
+
     let mut kept: std::collections::HashSet<model::node::Id> = std::collections::HashSet::new();
     for (entity, label, mut text) in existing_q.iter_mut() {
-        if let Some(value) = snapshot.node_ids_to_values.get(&label.node_id) {
+        if let Some(value) = resolved_now.get(&label.node_id) {
             let rendered = value.to_string();
             if text.0 != rendered {
                 text.0 = rendered;
@@ -4419,22 +4502,48 @@ fn sync_value_labels(
     // Taken only when there is something new to place. This runs every frame
     // and the walk allocates; with every label already standing there is
     // nothing for it to answer.
-    let missing: Vec<(&model::node::Id, &eval::EValue)> = snapshot
-        .node_ids_to_values
-        .iter()
+    let missing: Vec<(&model::node::Id, &eval::EValue)> = resolved_now
+        .into_iter()
         .filter(|(id, _)| !kept.contains(*id))
         .collect();
     if missing.is_empty() {
         return;
     }
+    // A node's own cell, except where that is not where it answers.
+    //
+    // A Match hands its value out behind its arms — `match_output_z` is how far
+    // behind, the same call the renderer places the anchor with — and its own
+    // cell is the entry in front of them. Written there, the answer to a large
+    // Match appears at the far end of the run from the branch that produced it,
+    // as if the value had jumped back over everything. So it is written where
+    // it is handed out, which is also the next thing anything downstream reads.
+    //
+    // Every other kind keeps its cell. Their outputs sit a cell or two along a
+    // body the eye crosses in one go, and moving those labels would buy nothing
+    // but a second rule.
     let positions: std::collections::HashMap<model::node::Id, Vec3> = state
         .layout_graph
         .walk_all()
         .into_iter()
         .map(|walked| {
+            let answers_at = match walked
+                .layout_graph
+                .graph
+                .nodes
+                .get(&walked.layout_node.node_id)
+            {
+                Some(model::node::ENode::Match { patterns, .. }) => Vec3::new(
+                    0.0,
+                    0.0,
+                    walked.layout_graph.match_output_z(patterns) as f32,
+                ),
+                _ => Vec3::ZERO,
+            };
             (
                 walked.layout_node.node_id.clone(),
-                render::cell_center_world(walked.layout_node.pos + walked.extra_offset),
+                render::cell_center_world(
+                    walked.layout_node.pos + walked.extra_offset + answers_at,
+                ),
             )
         })
         .collect();
@@ -4506,6 +4615,7 @@ fn rebuild_scene(
     materials_edge: ResMut<Assets<edge::EdgeMaterial>>,
     images: ResMut<Assets<Image>>,
     state: Res<GraphState>,
+    eval: Res<EvalState>,
     ui_font: Res<UiFont>,
     pick: Res<PickState>,
     editor_mode: Res<EditorMode>,
@@ -4521,11 +4631,34 @@ fn rebuild_scene(
             materials_edge,
             images,
             state,
+            eval,
             ui_font,
             pick,
             editor_mode,
         );
         rebuild.0 = false;
+    }
+}
+
+/// Redraw when the run moves, because a step changes what the anchors say.
+///
+/// Watching rather than flagging. `Running` is entered from the Evaluate button
+/// and from the source modal, left by `Exit Evaluation` and by any error a step
+/// raises, and `current` moves under both `Prev` and `Next` — six places that
+/// would each have to remember, against one that cannot forget. The pair it
+/// compares is the whole of what the drawing reads out of `EvalState`.
+fn sync_eval_rebuild(
+    eval: Res<EvalState>,
+    mut rebuild: ResMut<NeedsRebuild>,
+    mut last: Local<Option<(bool, usize)>>,
+) {
+    let now = match &eval.phase {
+        EvalPhase::Running { current, .. } => (true, *current),
+        _ => (false, 0),
+    };
+    if *last != Some(now) {
+        *last = Some(now);
+        rebuild.0 = true;
     }
 }
 
@@ -4813,7 +4946,7 @@ fn spawn_declared_cell_links(
     meshes: &mut Assets<Mesh>,
     materials_edge: &mut Assets<edge::EdgeMaterial>,
     in_pos: Vec3,
-    in_leaves: &[infer::EType],
+    in_rows: &[(usize, infer::EType)],
     in_value: Option<&str>,
     band_pos: Vec3,
     declared: Option<&model::r#type::EType>,
@@ -4833,11 +4966,19 @@ fn spawn_declared_cell_links(
     // arm against a `1|2` anchor consumes both rows, and has to be seen doing
     // it or the match would read as missing an arm.
     //
-    // `max(1)` rather than the leaf count alone: an anchor whose type is
-    // undecided has no leaf rows, but it still has the one row its grey
-    // `plain_anchor_body` is drawn on, and that is where its band leaves from.
-    for row in 0..in_leaves.len().max(1) {
-        let anchor_leaf = in_leaves.get(row);
+    // The rows carry their own indices (`render::drawn_rows`), because a run
+    // may have dropped the ones it did not take and the survivors keep the
+    // places the layout gave them.
+    //
+    // An empty list still draws one row: an anchor whose type is undecided has
+    // no leaf rows, but it still has the one its grey `plain_anchor_body` is
+    // drawn on, and that is where its band leaves from.
+    let rows: Vec<(usize, Option<&infer::EType>)> = if in_rows.is_empty() {
+        vec![(0, None)]
+    } else {
+        in_rows.iter().map(|(row, leaf)| (*row, Some(leaf))).collect()
+    };
+    for (row, anchor_leaf) in rows {
         let row_y = in_pos.y + render::leaf_row_offset(row);
         let row_is_line =
             anchor_leaf.is_some_and(|leaf| render::leaf_is_drawn_as_line(leaf, in_value));
@@ -4898,12 +5039,14 @@ fn spawn_declared_cell_links(
 /// A plain `fn` and not a system: the two maps it needs are locals of
 /// `spawn_graph_nodes`, and making them a resource would buy nothing but an
 /// ordering constraint.
+#[allow(clippy::too_many_arguments)]
 fn spawn_match_links(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials_edge: &mut Assets<edge::EdgeMaterial>,
     state: &GraphState,
     flat_graph: &model::term_graph::TermGraph,
+    known: &infer::Known,
     anchor_world_positions: &std::collections::HashMap<model::anchor::Id, Vec3>,
     declared_band_positions: &std::collections::HashMap<model::node::Id, Vec3>,
 ) {
@@ -4929,11 +5072,13 @@ fn spawn_match_links(
         // ── What arrives, reaching the arms ──
         //
         // Read through the same calls the Match's own anchor is drawn from, so
-        // the rows a strand aims at are the rows that are actually there.
-        let in_leaves = infer::incoming_anchor_type(flat_graph, input_anchor, decls)
-            .map(|t| render::ordered_supported_leaves(&t))
+        // the rows a strand aims at are the rows that are actually there — the
+        // run's narrowing included, or a strand would leave a row that is no
+        // longer drawn.
+        let in_rows = infer::incoming_anchor_type(flat_graph, input_anchor, decls)
+            .map(|t| render::drawn_rows(&t, known.at_input(flat_graph, input_anchor)))
             .unwrap_or_default();
-        let in_value = infer::incoming_anchor_literal(flat_graph, input_anchor);
+        let in_value = infer::incoming_anchor_literal(flat_graph, input_anchor, known);
         if let Some(&in_pos) = anchor_world_positions.get(input_anchor) {
             for pattern_id in patterns {
                 // An arm that declares nothing is still an arm: what reaches it
@@ -4953,7 +5098,7 @@ fn spawn_match_links(
                     meshes,
                     materials_edge,
                     in_pos,
-                    &in_leaves,
+                    &in_rows,
                     in_value.as_deref(),
                     band_pos,
                     arm_type.as_ref(),
@@ -4972,8 +5117,9 @@ fn spawn_match_links(
         // *row* a strand lands on and nothing else: a branch whose own type is
         // settled still draws its strand, aimed at the anchor's own row, rather
         // than being blanked by a sibling it has nothing to do with.
-        let out_leaves = render::ordered_supported_leaves(
+        let out_rows = render::drawn_rows(
             &infer::anchor_type(flat_graph, output_anchor, decls).unwrap_or(infer::EType::Pending),
+            known.at_output(flat_graph, output_anchor),
         );
         let Some(&out_pos) = anchor_world_positions.get(output_anchor) else {
             continue;
@@ -4996,9 +5142,9 @@ fn spawn_match_links(
             let Some(&sink_pos) = anchor_world_positions.get(sink_input) else {
                 continue;
             };
-            let sink_value = infer::incoming_anchor_literal(flat_graph, sink_input);
-            let sink_leaves = infer::incoming_anchor_type(flat_graph, sink_input, decls)
-                .map(|t| render::ordered_supported_leaves(&t))
+            let sink_value = infer::incoming_anchor_literal(flat_graph, sink_input, known);
+            let sink_rows = infer::incoming_anchor_type(flat_graph, sink_input, decls)
+                .map(|t| render::drawn_rows(&t, known.at_input(flat_graph, sink_input)))
                 .unwrap_or_default();
             let from = render::anchor_body_face_world(sink_pos, true);
             // Arrive at the output band's near face, in front of it — aiming at
@@ -5010,7 +5156,7 @@ fn spawn_match_links(
             // own Sink is what is asked. Nothing wired into it, or wired and
             // itself still `Pending`, and there is a connection to draw with no
             // type to draw it in.
-            if sink_leaves.is_empty() {
+            if sink_rows.is_empty() {
                 spawn_pending_ribbon(
                     commands,
                     meshes,
@@ -5024,14 +5170,14 @@ fn spawn_match_links(
                 continue;
             }
 
-            for (k, leaf) in sink_leaves.iter().enumerate() {
+            for (k, leaf) in sink_rows.iter() {
                 // The output has not decided what it is yet, so there is no row
                 // to pick and the strand aims at the anchor's own — the same
                 // fallback the edge pass uses for a leaf its target has no row
                 // for. It carries the branch's own colour all the same: what
                 // *this* branch produces is settled even while the union of all
                 // of them is not.
-                if out_leaves.is_empty() {
+                if out_rows.is_empty() {
                     let as_line = render::leaf_is_drawn_as_line(leaf, sink_value.as_deref());
                     spawn_link_ribbon(
                         commands,
@@ -5041,14 +5187,14 @@ fn spawn_match_links(
                         leaf,
                         from,
                         to,
-                        whole_row_end(sink_pos.y + render::leaf_row_offset(k), as_line),
+                        whole_row_end(sink_pos.y + render::leaf_row_offset(*k), as_line),
                         // The same shape at both ends: there is nothing at the
                         // output end that could ask for a different one.
                         whole_row_end(out_pos.y, as_line),
                     );
                     continue;
                 }
-                for (row, out_leaf) in out_leaves.iter().enumerate() {
+                for (row, out_leaf) in out_rows.iter() {
                     // What this branch produces claims its share of the output
                     // row it lands on. Two branches yielding `true` and `false`
                     // cover the Bool band between them — which is why the
@@ -5059,15 +5205,18 @@ fn spawn_match_links(
                         continue;
                     };
                     let start = edge::ribbon_end(
-                        sink_pos.y + render::leaf_row_offset(k),
+                        sink_pos.y + render::leaf_row_offset(*k),
                         &span,
                         render::leaf_is_drawn_as_line(leaf, sink_value.as_deref()),
                     );
                     // The Match output is drawn from its type alone — deriving
                     // an extra literal for it would be constant folding — so it
-                    // is a line only where its own type says so.
+                    // is a line only where its own type says so. Under a run
+                    // the type *does* say so, the run having narrowed it to the
+                    // value: proved rather than folded, which is the whole
+                    // difference.
                     let end = edge::ribbon_end(
-                        out_pos.y + render::leaf_row_offset(row),
+                        out_pos.y + render::leaf_row_offset(*row),
                         &span,
                         render::leaf_is_drawn_as_line(out_leaf, None),
                     );
@@ -5129,12 +5278,14 @@ fn spawn_match_links(
 /// condition *is* the drawing and the two cannot drift apart.
 ///
 /// A plain `fn` and not a system, for the reason `spawn_match_links` gives.
+#[allow(clippy::too_many_arguments)]
 fn spawn_cast_links(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials_edge: &mut Assets<edge::EdgeMaterial>,
     state: &GraphState,
     flat_graph: &model::term_graph::TermGraph,
+    known: &infer::Known,
     anchor_world_positions: &std::collections::HashMap<model::anchor::Id, Vec3>,
     declared_band_positions: &std::collections::HashMap<model::node::Id, Vec3>,
 ) {
@@ -5157,10 +5308,10 @@ fn spawn_cast_links(
         };
         // Read through the same call the cast's own input anchor is drawn from,
         // so the rows a strand aims at are the rows that are actually there.
-        let in_leaves = infer::incoming_anchor_type(flat_graph, input_anchor, decls)
-            .map(|t| render::ordered_supported_leaves(&t))
+        let in_rows = infer::incoming_anchor_type(flat_graph, input_anchor, decls)
+            .map(|t| render::drawn_rows(&t, known.at_input(flat_graph, input_anchor)))
             .unwrap_or_default();
-        let in_value = infer::incoming_anchor_literal(flat_graph, input_anchor);
+        let in_value = infer::incoming_anchor_literal(flat_graph, input_anchor, known);
 
         let target_leaf = r#type.as_ref().map(infer::graph_type_to_eval_type);
         let target_value = r#type.as_ref().and_then(layout::value_of_etype);
@@ -5174,25 +5325,38 @@ fn spawn_cast_links(
         // `none` row and still has strands to draw, and an output that has not
         // been placed must not take the target leg down with it.
         let out_pos = anchor_world_positions.get(output_anchor).copied();
-        let out_leaves = render::ordered_supported_leaves(
+        let out_rows = render::drawn_rows(
             &infer::anchor_type(flat_graph, output_anchor, decls).unwrap_or(infer::EType::Pending),
+            known.at_output(flat_graph, output_anchor),
         );
-        let out_value = infer::anchor_literal(flat_graph, output_anchor);
-        let none_row = out_leaves
+        let out_value = infer::anchor_literal(flat_graph, output_anchor, known);
+        // The row index the `none` still owns, not where it sits in the list: a
+        // run that took the happy path leaves no `none` row at all, and then
+        // the sad leg has nowhere to arrive and is not drawn.
+        let none_row = out_rows
             .iter()
-            .position(|leaf| matches!(leaf, infer::EType::None));
+            .find(|(_, leaf)| matches!(leaf, infer::EType::None))
+            .map(|(row, _)| *row);
 
         // Leave by the band's far face. The cell centre is the outward face,
         // where the *incoming* edge already ends.
         let from = render::anchor_body_face_world(in_pos, true);
         let mut reaches_target = false;
 
-        // `max(1)` rather than the leaf count alone: an anchor whose type is
-        // undecided has no leaf rows, but it still has the one row its grey
+        // The rows carry their own indices, for the reason
+        // `spawn_declared_cell_links` gives: a run drops the rows it did not
+        // take and the survivors keep their places.
+        //
+        // An empty list still draws one row: an anchor whose type is undecided
+        // has no leaf rows, but it still has the one its grey
         // `plain_anchor_body` is drawn on, and that is where its band leaves
         // from.
-        for row in 0..in_leaves.len().max(1) {
-            let anchor_leaf = in_leaves.get(row);
+        let rows: Vec<(usize, Option<&infer::EType>)> = if in_rows.is_empty() {
+            vec![(0, None)]
+        } else {
+            in_rows.iter().map(|(row, leaf)| (*row, Some(leaf))).collect()
+        };
+        for (row, anchor_leaf) in rows {
             let row_y = in_pos.y + render::leaf_row_offset(row);
             let row_is_line = anchor_leaf
                 .is_some_and(|leaf| render::leaf_is_drawn_as_line(leaf, in_value.as_deref()));
@@ -5285,7 +5449,7 @@ fn spawn_cast_links(
         // the way every leg between two cells is drawn here.
         let from = render::anchor_body_face_world(band_pos, true);
         let to = render::anchor_body_face_world(out_pos, false);
-        for (row, out_leaf) in out_leaves.iter().enumerate() {
+        for (row, out_leaf) in out_rows.iter() {
             // Every row but the sad one: what the target produces may itself
             // be more than a single leaf, and each of those rows is reached on
             // success.
@@ -5306,7 +5470,7 @@ fn spawn_cast_links(
                 to,
                 whole_row_end(band_pos.y, cell_is_line),
                 whole_row_end(
-                    out_pos.y + render::leaf_row_offset(row),
+                    out_pos.y + render::leaf_row_offset(*row),
                     render::leaf_is_drawn_as_line(out_leaf, out_value.as_deref()),
                 ),
             );
@@ -6933,6 +7097,12 @@ fn main() {
                     drag_start_system,
                     drag_update_system,
                     drag_end_system,
+                    // Between the press and the teardown, so a step is
+                    // redrawn in the frame it moved in rather than the one
+                    // after. `handle_eval_step_buttons` ends the chain that
+                    // every way into and out of `Running` goes through, which
+                    // is why naming it alone is enough.
+                    sync_eval_rebuild.after(handle_eval_step_buttons),
                     clear_scene,
                     ApplyDeferred,
                     rebuild_scene,

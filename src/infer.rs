@@ -1010,7 +1010,135 @@ pub fn node_output_type(
     anchor_type(graph, &output_anchor, function_declarations)
 }
 
+/// What a run has proved about the graph, as types.
+///
+/// Evaluation is narrowing. A node that produced `30` has the type `30` from
+/// then on — `EType::Int(Some("30"))`, which is not a decorated `Integer` but a
+/// narrower type outright (see this module's opening comment) — and the anchor
+/// it produced it at draws that: a line where an unevaluated call draws a band.
+/// A graph stepped to the end therefore stands entirely on literal types, which
+/// is what evaluating it *means*.
+///
+/// This struct is the only way a run reaches the drawing at all. Everything else
+/// in this module reads the program as written, and a `Known::nothing()` — what
+/// every caller away from the step bar hands in — leaves the picture exactly as
+/// it was.
+///
+/// It reaches the *literals* and not the row counts, and that line is worth
+/// holding. How many rows an anchor claims is an addressing fact about the
+/// program: `layout::anchor_cells` builds the node footprints from it and
+/// `GraphState::resettle` the whole layout. A run that moved it would slide the
+/// graph out from under the pointer between two presses of `Next`. So a
+/// narrowed anchor keeps the cells its declared type reserved, and only what is
+/// drawn in them changes.
+///
+/// Two channels, and the second one exists because they are two different
+/// claims. `proved` is what the program computed and may be read anywhere
+/// downstream. `offered` is what is waiting at a Source — an answer typed at
+/// the prompt, which is true of the world outside the program from the moment
+/// it is given and says nothing whatever about the program until the Source is
+/// evaluated. Only the Source's own drawn-only input cell reads it, and that
+/// cell is the one thing in the picture that stands outside the volume. Step 0
+/// is exactly the state in which the second channel is full and the first is
+/// empty.
+pub struct Known {
+    proved: std::collections::HashMap<crate::model::node::Id, EType>,
+    offered: std::collections::HashMap<crate::model::node::Id, EType>,
+}
+
+impl Known {
+    /// No run, or none that has reached anything yet: the graph as written.
+    pub fn nothing() -> Self {
+        Self {
+            proved: std::collections::HashMap::new(),
+            offered: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Build from what a run produced. `eval::State::known` is the one caller —
+    /// this takes pairs rather than values so that types may be read here
+    /// without this module having to know how they are computed.
+    pub fn of(entries: impl IntoIterator<Item = (crate::model::node::Id, EType)>) -> Self {
+        Self {
+            proved: entries.into_iter().collect(),
+            offered: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Add what is waiting at the program's edges: the prompt's answers, by the
+    /// Source each was typed for.
+    ///
+    /// Taken separately from `of` rather than alongside it, because the two
+    /// come from different places and at different times — the proved types
+    /// from the snapshot on screen, which changes with every press, and these
+    /// from the run's own record, which was fixed before the first one.
+    pub fn offering(
+        mut self,
+        entries: impl IntoIterator<Item = (crate::model::node::Id, EType)>,
+    ) -> Self {
+        self.offered = entries.into_iter().collect();
+        self
+    }
+
+    /// What is waiting outside `node_id`, if it is a Source and the prompt has
+    /// been answered.
+    ///
+    /// By node and not by anchor, deliberately: the cell that reads this is
+    /// drawn only and owns no anchor at all (see the Source arm of
+    /// `render::layoutnode_to_rendernode`). There is nothing here an edge could
+    /// reach, which is the whole reason a value may stand here without the
+    /// program having read it.
+    pub fn offered_at(&self, node_id: &crate::model::node::Id) -> Option<&EType> {
+        self.offered.get(node_id)
+    }
+
+    /// The type a run proved at `anchor_id`, if that anchor is where a node it
+    /// evaluated hands its value out.
+    ///
+    /// Outputs only. An input anchor carries no value of its own — what stands
+    /// on it is what arrived — and the anchor upstream already answers that, so
+    /// asking here as well would state it twice and let the two disagree.
+    pub fn at_output(
+        &self,
+        graph: &crate::model::term_graph::TermGraph,
+        anchor_id: &crate::model::anchor::Id,
+    ) -> Option<&EType> {
+        let node_id = graph.anchor_to_node.get(anchor_id)?;
+        let is_output = graph
+            .nodes
+            .get(node_id)?
+            .anchors()
+            .into_iter()
+            .any(|(id, anchor)| {
+                matches!(anchor, crate::model::anchor::EAnchor::Output) && &id == anchor_id
+            });
+        if !is_output {
+            return Option::None;
+        }
+        self.proved.get(node_id)
+    }
+
+    /// The type a run proved for whatever feeds `input`.
+    ///
+    /// The same hop upstream `incoming_anchor_literal` takes, and for the same
+    /// reason: an input shows what arrived, and what arrived is the business of
+    /// the anchor that sent it.
+    pub fn at_input(
+        &self,
+        graph: &crate::model::term_graph::TermGraph,
+        input: &crate::model::anchor::Id,
+    ) -> Option<&EType> {
+        let source = source_anchor_for_input(graph, input)?;
+        self.at_output(graph, &source)
+    }
+}
+
 /// graph-level literal an anchor's type is pinned to, if any.
+///
+/// A run answers first. Once a node has produced a value, the value is what its
+/// output anchor carries, whatever the declaration says it *could* have carried
+/// — that is the whole of the narrowing, and every drawing of a literal goes
+/// through here, so stating it once is enough.
 ///
 /// A BranchSource borrows its Pattern's whole declaration, literal included:
 /// inside the branch the matched value is known to be exactly that literal, so
@@ -1022,7 +1150,14 @@ pub fn node_output_type(
 pub fn anchor_literal(
     graph: &crate::model::term_graph::TermGraph,
     anchor_id: &crate::model::anchor::Id,
+    known: &Known,
 ) -> Option<String> {
+    // `none` is deliberately not a literal here, the same way `leaf_literal`
+    // refuses it: its value is its type, so there is nothing pinned to it, and
+    // the row it takes is drawn as a line on that ground alone.
+    if let Some(proved) = known.at_output(graph, anchor_id) {
+        return leaf_literal(proved).map(str::to_string);
+    }
     let node_id = graph.anchor_to_node.get(anchor_id)?;
     match graph.nodes.get(node_id)? {
         crate::model::node::ENode::Constant {
@@ -1074,8 +1209,9 @@ pub fn anchor_literal(
 pub fn incoming_anchor_literal(
     graph: &crate::model::term_graph::TermGraph,
     input: &crate::model::anchor::Id,
+    known: &Known,
 ) -> Option<String> {
-    source_anchor_for_input(graph, input).and_then(|source| anchor_literal(graph, &source))
+    source_anchor_for_input(graph, input).and_then(|source| anchor_literal(graph, &source, known))
 }
 
 /// Structural type equality, ignoring any carried value literal. Two `SumType`s

@@ -1,6 +1,8 @@
 # TODOs
 
-- evaluation step wise -> narrowing to literal types? -> also the match branches? fade away/remove/collapse?
+- a run narrows every anchor it reaches to the literal it produced, but the
+  arms it went past stay drawn in full. A branch the Match did not select is
+  as settled as the row it did — fade away/remove/collapse?
 - evaluation values rendered at correct positions for match/pattern/patternsink
 - cast to a literal compares literal *text* in `infer::cast_kind` and parsed
   *values* in `eval::value_matches_type`, so a Constant typed `07` cast to `7`
