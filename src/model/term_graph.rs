@@ -160,6 +160,49 @@ impl TermGraph {
         }
     }
 
+    /// Keep only the edges both of whose ends are still anchors of something.
+    ///
+    /// The counterpart to `minus_node` for a scene made of more than one graph.
+    /// `minus_node` takes a node's edges with it, but only the ones recorded in
+    /// the *same* `TermGraph` — and a branch's nodes live in their own one while
+    /// every edge is recorded on the root (`LayoutGraph::plus_edge` is called on
+    /// `root_graph()` alone, whatever scope the two anchors are in). So a node
+    /// taken out of a branch leaves the root holding edges to anchors that are
+    /// gone.
+    ///
+    /// Asked as a question about what is still there, rather than answered by
+    /// listing what a removal took away. The list is the hard part — a Pattern
+    /// takes a whole branch volume with it and a Match takes every Pattern —
+    /// and a list one entry short leaves an edge pointing at nothing, which
+    /// `LayoutGraph::layout_anchor` meets as a panic rather than as a missing
+    /// strand. There is nothing for this to be short of.
+    ///
+    /// An entry left with no edges is dropped rather than kept empty, for the
+    /// reason `minus_edges_into` gives.
+    pub fn retaining_edges(&self, live: &std::collections::HashSet<super::anchor::Id>) -> Self {
+        Self {
+            nodes: self.nodes.clone(),
+            anchors: self.anchors.clone(),
+            anchor_to_node: self.anchor_to_node.clone(),
+            sink_node_id: self.sink_node_id.clone(),
+            edges: self
+                .edges
+                .clone()
+                .into_iter()
+                .filter(|(from, _)| live.contains(from))
+                .filter_map(|(from, edges)| {
+                    let kept: Vec<super::edge::Edge> =
+                        edges.into_iter().filter(|e| live.contains(&e.to)).collect();
+                    if kept.is_empty() {
+                        None
+                    } else {
+                        Some((from, kept))
+                    }
+                })
+                .collect(),
+        }
+    }
+
     pub fn plus_node(&self, node_id: super::node::Id, n: super::node::ENode) -> Self {
         let anchors = n.anchors();
         Self {

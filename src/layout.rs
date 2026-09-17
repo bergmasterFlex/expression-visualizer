@@ -491,6 +491,60 @@ impl LayoutGraph {
         }
     }
 
+    /// Drop every edge whose ends are no longer in the scene.
+    ///
+    /// The sweep that has to follow a removal, and the reason is one asymmetry:
+    /// a node lives in the scope that owns it — a branch's nodes in
+    /// `sub_layouts[pattern_id]` — while *every* edge is recorded on the root,
+    /// because `plus_edge` is only ever called there. `minus_node` takes the
+    /// edges it can see with it, and from a branch it can see none of them.
+    ///
+    /// A Tunnel is where this shows first and always: its input anchor stands
+    /// outside its own scope and the edge reaching it is by definition one the
+    /// branch's graph never held. Deleting one left the root pointing at an
+    /// anchor that no longer existed, and the next walk over `edges()` met that
+    /// as a panic. But it is not the Tunnel's problem — any node in a branch
+    /// strands its edges the same way, and a Match strands every edge inside
+    /// every arm it takes with it.
+    ///
+    /// Run from the root, because that is where the edges are; the recursion
+    /// into sub-layouts is for the anchors, which are everywhere.
+    pub fn minus_dangling_edges(&self) -> Self {
+        self.retaining_edges_of(&self.all_anchor_ids())
+    }
+
+    /// Every anchor in this scope and in every scope nested inside it. The
+    /// question `minus_dangling_edges` asks the scene before deciding what an
+    /// edge may still point at.
+    fn all_anchor_ids(&self) -> std::collections::HashSet<crate::model::anchor::Id> {
+        self.graph
+            .anchors
+            .keys()
+            .cloned()
+            .chain(
+                self.sub_layouts
+                    .values()
+                    .flat_map(|sub| sub.all_anchor_ids()),
+            )
+            .collect()
+    }
+
+    fn retaining_edges_of(
+        &self,
+        live: &std::collections::HashSet<crate::model::anchor::Id>,
+    ) -> Self {
+        Self {
+            graph: self.graph.retaining_edges(live),
+            layout_nodes: self.layout_nodes.clone(),
+            reserved_max: self.reserved_max,
+            sub_layouts: self
+                .sub_layouts
+                .iter()
+                .map(|(id, sub)| (id.clone(), sub.retaining_edges_of(live)))
+                .collect(),
+        }
+    }
+
     /// Returns the node whose footprint contains `pos`, if any.
     /// `Match` containers are excluded — only their `Pattern` children are
     /// selectable, so a click on the envelope never picks the container.

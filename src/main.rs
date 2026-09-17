@@ -1926,6 +1926,13 @@ fn remove_node_at_caret(
         return false;
     };
     *caret_graph_mut = updated;
+    // `minus_node` took the edges its own graph held. Every other edge in the
+    // scene is the root's — `plus_edge` is only ever called there — so a node
+    // removed from a branch leaves its wiring behind, pointing at anchors that
+    // are gone. Swept here, at the one removal in the program, rather than left
+    // for `edges()` to walk into.
+    let swept = state.root_graph().minus_dangling_edges();
+    *state.root_graph_mut() = swept;
     // Removing a node can shrink a constraint-less input that fed off it, so
     // shapes have to be recomputed, not just the layout.
     state.resettle();
