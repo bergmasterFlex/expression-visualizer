@@ -960,7 +960,27 @@ fn setup_scene(mut commands: Commands) {
         // mode switch replaces this component; nothing else touches it.
         camera::bound_projection(camera::DEFAULT_CELL_PIXELS, camera::RESET_RADIUS, 0.0),
         Transform::from_xyz(0.0, 5.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
-        OrderIndependentTransparencySettings::default(),
+        // `layer_count` stays at Bevy's eight, and not because eight is
+        // comfortable. The layer buffer is one `vec2<u32>` per pixel per layer
+        // across the whole viewport, bound whole, and wgpu's default
+        // `max_storage_buffer_binding_size` is 128 MiB — so eight layers
+        // already spend 98.9% of that budget at 1920x1080. Sixteen would halve
+        // the window this can run in.
+        //
+        // `alpha_threshold` does not stay. Bevy's default is `0.0`, and
+        // `oit_draw` tests `color.a < alpha_threshold` — a test `0.0` can never
+        // pass. Every blended fragment therefore claims a slot, including the
+        // ones a scope surface has already faded to nothing at its outer edge,
+        // and slots are the scarce thing here: a ray through a nested program
+        // crosses four surfaces per volume before it reaches the caret, and
+        // what does not fit is dropped by draw order rather than by depth. One
+        // step of the eight-bit alpha a layer entry stores is 1/255, and
+        // anything under it packs to zero regardless — so this drops exactly
+        // the fragments that could not have shown up, and nothing else.
+        OrderIndependentTransparencySettings {
+            alpha_threshold: 1.0 / 255.0,
+            ..default()
+        },
         Msaa::Off,
         // Reads the depth buffer back in a full-screen pass. OIT is what makes
         // that possible without a depth prepass: it already marks the depth
@@ -4983,7 +5003,10 @@ fn spawn_declared_cell_links(
     let rows: Vec<(usize, Option<&infer::EType>)> = if in_rows.is_empty() {
         vec![(0, None)]
     } else {
-        in_rows.iter().map(|(row, leaf)| (*row, Some(leaf))).collect()
+        in_rows
+            .iter()
+            .map(|(row, leaf)| (*row, Some(leaf)))
+            .collect()
     };
     for (row, anchor_leaf) in rows {
         let row_y = in_pos.y + render::leaf_row_offset(row);
@@ -5361,7 +5384,10 @@ fn spawn_cast_links(
         let rows: Vec<(usize, Option<&infer::EType>)> = if in_rows.is_empty() {
             vec![(0, None)]
         } else {
-            in_rows.iter().map(|(row, leaf)| (*row, Some(leaf))).collect()
+            in_rows
+                .iter()
+                .map(|(row, leaf)| (*row, Some(leaf)))
+                .collect()
         };
         for (row, anchor_leaf) in rows {
             let row_y = in_pos.y + render::leaf_row_offset(row);

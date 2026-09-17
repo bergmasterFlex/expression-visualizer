@@ -645,8 +645,7 @@ fn build_anchor_strands(
     let full_rect_z_center = anchor_world_pos.z + sign * ANCHOR_HALF_DEPTH;
     let line_tip_z = anchor_world_pos.z + sign * full_depth;
 
-    rows
-        .into_iter()
+    rows.into_iter()
         .map(|(k, leaf)| {
             let y_center = anchor_world_pos.y + leaf_row_offset(k);
             let color = strand_color(&leaf);
