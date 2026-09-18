@@ -12,7 +12,12 @@ mod render;
 
 use bevy::core_pipeline::oit::OrderIndependentTransparencySettings;
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
-use bevy::{input::keyboard::KeyboardInput, math::VectorSpace, prelude::*};
+use bevy::{
+    input::keyboard::KeyboardInput,
+    input::mouse::{MouseMotion, MouseWheel},
+    math::VectorSpace,
+    prelude::*,
+};
 
 // ── Resources ───────────────────────────────────────────────
 
@@ -162,6 +167,40 @@ enum EditorMode {
     Normal,
     Insert,
 }
+
+/// Everything the editor draws about itself is off, and what is left standing
+/// is the program. It takes no picture of its own — the screen is simply clear
+/// for whatever does.
+///
+/// It ends at the first sign of life, and the input that ends it also does
+/// whatever it normally would: leaving is not an act of its own, it is what
+/// *using the editor again* means.
+#[derive(Resource, Default)]
+struct ScreenshotMode {
+    /// `None` while it is off; otherwise when it was entered.
+    ///
+    /// The time is kept rather than a bare flag because of how it is entered:
+    /// with the mouse, on a button. Without a moment's grace the very movement
+    /// that carries the hand off that button would end it again, and the mode
+    /// would be unreachable by the one gesture that reaches it.
+    entered_at: Option<f32>,
+}
+
+impl ScreenshotMode {
+    fn active(&self) -> bool {
+        self.entered_at.is_some()
+    }
+
+    /// Whether input should be listened to yet.
+    fn listening(&self, now: f32) -> bool {
+        self.entered_at
+            .is_some_and(|entered| now - entered >= SCREENSHOT_GRACE_SECONDS)
+    }
+}
+
+/// How long the screenshot mode ignores input after being entered. Long enough
+/// for a hand to leave the mouse, short enough that nobody waits for it.
+const SCREENSHOT_GRACE_SECONDS: f32 = 0.5;
 
 /// What has been typed in INSERT so far, and which suggestion it stands on.
 /// One resource for every prompt — the one that creates and the one that edits
@@ -430,9 +469,16 @@ struct StartMenuCancelButton;
 #[derive(Component)]
 struct StartMenuControlsButton;
 
-/// Marker for UI entities that should be hidden while the start menu is open.
+/// Marker for everything the editor draws about *itself* — buttons, panels, the
+/// HUD readouts — as opposed to what it draws about the program.
+///
+/// Carrying it is a standing offer to be taken off screen whenever the editor
+/// has nothing to say: while the start menu or a modal owns the screen, and in
+/// screenshot mode, where the point is that only the program is left. One
+/// system writes their `display`, and a widget that manages its own must not
+/// also wear this — two writers flicker on the transition frame.
 #[derive(Component)]
-struct HideDuringStartMenu;
+struct EditorChrome;
 
 /// Stores the currently selected grid position and hover state.
 ///
@@ -735,12 +781,25 @@ enum EvalPhase {
 #[derive(Resource)]
 struct EvalState {
     phase: EvalPhase,
+    /// A standing wish to reach the end of the run, rather than a phase of it.
+    ///
+    /// Its own field because the wish has to survive the way a run *starts*: a
+    /// graph with Sources goes through the values modal first, and the run only
+    /// begins when that is answered. Asking for the end is therefore said at one
+    /// moment and carried out at another, and between the two there is nothing
+    /// in `phase` that could remember it.
+    ///
+    /// Cleared by `apply_run_to_end` — on carrying it out, and on any phase that
+    /// is neither running nor on its way to running, so a cancelled modal leaves
+    /// no wish lying in wait for the next run.
+    run_to_end: bool,
 }
 
 impl Default for EvalState {
     fn default() -> Self {
         Self {
             phase: EvalPhase::Idle,
+            run_to_end: false,
         }
     }
 }
@@ -758,6 +817,20 @@ fn modal_is_open(eval: &EvalState) -> bool {
 
 #[derive(Component)]
 struct EvaluateButton;
+
+#[derive(Component)]
+struct ScreenshotButton;
+
+/// The standing container the evaluation controls live in, centred on the
+/// bottom edge. It never despawns, so exactly one system writes its `display`
+/// and its contents can be rebuilt underneath without that question arising.
+#[derive(Component)]
+struct PlayerControls;
+
+/// Tags the buttons and the counter inside `PlayerControls`, which are
+/// respawned whenever the phase changes.
+#[derive(Component)]
+struct PlayerControlsEntity;
 
 /// Tags any entity that belongs to the currently-displayed modal so we can
 /// nuke the whole subtree on phase transition.
@@ -780,16 +853,17 @@ struct ModalSourceInput {
     node_id: model::node::Id,
 }
 
-/// Tags entities that make up the Prev/Next/Exit bottom bar.
-#[derive(Component)]
-struct EvalStepBarEntity;
-
 #[derive(Component)]
 struct PrevStepButton;
 #[derive(Component)]
 struct NextStepButton;
 #[derive(Component)]
 struct ExitEvaluationButton;
+
+/// Takes the run to its end in one press — the same steps `NextStepButton`
+/// takes, taken until there are none left.
+#[derive(Component)]
+struct FullRunButton;
 
 /// The step the bar is standing on, written out beside the buttons that move
 /// it. A snapshot carries no number of its own — `current` indexes the history
@@ -981,6 +1055,7 @@ fn spawn_graph_nodes(
     ui_font: Res<UiFont>,
     pick: Res<PickState>,
     editor_mode: Res<EditorMode>,
+    screenshot: Res<ScreenshotMode>,
 ) {
     let mut node_entites = std::collections::HashMap::<model::node::Id, Entity>::new();
     let mut anchor_entities = std::collections::HashMap::<model::anchor::Id, Entity>::new();
@@ -1451,7 +1526,13 @@ fn spawn_graph_nodes(
     //
     // It shows which mode it is in: NORMAL outlines the cell, INSERT fills the
     // two faces the next insert would open along and blinks like a text caret.
+    //
+    // In screenshot mode there is none. It is the editor pointing at the
+    // program, and pointing is the one thing that mode is for leaving out — so
+    // it is not spawned rather than hidden, the way every other scene entity
+    // that is not wanted simply is not built.
     match *editor_mode {
+        _ if screenshot.active() => {}
         EditorMode::Normal => {
             for edge in render::cell_caret_edges(pick.selected_pos.as_vec3()) {
                 commands.spawn((
@@ -1527,16 +1608,22 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
     // The six "Add …" buttons are gone: what is created is typed at the
     // prompt that takes this slot in INSERT. The button is the mouse's way in
     // and does nothing but enter that mode. It hides itself, so unlike the
-    // other buttons it must not also answer to `HideDuringStartMenu` — two
-    // writers on one `display` flicker on the transition frame.
+    // other buttons it must not also answer to `EditorChrome` — two writers on
+    // one `display` flicker on the transition frame.
     spawn_insert_mode_button(&mut commands, &ui_font.0, Vec2::new(12.0, 96.0));
 
-    // Bottom-left, opposite the mode indicator in the bottom-right corner.
+    // Bottom-left, opposite the mode indicator in the bottom-right corner. It
+    // stands where `Evaluate` used to: that one is a control of the *program*
+    // and has moved to the middle with the rest of them, leaving this corner to
+    // the controls that are about the view.
+    //
+    // A word and not a glyph, because its neighbours here are words — and
+    // because the font has no camera in it.
     spawn_corner_button(
         &mut commands,
         &ui_font.0,
-        "Evaluate",
-        EvaluateButton,
+        "Screenshot",
+        ScreenshotButton,
         Val::Px(12.0),
         Val::Px(12.0),
     );
@@ -1600,7 +1687,7 @@ fn spawn_corner_checkbox<C: Bundle>(
             },
             BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
             component,
-            HideDuringStartMenu,
+            EditorChrome,
         ))
         .with_children(|parent| {
             parent.spawn((
@@ -1690,12 +1777,78 @@ fn spawn_corner_button<C: Bundle>(
             },
             BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
             component,
-            HideDuringStartMenu,
+            EditorChrome,
         ))
         .with_children(|parent| {
             parent.spawn((
                 Text::new(label),
                 text_font(font, 14.0),
+                TextColor(Color::srgb(0.6, 0.6, 0.7)),
+            ));
+        });
+}
+
+/// The standing container the evaluation controls sit in: centred on the bottom
+/// edge, laid out as a row.
+///
+/// Spawned once and never despawned, so `EditorChrome` stays its only `display`
+/// writer. Its contents come and go with the phase — see `sync_player_controls`
+/// — and a container born *while* the chrome is hidden would otherwise come up
+/// visible and stay wrong until the next transition.
+///
+/// `left: 0, right: 0` with `justify_content: Center` is what centres it: the
+/// row spans the window and the buttons gather in its middle, so the row's
+/// width can change without anything having to be measured.
+fn spawn_player_controls(mut commands: Commands) {
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.0),
+            right: Val::Px(0.0),
+            bottom: Val::Px(12.0),
+            flex_direction: FlexDirection::Row,
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            column_gap: Val::Px(8.0),
+            ..default()
+        },
+        PlayerControls,
+        EditorChrome,
+    ));
+}
+
+/// One control in that row: a square button wearing a glyph or two.
+///
+/// The flex twin of `spawn_corner_button` — same colours, same radius, but a
+/// child of the row rather than an address of its own, and wide enough that the
+/// glyphs sit in the middle of it rather than filling it. It carries no
+/// `EditorChrome`: the container wears that for all of them. Colour is not its
+/// business either; `update_step_button_visuals` writes the whole row's.
+fn spawn_control_button<C: Bundle>(
+    parent: &mut ChildSpawnerCommands,
+    font: &Handle<Font>,
+    glyph: &str,
+    component: C,
+) {
+    parent
+        .spawn((
+            Button,
+            Node {
+                width: Val::Px(40.0),
+                height: Val::Px(32.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                border_radius: BorderRadius::all(Val::Px(6.0)),
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+            component,
+            PlayerControlsEntity,
+        ))
+        .with_children(|button| {
+            button.spawn((
+                Text::new(glyph),
+                text_font(font, 18.0),
                 TextColor(Color::srgb(0.6, 0.6, 0.7)),
             ));
         });
@@ -1723,7 +1876,7 @@ fn spawn_ui_button<C: Bundle>(
             },
             BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
             component,
-            HideDuringStartMenu,
+            EditorChrome,
         ))
         .with_children(|parent| {
             parent.spawn((
@@ -1735,8 +1888,8 @@ fn spawn_ui_button<C: Bundle>(
 }
 
 /// The "Add" button. Same look as `spawn_ui_button` produces, minus
-/// `HideDuringStartMenu`: `sync_add_button` is its only writer, so the start
-/// menu's bulk toggle must not reach it.
+/// `EditorChrome`: `sync_add_button` is its only writer, so the bulk toggle
+/// must not reach it.
 fn spawn_insert_mode_button(commands: &mut Commands, font: &Handle<Font>, pos: Vec2) {
     commands
         .spawn((
@@ -1807,7 +1960,7 @@ fn spawn_hamburger_button(commands: &mut Commands, pos: Vec2) {
             },
             BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
             HamburgerButton,
-            HideDuringStartMenu,
+            EditorChrome,
         ))
         .with_children(|parent| {
             let bar_color = Color::srgb(0.85, 0.85, 0.9);
@@ -2200,12 +2353,13 @@ fn handle_add_button(
 
 /// The "Add" button's only writer: it shows in NORMAL and steps aside for the
 /// prompt in INSERT, plus the usual hover tint. Folding the start menu and the
-/// modals in here rather than wearing `HideDuringStartMenu` keeps it at one
-/// writer, the way `sync_node_editor_ui` does for its panel.
+/// modals in here rather than wearing `EditorChrome` keeps it at one writer,
+/// the way `sync_node_editor_ui` does for its panel.
 fn sync_add_button(
     mode: Res<EditorMode>,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
+    screenshot: Res<ScreenshotMode>,
     mut button_q: Query<
         (&Interaction, &mut Node, &mut BackgroundColor, &Children),
         With<AddNodeButton>,
@@ -2215,7 +2369,8 @@ fn sync_add_button(
     let visible = *mode == EditorMode::Normal
         && !start_menu.showing
         && !modal_is_open(&eval)
-        && !is_evaluating(&eval);
+        && !is_evaluating(&eval)
+        && !screenshot.active();
     let desired = if visible {
         Display::Flex
     } else {
@@ -2712,8 +2867,8 @@ struct InsertPromptFingerprint {
 /// The INSERT prompt: what was typed, and under it the node kinds that name
 /// could still become. Sole writer of the panel's `display`, so the start menu
 /// and the modals are folded in here rather than left to
-/// `HideDuringStartMenu`; contents are respawned only when the fingerprint
-/// moves, the way `sync_node_editor_ui` does it.
+/// `EditorChrome`; contents are respawned only when the fingerprint moves, the
+/// way `sync_node_editor_ui` does it.
 fn sync_insert_prompt_ui(
     mut commands: Commands,
     mode: Res<EditorMode>,
@@ -2722,6 +2877,7 @@ fn sync_insert_prompt_ui(
     pick: Res<PickState>,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
+    screenshot: Res<ScreenshotMode>,
     ui_font: Res<UiFont>,
     mut panel_q: Query<(Entity, &mut Node), With<InsertPromptPanel>>,
     prompt_children_q: Query<Entity, With<InsertPromptEntity>>,
@@ -2735,7 +2891,8 @@ fn sync_insert_prompt_ui(
         && insert_target(&state, &pick) == InsertTarget::Create
         && !start_menu.showing
         && !modal_is_open(&eval)
-        && !is_evaluating(&eval);
+        && !is_evaluating(&eval)
+        && !screenshot.active();
     let candidates = if visible {
         prompt_candidates(&state, &pick, &prompt.text)
     } else {
@@ -2962,6 +3119,7 @@ fn sync_node_editor_ui(
     pick: Res<PickState>,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
+    screenshot: Res<ScreenshotMode>,
     mode: Res<EditorMode>,
     prompt: Res<InsertPrompt>,
     ui_font: Res<UiFont>,
@@ -2975,7 +3133,8 @@ fn sync_node_editor_ui(
         // build, and the create prompt draws itself in its own place.
         InsertTarget::Create => None,
     };
-    let visible = target.is_some() && !start_menu.showing && !is_evaluating(&eval);
+    let visible =
+        target.is_some() && !start_menu.showing && !is_evaluating(&eval) && !screenshot.active();
     let editing = visible && *mode == EditorMode::Insert;
     let candidates = if editing {
         prompt_candidates(&state, &pick, &prompt.text)
@@ -3264,67 +3423,59 @@ fn sync_camera_mode_button(
     }
 }
 
+/// Begin a run: the checks a press has to pass, and whichever phase comes of
+/// them — the values modal where there are Sources to answer for, otherwise the
+/// run itself, at step 0.
+///
+/// A free function because two buttons start a run now. `▶` takes a step at a
+/// time from here on, `▶▌` goes to the end, but what it takes to *start* is the
+/// same question asked once.
+fn begin_evaluation(eval: &mut EvalState, state: &GraphState) {
+    if is_evaluating(eval) {
+        // Already showing a modal or running — ignore.
+        return;
+    }
+    if !infer::sink_has_input(&state.root_graph().graph) {
+        eval.phase = EvalPhase::ErrorModal(
+            "Cannot evaluate, because no node is connected to the sink".to_string(),
+        );
+        return;
+    }
+    // Flatten pattern sub-scenes in so eval and var-decl collection see every
+    // node, not just the program-level ones.
+    let graph = state.root_graph().flattened_graph();
+    let sources = infer::collect_sources(&graph);
+    if !sources.is_empty() {
+        eval.phase = EvalPhase::SourcePrompt {
+            inputs: sources
+                .into_iter()
+                .map(|(id, _name)| (id, String::new()))
+                .collect(),
+        };
+        return;
+    }
+    // A program with no Sources still opens on step 0. There is nothing waiting
+    // at its edges to look at, which is what a program given nothing looks like
+    // — and the alternative is starting such a run one step in while every other
+    // run starts at zero, so that the number on screen would mean two things.
+    eval.phase = EvalPhase::Running {
+        states: vec![eval::State::nothing_yet()],
+        current: 0,
+        user_source_values: std::collections::HashMap::new(),
+    };
+}
+
+/// Nothing but the press. What the button *looks* like is
+/// `update_step_button_visuals`' business, along with the rest of the row —
+/// see the note there about why the tint used to live in each handler and no
+/// longer does.
 fn handle_evaluate_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (Changed<Interaction>, With<EvaluateButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<EvaluateButton>)>,
     mut eval: ResMut<EvalState>,
     state: Res<GraphState>,
 ) {
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-        match *interaction {
-            Interaction::Pressed => {
-                if is_evaluating(&eval) {
-                    // Already showing a modal or running — ignore.
-                    continue;
-                }
-                if !infer::sink_has_input(&state.root_graph().graph) {
-                    eval.phase = EvalPhase::ErrorModal(
-                        "Cannot evaluate, because no node is connected to the sink".to_string(),
-                    );
-                    continue;
-                }
-                // Flatten pattern sub-scenes in so eval and var-decl collection
-                // see every node, not just the program-level ones.
-                let graph = state.root_graph().flattened_graph();
-                let sources = infer::collect_sources(&graph);
-                if !sources.is_empty() {
-                    eval.phase = EvalPhase::SourcePrompt {
-                        inputs: sources
-                            .into_iter()
-                            .map(|(id, _name)| (id, String::new()))
-                            .collect(),
-                    };
-                } else {
-                    // A program with no Sources still opens on step 0. There is
-                    // nothing waiting at its edges to look at, which is what a
-                    // program given nothing looks like — and the alternative is
-                    // starting such a run one step in while every other run
-                    // starts at zero, so that the number on screen would mean
-                    // two things.
-                    let user_source_values: std::collections::HashMap<
-                        model::node::Id,
-                        eval::EValue,
-                    > = std::collections::HashMap::new();
-                    eval.phase = EvalPhase::Running {
-                        states: vec![eval::State::nothing_yet()],
-                        current: 0,
-                        user_source_values,
-                    };
-                }
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                color.0 = Color::srgb(0.6, 0.6, 0.7);
-            }
-        }
+    if interaction_q.iter().any(|i| *i == Interaction::Pressed) {
+        begin_evaluation(&mut eval, &state);
     }
 }
 
@@ -3992,9 +4143,10 @@ fn sync_start_menu_ui(
     mut commands: Commands,
     start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
+    screenshot: Res<ScreenshotMode>,
     ui_font: Res<UiFont>,
     menu_entities: Query<Entity, With<StartMenuEntity>>,
-    mut hideable: Query<&mut Node, With<HideDuringStartMenu>>,
+    mut hideable: Query<&mut Node, With<EditorChrome>>,
     mut last_showing: Local<Option<bool>>,
     mut last_hidden: Local<Option<bool>>,
 ) {
@@ -4015,7 +4167,9 @@ fn sync_start_menu_ui(
         }
     }
 
-    let hidden = start_menu.showing || modal_is_open(&eval);
+    // Three reasons and one answer: the menu owns the screen, a modal owns it,
+    // or the point is that nothing of the editor is on it at all.
+    let hidden = start_menu.showing || modal_is_open(&eval) || screenshot.active();
     if *last_hidden == Some(hidden) {
         return;
     }
@@ -4168,69 +4322,141 @@ fn handle_modal_evaluate_button(
     }
 }
 
-fn sync_eval_step_bar(
+/// Enter the screenshot mode. Only ever entered, never left from here — what
+/// leaves it is using the editor again, which is `end_screenshot_mode`.
+///
+/// The rebuild is for the caret: it is a scene entity like any node, so it goes
+/// away by not being spawned rather than by being hidden.
+fn handle_screenshot_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (Changed<Interaction>, With<ScreenshotButton>),
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+    mut screenshot: ResMut<ScreenshotMode>,
+    mut rebuild: ResMut<NeedsRebuild>,
+    time: Res<Time>,
+) {
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
+        match *interaction {
+            Interaction::Pressed => {
+                screenshot.entered_at = Some(time.elapsed_secs());
+                rebuild.0 = true;
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
+                color.0 = Color::srgb(0.6, 0.6, 0.7);
+            }
+        }
+    }
+}
+
+/// End the screenshot mode at the first sign of life.
+///
+/// The input is not swallowed: it does whatever it normally does, and the mode
+/// ending is a side effect of the editor being used again rather than a command
+/// of its own. That is also why no system ordering is needed — nothing here
+/// races anything, and a `MessageReader` carries its own cursor, so the camera
+/// draining motion for itself does not drain it for us.
+///
+/// The readers are drained whatever the mode, because a message lives two
+/// frames: left standing, the movement that reached for the button would be
+/// waiting the moment the mode began, and end it before the grace could.
+fn end_screenshot_mode(
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut motion: MessageReader<MouseMotion>,
+    mut wheel: MessageReader<MouseWheel>,
+    mut screenshot: ResMut<ScreenshotMode>,
+    mut rebuild: ResMut<NeedsRebuild>,
+) {
+    // `fold` and `count`, not `any`/`next`: both have to walk the whole queue.
+    // A short-circuiting read leaves the rest of it standing for next frame,
+    // and next frame it would end a mode that had only just begun.
+    let moved = motion
+        .read()
+        .fold(false, |seen, m| seen || m.delta != Vec2::ZERO);
+    let scrolled = wheel.read().count() > 0;
+    if !screenshot.listening(time.elapsed_secs()) {
+        return;
+    }
+    let touched = moved
+        || scrolled
+        || keys.get_just_pressed().next().is_some()
+        || mouse.get_just_pressed().next().is_some();
+    if touched {
+        screenshot.entered_at = None;
+        rebuild.0 = true;
+    }
+}
+
+/// Fill the control row with what the current phase has to offer.
+///
+/// Idle is `▶ ▶▌` — begin, or begin and go all the way. Running is `◀ ■ ▶ ▶▌`,
+/// and `■` stands exactly where `▶` did: the same place answers "begin" and
+/// "stop", so the row grows outward from a fixed point rather than shuffling
+/// under the pointer. `▶▌` keeps its own place at the end throughout, because
+/// it means the same thing in both.
+///
+/// The shapes are the ones the bundled font has, which is why they are not the
+/// media-control block: it carries neither `⏭` (U+23ED) nor `⏩`, so `▶▌` is
+/// U+25B6 with U+258C — a left half block, which fills the left half of its
+/// cell and so sits against the triangle. Likewise `■` (U+25A0) rather than
+/// `⏹`. No pause at all, and none is wanted: a run already sits on its step
+/// until told to take another.
+///
+/// Latched on the phase, so the row is rebuilt only when it changes. The latch
+/// is an `Option` rather than a `bool` so the first run fills the idle row too;
+/// as a bare `bool` it would start out agreeing with "not running" and put
+/// nothing on screen until the first evaluation.
+fn sync_player_controls(
     mut commands: Commands,
     eval: Res<EvalState>,
     ui_font: Res<UiFont>,
-    bar_q: Query<Entity, With<EvalStepBarEntity>>,
-    mut was_running: Local<bool>,
+    row_q: Query<Entity, With<PlayerControls>>,
+    content_q: Query<Entity, With<PlayerControlsEntity>>,
+    mut was_running: Local<Option<bool>>,
 ) {
     let running_now = matches!(eval.phase, EvalPhase::Running { .. });
-    if running_now == *was_running {
+    if *was_running == Some(running_now) {
         return;
     }
-    for e in bar_q.iter() {
+    *was_running = Some(running_now);
+    for e in content_q.iter() {
         commands.entity(e).despawn();
     }
-    *was_running = running_now;
-    if !running_now {
+    let Ok(row) = row_q.single() else {
         return;
-    }
-    // Exit / Prev / Next / the count, from the bottom-left corner rightward —
-    // the corner the `Evaluate` button they replace sits in. Prev before Next,
-    // because that is the direction the two of them move along.
-    spawn_corner_button(
-        &mut commands,
-        &ui_font.0,
-        "Exit Evaluation",
-        (ExitEvaluationButton, EvalStepBarEntity),
-        Val::Px(12.0),
-        Val::Px(12.0),
-    );
-    spawn_corner_button(
-        &mut commands,
-        &ui_font.0,
-        "Prev",
-        (PrevStepButton, EvalStepBarEntity),
-        Val::Px(170.0),
-        Val::Px(12.0),
-    );
-    spawn_corner_button(
-        &mut commands,
-        &ui_font.0,
-        "Next",
-        (NextStepButton, EvalStepBarEntity),
-        Val::Px(240.0),
-        Val::Px(12.0),
-    );
-    // Spawned empty: `update_step_button_visuals` writes it every frame, and it
-    // is the only thing that knows which step the bar has moved to since.
-    commands.spawn((
-        Text::new(""),
-        text_font(&ui_font.0, 14.0),
-        TextColor(Color::srgb(0.6, 0.6, 0.7)),
-        Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(310.0),
-            // Not the buttons' 12: they carry 8px of padding around a 14px
-            // line, so sitting the bare text 8 higher puts it on their middle.
-            bottom: Val::Px(20.0),
-            ..default()
-        },
-        StepCounterText,
-        EvalStepBarEntity,
-        HideDuringStartMenu,
-    ));
+    };
+    commands.entity(row).with_children(|parent| {
+        if !running_now {
+            spawn_control_button(parent, &ui_font.0, "\u{25B6}", EvaluateButton);
+            spawn_control_button(parent, &ui_font.0, "\u{25B6}\u{258C}", FullRunButton);
+            return;
+        }
+        // Prev before Exit before Next: the two arrows sit either side of the
+        // step they move, and what stops the run is between them, where the
+        // thing that started it stood.
+        spawn_control_button(parent, &ui_font.0, "\u{25C0}", PrevStepButton);
+        spawn_control_button(parent, &ui_font.0, "\u{25A0}", ExitEvaluationButton);
+        spawn_control_button(parent, &ui_font.0, "\u{25B6}", NextStepButton);
+        spawn_control_button(parent, &ui_font.0, "\u{25B6}\u{258C}", FullRunButton);
+        // Spawned empty: `update_step_button_visuals` writes it every frame, and
+        // it is the only thing that knows which step the row has moved to since.
+        parent.spawn((
+            Text::new(""),
+            text_font(&ui_font.0, 14.0),
+            TextColor(Color::srgb(0.6, 0.6, 0.7)),
+            StepCounterText,
+            PlayerControlsEntity,
+        ));
+    });
 }
 
 fn handle_eval_step_buttons(
@@ -4301,28 +4527,163 @@ fn handle_eval_step_buttons(
     }
 }
 
+/// Say that the run should reach its end, and start one if none is going.
+///
+/// Only ever says it — `apply_run_to_end` is what does it. That split is what
+/// carries the wish across the values modal: pressed on an idle graph with
+/// Sources, this opens the modal and the run begins a few presses later, with
+/// nothing in between that could have remembered what was asked for.
+///
+/// No hover tint, like `Prev` and `Next` beside it: these three say whether they
+/// can be pressed, not whether they are being looked at.
+fn handle_full_run_button(
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<FullRunButton>)>,
+    mut eval: ResMut<EvalState>,
+    state: Res<GraphState>,
+) {
+    if !interaction_q.iter().any(|i| *i == Interaction::Pressed) {
+        return;
+    }
+    if matches!(eval.phase, EvalPhase::Idle) {
+        begin_evaluation(&mut eval, &state);
+    }
+    eval.run_to_end = true;
+}
+
+/// Take the run to its end, one step at a time, in a single frame.
+///
+/// Exactly what pressing `Next` until it goes quiet would do, and for the same
+/// reason: every snapshot is kept, so `Step N` lands on the last number and
+/// `Prev` walks back through the run rather than jumping over it. The button
+/// spares presses, not the history.
+///
+/// Three ways to stop, and all three are needed:
+///
+/// - the sink has a value, which is what being evaluated *is*;
+/// - the step failed, which ends the run the way a failed `Next` does;
+/// - the step resolved nothing new. This is the one that matters: a node whose
+///   inputs never all arrive leaves `eval_next_step` returning the state
+///   unchanged, for ever. `Next` already tests for it — a press that resolves
+///   nothing does not grow the history — and here it is the difference between
+///   stopping and hanging.
+///
+/// The cap behind them is a real bound rather than a guess: a productive round
+/// resolves at least one node, so there cannot be more rounds than there are
+/// nodes. It is there in case a fourth way to stand still is ever invented.
+///
+/// The graph is flattened once. A step never changes it, and flattening deep
+/// clones every sub-layout — doing it per round would cost more than the steps.
+fn apply_run_to_end(mut eval: ResMut<EvalState>, state: Res<GraphState>) {
+    if !eval.run_to_end {
+        return;
+    }
+    // Still on its way to a run — the values modal is open, and the wish waits
+    // for it rather than being spent on a phase that is not one.
+    if matches!(eval.phase, EvalPhase::SourcePrompt { .. }) {
+        return;
+    }
+    eval.run_to_end = false;
+    if !matches!(eval.phase, EvalPhase::Running { .. }) {
+        // Cancelled, or refused before it began. Nothing to run.
+        return;
+    }
+    let graph = state.root_graph().flattened_graph();
+    let Some(sink_node) = graph.nodes.get(&graph.sink_node_id).cloned() else {
+        return;
+    };
+    let cap = graph.nodes.len() + 1;
+    let mut rounds = 0usize;
+    loop {
+        if rounds >= cap {
+            warn!("run to end: gave up after {} rounds without finishing", cap);
+            break;
+        }
+        rounds += 1;
+        // Computed in a block of its own so the read of `eval.phase` is over
+        // before the write below — the same two-step the `Next` press takes,
+        // and for the same reason.
+        let stepped = {
+            let EvalPhase::Running {
+                states,
+                current,
+                user_source_values,
+            } = &eval.phase
+            else {
+                break;
+            };
+            if states[*current].is_evaluated(&state.root_graph().graph) {
+                break;
+            }
+            states[*current].eval_next_step(
+                &graph,
+                user_source_values,
+                (graph.sink_node_id.clone(), sink_node.clone()),
+                &state.function_declarations,
+            )
+        };
+        let next_state = match stepped {
+            Ok(next_state) => next_state,
+            Err(errors) => {
+                eval.phase = EvalPhase::ErrorModal(errors.join("\n"));
+                break;
+            }
+        };
+        let EvalPhase::Running {
+            states, current, ..
+        } = &mut eval.phase
+        else {
+            break;
+        };
+        // Nothing new resolved: the run is standing still and no further press
+        // would move it either.
+        if next_state.node_ids_to_values.len() <= states[*current].node_ids_to_values.len() {
+            break;
+        }
+        states.truncate(*current + 1);
+        states.push(next_state);
+        *current += 1;
+    }
+}
+
 fn update_step_button_visuals(
     eval: Res<EvalState>,
     state: Res<GraphState>,
-    mut prev_q: Query<
-        (&mut BackgroundColor, &Children),
-        (With<PrevStepButton>, Without<NextStepButton>),
-    >,
-    mut next_q: Query<
-        (&mut BackgroundColor, &Children),
-        (With<NextStepButton>, Without<PrevStepButton>),
+    // One query over the whole row rather than one per button with `Without`
+    // filters of each other, which grow as the square of them. Which button an
+    // entity is, it says itself; the two that are simply pressable whenever they
+    // are on screen say nothing and fall through.
+    mut row_q: Query<
+        (
+            &Interaction,
+            &mut BackgroundColor,
+            &Children,
+            Has<PrevStepButton>,
+            Has<NextStepButton>,
+            Has<FullRunButton>,
+        ),
+        Or<(
+            With<EvaluateButton>,
+            With<PrevStepButton>,
+            With<NextStepButton>,
+            With<FullRunButton>,
+            With<ExitEvaluationButton>,
+        )>,
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut counter_q: Query<&mut Text, With<StepCounterText>>,
 ) {
-    let (prev_enabled, next_enabled) = match &eval.phase {
+    // Running to the end is the one of the three that can be asked for with no
+    // run going: it starts one. The other two only move within a run.
+    let (prev_enabled, next_enabled, full_enabled) = match &eval.phase {
         EvalPhase::Running {
             states, current, ..
         } => {
             let next_possible = !states[*current].is_evaluated(&state.root_graph().graph);
-            (*current > 0, next_possible)
+            (*current > 0, next_possible, next_possible)
         }
-        _ => (false, false),
+        EvalPhase::Idle => (false, false, true),
+        // A modal owns the screen and the row is hidden behind it anyway.
+        _ => (false, false, false),
     };
     // The index itself: snapshot 0 is a run at rest
     // (`eval::State::nothing_yet`), with the prompt's answers waiting at the
@@ -4340,41 +4701,45 @@ fn update_step_button_visuals(
             text.0 = counted.clone();
         }
     }
-    let apply = |enabled: bool, bg: &mut BackgroundColor, text_color: &mut TextColor| {
-        if enabled {
-            bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-            text_color.0 = Color::srgb(0.85, 0.85, 0.9);
+    // Three states and one writer for all of them. It used to be two — the
+    // greying here, the hover tint in each button's own handler — which left
+    // `Evaluate` resting a shade darker than the `Prev` beside it, for no
+    // reason either of them stated.
+    let apply = |enabled: bool,
+                 interaction: &Interaction,
+                 bg: &mut BackgroundColor,
+                 text_color: &mut TextColor| {
+        let (fill, ink) = match (enabled, interaction) {
+            (false, _) => (
+                Color::srgba(0.10, 0.10, 0.13, 0.9),
+                Color::srgb(0.35, 0.35, 0.4),
+            ),
+            (true, Interaction::Hovered | Interaction::Pressed) => (
+                Color::srgba(0.2, 0.2, 0.3, 0.95),
+                Color::srgb(0.85, 0.85, 0.9),
+            ),
+            (true, Interaction::None) => (
+                Color::srgba(0.16, 0.16, 0.22, 0.9),
+                Color::srgb(0.6, 0.6, 0.7),
+            ),
+        };
+        bg.0 = fill;
+        text_color.0 = ink;
+    };
+    for (interaction, mut bg, children, is_prev, is_next, is_full) in row_q.iter_mut() {
+        // `Evaluate` and `Exit` fall through: each is only ever on screen in the
+        // phase it belongs to, and in that phase it can always be pressed.
+        let enabled = if is_prev {
+            prev_enabled
+        } else if is_next {
+            next_enabled
+        } else if is_full {
+            full_enabled
         } else {
-            bg.0 = Color::srgba(0.10, 0.10, 0.13, 0.9);
-            text_color.0 = Color::srgb(0.35, 0.35, 0.4);
-        }
-    };
-    for (mut bg, children) in prev_q.iter_mut() {
+            true
+        };
         if let Ok(mut c) = text_color_q.get_mut(children[0]) {
-            apply(prev_enabled, &mut *bg, &mut *c);
-        }
-    }
-    for (mut bg, children) in next_q.iter_mut() {
-        if let Ok(mut c) = text_color_q.get_mut(children[0]) {
-            apply(next_enabled, &mut *bg, &mut *c);
-        }
-    }
-}
-
-fn sync_evaluate_button_visibility(
-    eval: Res<EvalState>,
-    start_menu: Res<StartMenu>,
-    mut q: Query<&mut Node, With<EvaluateButton>>,
-) {
-    let running = matches!(eval.phase, EvalPhase::Running { .. });
-    let desired = if start_menu.showing || running || modal_is_open(&eval) {
-        Display::None
-    } else {
-        Display::Flex
-    };
-    for mut node in q.iter_mut() {
-        if node.display != desired {
-            node.display = desired;
+            apply(enabled, interaction, &mut *bg, &mut *c);
         }
     }
 }
@@ -4578,6 +4943,7 @@ fn rebuild_scene(
     ui_font: Res<UiFont>,
     pick: Res<PickState>,
     editor_mode: Res<EditorMode>,
+    screenshot: Res<ScreenshotMode>,
     mut rebuild: ResMut<NeedsRebuild>,
     _query_scene_entities: Query<Entity, With<SceneEntity>>,
 ) {
@@ -4594,6 +4960,7 @@ fn rebuild_scene(
             ui_font,
             pick,
             editor_mode,
+            screenshot,
         );
         rebuild.0 = false;
     }
@@ -5538,7 +5905,7 @@ fn spawn_selection_display(mut commands: Commands, ui_font: Res<UiFont>) {
             ..default()
         },
         SelectionDisplay,
-        HideDuringStartMenu,
+        EditorChrome,
     ));
 }
 
@@ -5559,11 +5926,24 @@ fn spawn_fps_display(mut commands: Commands, ui_font: Res<UiFont>) {
 
 fn update_fps_display(
     diagnostics: Res<DiagnosticsStore>,
-    mut text_q: Query<&mut Text, With<FpsDisplay>>,
+    screenshot: Res<ScreenshotMode>,
+    mut text_q: Query<(&mut Text, &mut Node), With<FpsDisplay>>,
 ) {
-    let Ok(mut text) = text_q.single_mut() else {
+    let Ok((mut text, mut node)) = text_q.single_mut() else {
         return;
     };
+    // The one readout that stays lit behind the start menu — a frame rate is
+    // true of the program whoever is looking at it. A screenshot is the one
+    // case where it is not wanted, so this writes its own `display` rather
+    // than wearing `EditorChrome` and answering to every reason at once.
+    let desired = if screenshot.active() {
+        Display::None
+    } else {
+        Display::Flex
+    };
+    if node.display != desired {
+        node.display = desired;
+    }
     let fps = diagnostics
         .get(&FrameTimeDiagnosticsPlugin::FPS)
         .and_then(|d| d.smoothed());
@@ -5591,7 +5971,7 @@ fn spawn_mode_display(mut commands: Commands, ui_font: Res<UiFont>) {
             ..default()
         },
         ModeDisplay,
-        HideDuringStartMenu,
+        EditorChrome,
     ));
 }
 
@@ -5651,7 +6031,7 @@ fn spawn_breadcrumb_display(mut commands: Commands, ui_font: Res<UiFont>) {
             ..default()
         },
         BreadcrumbDisplay,
-        HideDuringStartMenu,
+        EditorChrome,
     ));
 }
 
@@ -5925,6 +6305,7 @@ fn update_selection_display(
 fn update_grid_material(
     pick: Res<PickState>,
     state: Res<GraphState>,
+    screenshot: Res<ScreenshotMode>,
     grid_q: Query<(
         Entity,
         &ScopeGridEntity,
@@ -5932,6 +6313,11 @@ fn update_grid_material(
     )>,
     mut materials: ResMut<Assets<grid::GridMaterial>>,
 ) {
+    // Both of these say where something *is* rather than what the program does
+    // — the border where the caret stands, the highlight where the pointer
+    // does. In screenshot mode neither is on screen to be pointed at, so
+    // neither marks anything.
+    let marking = !screenshot.active();
     // The bordered grid is the one the caret addresses.
     let caret_path = state.scope_of_caret(&pick).map(|s| s.path);
     let hit_entity = pick.hovered_grid.as_ref().map(|h| h.entity);
@@ -5944,17 +6330,18 @@ fn update_grid_material(
         let Some(mat) = materials.get_mut(&mat_handle.0) else {
             continue;
         };
-        if Some(entity) == hit_entity {
+        if marking && Some(entity) == hit_entity {
             mat.hover_pos = hit_center;
             mat.hover_active = 1.0;
         } else {
             mat.hover_active = 0.0;
         }
-        mat.border_active = if Some(scope_grid.context.as_slice()) == caret_path.as_deref() {
-            1.0
-        } else {
-            0.0
-        };
+        mat.border_active =
+            if marking && Some(scope_grid.context.as_slice()) == caret_path.as_deref() {
+                1.0
+            } else {
+                0.0
+            };
     }
 }
 
@@ -7014,6 +7401,7 @@ fn main() {
         .init_resource::<EditorMode>()
         .init_resource::<InsertPrompt>()
         .init_resource::<PendingNode>()
+        .init_resource::<ScreenshotMode>()
         .add_systems(
             Startup,
             (
@@ -7024,6 +7412,7 @@ fn main() {
                 spawn_selection_display,
                 spawn_node_editor_panel,
                 spawn_insert_prompt_panel,
+                spawn_player_controls,
                 spawn_fps_display,
                 spawn_breadcrumb_display,
                 spawn_mode_display,
@@ -7038,6 +7427,11 @@ fn main() {
                     draw_drag_preview,
                     animate_nodes,
                     (
+                        // First, because the mode it ends is the reason the
+                        // caret is missing: leaving has to be seen before
+                        // `rebuild_scene` at the end of this chain, or the
+                        // caret comes back a frame late.
+                        end_screenshot_mode,
                         handle_delete_node_button,
                         handle_add_button,
                         handle_insert_prompt_click,
@@ -7082,10 +7476,10 @@ fn main() {
                     drag_end_system,
                     // Between the press and the teardown, so a step is
                     // redrawn in the frame it moved in rather than the one
-                    // after. `handle_eval_step_buttons` ends the chain that
-                    // every way into and out of `Running` goes through, which
-                    // is why naming it alone is enough.
-                    sync_eval_rebuild.after(handle_eval_step_buttons),
+                    // after. `apply_run_to_end` ends the chain that every way
+                    // into and out of `Running` goes through, which is why
+                    // naming it alone is enough.
+                    sync_eval_rebuild.after(apply_run_to_end),
                     clear_scene,
                     ApplyDeferred,
                     rebuild_scene,
@@ -7108,6 +7502,7 @@ fn main() {
             Update,
             (
                 handle_evaluate_button,
+                handle_screenshot_button,
                 handle_camera_mode_button,
                 sync_camera_mode_button,
                 handle_semi_ortho_checkbox,
@@ -7117,9 +7512,10 @@ fn main() {
                 handle_modal_cancel_button,
                 handle_modal_evaluate_button,
                 handle_eval_step_buttons,
+                handle_full_run_button,
+                apply_run_to_end,
                 sync_modal_ui,
-                sync_eval_step_bar,
-                sync_evaluate_button_visibility,
+                sync_player_controls,
                 update_step_button_visuals,
                 update_delete_button_visuals,
                 sync_add_button,
