@@ -68,6 +68,37 @@ const CARET_EDGE_THICKNESS: f32 = CELL / 60.0;
 /// keeps the cell behind the caret readable, not the paint.
 const CARET_FACE_ALPHA: f32 = 0.8;
 
+/// Why the caret is opaque, when everything about it says it should blend.
+///
+/// The OIT layer buffer holds eight fragments per pixel and no more. `oit_draw`
+/// counts them up and drops everything past the eighth where it stands — and
+/// *which* eight survive is settled by draw order, not by depth. The
+/// transparent phase runs back to front, so a ray crossing a few nested volumes
+/// spends the buffer on their surfaces on the way in, and the caret, being the
+/// nearest thing on that ray, is exactly what falls off the end. The picture
+/// then put a scope's shell in front of a caret standing in front of it, which
+/// is the one thing a pointer must never do.
+///
+/// There is no way to buy the caret a slot. Draw order is the only lever, the
+/// sort key is the mesh's view distance, and the one knob that shifts it —
+/// `StandardMaterial::depth_bias` — is not a sort key: `StandardMaterial`'s own
+/// `specialize` writes it straight into `DepthBiasState::constant`, so biasing
+/// the order biases the depth with it and the caret sinks to the far plane.
+///
+/// So it leaves the blended path instead. Opaque geometry is drawn in its own
+/// pass, writes depth, and cannot be dropped: a shell behind the caret is cut
+/// by the depth test, and one genuinely in front still blends over it, because
+/// the resolve stops at the opaque depth. It is the reading `edge_band.wgsl`
+/// already takes for a strand — cut out rather than blended, to be in the depth
+/// buffer at all — and it hands four OIT slots per ray back to the surfaces
+/// that still need them.
+///
+/// The cost is that the caret no longer shows what is behind it. On the NORMAL
+/// outline that is twelve hairlines' worth of nothing; on the INSERT faces it
+/// is real, and the blink is what answers it — which is what those faces were
+/// already relying on rather than on the paint.
+const CARET_ALPHA_MODE: AlphaMode = AlphaMode::Opaque;
+
 /// The linear brightness that arrives on screen as #FFFFFF — well past white.
 ///
 /// The camera tonemaps (TonyMcMapface), which maps a linear 1.0 to roughly 0.8
@@ -103,7 +134,10 @@ pub fn cell_caret_faces(cell: Vec3) -> Vec<RenderObject> {
             DISPLAY_WHITE,
             CARET_FACE_ALPHA,
         )),
-        alpha_mode: AlphaMode::Blend,
+        // The alpha above is carried but not spent — see `CARET_ALPHA_MODE`.
+        // Kept rather than dropped because it is what the face goes back to the
+        // moment the caret is allowed into the blended path again.
+        alpha_mode: CARET_ALPHA_MODE,
         cull_mode: None,
         unlit: true,
         ..default()
@@ -154,7 +188,7 @@ pub fn cell_caret_edges(cell: Vec3) -> Vec<RenderObject> {
                 mesh: Cuboid::new(size.x, size.y, size.z).mesh().build(),
                 material: StandardMaterial {
                     base_color: Color::srgba(0.85, 0.84, 0.80, 0.7),
-                    alpha_mode: AlphaMode::Blend,
+                    alpha_mode: CARET_ALPHA_MODE,
                     cull_mode: None,
                     unlit: true,
                     ..default()
