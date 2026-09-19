@@ -91,6 +91,12 @@ pub struct GridMaterial {
     pub axis_u: Vec4,
     #[uniform(0)]
     pub axis_v: Vec4,
+    /// The point the distance fade is measured from: the centre of the cell the
+    /// caret stands on, in world space. The one uniform here that is *not* in
+    /// the plane's own two coordinates — the fade needs all three axes, or it
+    /// would be blind to the one each surface stands on. `w` is unused padding.
+    #[uniform(0)]
+    pub fog_origin: Vec4,
     /// World-space footprints of multi-cell nodes: `xy = min.xz`, `zw =
     /// max.xz`. Fragments whose neighbours across the nearest grid line all
     /// lie inside the same footprint suppress that line.
@@ -108,9 +114,16 @@ impl GridMaterial {
     /// colours and leaves the hues alone: a volume further off is the same
     /// surface seen through more walls, not a differently coloured one.
     ///
+    /// `fog_origin` is where the *other* fade hangs from — the smooth one the
+    /// shader runs on distance, as against the stepped one `fade` carries. It
+    /// is the caret's cell centre, and passing it rather than assuming the
+    /// origin is what lets the lit region travel with the work. Baked in here
+    /// because a caret move rebuilds the scene, the reading `lod` already
+    /// takes.
+    ///
     /// Hover, border and footprints start off — only a scope's own floor fills
     /// them in, per frame.
-    pub fn scope_surface(axis_u: Vec3, axis_v: Vec3, fade: f32) -> Self {
+    pub fn scope_surface(axis_u: Vec3, axis_v: Vec3, fade: f32, fog_origin: Vec3) -> Self {
         Self {
             plane_color: LinearRgba::new(0.07, 0.07, 0.1, 0.55 * fade),
             line_color: LinearRgba::new(0.2, 0.2, 0.5, 0.4 * fade),
@@ -130,6 +143,7 @@ impl GridMaterial {
             _pad2: 0.0,
             axis_u: axis_u.extend(0.0),
             axis_v: axis_v.extend(0.0),
+            fog_origin: fog_origin.extend(0.0),
             footprints: [Vec4::ZERO; MAX_FOOTPRINTS],
         }
     }
@@ -223,6 +237,10 @@ fn spawn_grid(
             _pad2: 0.0,
             axis_u: Vec3::X.extend(0.0),
             axis_v: Vec3::Z.extend(0.0),
+            // The world origin, which is what this grid's fade always hung
+            // from — a ground plane is not addressed by the caret, so it has
+            // nothing else to centre on.
+            fog_origin: Vec4::ZERO,
             footprints: [Vec4::ZERO; MAX_FOOTPRINTS],
         })),
         BaseGridEntity,

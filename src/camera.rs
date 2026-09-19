@@ -108,9 +108,11 @@ pub const RESET_RADIUS: f32 = 20.0;
 /// Default and range of the scale setting, in pixels per cell.
 pub const DEFAULT_CELL_PIXELS: f32 = 40.0;
 /// The lower bound is not comfort but geometry: a grid surface fades to nothing
-/// 34 cells from the origin (`GridMaterial::scope_surface`), and an orthographic
+/// 34 cells from the caret (`GridMaterial::scope_surface`), and an orthographic
 /// view zoomed out past that would show the fade end as a hard disc edge, which
-/// perspective used to hide.
+/// perspective used to hide. The centre travels with the caret now, so the edge
+/// travels with it too — which changes where the disc sits, not that zooming
+/// out far enough brings it into frame.
 const MIN_CELL_PIXELS: f32 = 20.0;
 const MAX_CELL_PIXELS: f32 = 160.0;
 

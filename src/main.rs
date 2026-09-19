@@ -1069,6 +1069,13 @@ fn spawn_graph_nodes(
         state.scope_of_caret(&pick).map(|scope| scope.path),
         clipping.0,
     );
+    // Where the grid surfaces' distance fade hangs from — the same reading as
+    // above, one step finer. `grading` asks which volume the caret is in and
+    // grades a whole scope by the answer; this asks which cell, so the fade can
+    // fall off smoothly around it instead of in steps. Baked in for the same
+    // reason, and it is the caret's point for every volume alike: a fade that
+    // re-centred per volume would say nothing about where the work is.
+    let fog_origin = render::cell_center_world(pick.selected_pos.as_vec3());
     let mut node_entites = std::collections::HashMap::<model::node::Id, Entity>::new();
     let mut anchor_entities = std::collections::HashMap::<model::anchor::Id, Entity>::new();
     let mut anchor_world_positions = std::collections::HashMap::<model::anchor::Id, Vec3>::new();
@@ -1543,6 +1550,7 @@ fn spawn_graph_nodes(
             offset,
             grading.content(&walked_graph.context),
             grading.shell(&walked_graph.context),
+            fog_origin,
             InteractiveFloor {
                 scope: ScopeGridEntity {
                     context: walked_graph.context.clone(),
@@ -5167,6 +5175,10 @@ struct InteractiveFloor {
 /// `min`/`max` are the volume's inclusive cell bounds in coordinates `offset`
 /// carries to global, always `grid_bounds()`. Cells are corner-anchored, so
 /// every far edge is `max + 1`.
+///
+/// `fog_origin` goes to all four surfaces unchanged: it is the caret's, not the
+/// volume's, and a fade that re-centred per volume would say nothing about
+/// where the work is.
 #[allow(clippy::too_many_arguments)]
 fn spawn_volume_surfaces(
     commands: &mut Commands,
@@ -5178,6 +5190,7 @@ fn spawn_volume_surfaces(
     offset: Vec3,
     fade: f32,
     shell: f32,
+    fog_origin: Vec3,
     floor: InteractiveFloor,
 ) {
     let size_x = (max.x - min.x + 1) as f32 * render::LAYOUT_SCALE.x.abs();
@@ -5238,7 +5251,7 @@ fn spawn_volume_surfaces(
             border_max: floor.border_max,
             footprint_count: floor.footprint_count,
             footprints: floor.footprints,
-            ..grid::GridMaterial::scope_surface(Vec3::X, Vec3::Z, fade)
+            ..grid::GridMaterial::scope_surface(Vec3::X, Vec3::Z, fade, fog_origin)
         })),
         Transform::from_translation(floor_center),
         floor.scope,
@@ -5267,6 +5280,7 @@ fn spawn_volume_surfaces(
             Vec3::Z,
             Vec3::Y,
             fade,
+            fog_origin,
         ))),
         Transform::from_xyz(wall_center.x, wall_center.y, wall_center.z),
         SceneEntity,
@@ -5291,6 +5305,7 @@ fn spawn_volume_surfaces(
                 Vec3::X,
                 Vec3::Y,
                 fade,
+                fog_origin,
             ))),
             Transform::from_xyz(face_center.x, face_center.y, face_z),
             SceneEntity,

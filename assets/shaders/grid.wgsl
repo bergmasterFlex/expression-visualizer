@@ -29,6 +29,10 @@ struct GridParams {
     // World axes the plane's 2D grid coordinates are read along.
     axis_u: vec4<f32>,
     axis_v: vec4<f32>,
+    // The point the fade below is measured from: the centre of the cell the
+    // caret stands on. World space, in all three axes — unlike everything
+    // above, which is in the plane's own two. `w` is unused padding.
+    fog_origin: vec4<f32>,
     // World-space footprints of multi-cell nodes: `xy = min.xz`,
     // `zw = max.xz`. Interior grid lines are suppressed inside these.
     footprints: array<vec4<f32>, 16>,
@@ -129,7 +133,19 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         );
     }
 
-    let dist = length(world_pos);
+    // Measured in three axes from the caret, not in the plane's own two from
+    // the origin, and both halves of that matter.
+    //
+    // `world_pos` drops whichever axis the surface stands on — a Z face's own
+    // Z, a floor's Y — so the fade it yields is a cylinder around exactly the
+    // axis that surface is displaced along, and a face sitting far down the
+    // graph never faded for sitting there at all. A sphere has no privileged
+    // axis, so it grades every orientation alike.
+    //
+    // And it hangs from the caret rather than the world origin, so what is
+    // being worked on is what stays lit. `fog_origin` is baked in at spawn:
+    // a caret move rebuilds the scene, the same way `lod` reads its grading.
+    let dist = length(in.world_position.xyz - params.fog_origin.xyz);
     let fade = 1.0 - saturate((dist - params.fade_start) / (params.fade_end - params.fade_start));
 
     let out_color = vec4<f32>(color.rgb, color.a * fade);
