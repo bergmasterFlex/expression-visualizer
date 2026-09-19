@@ -954,6 +954,69 @@ fn text_font(font: &Handle<Font>, size: f32) -> TextFont {
 
 // ── Systems ─────────────────────────────────────────────────
 
+/// What the OIT layer budget actually is on this machine, said once at startup.
+///
+/// The layer count is not a free choice: the layers buffer is one `vec2<u32>`
+/// per pixel per layer over the whole viewport, bound whole, so it is measured
+/// against `max_storage_buffer_binding_size` — and that number is the adapter's,
+/// not wgpu's 128 MiB default. Bevy's default priority is `Functionality`, and
+/// `initialize_renderer` throws the requested limits away and asks the adapter
+/// for its own, so what is in force here is whatever this GPU reports. Which is
+/// exactly why it is worth printing rather than reasoning about: raising
+/// `layer_count` is a one-line change, and this is the line that says whether
+/// there is room for it.
+///
+/// The ceiling it prints is the binding limit alone. It is not advice — the
+/// resolve pass keeps `array<OitFragment, LAYER_COUNT>` in private memory and
+/// bubble-sorts it, so the practical ceiling is well under the one the buffer
+/// allows.
+fn log_oit_budget(
+    device: Option<Res<bevy::render::renderer::RenderDevice>>,
+    adapter: Option<Res<bevy::render::renderer::RenderAdapterInfo>>,
+    windows: Query<&Window>,
+    settings: Query<&OrderIndependentTransparencySettings>,
+) {
+    /// One layer entry: the `vec2<u32>` `oit_draw` packs colour and depth into.
+    const ENTRY_BYTES: u64 = 8;
+
+    // A diagnostic must not be the thing that takes the app down, so every one
+    // of these is a question rather than an assertion.
+    let (Some(device), Some(adapter), Ok(window)) = (device, adapter, windows.single()) else {
+        return;
+    };
+    let size = window.physical_size();
+    let pixels = u64::from(size.x) * u64::from(size.y);
+    if pixels == 0 {
+        return;
+    }
+
+    let limit = device.limits().max_storage_buffer_binding_size as u64;
+    let per_layer = pixels * ENTRY_BYTES;
+    let layers = settings.iter().next().map(|s| s.layer_count.max(0) as u64);
+    let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+
+    info!(
+        "oit: {}x{} px costs {:.1} MiB per layer, limit {:.0} MiB -> room for {} layers; \
+         in use: {}. adapter: {:?} / {}",
+        size.x,
+        size.y,
+        mib(per_layer),
+        mib(limit),
+        limit / per_layer,
+        match layers {
+            Some(n) => format!(
+                "{} layers, {:.0} MiB ({:.0}%)",
+                n,
+                mib(per_layer * n),
+                100.0 * (per_layer * n) as f64 / limit as f64,
+            ),
+            None => "no OIT camera".to_string(),
+        },
+        adapter.backend,
+        adapter.name,
+    );
+}
+
 /// Initial scene setup: camera, lights, ambient.
 fn setup_scene(mut commands: Commands) {
     // Camera with order-independent transparency for correct intersection
@@ -977,10 +1040,20 @@ fn setup_scene(mut commands: Commands) {
         Transform::from_xyz(0.0, 5.0, 12.0).looking_at(Vec3::ZERO, Vec3::Y),
         // `layer_count` stays at Bevy's eight, and not because eight is
         // comfortable. The layer buffer is one `vec2<u32>` per pixel per layer
-        // across the whole viewport, bound whole, and wgpu's default
-        // `max_storage_buffer_binding_size` is 128 MiB — so eight layers
-        // already spend 98.9% of that budget at 1920x1080. Sixteen would halve
-        // the window this can run in.
+        // across the whole viewport, bound whole, so it is spent against
+        // `max_storage_buffer_binding_size` — 127 MiB of it at 1920x1080.
+        //
+        // What that budget *is* is not wgpu's 128 MiB default: Bevy's default
+        // priority is `Functionality`, and `initialize_renderer` discards the
+        // requested limits and takes the adapter's own, so the ceiling is
+        // whatever this GPU reports. `log_oit_budget` prints it at startup
+        // rather than leaving it to be assumed.
+        //
+        // The buffer is not the binding constraint either way. The resolve pass
+        // holds `array<OitFragment, LAYER_COUNT>` in private memory — 32 bytes
+        // an entry — and bubble-sorts it, so doubling the layers quadruples the
+        // sort and doubles a spill that is already costly. Bevy warns past 32;
+        // the useful ceiling is well under it.
         //
         // `alpha_threshold` does not stay. Bevy's default is `0.0`, and
         // `oit_draw` tests `color.a < alpha_threshold` — a test `0.0` can never
@@ -7646,6 +7719,9 @@ fn main() {
                 spawn_breadcrumb_display,
                 spawn_mode_display,
                 spawn_start_menu,
+                // Last: it reads the window's physical size, and the camera
+                // above is what puts the OIT settings there to be read.
+                log_oit_budget,
             )
                 .chain(),
         )
