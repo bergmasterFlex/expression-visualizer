@@ -98,31 +98,15 @@ pub struct GridMaterial {
     pub footprints: [Vec4; MAX_FOOTPRINTS],
 }
 
-/// How much of a surface's colour survives per volume boundary between the
-/// volume it frames and the one the caret stands in.
-///
-/// Multiplicative and unfloored: the drop is meant to read as distance, and a
-/// floor would flatten the far end of a deep nesting into one tone that says
-/// nothing about how far away it is. At 0.7 a volume four boundaries out still
-/// holds a quarter of its paint — enough to be seen without competing.
-pub const VOLUME_FADE_PER_BOUNDARY: f32 = 0.7;
-
-/// The factor a surface is painted with, `boundaries` volume walls away from
-/// the caret's own volume. `0` is the volume the caret is in, and keeps
-/// everything.
-pub fn volume_fade(boundaries: usize) -> f32 {
-    VOLUME_FADE_PER_BOUNDARY.powi(boundaries as i32)
-}
-
 impl GridMaterial {
     /// The style every volume surface shares: the floor a volume stands on, the
     /// back wall behind it, and the two Z faces closing it. `axis_u`/`axis_v`
     /// orient the grid on the plane.
     ///
-    /// `fade` is how far this volume sits from the one the caret is in, as a
-    /// factor from `volume_fade`. It takes the alpha of both colours and leaves
-    /// the hues alone: a volume further off is the same surface seen through
-    /// more walls, not a differently coloured one.
+    /// `fade` is what survives of this volume at the distance it stands from the
+    /// caret's, as `lod::Lod::content` grades it. It takes the alpha of both
+    /// colours and leaves the hues alone: a volume further off is the same
+    /// surface seen through more walls, not a differently coloured one.
     ///
     /// Hover, border and footprints start off — only a scope's own floor fills
     /// them in, per frame.

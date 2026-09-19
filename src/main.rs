@@ -6,6 +6,7 @@ mod eval;
 mod grid;
 mod infer;
 mod layout;
+mod lod;
 mod mesh;
 mod model;
 mod render;
@@ -544,20 +545,18 @@ struct CaretScope {
     local: IVec3,
 }
 
-/// Volume boundaries between two volumes: the walls crossed going from one to
-/// the other through their nearest common ancestor.
+/// The scope a walked node stands in, written the way every scope path is:
+/// relative to the root graph, empty at the program's own scope.
 ///
-/// Both paths are scope `context`s, which is all a volume path is — a Match used
-/// to be a rung between a scope and its arms, and is not any more: it is drawn
-/// as the node it is, so there is no wall there to cross.
-///
-/// Siblings come out two apart, not one — there is a wall out of the first and a
-/// wall into the second, and no shortcut between them. Going out to the scope
-/// that holds their Match is one, because that is one wall and there is nothing
-/// standing behind it.
-fn volume_boundaries(a: &[model::node::Id], b: &[model::node::Id]) -> usize {
-    let common = a.iter().zip(b).take_while(|(x, y)| x == y).count();
-    (a.len() - common) + (b.len() - common)
+/// `LayoutGraph::walk_all` is started one level further out than that — at the
+/// shell holding the Root node — so its contexts carry the root id in front.
+/// Scope paths from `scope_at` do not, and the two have to be comparable or the
+/// level of detail would grade every volume against the wrong one.
+fn scope_of_walk<'a>(state: &GraphState, context: &'a [model::node::Id]) -> &'a [model::node::Id] {
+    match context.split_first() {
+        Some((first, rest)) if *first == state.root_id => rest,
+        _ => &[],
+    }
 }
 
 impl GraphState {
@@ -1056,10 +1055,28 @@ fn spawn_graph_nodes(
     pick: Res<PickState>,
     editor_mode: Res<EditorMode>,
     screenshot: Res<ScreenshotMode>,
+    clipping: Res<lod::Clipping>,
 ) {
+    // Which volume the caret is in — which is to say which scope, the two being
+    // the same question. Fixed for the whole pass: every volume below is graded
+    // by how far it sits from this one, outward to nothing and inward to a
+    // closed box.
+    //
+    // Baked in at spawn rather than followed per frame, because a caret move
+    // already rebuilds the scene — the caret's own mesh is built from
+    // `pick.selected_pos` further down, and would not move otherwise.
+    let grading = lod::Lod::new(
+        state.scope_of_caret(&pick).map(|scope| scope.path),
+        clipping.0,
+    );
     let mut node_entites = std::collections::HashMap::<model::node::Id, Entity>::new();
     let mut anchor_entities = std::collections::HashMap::<model::anchor::Id, Entity>::new();
     let mut anchor_world_positions = std::collections::HashMap::<model::anchor::Id, Vec3>::new();
+    // What the level of detail leaves of each anchor's own scope. The edge pass
+    // below reads it at both ends of a ribbon: an edge into a Tunnel crosses one
+    // wall, so the two ends may be graded a step apart and the strand has to
+    // pick one.
+    let mut anchor_opacity = std::collections::HashMap::<model::anchor::Id, f32>::new();
     // A Pattern and a TypeCast both hang their declared type on a cell of their
     // own rather than on an anchor, so those cells are recorded here — the link
     // pass has to meet them and would otherwise have no way to ask where they
@@ -1096,6 +1113,15 @@ fn spawn_graph_nodes(
     let mut face_tex_cache: std::collections::HashMap<(String, u32, [u8; 4]), Handle<Image>> =
         std::collections::HashMap::new();
     for walked in state.layout_graph.walk_all() {
+        // Nothing of a scope the grading has closed over or taken to nothing —
+        // not the node, not its anchors, not its labels. Its anchors therefore
+        // never reach `anchor_world_positions`, and every edge and link that
+        // would have met one falls away on the lookup that expects it there.
+        let scope = scope_of_walk(&state, &walked.context);
+        if grading.hidden(scope) {
+            continue;
+        }
+        let opacity = grading.content(scope);
         let layout_node = walked.layout_node;
         let node_id = &layout_node.node_id;
         let node = walked.layout_graph.graph.nodes.get(node_id).unwrap();
@@ -1128,7 +1154,7 @@ fn spawn_graph_nodes(
             Some(obj) => commands
                 .spawn((
                     Mesh3d(meshes.add(obj.mesh)),
-                    MeshMaterial3d(materials.add(obj.material)),
+                    MeshMaterial3d(materials.add(lod::faded(obj.material, opacity))),
                     obj.transform,
                     NodeEntity {
                         node_id: node_id.clone(),
@@ -1156,7 +1182,7 @@ fn spawn_graph_nodes(
         for object in render_node.objects {
             commands.spawn((
                 Mesh3d(meshes.add(object.mesh)),
-                MeshMaterial3d(materials.add(object.material)),
+                MeshMaterial3d(materials.add(lod::faded(object.material, opacity))),
                 object.transform,
                 SceneEntity,
             ));
@@ -1184,10 +1210,13 @@ fn spawn_graph_nodes(
                 .clone();
             commands.spawn((
                 Mesh3d(meshes.add(face.mesh)),
-                MeshMaterial3d(materials.add(StandardMaterial {
-                    base_color_texture: Some(texture),
-                    ..face.material
-                })),
+                MeshMaterial3d(materials.add(lod::faded(
+                    StandardMaterial {
+                        base_color_texture: Some(texture),
+                        ..face.material
+                    },
+                    opacity,
+                ))),
                 face.transform,
                 SceneEntity,
             ));
@@ -1201,6 +1230,7 @@ fn spawn_graph_nodes(
             &mut materials,
             &ui_font.0,
             render_node.strands,
+            opacity,
         );
 
         render_node
@@ -1219,13 +1249,14 @@ fn spawn_graph_nodes(
                     &mut materials,
                     &ui_font.0,
                     strands,
+                    opacity,
                 );
 
                 // Neutral cuboid for anchors without strands.
                 if let Some(body) = plain_body {
                     commands.spawn((
                         Mesh3d(meshes.add(body.mesh)),
-                        MeshMaterial3d(materials.add(body.material)),
+                        MeshMaterial3d(materials.add(lod::faded(body.material, opacity))),
                         body.transform,
                         SceneEntity,
                     ));
@@ -1249,13 +1280,14 @@ fn spawn_graph_nodes(
                     ))
                     .id();
                 anchor_entities.insert(anchor_id.clone(), spawned);
+                anchor_opacity.insert(anchor_id.clone(), opacity);
                 anchor_world_positions.insert(anchor_id, pick_center);
             });
 
         node_entites.insert(node_id.clone(), node_entity.clone());
 
         render_node.labels.into_iter().for_each(|l| {
-            spawn_world_label(&mut commands, &ui_font.0, l, SceneEntity);
+            spawn_world_label(&mut commands, &ui_font.0, l, SceneEntity, opacity);
         });
     }
 
@@ -1269,6 +1301,15 @@ fn spawn_graph_nodes(
         let Some(&to_world) = anchor_world_positions.get(tgt_id) else {
             continue;
         };
+        // The dimmer of the two ends. An edge reaching out of a scope goes into
+        // a Tunnel one wall away, so the two gradings differ by at most a step,
+        // and taking the lesser keeps a strand from being the brightest thing
+        // in the volume it is leaving.
+        let opacity = anchor_opacity
+            .get(src_id)
+            .copied()
+            .unwrap_or(1.0)
+            .min(anchor_opacity.get(tgt_id).copied().unwrap_or(1.0));
 
         let src_type = infer::anchor_type(&flat_graph, src_id, &state.function_declarations)
             .unwrap_or(infer::EType::Pending);
@@ -1317,6 +1358,7 @@ fn spawn_graph_nodes(
                 whole_row_end(from_world.y, false),
                 whole_row_end(to_world.y, false),
                 Some(edge_root),
+                opacity,
             );
             continue;
         }
@@ -1396,6 +1438,7 @@ fn spawn_graph_nodes(
                     arc_total,
                     dash_period: 0.0,
                     dash_duty: 0.0,
+                    opacity,
                 })),
                 ChildOf(edge_root),
                 SceneEntity,
@@ -1415,6 +1458,7 @@ fn spawn_graph_nodes(
         &known,
         &anchor_world_positions,
         &declared_band_positions,
+        &grading,
     );
     spawn_cast_links(
         &mut commands,
@@ -1425,28 +1469,20 @@ fn spawn_graph_nodes(
         &known,
         &anchor_world_positions,
         &declared_band_positions,
+        &grading,
     );
-
-    // Which volume the caret is in — which is to say which scope, the two being
-    // the same question. Fixed for the whole pass: every surface below is faded
-    // by how far its own volume sits from this one.
-    //
-    // Baked in at spawn rather than followed per frame, because a caret move
-    // already rebuilds the scene — the caret's own mesh is built from
-    // `pick.selected_pos` a few lines down, and would not move otherwise.
-    let caret_volume = state.scope_of_caret(&pick).map(|scope| scope.path);
-    // Everything at full strength while the caret is outside every volume:
-    // there is nothing to measure a distance from, and measuring anyway would
-    // be a fiction.
-    let fade_of = |path: &[model::node::Id]| match &caret_volume {
-        Some(caret) => grid::volume_fade(volume_boundaries(path, caret)),
-        None => 1.0,
-    };
 
     for walked_graph in state.root_graph().walk_all_graphs() {
         let Some(bounds) = walked_graph.layout_graph.grid_bounds() else {
             continue;
         };
+        // A volume inside one already drawn as a solid body is not reached at
+        // all, its own box included. A sealed volume itself still is — the box
+        // is the whole of what is left of it, and `spawn_volume_surfaces` leaves
+        // out the four surfaces once nothing of the volume survives.
+        if grading.dropped(&walked_graph.context) {
+            continue;
+        }
         let offset = walked_graph.extra_offset;
         // `layout_range_to_world` re-normalises min/max: LAYOUT_SCALE negates
         // Z, so scaling the corners individually would yield an inverted rect
@@ -1501,10 +1537,12 @@ fn spawn_graph_nodes(
             &mut commands,
             &mut meshes,
             &mut materials_grid,
+            &mut materials,
             bounds.min,
             bounds.max,
             offset,
-            fade_of(&walked_graph.context),
+            grading.content(&walked_graph.context),
+            grading.shell(&walked_graph.context),
             InteractiveFloor {
                 scope: ScopeGridEntity {
                     context: walked_graph.context.clone(),
@@ -1643,8 +1681,20 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
         &ui_font.0,
         "semi ortho",
         SemiOrthoCheckbox,
+        SemiOrthoCheckboxBox,
         Val::Px(150.0),
         Val::Px(52.0),
+    );
+    // Beside `Screenshot`, in the same column as `semi ortho` above it: both
+    // are about what the picture shows rather than about the program in it.
+    spawn_corner_checkbox(
+        &mut commands,
+        &ui_font.0,
+        "Clipping",
+        ClippingCheckbox,
+        ClippingCheckboxBox,
+        Val::Px(150.0),
+        Val::Px(12.0),
     );
 }
 
@@ -1656,16 +1706,21 @@ struct SemiOrthoCheckbox;
 #[derive(Component)]
 struct SemiOrthoCheckboxBox;
 
-/// A labelled checkbox pinned to a screen corner — the last one in the editor,
-/// and a setting rather than a property of the graph, which is why it is not a
-/// prompt. It stands still instead of being respawned, so it carries its own
-/// label, makes the whole row clickable, and leaves the swatch to a sync
-/// system.
-fn spawn_corner_checkbox<C: Bundle>(
+/// A labelled checkbox pinned to a screen corner — a setting rather than a
+/// property of the graph, which is why it is not a prompt. It stands still
+/// instead of being respawned, so it carries its own label, makes the whole row
+/// clickable, and leaves the swatch to a sync system.
+///
+/// The row marker and the swatch marker are separate because the two are read
+/// by different systems: the row answers to `Interaction`, the swatch is what a
+/// sync system paints. One generic each, so a second checkbox does not end up
+/// driven by the first one's sync.
+fn spawn_corner_checkbox<C: Bundle, B: Bundle>(
     commands: &mut Commands,
     font: &Handle<Font>,
     label: &str,
     component: C,
+    swatch: B,
     left: Val,
     bottom: Val,
 ) {
@@ -1701,7 +1756,7 @@ fn spawn_corner_checkbox<C: Bundle>(
                 },
                 BackgroundColor(UNCHECKED_COLOR),
                 BorderColor::all(Color::srgb(0.35, 0.35, 0.5)),
-                SemiOrthoCheckboxBox,
+                swatch,
             ));
             parent.spawn((
                 Text::new(label),
@@ -1732,6 +1787,47 @@ fn sync_semi_ortho_checkbox(
     mut box_q: Query<&mut BackgroundColor, With<SemiOrthoCheckboxBox>>,
 ) {
     let wanted = if orbit.semi_ortho {
+        CHECKED_COLOR
+    } else {
+        UNCHECKED_COLOR
+    };
+    for mut color in box_q.iter_mut() {
+        if color.0 != wanted {
+            color.0 = wanted;
+        }
+    }
+}
+
+/// Marker for the checkbox that turns the level-of-detail grading on.
+#[derive(Component)]
+struct ClippingCheckbox;
+
+/// Marker on that checkbox's swatch.
+#[derive(Component)]
+struct ClippingCheckboxBox;
+
+/// Toggle the grading. Every opacity it decides is baked into a material at
+/// spawn — a caret move already rebuilds the scene, so nothing follows it per
+/// frame — which is why this has to ask for a rebuild itself, the way
+/// `handle_screenshot_button` does for the caret it removes.
+fn handle_clipping_checkbox(
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<ClippingCheckbox>)>,
+    mut clipping: ResMut<lod::Clipping>,
+    mut rebuild: ResMut<NeedsRebuild>,
+) {
+    for interaction in interaction_q.iter() {
+        if *interaction == Interaction::Pressed {
+            clipping.0 = !clipping.0;
+            rebuild.0 = true;
+        }
+    }
+}
+
+fn sync_clipping_checkbox(
+    clipping: Res<lod::Clipping>,
+    mut box_q: Query<&mut BackgroundColor, With<ClippingCheckboxBox>>,
+) {
+    let wanted = if clipping.0 {
         CHECKED_COLOR
     } else {
         UNCHECKED_COLOR
@@ -4744,12 +4840,19 @@ fn update_step_button_visuals(
     }
 }
 
+/// The yellow a value a run has produced is written in. Named because the label
+/// is spawned in one place and regraded in another, and the two have to agree
+/// on what colour they are fading.
+const VALUE_LABEL_COLOR: Color = Color::srgb(1.0, 0.95, 0.3);
+
 fn sync_value_labels(
     mut commands: Commands,
     eval: Res<EvalState>,
     state: Res<GraphState>,
+    pick: Res<PickState>,
+    clipping: Res<lod::Clipping>,
     ui_font: Res<UiFont>,
-    mut existing_q: Query<(Entity, &ValueLabel, &mut Text)>,
+    mut existing_q: Query<(Entity, &ValueLabel, &mut Text, &mut TextColor)>,
 ) {
     let Some((states, current)) = (match &eval.phase {
         EvalPhase::Running {
@@ -4757,10 +4860,25 @@ fn sync_value_labels(
         } => Some((states, *current)),
         _ => None,
     }) else {
-        for (entity, _, _) in existing_q.iter() {
+        for (entity, _, _, _) in existing_q.iter() {
             commands.entity(entity).despawn();
         }
         return;
+    };
+
+    // These labels outlive a rebuild — they are reconciled by hand rather than
+    // cleared with the scene — so the grading has to be asked here too, and
+    // asked every frame: the caret moves, the picture around it regrades, and
+    // nothing else would tell a standing label about it.
+    let grading = lod::Lod::new(
+        state.scope_of_caret(&pick).map(|scope| scope.path),
+        clipping.0,
+    );
+    let opacity_of = |id: &model::node::Id| match state.root_graph().context_of_node(id) {
+        Some(context) if grading.hidden(&context) => None,
+        Some(context) => Some(grading.content(&context)),
+        // A node no scope claims is not the grading's business.
+        None => Some(1.0),
     };
 
     // What *this* step resolved, rather than everything the run knows by now.
@@ -4792,11 +4910,22 @@ fn sync_value_labels(
     };
 
     let mut kept: std::collections::HashSet<model::node::Id> = std::collections::HashSet::new();
-    for (entity, label, mut text) in existing_q.iter_mut() {
+    for (entity, label, mut text, mut color) in existing_q.iter_mut() {
+        let Some(opacity) = opacity_of(&label.node_id) else {
+            // Inside a volume the grading has closed over or taken to nothing.
+            // A label is screen chrome and would otherwise hang in front of a
+            // box that is supposed to be shut.
+            commands.entity(entity).despawn();
+            continue;
+        };
         if let Some(value) = resolved_now.get(&label.node_id) {
             let rendered = value.to_string();
             if text.0 != rendered {
                 text.0 = rendered;
+            }
+            let wanted = lod::faded_color(VALUE_LABEL_COLOR, opacity);
+            if color.0 != wanted {
+                color.0 = wanted;
             }
             kept.insert(label.node_id.clone());
         } else {
@@ -4876,10 +5005,13 @@ fn sync_value_labels(
         let Some(&world_pos) = positions.get(id) else {
             continue;
         };
+        let Some(opacity) = opacity_of(id) else {
+            continue;
+        };
         commands.spawn((
             Text::new(value.to_string()),
             text_font(&ui_font.0, 28.0),
-            TextColor(Color::srgb(1.0, 0.95, 0.3)),
+            TextColor(lod::faded_color(VALUE_LABEL_COLOR, opacity)),
             Node {
                 position_type: PositionType::Absolute,
                 ..default()
@@ -4944,6 +5076,7 @@ fn rebuild_scene(
     pick: Res<PickState>,
     editor_mode: Res<EditorMode>,
     screenshot: Res<ScreenshotMode>,
+    clipping: Res<lod::Clipping>,
     mut rebuild: ResMut<NeedsRebuild>,
     _query_scene_entities: Query<Entity, With<SceneEntity>>,
 ) {
@@ -4961,6 +5094,7 @@ fn rebuild_scene(
             pick,
             editor_mode,
             screenshot,
+            clipping,
         );
         rebuild.0 = false;
     }
@@ -5014,8 +5148,14 @@ struct InteractiveFloor {
 ///
 /// Four for every volume there is — the program's scope and every branch of
 /// every Match — so that a volume is recognisable as one wherever it sits. What
-/// tells them apart is `fade`, which says how many volume walls stand between
-/// this one and the one the caret is in.
+/// tells them apart is `fade`, which says how much of this volume survives at
+/// the distance it stands from the one the caret is in.
+///
+/// `shell` is the other direction: the alpha of a closed grey body drawn around
+/// the whole volume, filling in the deeper inside the caret's own the volume
+/// sits. At `1.0` it is all there is — `spawn_graph_nodes` builds nothing
+/// inside a sealed volume, so the sub-graph reads as the one node-sized box it
+/// has become. `0.0` spawns none.
 ///
 /// A volume *is* a scope, and that is why this takes an `InteractiveFloor`
 /// rather than an optional one. A Match used to be drawn as a volume too,
@@ -5032,10 +5172,12 @@ fn spawn_volume_surfaces(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     materials_grid: &mut Assets<grid::GridMaterial>,
+    materials: &mut Assets<StandardMaterial>,
     min: IVec3,
     max: IVec3,
     offset: Vec3,
     fade: f32,
+    shell: f32,
     floor: InteractiveFloor,
 ) {
     let size_x = (max.x - min.x + 1) as f32 * render::LAYOUT_SCALE.x.abs();
@@ -5048,6 +5190,43 @@ fn spawn_volume_surfaces(
     let mid_x = (min.x + max.x + 1) as f32 * 0.5;
     let mid_y = (min.y + max.y + 1) as f32 * 0.5;
     let mid_z = (min.z + max.z + 1) as f32 * 0.5;
+
+    // ── The shell. Closed where the four surfaces below are open, because it is
+    // saying the opposite thing: they frame a volume to be looked into, and this
+    // one stands in for a volume that is not to be. Back faces are culled, so it
+    // reads as a body rather than as a room seen from inside.
+    //
+    // Drawn first so what follows can simply leave: by the step where the shell
+    // is whole the volume itself has nothing left, and the four surfaces would
+    // be four blended planes inside a closed box.
+    if shell > 0.0 {
+        let shell_center = centre(mid_x, mid_y, mid_z);
+        commands.spawn((
+            Mesh3d(meshes.add(Cuboid::new(size_x, size_y, size_z).mesh().build())),
+            MeshMaterial3d(materials.add(StandardMaterial {
+                base_color: lod::SHELL_COLOR.with_alpha(shell).into(),
+                unlit: true,
+                // Opaque once it is whole: a sealed volume has to occlude, and a
+                // blended fragment at alpha 1 still spends an OIT slot to say
+                // the same thing.
+                alpha_mode: if shell >= 1.0 {
+                    AlphaMode::Opaque
+                } else {
+                    AlphaMode::Blend
+                },
+                ..default()
+            })),
+            Transform::from_translation(shell_center),
+            SceneEntity,
+        ));
+    }
+
+    // Nothing of the volume itself survives the grading. With no floor there is
+    // also no way to click into it, which is the point: what is not drawn is not
+    // edited either.
+    if fade <= 0.0 {
+        return;
+    }
 
     // ── The floor: the lower bounding edge of the volume's last row, so what
     // stands in it stands *on* it rather than hanging under it.
@@ -5145,6 +5324,7 @@ fn spawn_link_ribbon(
     to: Vec3,
     start: edge::RibbonEnd,
     end: edge::RibbonEnd,
+    opacity: f32,
 ) {
     // A leaf that claims no row of its own — a sum type, or `Pending` — has no
     // strand to draw, and a strand has to know what it is at *both* ends
@@ -5168,6 +5348,7 @@ fn spawn_link_ribbon(
             arc_total,
             dash_period: 0.0,
             dash_duty: 0.0,
+            opacity,
         })),
         SceneEntity,
     ));
@@ -5194,6 +5375,7 @@ fn spawn_pending_ribbon(
     start: edge::RibbonEnd,
     end: edge::RibbonEnd,
     parent: Option<Entity>,
+    opacity: f32,
 ) {
     let curve = edge::EdgeCurve::from_endpoints(from, to);
     let (mesh, arc_total) = edge::build_tapered_ribbon_mesh(&curve, &start, &end);
@@ -5217,6 +5399,7 @@ fn spawn_pending_ribbon(
             arc_total,
             dash_period: edge::RIBBON_DASH_PERIOD,
             dash_duty: edge::RIBBON_DASH_DUTY,
+            opacity,
         })),
         SceneEntity,
     ));
@@ -5270,6 +5453,7 @@ fn spawn_declared_cell_links(
     in_value: Option<&str>,
     band_pos: Vec3,
     declared: Option<&model::r#type::EType>,
+    opacity: f32,
 ) {
     let declared_leaf = declared.map(infer::graph_type_to_eval_type);
     let declared_value = declared.and_then(layout::value_of_etype);
@@ -5321,6 +5505,7 @@ fn spawn_declared_cell_links(
                 whole_row_end(row_y, row_is_line),
                 whole_row_end(band_pos.y, cell_is_line),
                 None,
+                opacity,
             );
             continue;
         };
@@ -5337,6 +5522,7 @@ fn spawn_declared_cell_links(
             band_pos,
             edge::ribbon_end(row_y, &span, row_is_line),
             whole_row_end(band_pos.y, cell_is_line),
+            opacity,
         );
     }
 }
@@ -5372,6 +5558,7 @@ fn spawn_match_links(
     known: &infer::Known,
     anchor_world_positions: &std::collections::HashMap<model::anchor::Id, Vec3>,
     declared_band_positions: &std::collections::HashMap<model::node::Id, Vec3>,
+    grading: &lod::Lod,
 ) {
     let decls = &state.function_declarations;
     // `walk_all` reaches every scope with its offset already composed, and a
@@ -5379,6 +5566,15 @@ fn spawn_match_links(
     // (`plus_match`), so a nested Match needs nothing path-aware here — it is
     // reached like any other and resolves its arms by lookup.
     for walked in state.layout_graph.walk_all() {
+        // Every link a Match owns is graded with the Match, arms included: they
+        // are the one node's own making. A leg reaching into an arm whose scope
+        // is not drawn ends at an anchor that was never placed, and falls away
+        // on the lookup below.
+        let scope = scope_of_walk(state, &walked.context);
+        if grading.hidden(scope) {
+            continue;
+        }
+        let opacity = grading.content(scope);
         let Some(model::node::ENode::Match {
             patterns,
             input_anchor,
@@ -5425,6 +5621,7 @@ fn spawn_match_links(
                     in_value.as_deref(),
                     band_pos,
                     arm_type.as_ref(),
+                    opacity,
                 );
             }
         }
@@ -5489,6 +5686,7 @@ fn spawn_match_links(
                     whole_row_end(sink_pos.y, false),
                     whole_row_end(out_pos.y, false),
                     None,
+                    opacity,
                 );
                 continue;
             }
@@ -5514,6 +5712,7 @@ fn spawn_match_links(
                         // The same shape at both ends: there is nothing at the
                         // output end that could ask for a different one.
                         whole_row_end(out_pos.y, as_line),
+                        opacity,
                     );
                     continue;
                 }
@@ -5553,6 +5752,7 @@ fn spawn_match_links(
                         to,
                         start,
                         end,
+                        opacity,
                     );
                 }
             }
@@ -5611,9 +5811,16 @@ fn spawn_cast_links(
     known: &infer::Known,
     anchor_world_positions: &std::collections::HashMap<model::anchor::Id, Vec3>,
     declared_band_positions: &std::collections::HashMap<model::node::Id, Vec3>,
+    grading: &lod::Lod,
 ) {
     let decls = &state.function_declarations;
     for walked in state.layout_graph.walk_all() {
+        // Graded with the cast, the same way a Match grades its own legs.
+        let scope = scope_of_walk(state, &walked.context);
+        if grading.hidden(scope) {
+            continue;
+        }
+        let opacity = grading.content(scope);
         let node_id = &walked.layout_node.node_id;
         let Some(model::node::ENode::TypeCast {
             r#type,
@@ -5702,6 +5909,7 @@ fn spawn_cast_links(
                     whole_row_end(row_y, row_is_line),
                     whole_row_end(band_pos.y, cell_is_line),
                     None,
+                    opacity,
                 );
                 continue;
             };
@@ -5720,6 +5928,7 @@ fn spawn_cast_links(
                     band_pos,
                     edge::ribbon_end(row_y, &span, row_is_line),
                     whole_row_end(band_pos.y, cell_is_line),
+                    opacity,
                 );
             }
 
@@ -5755,6 +5964,7 @@ fn spawn_cast_links(
                     &infer::RowSpan::FULL,
                     true,
                 ),
+                opacity,
             );
         }
 
@@ -5799,6 +6009,7 @@ fn spawn_cast_links(
                     out_pos.y + render::leaf_row_offset(*row),
                     render::leaf_is_drawn_as_line(out_leaf, out_value.as_deref()),
                 ),
+                opacity,
             );
         }
     }
@@ -5817,6 +6028,7 @@ fn spawn_anchor_strands(
     materials: &mut Assets<StandardMaterial>,
     font: &Handle<Font>,
     strands: Vec<render::RenderStrand>,
+    opacity: f32,
 ) {
     for strand in strands {
         let render::RenderStrand {
@@ -5830,13 +6042,13 @@ fn spawn_anchor_strands(
         for shape in [band, line].into_iter().flatten() {
             commands.spawn((
                 Mesh3d(meshes.add(shape.mesh)),
-                MeshMaterial3d(materials.add(shape.material)),
+                MeshMaterial3d(materials.add(lod::faded(shape.material, opacity))),
                 shape.transform,
                 SceneEntity,
             ));
         }
         for text in [band_label, line_label].into_iter().flatten() {
-            spawn_world_label(commands, font, text, SceneEntity);
+            spawn_world_label(commands, font, text, SceneEntity, opacity);
         }
     }
 }
@@ -5845,12 +6057,13 @@ fn spawn_world_label(
     font: &Handle<Font>,
     render_label: render::RenderLabel,
     marker: impl Bundle,
+    opacity: f32,
 ) -> Entity {
     commands
         .spawn((
             Text::new(render_label.text),
             text_font(font, render_label.font_size),
-            TextColor(render_label.color),
+            TextColor(lod::faded_color(render_label.color, opacity)),
             Node {
                 position_type: PositionType::Absolute,
                 ..default()
@@ -7402,6 +7615,7 @@ fn main() {
         .init_resource::<InsertPrompt>()
         .init_resource::<PendingNode>()
         .init_resource::<ScreenshotMode>()
+        .init_resource::<lod::Clipping>()
         .add_systems(
             Startup,
             (
@@ -7505,8 +7719,17 @@ fn main() {
                 handle_screenshot_button,
                 handle_camera_mode_button,
                 sync_camera_mode_button,
-                handle_semi_ortho_checkbox,
-                sync_semi_ortho_checkbox,
+                // The corner checkboxes, nested into one entry: a tuple of
+                // systems tops out at twenty, and each of these is a pair that
+                // belongs together anyway. Chained inside as well as out, so a
+                // handler still runs before the sync that reads what it wrote.
+                (
+                    handle_semi_ortho_checkbox,
+                    sync_semi_ortho_checkbox,
+                    handle_clipping_checkbox,
+                    sync_clipping_checkbox,
+                )
+                    .chain(),
                 handle_modal_ok_button,
                 handle_controls_modal_ok_button,
                 handle_modal_cancel_button,

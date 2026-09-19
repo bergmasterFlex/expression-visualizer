@@ -5,11 +5,17 @@
 // through. That is what puts a strand in the depth buffer, which is what lets
 // the depth cue lay a shadow under it and draw its silhouette.
 //
-// There is no OIT path here any more. Bevy only defines `OIT_ENABLED` for a
-// pass keyed `BLEND_ALPHA`, so for a masked material the branch could never be
-// taken.
+// `params.opacity` is the one thing that changes that, and only where the level
+// of detail has taken something off the strand's scope. `EdgeMaterial` keys
+// such a strand `BLEND_ALPHA` instead, which is the only pass Bevy defines
+// `OIT_ENABLED` for — so the branch below is live exactly when the opacity is
+// not 1, and dead the rest of the time. The coverage cut is untouched either
+// way: it is geometry, and geometry does not fade.
 
 #import bevy_pbr::forward_io::VertexOutput
+#ifdef OIT_ENABLED
+#import bevy_core_pipeline::oit::oit_draw
+#endif
 
 // Must match `COVERAGE_CUTOFF` in `src/edge.rs`, which names the same number to
 // the material.
@@ -32,6 +38,10 @@ struct EdgeParams {
     arc_total: f32,
     dash_period: f32,
     dash_duty: f32,
+    // What survives of the strand at the distance its scope stands from the
+    // caret's. 1.0 for everything at full strength, which is also the only
+    // value that keeps the masked path.
+    opacity: f32,
 }
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> params: EdgeParams;
@@ -115,5 +125,16 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // anchor segment at either end without a seam.
     let rgb = mix(params.band_color_start.rgb, params.band_color_end.rgb, along);
 
-    return vec4<f32>(rgb, 1.0);
+    let out_color = vec4<f32>(rgb, params.opacity);
+
+#ifdef OIT_ENABLED
+    // Submit fragment to OIT layer buffer, then discard so the regular
+    // forward pass doesn't also write blended color. The same hand-off
+    // `grid.wgsl` makes, for the same reason: neither shader goes through
+    // `pbr_functions.wgsl`, which is where Bevy would otherwise do it.
+    oit_draw(in.position, out_color);
+    discard;
+#endif
+
+    return out_color;
 }

@@ -244,6 +244,10 @@ pub struct LayoutAnchor {
 pub struct WalkedNode<'a> {
     pub layout_graph: &'a LayoutGraph,
     pub layout_node: &'a LayoutNode,
+    /// Owner path from the walk root to the graph this node sits in — the same
+    /// path `WalkedGraph::context` carries, and the one a scope *is*. Empty at
+    /// the outermost LayoutGraph.
+    pub context: Vec<crate::model::node::Id>,
     pub extra_offset: Vec3,
 }
 
@@ -2450,21 +2454,29 @@ impl LayoutGraph {
     /// entered with offset (0,0,0).
     pub fn walk_all(&self) -> Vec<WalkedNode> {
         let mut out = Vec::new();
-        self.walk_all_into(Vec3::ZERO, &mut out);
+        self.walk_all_into(Vec::new(), Vec3::ZERO, &mut out);
         out
     }
 
-    fn walk_all_into<'a>(&'a self, offset: Vec3, out: &mut Vec<WalkedNode<'a>>) {
+    fn walk_all_into<'a>(
+        &'a self,
+        context: Vec<crate::model::node::Id>,
+        offset: Vec3,
+        out: &mut Vec<WalkedNode<'a>>,
+    ) {
         for layout_node in self.layout_nodes.values() {
             out.push(WalkedNode {
                 layout_graph: self,
                 layout_node,
+                context: context.clone(),
                 extra_offset: offset,
             });
         }
         for (owner_id, sub_layout) in &self.sub_layouts {
+            let mut sub_context = context.clone();
+            sub_context.push(owner_id.clone());
             let sub_offset = offset + self.sub_layout_origin(owner_id);
-            sub_layout.walk_all_into(sub_offset, out);
+            sub_layout.walk_all_into(sub_context, sub_offset, out);
         }
     }
 

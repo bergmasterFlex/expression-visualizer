@@ -397,6 +397,14 @@ pub struct EdgeMaterial {
     /// Share of a period that is dash. Read only where `dash_period` stands.
     #[uniform(0)]
     pub dash_duty: f32,
+    /// How much of the strand survives the level-of-detail grading its scope
+    /// sits at — `lod::Lod::content`, and `1.0` for everything at full
+    /// strength.
+    ///
+    /// The only thing in this block that is not about the strand's shape, and
+    /// the one that decides which pass it goes down: see `alpha_mode`.
+    #[uniform(0)]
+    pub opacity: f32,
 }
 
 impl Material for EdgeMaterial {
@@ -417,8 +425,20 @@ impl Material for EdgeMaterial {
     /// The cutting is the shader's own job — Bevy's automatic one lives in
     /// `pbr_functions.wgsl`, which `edge_band.wgsl` does not import — so this
     /// threshold only selects the pass. `edge_band.wgsl` cuts at the same 0.5.
+    ///
+    /// A graded strand is the exception, and only while it is graded. There is
+    /// no masking a strand to 75% of itself — coverage says where the strand
+    /// is, never how much of it shows — so a strand the level of detail has
+    /// taken something off goes down the blended path instead, and gives up its
+    /// depth write and its share of the cue with it. That is the trade the
+    /// grading makes everywhere: what is far off stops helping to read what is
+    /// near. A strand at full strength never enters it.
     fn alpha_mode(&self) -> AlphaMode {
-        AlphaMode::Mask(COVERAGE_CUTOFF)
+        if self.opacity >= 1.0 {
+            AlphaMode::Mask(COVERAGE_CUTOFF)
+        } else {
+            AlphaMode::Blend
+        }
     }
 
     fn specialize(
