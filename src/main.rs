@@ -127,11 +127,20 @@ pub struct DraftEdge;
 /// The two ways differ in exactly one thing — what moves the target — so
 /// everything else about a draft is shared between them, down to the rule that
 /// says which anchors it may reach and the one door it is committed through.
+#[derive(Clone, Copy)]
 pub enum DraftAim {
     /// The pointer aims it, by snapping to the nearest candidate on screen.
     Pointer,
-    /// The caret aims it, by stepping from one candidate to the next.
-    Caret,
+    /// The caret aims it, by stepping from one candidate to the next — and by
+    /// standing on it, because the caret *is* the far end while one is being
+    /// aimed. `caret_before` is the cell it left to go there, which a cancel
+    /// puts it back on: an aim that was thought better of should leave no
+    /// trace, and where the caret was standing is part of that.
+    ///
+    /// A commit does not use it. The anchor the edge began at may have been
+    /// pushed along by the re-settle the new edge causes, and the caret goes
+    /// back to the *anchor*, not to the cell the anchor used to be on.
+    Caret { caret_before: IVec3 },
 }
 
 /// An edge that is being drawn and has not been made.
@@ -177,6 +186,15 @@ impl DraftState {
                 ..
             })
         )
+    }
+
+    /// The cell a cancelled caret draft puts the caret back on, if it is a
+    /// caret draft that is standing.
+    pub fn caret_before(&self) -> Option<IVec3> {
+        match self.active.as_ref()?.aim {
+            DraftAim::Caret { caret_before } => Some(caret_before),
+            DraftAim::Pointer => None,
+        }
     }
 
     /// The edge the draft stands for, in the direction edges are stored.
@@ -3325,7 +3343,18 @@ fn leave_insert_mode(
     // same act: leaving INSERT is what cancels whatever INSERT had open. The
     // pointer's draft goes too — it is the button that would have committed it
     // and Escape is allowed to overrule a held button.
+    //
+    // The caret goes back to where the aim started, for the reason it goes back
+    // after a cancelled insert: an aim that was thought better of should leave
+    // no trace, and where the caret was standing is part of that. The cell and
+    // not the anchor, unlike after a commit — nothing was changed, so the cell
+    // the caret left is still exactly the cell it left. A pointer draft has no
+    // such cell and moves nothing.
+    let home = draft.caret_before();
     if draft.active.take().is_some() {
+        if let Some(home) = home {
+            pick.selected_pos = state.root_graph().clamp_to_volume(home);
+        }
         rebuild.0 = true;
     }
     if let Some(edit) = pending.0.take() {
@@ -4064,21 +4093,33 @@ fn sync_editor_panel(
         Vec::new()
     };
     let selected = clamped_selection(&candidates, prompt.selected);
-    // Where the edge being drawn is aimed, said the way every other address in
-    // the editor is said. Not a row: a row of the panel names a property, and
-    // an anchor names none — which is the whole reason the caret standing on
-    // one means "wire this" and not "answer that". So it stands under the rows
-    // instead, and only while there is an aim to report.
+    // The edge being drawn, said the way every other address in the editor is
+    // said. Not a row: a row of the panel names a property, and an anchor names
+    // none — which is the whole reason the caret standing on one means "wire
+    // this" and not "answer that". So it stands under the rows instead, and
+    // only while there is an edge being drawn.
+    //
+    // Both ends, and in the direction the edge would be stored — producer to
+    // consumer — rather than in the order the two were reached. The caret marks
+    // one end and the panel's own heading says which node that is, so a line
+    // naming only the other end would leave the reader assembling the sentence
+    // from two places. And there is the end the caret cannot stand on: a
+    // Tunnel's input has no addressable cell, so for that one this line is the
+    // only thing that says where the edge goes.
     let connect = (editing && matches!(here, RowAddress::Connect(_))).then(|| {
-        draft
-            .active
-            .as_ref()
-            .and_then(|aimed| aimed.target_anchor_id.as_ref())
-            .and_then(|id| state.root_graph().anchor_cell(id))
-            .map(cell_text)
+        let address = |anchor: &model::anchor::Id| {
+            state
+                .root_graph()
+                .anchor_cell(anchor)
+                .map(cell_text)
+                .unwrap_or_else(|| "?".to_string())
+        };
+        match draft.wiring() {
+            Some((from, to)) => format!("{} → {}", address(&from), address(&to)),
             // Only the Sink of an otherwise empty program can say this: there
             // is no producer anywhere for its input to come from.
-            .unwrap_or_else(|| "nothing to reach".to_string())
+            None => "nothing to reach".to_string(),
+        }
     });
 
     let fp = EditorPanelFingerprint {
@@ -4163,7 +4204,7 @@ fn sync_editor_panel(
             }
         }
         if let Some(aim) = &connect {
-            spawn_labeled_row(panel, font, "Edge to", |slot| {
+            spawn_labeled_row(panel, font, "Edge", |slot| {
                 slot.spawn((
                     Text::new(aim.clone()),
                     text_font(font, 14.0),
@@ -7957,7 +7998,7 @@ fn text_input_focus(
 fn sync_prompt_seed(
     mode: Res<EditorMode>,
     mut state: ResMut<GraphState>,
-    pick: Res<PickState>,
+    mut pick: ResMut<PickState>,
     mut prompt: ResMut<InsertPrompt>,
     mut pending: ResMut<PendingNode>,
     mut rebuild: ResMut<NeedsRebuild>,
@@ -8006,13 +8047,16 @@ fn sync_prompt_seed(
     // Only the caret's own — a draft the pointer is aiming belongs to the
     // button still held down, and the caret move that got here may well be the
     // click that started it.
-    if matches!(
-        &draft.active,
-        Some(EdgeDraft {
-            aim: DraftAim::Caret,
-            ..
-        })
-    ) {
+    //
+    // "Not the cell it was about" is the whole of the change: the caret travels
+    // with the aim now, so its own steps have to be told apart from a step
+    // somebody else took. `draft_holds_caret` is that telling apart, and it is
+    // also what keeps the arm below from re-seeding a draft from the anchor the
+    // caret has merely arrived at.
+    let holds_caret = draft_holds_caret(&state, &pick, &draft);
+    if !holds_caret
+        && matches!(&draft.active, Some(aimed) if !matches!(aimed.aim, DraftAim::Pointer))
+    {
         draft.active = None;
         rebuild.0 = true;
     }
@@ -8028,13 +8072,20 @@ fn sync_prompt_seed(
         }
         // An anchor opens a draft rather than a prompt. Opened here and nowhere
         // else, because this is the one place that knows the caret has arrived
-        // somewhere new — and it fires on a change of mode or cell and on
-        // nothing else, which is exactly when a draft should begin or end.
-        // Stepping the draft changes neither, so an aim survives.
-        (EditorMode::Insert, InsertTarget::Connect(anchor)) => {
+        // somewhere new. The guard is what tells the two kinds of arrival
+        // apart: the caret walking to the far end of the aim it is already
+        // holding is not an arrival at a new anchor, however much the addressed
+        // cell has changed.
+        (EditorMode::Insert, InsertTarget::Connect(anchor)) if !holds_caret => {
             prompt.clear();
             let grading = caret_grading(&state, &pick, &clipping);
-            draft.active = open_caret_draft(&state, &grading, anchor);
+            draft.active = open_caret_draft(&state, &grading, anchor, pick.selected_pos);
+            // Onto the far end straight away, so the first nav key moves the
+            // aim by one and not by two — and so the rule is the plain one it
+            // reads as: while an edge is being aimed, the caret is its far end.
+            if let Some(aimed) = draft.active.as_ref() {
+                follow_draft_target(&state, &mut pick, aimed);
+            }
             rebuild.0 = true;
         }
         // A create prompt has nothing to open on, and NORMAL has no prompt at
@@ -8339,6 +8390,24 @@ fn handle_editor_keys(
                     // node has nothing left to say.
                     if let Some(info) = draft.active.take() {
                         commit_draft(&mut state, &info);
+                        // Back to the anchor the edge began at. The caret went
+                        // out to the far end to aim, and what was just wired is
+                        // where the next thing is done — not wherever the aim
+                        // happened to come to rest.
+                        //
+                        // The *anchor*, not the cell it stood on: a new edge
+                        // can grow the anchor it lands on, and the re-settle
+                        // that follows may have pushed the source along. The
+                        // remembered cell is only the fallback for an anchor
+                        // the commit took out of the layout, which nothing
+                        // currently does.
+                        if let DraftAim::Caret { caret_before } = info.aim {
+                            let home = state
+                                .root_graph()
+                                .anchor_cell(&info.source_anchor_id)
+                                .unwrap_or(caret_before);
+                            pick.selected_pos = state.root_graph().clamp_to_volume(home);
+                        }
                     }
                     *mode = EditorMode::Normal;
                     rebuild.0 = true;
@@ -8371,6 +8440,9 @@ fn handle_editor_keys(
                 };
                 if let Some(next) = step_draft_target(&candidates, from, direction) {
                     info.target_anchor_id = Some(next);
+                    // The caret goes with it: the far end is what the key
+                    // moved, and the caret is what says where the far end is.
+                    follow_draft_target(&state, &mut pick, info);
                     rebuild.0 = true;
                     // The rest of the batch was struck against a different aim.
                     break;
@@ -8556,6 +8628,7 @@ fn open_caret_draft(
     state: &GraphState,
     grading: &lod::Lod,
     anchor: &model::anchor::Id,
+    caret_before: IVec3,
 ) -> Option<EdgeDraft> {
     let root = state.root_graph();
     let layout_anchor = root.try_layout_anchor(anchor)?;
@@ -8581,8 +8654,63 @@ fn open_caret_draft(
         source_is_output,
         source_cells,
         target_anchor_id: target,
-        aim: DraftAim::Caret,
+        aim: DraftAim::Caret { caret_before },
     })
+}
+
+/// Put the caret on the draft's far end.
+///
+/// The caret marks what is being aimed at, so where the edge would land is read
+/// the way every other address in the editor is read — and so the camera goes
+/// there, which is the only way to aim at something standing outside the
+/// screen. It is also what makes the return to the source on commit mean
+/// anything: the caret has somewhere to come back from.
+///
+/// It stays where it is when the far end has no cell the caret may stand on. A
+/// Tunnel's input is the one such end — it hangs outside its scope, on exactly
+/// the address `clamp_to_volume` refuses — and it is still perfectly aimable:
+/// the blinking edge says where the aim is, which is what the caret would only
+/// have said twice.
+fn follow_draft_target(state: &GraphState, pick: &mut PickState, draft: &EdgeDraft) {
+    let Some(cell) = draft
+        .target_anchor_id
+        .as_ref()
+        .and_then(|id| state.root_graph().anchor_cell(id))
+    else {
+        return;
+    };
+    if state.root_graph().clamp_to_volume(cell) == cell {
+        pick.selected_pos = cell;
+    }
+}
+
+/// Whether the caret is standing somewhere the draft put it.
+///
+/// The question `sync_prompt_seed` has to ask before it tears a caret draft
+/// down. A caret move used to be reason enough — the caret leaving a cell is
+/// what unmakes what was open on it — but the caret now travels *with* the
+/// draft, so its own steps would end it on the first one.
+///
+/// Either end counts. The far end is where the caret usually stands, and the
+/// anchor the draft began at is where it stands when the far end has no
+/// address to offer — or when there was nothing to aim at in the first place.
+/// Anywhere else is a move the draft did not make, which is a click somewhere
+/// else, which is the statement the teardown is for.
+fn draft_holds_caret(state: &GraphState, pick: &PickState, draft: &DraftState) -> bool {
+    let Some(aimed) = draft.active.as_ref() else {
+        return false;
+    };
+    if !matches!(aimed.aim, DraftAim::Caret { .. }) {
+        return false;
+    }
+    if aimed.source_cells.contains(&pick.selected_pos) {
+        return true;
+    }
+    aimed
+        .target_anchor_id
+        .as_ref()
+        .and_then(|id| state.root_graph().anchor_cells_of(id))
+        .is_some_and(|cells| cells.contains(&pick.selected_pos))
 }
 
 /// The anchor an edge arrives at `anchor` from, if one does.
@@ -8862,13 +8990,23 @@ fn anchor_hover_system(
 /// Whether an edge may be offered between these two anchors at all — every
 /// refusal the editor has, asked in one place.
 ///
-/// Three questions and they are not interchangeable. The first two are about
-/// this pair: an anchor is not its own counterpart, and a producer only meets a
-/// consumer. The third is about the program's shape and is
-/// `connection_allowed`'s, which speaks of producer → consumer — so the pair is
-/// turned into that direction before it is asked. Left the other way round, a
-/// draft begun at a Tunnel's input and aimed at a Source would read as a
-/// connection *out* of a branch and be refused.
+/// Four questions and they are not interchangeable. The first three are about
+/// this pair: an anchor is not its own counterpart, a producer only meets a
+/// consumer, and the two ends must belong to two nodes. The fourth is about the
+/// program's shape and is `connection_allowed`'s, which speaks of producer →
+/// consumer — so the pair is turned into that direction before it is asked.
+/// Left the other way round, a draft begun at a Tunnel's input and aimed at a
+/// Source would read as a connection *out* of a branch and be refused.
+///
+/// The third is the one that is easy to leave out, because the kinds it catches
+/// are the ones that have both an input and an output: a TypeCast, a Match, a
+/// FunctionCall. Wiring such a node's output back onto its own input is a cycle
+/// of length one — `infer::anchor_type_guarded` meets it as `Pending` and no
+/// run ever gets a value out of it — but it is refused for the plainer reason
+/// that it is never what was meant. The two anchors of a node are its two ends;
+/// they are where a value arrives and where it leaves, not two places to join
+/// to each other. A Tunnel is caught by the scope rule anyway, since its input
+/// may only be fed from one scope out.
 ///
 /// A pair that is **already joined** is deliberately not refused here. That
 /// question belongs to the commit, which is where `anchors_already_connected`
@@ -8889,6 +9027,15 @@ fn connection_offered(
     target_is_output: bool,
 ) -> bool {
     if source == target || target_is_output == source_is_output {
+        return false;
+    }
+    let node_of = |anchor: &model::anchor::Id| root.try_layout_anchor(anchor).map(|a| a.node_id);
+    let (Some(source_node), Some(target_node)) = (node_of(source), node_of(target)) else {
+        // An anchor no layout holds is an anchor nothing can be drawn to, which
+        // `connection_allowed` would answer the same way a step later.
+        return false;
+    };
+    if source_node == target_node {
         return false;
     }
     let (from, to) = if source_is_output {
