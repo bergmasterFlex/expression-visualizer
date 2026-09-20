@@ -423,45 +423,30 @@ struct Suggestion {
 struct SceneEntity;
 
 //Buttons
+/// Asks for a fresh graph. What it opens is the confirmation, not the reset —
+/// the reset itself is the only editor action that cannot be undone, so it is
+/// never one click away.
 #[derive(Component)]
-struct HamburgerButton;
+struct NewButton;
+
+/// Opens the controls list. Nothing is destroyed on the way, so it acts at once.
+#[derive(Component)]
+struct HelpButton;
+
 /// A clickable suggestion row, so the mouse path into INSERT does not dead-end
 /// at a keyboard-only list.
 #[derive(Component)]
 struct InsertPromptOption(PromptAction);
 
-#[derive(Resource)]
-struct StartMenu {
-    showing: bool,
-    has_cancel: bool,
-}
-
-impl Default for StartMenu {
-    fn default() -> Self {
-        Self {
-            showing: true,
-            has_cancel: false,
-        }
-    }
-}
-
-#[derive(Component)]
-struct StartMenuEntity;
-#[derive(Component)]
-struct StartMenuNewButton;
-#[derive(Component)]
-struct StartMenuCancelButton;
-#[derive(Component)]
-struct StartMenuControlsButton;
-
 /// Marker for everything the editor draws about *itself* — buttons, panels, the
 /// HUD readouts — as opposed to what it draws about the program.
 ///
 /// Carrying it is a standing offer to be taken off screen whenever the editor
-/// has nothing to say: while the start menu or a modal owns the screen, and in
-/// screenshot mode, where the point is that only the program is left. One
-/// system writes their `display`, and a widget that manages its own must not
-/// also wear this — two writers flicker on the transition frame.
+/// has nothing to say: while a modal owns the screen, and in screenshot mode,
+/// where the point is that only the program is left. One system writes their
+/// `display`, and a widget that manages its own must not also wear this — two
+/// writers flicker on the transition frame. For the same reason it goes on the
+/// container of a group rather than on each member.
 #[derive(Component)]
 struct EditorChrome;
 
@@ -989,6 +974,10 @@ enum EvalPhase {
     Idle,
     ErrorModal(String),
     ControlsModal,
+    /// The question before a New. It carries nothing: the reset reads the
+    /// graph state when it runs, and the only thing this phase remembers is
+    /// that the question is on screen.
+    ConfirmNew,
     SourcePrompt {
         /// Stable node_id order; values mirror what the user has typed so far.
         inputs: Vec<(model::node::Id, String)>,
@@ -1036,7 +1025,10 @@ fn is_evaluating(eval: &EvalState) -> bool {
 fn modal_is_open(eval: &EvalState) -> bool {
     matches!(
         eval.phase,
-        EvalPhase::ErrorModal(_) | EvalPhase::ControlsModal | EvalPhase::SourcePrompt { .. }
+        EvalPhase::ErrorModal(_)
+            | EvalPhase::ControlsModal
+            | EvalPhase::ConfirmNew
+            | EvalPhase::SourcePrompt { .. }
     )
 }
 
@@ -1065,8 +1057,12 @@ struct ModalOkButton;
 struct ModalCancelButton;
 #[derive(Component)]
 struct ModalEvaluateButton;
+
+/// The affirmative half of the New question. Its own marker because it is the
+/// only modal button that does something: `ModalCancelButton` beside it, and
+/// `ModalOkButton` everywhere else, do no more than close what they are on.
 #[derive(Component)]
-struct ControlsModalOkButton;
+struct ConfirmNewButton;
 
 /// Marker on a TextInputBox inside the Source modal so we can collect
 /// typed values per Source when the user confirms.
@@ -1940,9 +1936,87 @@ fn spawn_graph_nodes(
     */
 }
 
-fn spawn_ui(mut commands: Commands) {
-    // Hamburger menu button (top-left) — opens the menu modal.
-    spawn_hamburger_button(&mut commands, Vec2::new(12.0, 12.0));
+/// The top edge: the two actions that are about the document rather than about
+/// the graph, and the name of the thing they belong to.
+///
+/// Both wear `EditorChrome` on their container and not on their parts — the
+/// system that writes that `display` blanks every carrier it finds, so a part
+/// that carried it too would be a second writer on the same node.
+fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(12.0),
+                left: Val::Px(12.0),
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(8.0),
+                ..default()
+            },
+            EditorChrome,
+        ))
+        .with_children(|row| {
+            row.spawn((
+                Button,
+                chrome_button_node(),
+                BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+                NewButton,
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new("New"),
+                    text_font(&ui_font.0, 14.0),
+                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                ));
+            });
+            row.spawn((
+                Button,
+                chrome_button_node(),
+                BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+                HelpButton,
+            ))
+            .with_children(|b| {
+                b.spawn((
+                    Text::new("Help"),
+                    text_font(&ui_font.0, 14.0),
+                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                ));
+            });
+        });
+
+    // Centred by a full-width row rather than by a guessed offset, so it stays
+    // centred as the window resizes. The same arrangement the mode toggle has.
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(14.0),
+                left: Val::Px(0.0),
+                right: Val::Px(0.0),
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            EditorChrome,
+        ))
+        .with_children(|row| {
+            row.spawn((
+                Text::new("Expression Visualizer"),
+                text_font(&ui_font.0, 18.0),
+                TextColor(Color::srgb(0.95, 0.95, 1.0)),
+            ));
+        });
+}
+
+/// The shape of a button that stands on the scene rather than inside a panel:
+/// the same padding and radius `modal_button_node` has, without the margin a
+/// button in a row of buttons needs — the row here sets its own gap.
+fn chrome_button_node() -> Node {
+    Node {
+        padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+        border_radius: BorderRadius::all(Val::Px(6.0)),
+        ..default()
+    }
 }
 
 /// Marker on the bottom-right box that holds the problem list and the run
@@ -2181,7 +2255,7 @@ fn handle_view_menu_click(
 /// Write the trigger's caption, and build or clear the list.
 ///
 /// The list is a despawned subtree rather than a node whose `display` is
-/// toggled, and that is not a style choice: `sync_start_menu_ui` writes
+/// toggled, and that is not a style choice: `sync_editor_chrome` writes
 /// `Display::Flex` on every `EditorChrome` node whenever a modal closes, so a
 /// folded list that wore the marker would be torn open by something that knows
 /// nothing about it. Under a trigger that wears it, a subtree that is simply
@@ -2550,40 +2624,6 @@ fn spawn_control_button<C: Bundle>(
                 text_font(font, 18.0),
                 TextColor(Color::srgb(0.6, 0.6, 0.7)),
             ));
-        });
-}
-
-fn spawn_hamburger_button(commands: &mut Commands, pos: Vec2) {
-    let bar = || Node {
-        width: Val::Px(20.0),
-        height: Val::Px(2.5),
-        margin: UiRect::vertical(Val::Px(2.0)),
-        ..default()
-    };
-    commands
-        .spawn((
-            Button,
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(pos.y),
-                left: Val::Px(pos.x),
-                width: Val::Px(36.0),
-                height: Val::Px(36.0),
-                flex_direction: FlexDirection::Column,
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                border_radius: BorderRadius::all(Val::Px(6.0)),
-                ..default()
-            },
-            BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
-            HamburgerButton,
-            EditorChrome,
-        ))
-        .with_children(|parent| {
-            let bar_color = Color::srgb(0.85, 0.85, 0.9);
-            parent.spawn((bar(), BackgroundColor(bar_color)));
-            parent.spawn((bar(), BackgroundColor(bar_color)));
-            parent.spawn((bar(), BackgroundColor(bar_color)));
         });
 }
 
@@ -3630,14 +3670,13 @@ struct EditorPanelFingerprint {
 /// is the row that would open, and on an empty cell it is the panel's whole
 /// content.
 ///
-/// Sole writer of the panel's `display`, so the start menu and the modals are
-/// folded in here rather than left to `EditorChrome`; contents are respawned
-/// only when the fingerprint moves.
+/// Sole writer of the panel's `display`, so the modals are folded in here
+/// rather than left to `EditorChrome`; contents are respawned only when the
+/// fingerprint moves.
 fn sync_editor_panel(
     mut commands: Commands,
     state: Res<GraphState>,
     pick: Res<PickState>,
-    start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
     screenshot: Res<ScreenshotMode>,
     mode: Res<EditorMode>,
@@ -3658,7 +3697,6 @@ fn sync_editor_panel(
     let loose_prompt =
         *mode == EditorMode::Insert && focus.is_none() && matches!(here, RowAddress::ArmGap(_));
     let visible = (subject.is_some() || loose_prompt)
-        && !start_menu.showing
         && !modal_is_open(&eval)
         && !is_evaluating(&eval)
         && !screenshot.active();
@@ -4014,6 +4052,7 @@ enum ModalKind {
     None,
     Error,
     Controls,
+    ConfirmNew,
     SourcePrompt,
 }
 
@@ -4021,6 +4060,7 @@ fn modal_kind(phase: &EvalPhase) -> ModalKind {
     match phase {
         EvalPhase::ErrorModal(_) => ModalKind::Error,
         EvalPhase::ControlsModal => ModalKind::Controls,
+        EvalPhase::ConfirmNew => ModalKind::ConfirmNew,
         EvalPhase::SourcePrompt { .. } => ModalKind::SourcePrompt,
         _ => ModalKind::None,
     }
@@ -4050,6 +4090,9 @@ fn sync_modal_ui(
         }
         EvalPhase::ControlsModal => {
             spawn_controls_modal(&mut commands, &ui_font.0);
+        }
+        EvalPhase::ConfirmNew => {
+            spawn_confirm_new_modal(&mut commands, &ui_font.0);
         }
         EvalPhase::SourcePrompt { inputs } => {
             let root = state.root_graph();
@@ -4141,6 +4184,93 @@ fn spawn_error_modal(commands: &mut Commands, font: &Handle<Font>, msg: String) 
         });
 }
 
+/// The question a New has to get through. Same frame as the error modal, two
+/// buttons instead of one, and the affirmative one named after what it does
+/// rather than after agreeing — "Discard" is the fact of the matter, and the
+/// graph is not recoverable once it is pressed.
+fn spawn_confirm_new_modal(commands: &mut Commands, font: &Handle<Font>) {
+    commands
+        .spawn((
+            backdrop_node(),
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            GlobalZIndex(50),
+            ModalEntity,
+        ))
+        .with_children(|root| {
+            root.spawn((
+                panel_node(),
+                BackgroundColor(Color::srgba(0.10, 0.10, 0.16, 0.98)),
+                BorderColor::all(Color::srgb(0.25, 0.25, 0.4)),
+                ModalEntity,
+            ))
+            .with_children(|panel| {
+                panel.spawn((
+                    Text::new("New"),
+                    text_font(font, 20.0),
+                    TextColor(Color::srgb(0.95, 0.95, 1.0)),
+                    Node {
+                        margin: UiRect::all(Val::Px(12.0)),
+                        align_self: AlignSelf::Center,
+                        ..default()
+                    },
+                    ModalEntity,
+                ));
+                panel.spawn((
+                    Text::new("Discard the current graph and start over?"),
+                    text_font(font, 16.0),
+                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                    Node {
+                        margin: UiRect::all(Val::Px(12.0)),
+                        ..default()
+                    },
+                    ModalEntity,
+                ));
+                panel
+                    .spawn((
+                        Node {
+                            flex_direction: FlexDirection::Row,
+                            justify_content: JustifyContent::Center,
+                            margin: UiRect::all(Val::Px(8.0)),
+                            ..default()
+                        },
+                        ModalEntity,
+                    ))
+                    .with_children(|btns| {
+                        btns.spawn((
+                            Button,
+                            modal_button_node(),
+                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
+                            ConfirmNewButton,
+                            ModalEntity,
+                        ))
+                        .with_children(|b| {
+                            b.spawn((
+                                Text::new("Discard"),
+                                text_font(font, 14.0),
+                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                                ModalEntity,
+                            ));
+                        });
+                        btns.spawn((
+                            Button,
+                            modal_button_node(),
+                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
+                            ModalCancelButton,
+                            ModalEntity,
+                        ))
+                        .with_children(|b| {
+                            b.spawn((
+                                Text::new("Cancel"),
+                                text_font(font, 14.0),
+                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                                ModalEntity,
+                            ));
+                        });
+                    });
+            });
+        });
+}
+
 fn spawn_controls_modal(commands: &mut Commands, font: &Handle<Font>) {
     let mouse_bindings: &[(&str, &str)] = &[
         ("Left click", "Select node / grid position"),
@@ -4214,7 +4344,7 @@ fn spawn_controls_modal(commands: &mut Commands, font: &Handle<Font>) {
                             Button,
                             modal_button_node(),
                             BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
-                            ControlsModalOkButton,
+                            ModalOkButton,
                             ModalEntity,
                         ))
                         .with_children(|b| {
@@ -4450,110 +4580,83 @@ fn modal_button_node() -> Node {
     }
 }
 
-fn spawn_start_menu(mut commands: Commands, start_menu: Res<StartMenu>, ui_font: Res<UiFont>) {
-    spawn_start_menu_ui(&mut commands, &ui_font.0, start_menu.has_cancel);
-}
-
-fn spawn_start_menu_ui(commands: &mut Commands, font: &Handle<Font>, has_cancel: bool) {
-    commands
-        .spawn((
-            backdrop_node(),
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
-            GlobalZIndex(50),
-            StartMenuEntity,
-        ))
-        .with_children(|root| {
-            root.spawn((
-                panel_node(),
-                BackgroundColor(Color::srgba(0.10, 0.10, 0.16, 0.98)),
-                BorderColor::all(Color::srgb(0.25, 0.25, 0.4)),
-                StartMenuEntity,
-            ))
-            .with_children(|panel| {
-                panel.spawn((
-                    Text::new("Expression Visualizer"),
-                    text_font(font, 24.0),
-                    TextColor(Color::srgb(0.95, 0.95, 1.0)),
-                    Node {
-                        margin: UiRect::all(Val::Px(12.0)),
-                        align_self: AlignSelf::Center,
-                        ..default()
-                    },
-                    StartMenuEntity,
-                ));
-                panel
-                    .spawn((
-                        Node {
-                            flex_direction: FlexDirection::Row,
-                            justify_content: JustifyContent::Center,
-                            margin: UiRect::all(Val::Px(8.0)),
-                            ..default()
-                        },
-                        StartMenuEntity,
-                    ))
-                    .with_children(|btns| {
-                        btns.spawn((
-                            Button,
-                            modal_button_node(),
-                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
-                            StartMenuNewButton,
-                            StartMenuEntity,
-                        ))
-                        .with_children(|b| {
-                            b.spawn((
-                                Text::new("New"),
-                                text_font(font, 14.0),
-                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
-                                StartMenuEntity,
-                            ));
-                        });
-                        btns.spawn((
-                            Button,
-                            modal_button_node(),
-                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
-                            StartMenuControlsButton,
-                            StartMenuEntity,
-                        ))
-                        .with_children(|b| {
-                            b.spawn((
-                                Text::new("Controls"),
-                                text_font(font, 14.0),
-                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
-                                StartMenuEntity,
-                            ));
-                        });
-                        if has_cancel {
-                            btns.spawn((
-                                Button,
-                                modal_button_node(),
-                                BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
-                                StartMenuCancelButton,
-                                StartMenuEntity,
-                            ))
-                            .with_children(|b| {
-                                b.spawn((
-                                    Text::new("Cancel"),
-                                    text_font(font, 14.0),
-                                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
-                                    StartMenuEntity,
-                                ));
-                            });
-                        }
-                    });
-            });
-        });
-}
-
-fn handle_start_menu_new_button(
+/// Ask before resetting. The question is a modal phase like any other, so
+/// everything that already steps aside for a modal steps aside for this one
+/// too; `handle_confirm_new_button` is what carries it out.
+fn handle_new_button(
     mut interaction_q: Query<
         (&Interaction, &mut BackgroundColor, &Children),
-        (Changed<Interaction>, With<StartMenuNewButton>),
+        (Changed<Interaction>, With<NewButton>),
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+    mut eval: ResMut<EvalState>,
+) {
+    if is_evaluating(&eval) {
+        return;
+    }
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
+        match *interaction {
+            Interaction::Pressed => {
+                eval.phase = EvalPhase::ConfirmNew;
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
+                color.0 = Color::srgb(1.0, 1.0, 1.0);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+        }
+    }
+}
+
+fn handle_help_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (Changed<Interaction>, With<HelpButton>),
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+    mut eval: ResMut<EvalState>,
+) {
+    if is_evaluating(&eval) {
+        return;
+    }
+    for (interaction, mut bg, children) in interaction_q.iter_mut() {
+        let mut color = text_color_q.get_mut(children[0]).unwrap();
+        match *interaction {
+            Interaction::Pressed => {
+                eval.phase = EvalPhase::ControlsModal;
+            }
+            Interaction::Hovered => {
+                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
+                color.0 = Color::srgb(1.0, 1.0, 1.0);
+            }
+            Interaction::None => {
+                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
+                color.0 = Color::srgb(0.85, 0.85, 0.9);
+            }
+        }
+    }
+}
+
+/// Carry out the New that was asked about.
+///
+/// Only the root sub-layout is replaced; the wrapper and its `root_id` stand,
+/// which is what keeps the caret's addresses meaning the same thing. The id
+/// domains are threaded through rather than reset, so an id minted before the
+/// New can never collide with one minted after it.
+fn handle_confirm_new_button(
+    mut interaction_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        (Changed<Interaction>, With<ConfirmNewButton>),
     >,
     mut text_color_q: Query<&mut TextColor>,
     mut state: ResMut<GraphState>,
     mut rebuild: ResMut<NeedsRebuild>,
-    mut start_menu: ResMut<StartMenu>,
     mut pick: ResMut<PickState>,
+    mut eval: ResMut<EvalState>,
 ) {
     for (interaction, mut bg, children) in interaction_q.iter_mut() {
         let mut color = text_color_q.get_mut(children[0]).unwrap();
@@ -4569,8 +4672,7 @@ fn handle_start_menu_new_button(
                 pick.selected_pos = IVec3::ZERO;
                 state.resettle();
                 rebuild.0 = true;
-                start_menu.showing = false;
-                start_menu.has_cancel = false;
+                eval.phase = EvalPhase::Idle;
             }
             Interaction::Hovered => {
                 bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
@@ -4584,119 +4686,18 @@ fn handle_start_menu_new_button(
     }
 }
 
-fn handle_start_menu_controls_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (Changed<Interaction>, With<StartMenuControlsButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
-    mut start_menu: ResMut<StartMenu>,
-    mut eval: ResMut<EvalState>,
-) {
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-        match *interaction {
-            Interaction::Pressed => {
-                start_menu.showing = false;
-                eval.phase = EvalPhase::ControlsModal;
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
-                color.0 = Color::srgb(1.0, 1.0, 1.0);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-        }
-    }
-}
-
-fn handle_start_menu_cancel_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (Changed<Interaction>, With<StartMenuCancelButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
-    mut start_menu: ResMut<StartMenu>,
-) {
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-        match *interaction {
-            Interaction::Pressed => {
-                start_menu.showing = false;
-                start_menu.has_cancel = false;
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
-                color.0 = Color::srgb(1.0, 1.0, 1.0);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-        }
-    }
-}
-
-fn handle_hamburger_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor),
-        (Changed<Interaction>, With<HamburgerButton>),
-    >,
-    mut start_menu: ResMut<StartMenu>,
-    eval: Res<EvalState>,
-) {
-    if is_evaluating(&eval) {
-        return;
-    }
-    for (interaction, mut bg) in interaction_q.iter_mut() {
-        match *interaction {
-            Interaction::Pressed => {
-                start_menu.showing = true;
-                start_menu.has_cancel = true;
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-            }
-        }
-    }
-}
-
-fn sync_start_menu_ui(
-    mut commands: Commands,
-    start_menu: Res<StartMenu>,
+/// Sole writer of every `EditorChrome` node's `display`.
+///
+/// Two reasons and one answer: a modal owns the screen, or the point is that
+/// nothing of the editor is on it at all. Both say the same thing about the
+/// chrome, so both are decided here rather than at each widget.
+fn sync_editor_chrome(
     eval: Res<EvalState>,
     screenshot: Res<ScreenshotMode>,
-    ui_font: Res<UiFont>,
-    menu_entities: Query<Entity, With<StartMenuEntity>>,
     mut hideable: Query<&mut Node, With<EditorChrome>>,
-    mut last_showing: Local<Option<bool>>,
     mut last_hidden: Local<Option<bool>>,
 ) {
-    if *last_showing != Some(start_menu.showing) {
-        let was_showing = *last_showing;
-        *last_showing = Some(start_menu.showing);
-
-        if !start_menu.showing {
-            for e in menu_entities.iter() {
-                commands.entity(e).despawn();
-            }
-        } else if was_showing == Some(false) {
-            // Re-open after a Cancel/close — respawn the menu.
-            for e in menu_entities.iter() {
-                commands.entity(e).despawn();
-            }
-            spawn_start_menu_ui(&mut commands, &ui_font.0, start_menu.has_cancel);
-        }
-    }
-
-    // Three reasons and one answer: the menu owns the screen, a modal owns it,
-    // or the point is that nothing of the editor is on it at all.
-    let hidden = start_menu.showing || modal_is_open(&eval) || screenshot.active();
+    let hidden = modal_is_open(&eval) || screenshot.active();
     if *last_hidden == Some(hidden) {
         return;
     }
@@ -4720,34 +4721,6 @@ fn handle_modal_ok_button(
         match *interaction {
             Interaction::Pressed => {
                 eval.phase = EvalPhase::Idle;
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
-                color.0 = Color::srgb(1.0, 1.0, 1.0);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-        }
-    }
-}
-
-fn handle_controls_modal_ok_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (Changed<Interaction>, With<ControlsModalOkButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
-    mut eval: ResMut<EvalState>,
-    mut start_menu: ResMut<StartMenu>,
-) {
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-        match *interaction {
-            Interaction::Pressed => {
-                eval.phase = EvalPhase::Idle;
-                start_menu.showing = true;
             }
             Interaction::Hovered => {
                 bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
@@ -7139,19 +7112,17 @@ fn pick_nodes(
     node_q: Query<(&NodeEntity, &Transform)>,
     grid_q: Query<(Entity, &ScopeGridEntity)>,
     state: Res<GraphState>,
-    start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
     ui_interactions: Query<&Interaction, With<Button>>,
     mut rebuild: ResMut<NeedsRebuild>,
 ) {
-    if start_menu.showing {
+    // A modal owns the screen, and what was hovered or half-pressed under it
+    // is not what the user will be looking at when it closes.
+    if modal_is_open(&eval) {
         pick.hovered_node = None;
         pick.hovered_grid = None;
         pick.press_cursor = None;
         pick.press_over_ui = false;
-        return;
-    }
-    if modal_is_open(&eval) {
         return;
     }
     let Ok((camera, cam_gt)) = camera_q.single() else {
@@ -7681,11 +7652,7 @@ fn trigger_camera_focus_on_selection_change(
     orbit: Res<camera::OrbitCamera>,
     mut tween: ResMut<camera::CameraTween>,
     mut last_selection: Local<Option<IVec3>>,
-    start_menu: Res<StartMenu>,
 ) {
-    if start_menu.showing {
-        return;
-    }
     let current = pick.selected_pos;
     if *last_selection != Some(current) {
         if last_selection.is_some() {
@@ -7698,22 +7665,15 @@ fn trigger_camera_focus_on_selection_change(
 }
 
 /// True while something other than the graph owns the keyboard: a modal's text
-/// field, a modal, the start menu, or a running evaluation. Mode switching and
-/// the INSERT-mode inserts stay out of the way then — otherwise `i` would both
-/// type an `i` and change the mode.
+/// field, a modal, or a running evaluation. Mode switching and the INSERT-mode
+/// inserts stay out of the way then — otherwise `i` would both type an `i` and
+/// change the mode.
 ///
 /// The editor itself never appears here any more: its one text field was the
 /// Source's name, and that is typed into the prompt now, which is deliberately
 /// not a `TextInput` precisely so it does not capture.
-fn keyboard_captured(
-    text_inputs: &Query<&TextInput>,
-    start_menu: &StartMenu,
-    eval: &EvalState,
-) -> bool {
-    start_menu.showing
-        || modal_is_open(eval)
-        || is_evaluating(eval)
-        || text_inputs.iter().any(|input| input.focused)
+fn keyboard_captured(text_inputs: &Query<&TextInput>, eval: &EvalState) -> bool {
+    modal_is_open(eval) || is_evaluating(eval) || text_inputs.iter().any(|input| input.focused)
 }
 
 /// Apply an insert that makes room and let the caret ride it, so it keeps
@@ -7774,13 +7734,12 @@ fn apply_room_insert(
 /// rather than left standing: a message survives two updates, so keys struck
 /// under the guard would otherwise fire once it lifts — and a field's text
 /// would land in the prompt. There are no exceptions left: the editor's own
-/// text field is gone, so whatever owns the keyboard is the start menu, a modal
-/// or an evaluation, and none of them are a mode to leave.
+/// text field is gone, so whatever owns the keyboard is a modal or an
+/// evaluation, and neither is a mode to leave.
 fn handle_editor_keys(
     mut key_events: MessageReader<KeyboardInput>,
     keys: Res<ButtonInput<KeyCode>>,
     text_inputs: Query<&TextInput>,
-    start_menu: Res<StartMenu>,
     eval: Res<EvalState>,
     mut mode: ResMut<EditorMode>,
     mut prompt: ResMut<InsertPrompt>,
@@ -7789,7 +7748,7 @@ fn handle_editor_keys(
     mut pick: ResMut<PickState>,
     mut rebuild: ResMut<NeedsRebuild>,
 ) {
-    let captured = keyboard_captured(&text_inputs, &start_menu, &eval);
+    let captured = keyboard_captured(&text_inputs, &eval);
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     let target = insert_target(&state, &pick);
 
@@ -8036,7 +7995,6 @@ fn handle_arrow_keys(
     keys: Res<ButtonInput<KeyCode>>,
     mut key_events: MessageReader<KeyboardInput>,
     text_inputs: Query<&TextInput>,
-    start_menu: Res<StartMenu>,
     mut state: ResMut<GraphState>,
     mut pick: ResMut<PickState>,
     mut rebuild: ResMut<NeedsRebuild>,
@@ -8053,9 +8011,7 @@ fn handle_arrow_keys(
     // rather than from the message — walked straight past it: typing in a
     // field, Left and Right moved the text cursor *and* the caret, and the
     // travelling caret pulled the panel out from under the typist.
-    if is_evaluating(&eval)
-        || *mode == EditorMode::Insert
-        || keyboard_captured(&text_inputs, &start_menu, &eval)
+    if is_evaluating(&eval) || *mode == EditorMode::Insert || keyboard_captured(&text_inputs, &eval)
     {
         key_events.clear();
         return;
@@ -8500,7 +8456,6 @@ fn main() {
         .init_resource::<PickState>()
         .init_resource::<DragState>()
         .init_resource::<EvalState>()
-        .init_resource::<StartMenu>()
         .init_resource::<EditorMode>()
         .init_resource::<InsertPrompt>()
         .init_resource::<PendingNode>()
@@ -8523,7 +8478,6 @@ fn main() {
                 spawn_fps_display,
                 spawn_breadcrumb_display,
                 spawn_mode_display,
-                spawn_start_menu,
                 // Last: it reads the window's physical size, and the camera
                 // above is what puts the OIT settings there to be read.
                 log_oit_budget,
@@ -8544,11 +8498,14 @@ fn main() {
                         end_screenshot_mode,
                         handle_mode_toggle,
                         handle_insert_prompt_click,
-                        handle_hamburger_button,
-                        handle_start_menu_new_button,
-                        handle_start_menu_controls_button,
-                        handle_start_menu_cancel_button,
-                        sync_start_menu_ui,
+                        handle_new_button,
+                        handle_help_button,
+                        // With the other click handlers, not with the modal
+                        // ones: it rewrites the graph, and this is the chain
+                        // that ends in `rebuild_scene`, so the fresh graph is
+                        // on screen in the frame it was asked for.
+                        handle_confirm_new_button,
+                        sync_editor_chrome,
                         pick_nodes,
                     )
                         .chain()
@@ -8626,7 +8583,6 @@ fn main() {
                 // that reads what it wrote.
                 (handle_clipping_checkbox, sync_clipping_checkbox).chain(),
                 handle_modal_ok_button,
-                handle_controls_modal_ok_button,
                 handle_modal_cancel_button,
                 handle_modal_evaluate_button,
                 handle_eval_step_buttons,
