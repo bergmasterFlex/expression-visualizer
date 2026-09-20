@@ -424,11 +424,10 @@ struct SceneEntity;
 
 //Buttons
 #[derive(Component)]
-struct DeleteNodeButton;
-#[derive(Component)]
 struct HamburgerButton;
-/// Root of the INSERT-mode prompt, on the left edge under the "Delete Node"
-/// button.
+/// Root of the INSERT-mode prompt, on the left edge under the hamburger — the
+/// same rectangle the node editor panel stands in, which it never shares with
+/// it: a cell either names a property or it doesn't.
 #[derive(Component)]
 struct InsertPromptPanel;
 
@@ -1712,18 +1711,9 @@ fn spawn_graph_nodes(
     */
 }
 
-fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
+fn spawn_ui(mut commands: Commands) {
     // Hamburger menu button (top-left) — opens the menu modal.
     spawn_hamburger_button(&mut commands, Vec2::new(12.0, 12.0));
-
-    spawn_ui_button(
-        &mut commands,
-        &ui_font.0,
-        "Delete Node",
-        DeleteNodeButton,
-        Vec2::new(12.0, 60.0),
-        Display::Flex,
-    );
 }
 
 /// Marker on the bottom-right box that holds the problem list and the run
@@ -2334,40 +2324,7 @@ fn spawn_control_button<C: Bundle>(
         });
 }
 
-fn spawn_ui_button<C: Bundle>(
-    commands: &mut Commands,
-    font: &Handle<Font>,
-    label: &str,
-    component: C,
-    pos: Vec2,
-    initial_display: Display,
-) {
-    commands
-        .spawn((
-            Button,
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(pos.y),
-                left: Val::Px(pos.x),
-                padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
-                display: initial_display,
-                ..default()
-            },
-            BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
-            component,
-            EditorChrome,
-        ))
-        .with_children(|parent| {
-            parent.spawn((
-                Text::new(label),
-                text_font(font, 14.0),
-                TextColor(Color::srgb(0.6, 0.6, 0.7)),
-            ));
-        });
-}
-
-/// The INSERT prompt's panel, standing under the "Delete Node" button. Empty at
+/// The INSERT prompt's panel, on the left edge under the hamburger. Empty at
 /// startup — `sync_insert_prompt_ui` fills it. `Button` on the root so
 /// `pick_nodes`' `over_ui` test covers it and a click on the panel doesn't
 /// move the caret to whatever cell lies behind it, the same reason
@@ -2423,39 +2380,27 @@ fn spawn_hamburger_button(commands: &mut Commands, pos: Vec2) {
         });
 }
 
-fn handle_delete_node_button(
-    interaction_q: Query<&Interaction, (Changed<Interaction>, With<DeleteNodeButton>)>,
-    mut state: ResMut<GraphState>,
-    mut rebuild: ResMut<NeedsRebuild>,
-    pick: Res<PickState>,
-    eval: Res<EvalState>,
-) {
-    if is_evaluating(&eval) {
-        return;
+/// Take out what the caret stands on, where it stands on something that may
+/// go. Says whether the graph changed, like the `remove_node` it ends in;
+/// flagging the rebuild is the caller's.
+///
+/// Sink and BranchSource are constitutive parts of their scope, not
+/// user-placed nodes — neither can be deleted.
+fn delete_node_at_caret(state: &mut GraphState, pick: &PickState) -> bool {
+    let Some((caret_graph, local)) = state.caret_graph(pick) else {
+        return false;
+    };
+    let Some(node_id) = caret_graph.node_at(local) else {
+        return false;
+    };
+    let is_fixture = matches!(
+        caret_graph.graph.nodes.get(&node_id),
+        Some(model::node::ENode::Sink { .. } | model::node::ENode::BranchSource { .. })
+    );
+    if is_fixture {
+        return false;
     }
-    for interaction in interaction_q.iter() {
-        if *interaction != Interaction::Pressed {
-            continue;
-        }
-        let Some((caret_graph, local)) = state.caret_graph(&pick) else {
-            continue;
-        };
-        let Some(selected_node_id) = caret_graph.node_at(local) else {
-            continue;
-        };
-        // Sink and BranchSource are constitutive parts of their scope, not
-        // user-placed nodes — neither can be deleted.
-        let is_fixture = matches!(
-            caret_graph.graph.nodes.get(&selected_node_id),
-            Some(model::node::ENode::Sink { .. } | model::node::ENode::BranchSource { .. })
-        );
-        if is_fixture {
-            continue;
-        }
-        if remove_node(&mut state, &selected_node_id) {
-            rebuild.0 = true;
-        }
-    }
+    remove_node(state, &node_id)
 }
 
 /// Take a node out of the graph it lives in, wherever that is. Returns whether
@@ -2741,44 +2686,6 @@ fn apply_prompt_action(
         _ => false,
     };
     changed.then_some(Inserted::Done)
-}
-
-fn update_delete_button_visuals(
-    pick: Res<PickState>,
-    state: Res<GraphState>,
-    mut button_q: Query<(&Interaction, &mut BackgroundColor, &Children), With<DeleteNodeButton>>,
-    mut text_color_q: Query<&mut TextColor>,
-) {
-    let enabled = match state.caret_graph(&pick) {
-        Some((layout, local)) => match layout.node_at(local) {
-            Some(id) => !matches!(
-                layout.graph.nodes.get(&id),
-                Some(model::node::ENode::Sink { .. } | model::node::ENode::BranchSource { .. })
-            ),
-            None => false,
-        },
-        None => false,
-    };
-    for (interaction, mut bg, children) in button_q.iter_mut() {
-        let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
-            continue;
-        };
-        if !enabled {
-            bg.0 = Color::srgba(0.10, 0.10, 0.13, 0.9);
-            text_color.0 = Color::srgb(0.35, 0.35, 0.4);
-            continue;
-        }
-        match *interaction {
-            Interaction::Hovered | Interaction::Pressed => {
-                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                text_color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                text_color.0 = Color::srgb(0.6, 0.6, 0.7);
-            }
-        }
-    }
 }
 
 /// The mode control's two halves are the mouse's way between the modes, and
@@ -3524,8 +3431,8 @@ fn spawn_node_editor_panel(mut commands: Commands) {
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
-            top: Val::Px(82.0),
-            right: Val::Px(14.0),
+            top: Val::Px(96.0),
+            left: Val::Px(12.0),
             width: Val::Px(280.0),
             flex_direction: FlexDirection::Column,
             padding: UiRect::all(Val::Px(10.0)),
@@ -3595,7 +3502,9 @@ fn sync_node_editor_ui(
     let target = match insert_target(&state, &pick) {
         InsertTarget::Edit(id, edit) => Some((id, edit)),
         // A cell that names no property has no panel. What INSERT does there is
-        // build, and the create prompt draws itself in its own place.
+        // build, and the create prompt draws itself — in this panel's very
+        // rectangle, which the two can share because this `match` is what
+        // decides between them: a cell either names a property or it doesn't.
         InsertTarget::Create => None,
     };
     let visible =
@@ -7698,6 +7607,16 @@ fn handle_editor_keys(
                 *mode = EditorMode::Insert;
                 rebuild.0 = true;
             }
+            // Deleting is the one edit NORMAL makes itself. In INSERT the
+            // same key is the prompt's forward delete, an arm below.
+            (EditorMode::Normal, bevy::input::keyboard::Key::Delete) if !ev.repeat => {
+                if delete_node_at_caret(&mut state, &pick) {
+                    rebuild.0 = true;
+                    // The rest of the batch was struck against a graph that no
+                    // longer holds what those keys were about.
+                    break;
+                }
+            }
             // NORMAL's own keys belong to `handle_arrow_keys`.
             (EditorMode::Normal, _) => {}
             (EditorMode::Insert, key) => match key {
@@ -8375,7 +8294,6 @@ fn main() {
                         // `rebuild_scene` at the end of this chain, or the
                         // caret comes back a frame late.
                         end_screenshot_mode,
-                        handle_delete_node_button,
                         handle_mode_toggle,
                         handle_insert_prompt_click,
                         handle_hamburger_button,
@@ -8469,7 +8387,6 @@ fn main() {
                 sync_modal_ui,
                 sync_player_controls,
                 update_step_button_visuals,
-                update_delete_button_visuals,
                 sync_value_labels,
             )
                 .chain(),
