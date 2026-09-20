@@ -1264,7 +1264,24 @@ fn log_oit_budget(
 }
 
 /// Initial scene setup: camera, lights, ambient.
-fn setup_scene(mut commands: Commands) {
+fn setup_scene(
+    mut commands: Commands,
+    pick: Res<PickState>,
+    mut orbit: ResMut<camera::OrbitCamera>,
+) {
+    // Where the camera looks before anything has asked it to move: the centre
+    // of the caret's cell, which is what every focus after this one aims at.
+    //
+    // `OrbitCamera::default` can only answer `Vec3::ZERO`, and zero is a
+    // cell's *corner* — a cell is anchored at its address by the face turned
+    // toward the origin, which is what `layout_to_world` says and
+    // `cell_center_world` exists to correct. Left at the default the view
+    // opened half a cell off on every axis and came right only once the caret
+    // had moved and `trigger_camera_focus_on_selection_change` had had its
+    // say: the first framing was the one framing not expressed in the same
+    // terms as the rest.
+    orbit.target = render::cell_center_world(pick.selected_pos.as_vec3());
+
     // Camera with order-independent transparency for correct intersection
     // of the two walls and the grid. OIT requires MSAA off.
     // The grid shader calls `oit_draw()` under #ifdef OIT_ENABLED to
@@ -7767,8 +7784,11 @@ fn text_input_keyboard(
 }
 
 /// Detect a change in `PickState::selected_pos` and start a camera
-/// auto-focus tween toward the new position. The first observation
-/// (fresh `Local`) does not trigger, so app startup doesn't jump.
+/// auto-focus tween toward the new position.
+///
+/// The first observation (fresh `Local`) only records where the caret stands.
+/// There is nothing to travel to: `setup_scene` has already put the camera on
+/// that cell, so startup is a view that is right rather than one that arrives.
 fn trigger_camera_focus_on_selection_change(
     pick: Res<PickState>,
     orbit: Res<camera::OrbitCamera>,
