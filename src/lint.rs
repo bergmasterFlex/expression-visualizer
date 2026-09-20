@@ -11,12 +11,22 @@
 //! the node it is about, so the list can say where to go, and they all come out
 //! together, so a graph with three holes in it says so once.
 //!
-//! **Only what is reachable from the sink is an error.** An error is defined
-//! here as something that prevents evaluation, and evaluation never walks past
-//! the sink's input — so a node dangling off to one side cannot block it,
-//! however unfinished it is. Those get exactly one line, [`Severity::Warning`]
-//! and `is unreachable`, rather than one per hole in them. That is the whole of
-//! why `reachable_from_sink` runs first and everything below is gated on it.
+//! **Every node is asked every question, reachable or not.** It was gated on
+//! reachability for a while, on the reasoning that evaluation never walks past
+//! the sink's input and so a node dangling off to one side cannot block it. But
+//! a half-built node is half-built wherever it stands, and being told only once
+//! it is wired up is being told late — so the hole is reported where it is, and
+//! reachability is one more answer beside it rather than a gate in front of it.
+//!
+//! Being unreachable is itself worth one line: [`Severity::Warning`], at the
+//! *end* of each dangling run and not once per node in it. A chain nothing
+//! reads is one mistake and not four, and its end is where it reads — the node
+//! whose value nothing takes is the reason the ones behind it go unread.
+//!
+//! Reachability is asked per scope, from each scope's own sink. A Match that
+//! nothing reads is a statement about the Match; the arms below it go on being
+//! judged by whether they reach the end of their own arm, which is the only end
+//! an arm has.
 //!
 //! Nothing here reaches through Bevy, and nothing here reads a position: a
 //! diagnostic names a `node::Id` and the caller turns that into a cell. That
@@ -34,8 +44,9 @@ type FunctionDeclarations = std::collections::HashMap<
 /// the only one that decides anything: a run does not start while one stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
-    /// The run cannot start. Something reachable from the sink is missing, not
-    /// merely wrong.
+    /// The run cannot start. Something is missing rather than merely wrong —
+    /// wherever it stands, because a hole is a hole before anything is wired
+    /// to it.
     Error,
     /// The run starts and something in it is provably dead or provably
     /// disagrees. Nothing here is about a *value* — that is what a run finds
@@ -100,12 +111,13 @@ pub fn check(root: &crate::layout::LayoutGraph, decls: &FunctionDeclarations) ->
         });
     }
 
-    let reachable = reachable_from_sink(&graph);
+    let reachable = reachable_from_sinks(&graph);
+    let tails = unreachable_tails(&graph, &reachable);
 
     // E6. Before anything that recurses through inference, because a cycle
     // makes every type behind it `Pending` and the reports that follow would
     // all be consequences of this one.
-    for id in cyclic_nodes(&graph, &reachable) {
+    for id in cyclic_nodes(&graph) {
         out.push(Diagnostic {
             severity: Severity::Error,
             message: format!(
@@ -125,31 +137,15 @@ pub fn check(root: &crate::layout::LayoutGraph, decls: &FunctionDeclarations) ->
         let Some(node) = graph.nodes.get(&id) else {
             continue;
         };
-        if !reachable.contains(&id) {
-            // W5. One line, not one per hole: what is not reached is not
-            // evaluated, so nothing in it can be an error. The Root owns the
-            // outermost scope and is never wired to anything, and a Pattern is
-            // reached through its Match rather than through an edge — neither
-            // is dangling for not being on the sink's path.
-            //
-            // A BranchSource is the third, and for a reason of its own: it is
-            // created with its branch rather than by anyone, and a branch is
-            // free not to want the matched value at all — one that builds its
-            // result from a Tunnel or a literal simply never reads it. Unused
-            // is the normal case there, not a mistake to report.
-            if !matches!(
-                node,
-                crate::model::node::ENode::Root { .. }
-                    | crate::model::node::ENode::Pattern { .. }
-                    | crate::model::node::ENode::BranchSource { .. }
-            ) {
-                out.push(Diagnostic {
-                    severity: Severity::Warning,
-                    message: format!("{} is unreachable from the sink", label(&graph, &id, decls)),
-                    node: Some(id.clone()),
-                });
-            }
-            continue;
+        // W5. `unreachable_tails` has already decided which of the unread
+        // nodes speaks for its run; the rest of that run says nothing, and
+        // every node — read or not — is asked the same questions below.
+        if tails.contains(&id) {
+            out.push(Diagnostic {
+                severity: Severity::Warning,
+                message: format!("Unreachable node: {}", label(&graph, &id, decls)),
+                node: Some(id.clone()),
+            });
         }
 
         check_node(&graph, &id, node, decls, &mut out);
@@ -161,7 +157,7 @@ pub fn check(root: &crate::layout::LayoutGraph, decls: &FunctionDeclarations) ->
     out
 }
 
-/// Everything asked of one reachable node.
+/// Everything asked of one node, whether or not anything reads it.
 fn check_node(
     graph: &crate::model::term_graph::TermGraph,
     id: &crate::model::node::Id,
@@ -176,7 +172,9 @@ fn check_node(
     // it "an error of the graph and not a `none` travelling along an edge".
     let untyped = match node {
         crate::model::node::ENode::Source { r#type, .. } => r#type.is_none().then_some("Source"),
-        crate::model::node::ENode::TypeCast { r#type, .. } => r#type.is_none().then_some("Cast"),
+        crate::model::node::ENode::TypeCast { r#type, .. } => {
+            r#type.is_none().then_some("TypeCast")
+        }
         crate::model::node::ENode::Pattern { r#type, .. } => r#type.is_none().then_some("Arm"),
         crate::model::node::ENode::Tunnel { r#type, .. } => r#type.is_none().then_some("Tunnel"),
         _ => None,
@@ -415,13 +413,17 @@ fn check_match(
             .map(|(_, arm)| crate::infer::claimed_span(&row, arm))
             .collect();
 
-        // W1.
+        // E7. An error and not a warning: a value the arms do not claim
+        // reaches the Match and there is nothing for it to go down, so the run
+        // stops there. That it stops at a value rather than at a hole in the
+        // picture is what used to make it read as a warning, but a run that
+        // cannot finish is a run that cannot start.
         let spans: Vec<crate::infer::RowSpan> = claimed.iter().flatten().copied().collect();
         if !crate::infer::spans_cover_band(&spans) {
             out.push(Diagnostic {
-                severity: Severity::Warning,
+                severity: Severity::Error,
                 node: Some(id.clone()),
-                message: format!("Match does not cover every {}", row.to_string()),
+                message: format!("Non-exhaustive Match: {} not covered", row.to_string()),
             });
         }
 
@@ -466,20 +468,33 @@ fn covers(outer: &crate::infer::RowSpan, inner: &crate::infer::RowSpan) -> bool 
     outer.top <= inner.top + f32::EPSILON && outer.bottom >= inner.bottom - f32::EPSILON
 }
 
-/// Every node the sink's input reaches, walking backwards along the edges.
+/// Every node some sink's input reaches, walking backwards along the edges.
 ///
-/// Carries its own `seen` set and so terminates on a cycle — which is what lets
-/// `cyclic_nodes` below run against the result rather than having to guard
-/// itself twice.
+/// Every scope has one and answers to it alone, so every one of them is a
+/// starting point — see the seeding below. A Match reaching its arms is
+/// deliberately *not* followed: what an arm's contents answer to is the end of
+/// that arm, and making it depend on whether anything reads the Match is what
+/// turned one unread Match into a report per node standing under it.
 ///
-/// A Match reaches its arms through `patterns` and an arm reaches its branch
-/// through its Sink, neither of which is an edge; both are followed by hand, or
-/// every branch in the program would come out unreachable.
-fn reachable_from_sink(
+/// Carries its own `seen` set and so terminates on a cycle.
+fn reachable_from_sinks(
     graph: &crate::model::term_graph::TermGraph,
 ) -> std::collections::HashSet<crate::model::node::Id> {
     let mut seen = std::collections::HashSet::new();
+    // Every scope answers to its own terminal: the program to the outer Sink,
+    // a branch to the Sink it was born with. Seeding all of them at once is
+    // what keeps an unreachable Match from making its arms' contents
+    // unreachable too — an arm ends where its own Sink is, whatever reads the
+    // Match.
     let mut stack = vec![graph.sink_node_id.clone()];
+    stack.extend(graph.nodes.values().filter_map(|node| match node {
+        crate::model::node::ENode::Pattern { sink_node_id, .. } => Some(sink_node_id.clone()),
+        _ => None,
+    }));
+    // Backwards along input edges and nothing else. The walk crosses a scope
+    // boundary exactly where the graph does — a Tunnel is fed from outside —
+    // and nowhere else: a Match holding its Patterns is not a value arriving
+    // anywhere, so it is not a way to reach one.
     while let Some(id) = stack.pop() {
         if !seen.insert(id.clone()) {
             continue;
@@ -495,20 +510,61 @@ fn reachable_from_sink(
                 stack.push(producer.clone());
             }
         }
-        match node {
-            crate::model::node::ENode::Match { patterns, .. } => {
-                stack.extend(patterns.iter().cloned());
-            }
-            crate::model::node::ENode::Pattern { sink_node_id, .. } => {
-                stack.push(sink_node_id.clone());
-            }
-            crate::model::node::ENode::BranchSource { pattern, .. } => {
-                stack.push(pattern.clone());
-            }
-            _ => {}
-        }
     }
     seen
+}
+
+/// Which unreachable nodes are worth a line: the last of each dangling run.
+///
+/// Three kinds are never one, whatever the walk found. The Root owns the
+/// outermost scope and is never wired to anything. A Pattern is reached through
+/// its Match rather than through an edge. And a BranchSource is created with
+/// its branch rather than by anyone — a branch is free not to want the matched
+/// value at all, and one that builds its result from a Tunnel or a literal
+/// simply never reads it, so unused is the normal case there.
+fn unreachable_tails(
+    graph: &crate::model::term_graph::TermGraph,
+    reachable: &std::collections::HashSet<crate::model::node::Id>,
+) -> std::collections::HashSet<crate::model::node::Id> {
+    let speaks_for_itself = |id: &crate::model::node::Id| {
+        if reachable.contains(id) {
+            return false;
+        }
+        !matches!(
+            graph.nodes.get(id),
+            None | Some(
+                crate::model::node::ENode::Root { .. }
+                    | crate::model::node::ENode::Pattern { .. }
+                    | crate::model::node::ENode::BranchSource { .. }
+            )
+        )
+    };
+    // A producer whose value another unreachable node takes is not the end of
+    // anything: the one that takes it is further down the same dead run.
+    let mut feeds_the_dead: std::collections::HashSet<crate::model::node::Id> =
+        std::collections::HashSet::new();
+    for (from, edges) in &graph.edges {
+        let Some(producer) = graph.anchor_to_node.get(from) else {
+            continue;
+        };
+        if !speaks_for_itself(producer) {
+            continue;
+        }
+        if edges.iter().any(|edge| {
+            graph
+                .anchor_to_node
+                .get(&edge.to)
+                .is_some_and(|consumer| speaks_for_itself(consumer))
+        }) {
+            feeds_the_dead.insert(producer.clone());
+        }
+    }
+    graph
+        .nodes
+        .keys()
+        .filter(|id| speaks_for_itself(id) && !feeds_the_dead.contains(*id))
+        .cloned()
+        .collect()
 }
 
 /// Nodes that lie on a cycle of input edges.
@@ -519,14 +575,13 @@ fn reachable_from_sink(
 /// recurses until the stack is gone — so this is the one diagnostic that
 /// prevents a crash rather than a confusion.
 ///
-/// Only the reachable ones: a cycle off to one side is never walked into.
-fn cyclic_nodes(
-    graph: &crate::model::term_graph::TermGraph,
-    reachable: &std::collections::HashSet<crate::model::node::Id>,
-) -> Vec<crate::model::node::Id> {
+/// Every node, reachable or not. A cycle off to one side is never walked into
+/// by a run, but it is walked into by everything below — and what it does to
+/// the reports there is the same confusion it would cause anywhere else.
+fn cyclic_nodes(graph: &crate::model::term_graph::TermGraph) -> Vec<crate::model::node::Id> {
     let mut on_cycle = std::collections::BTreeSet::new();
     let mut settled = std::collections::HashSet::new();
-    let mut ids: Vec<&crate::model::node::Id> = reachable.iter().collect();
+    let mut ids: Vec<&crate::model::node::Id> = graph.nodes.keys().collect();
     ids.sort();
     for id in ids {
         walk(graph, id, &mut Vec::new(), &mut settled, &mut on_cycle);
@@ -617,7 +672,7 @@ fn label(
             format!("Source \"{}\"", name)
         }
         crate::model::node::ENode::Source { .. } => "Source".to_string(),
-        crate::model::node::ENode::TypeCast { .. } => "Cast".to_string(),
+        crate::model::node::ENode::TypeCast { .. } => "TypeCast".to_string(),
         crate::model::node::ENode::Match { .. } => "Match".to_string(),
         crate::model::node::ENode::Pattern { .. } => "Arm".to_string(),
         crate::model::node::ENode::BranchSource { .. } => "Branch source".to_string(),
