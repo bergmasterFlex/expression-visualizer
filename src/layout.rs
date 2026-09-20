@@ -704,12 +704,14 @@ impl LayoutGraph {
     ///
     /// A Tunnel's input is the exception, and it is answered rather than
     /// refused. It claims no cell at all: it hangs at node-local `(0, 0, -1)`,
-    /// outside the scope's non-negative address space, which is what keeps the
-    /// caret off it (`clamp_to_volume`). But the caret is not the only thing
-    /// that addresses an anchor — a *target* is addressed too, and a Tunnel
-    /// input is the one way a value crosses into a branch, so it has to be
-    /// aimable. The address it gets is the one the renderer draws it at, so the
-    /// distance measured against it is not a fiction.
+    /// outside its own scope's non-negative address space — but *on* a cell of
+    /// the scope around it, which is a cell like any other. So there is a real
+    /// address to give, and it has to be given: a Tunnel input is the one way a
+    /// value crosses into a branch, so both ends of the editor reach for it —
+    /// an edge aimed at it, and the caret standing on the cell it is drawn at
+    /// (`tunnel_input_at`, which reads this answer backwards). The address it
+    /// gets is the one the renderer draws it at, so the distance measured
+    /// against it is not a fiction.
     pub fn anchor_cells_of(&self, anchor: &crate::model::anchor::Id) -> Option<Vec<IVec3>> {
         let layout_anchor = self.try_layout_anchor(anchor)?;
         let context = self.context_of_node(&layout_anchor.node_id)?;
@@ -728,6 +730,34 @@ impl LayoutGraph {
     /// because a distance wants a point.
     pub fn anchor_cell(&self, anchor: &crate::model::anchor::Id) -> Option<IVec3> {
         self.anchor_cells_of(anchor)?.into_iter().next()
+    }
+
+    /// The Tunnel input the global cell `global` addresses, if it addresses
+    /// one.
+    ///
+    /// The inverse of the exception `anchor_cells_of` makes, and here for the
+    /// same reason. A Tunnel's input claims no cell of any shape: it hangs at
+    /// node-local `(0, 0, -1)`, which is a cell of the scope *around* its own.
+    /// Neither scope can find it by asking a shape what stands on a cell — the
+    /// branch has no such local address, and the graph that does hold the cell
+    /// holds no such node. So it is asked of the whole program at once, in the
+    /// coordinates the two scopes share.
+    ///
+    /// Without it the one way into a branch would be the one anchor the
+    /// keyboard cannot aim at: standing on it, INSERT would offer to build a
+    /// node on a cell that is already somebody's input.
+    pub fn tunnel_input_at(&self, global: IVec3) -> Option<crate::model::anchor::Id> {
+        self.walk_all().into_iter().find_map(|walked| {
+            let node = walked
+                .layout_graph
+                .graph
+                .nodes
+                .get(&walked.layout_node.node_id)?;
+            let crate::model::node::ENode::Tunnel { input_anchor, .. } = node else {
+                return None;
+            };
+            (self.anchor_cell(input_anchor) == Some(global)).then(|| input_anchor.clone())
+        })
     }
 
     /// Build a `grid position -> node id` lookup over all selectable nodes.
@@ -937,12 +967,16 @@ impl LayoutGraph {
             // than forgotten. The input hangs one cell in front of the entry
             // row, at local Z = −1, which is outside this scope's non-negative
             // address space — the face the enclosing graph reaches, not a cell
-            // of this graph. `clamp_to_volume` therefore keeps the caret off
-            // it, which is right: what a Tunnel declares is edited on the cell
-            // behind the input, from inside the branch, and the input itself
-            // is only where an edge lands. It is still a real anchor in
-            // `ENode::anchors`, so an edge can end on it and the pointer can
-            // pick it; only addressing passes it by.
+            // of this graph. Which is right: what a Tunnel declares is edited
+            // on the cell behind the input, from inside the branch, and the
+            // input itself is only where an edge lands.
+            //
+            // Nothing about that puts it out of reach. It is a real anchor in
+            // `ENode::anchors`, the pointer picks it, and the cell it hangs on
+            // belongs to the enclosing scope, where the caret may stand — so
+            // standing there addresses it, by `LayoutGraph::tunnel_input_at`
+            // and not by this shape, which is the whole of what is special
+            // about it.
             crate::model::node::ENode::Tunnel { output_anchor, .. } => {
                 cells.push((IVec3::new(0, 0, TUNNEL_TYPE_Z), CellRole::Body));
                 cells.extend(anchor_cells(

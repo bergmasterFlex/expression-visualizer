@@ -764,6 +764,9 @@ fn anchor_of_role(node: &model::node::ENode, role: &layout::CellRole) -> Option<
 
 /// The anchor the caret stands on, if it stands on one.
 ///
+/// Three questions and not one, because two anchors stand where the plain one
+/// does not reach.
+///
 /// `addressed_cell` answers for every node but one. `LayoutGraph::node_at`
 /// passes a Match over, so that standing inside one addresses the arm rather
 /// than the envelope around it — but a Match's own two anchors stand outside
@@ -775,6 +778,14 @@ fn anchor_of_role(node: &model::node::ENode, role: &layout::CellRole) -> Option<
 /// Narrow by construction: a Match's shape holds its two anchor cells and
 /// nothing else, so `role_at` answers for those two and refuses every other
 /// cell of the envelope — the arms and their volumes included.
+///
+/// The other is a Tunnel's input, and there no shape answers at all: it hangs
+/// on a cell of the scope *outside* the one the Tunnel is in, so the caret
+/// standing on it stands in a graph that holds no such node, while the graph
+/// that holds the node has no such cell. `tunnel_input_at` asks both at once.
+/// It is the last question and not the first, so a cell that a node does claim
+/// keeps answering for that node — which is the rule everywhere else, and a
+/// Tunnel's input is drawn on nobody else's cell anyway.
 fn anchor_at_caret(state: &GraphState, pick: &PickState) -> Option<model::anchor::Id> {
     let (layout, local) = state.caret_graph(pick)?;
     let anchor_of = |id: &model::node::Id| -> Option<model::anchor::Id> {
@@ -788,6 +799,7 @@ fn anchor_at_caret(state: &GraphState, pick: &PickState) -> Option<model::anchor
         .node_at(local)
         .and_then(|id| anchor_of(&id))
         .or_else(|| layout.match_containing(local).and_then(|id| anchor_of(&id)))
+        .or_else(|| state.root_graph().tunnel_input_at(pick.selected_pos))
 }
 
 fn insert_target(state: &GraphState, pick: &PickState) -> InsertTarget {
@@ -8678,11 +8690,17 @@ fn open_caret_draft(
 /// screen. It is also what makes the return to the source on commit mean
 /// anything: the caret has somewhere to come back from.
 ///
-/// It stays where it is when the far end has no cell the caret may stand on. A
-/// Tunnel's input is the one such end — it hangs outside its scope, on exactly
-/// the address `clamp_to_volume` refuses — and it is still perfectly aimable:
-/// the blinking edge says where the aim is, which is what the caret would only
-/// have said twice.
+/// It stays where it is when the far end stands somewhere the caret may not —
+/// the same volume test caret navigation goes through, asked of the program
+/// and not of one scope.
+///
+/// A Tunnel's input reads as such an end and is not one. It hangs outside the
+/// scope it belongs to, at node-local `(0, 0, -1)`, which is what keeps it out
+/// of every shape — but the cell it hangs on is a cell of the scope around it
+/// and as much part of the program's volume as any other, so the caret follows
+/// the aim onto it like anywhere else. The same standing is what lets INSERT
+/// open a draft there rather than offer to build a node
+/// (`LayoutGraph::tunnel_input_at`).
 fn follow_draft_target(state: &GraphState, pick: &mut PickState, draft: &EdgeDraft) {
     let Some(cell) = draft
         .target_anchor_id
