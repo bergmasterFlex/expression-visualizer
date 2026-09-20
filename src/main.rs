@@ -922,17 +922,24 @@ fn tab_step(subject: &PanelSubject, here: &RowAddress, back: bool) -> Option<IVe
     Some(subject.rows[next].cell)
 }
 
-/// UI text showing the selected node's info.
-#[derive(Component)]
-struct SelectionDisplay;
-
 /// Marker for the FPS counter text in the top-right corner.
 #[derive(Component)]
 struct FpsDisplay;
 
-/// UI text showing the scope the caret currently addresses, as a breadcrumb.
-#[derive(Component)]
-struct BreadcrumbDisplay;
+/// Which of the two lines above the panel a text node is.
+///
+/// One component with two values rather than two markers, because one system
+/// writes both: the relative line and the absolute one are the same walk of
+/// the caret's scope path, read twice.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum AddressLine {
+    /// The way to the caret as a chain of offsets, each measured in the frame
+    /// its segment names. The chain sums to `Absolute` — that is what makes it
+    /// readable as a path rather than as a list of numbers.
+    Relative,
+    /// Where the caret stands, full stop.
+    Absolute,
+}
 
 /// One half of the mode control on the bottom edge: the mode a click on it
 /// asks for. Which half is on is `EditorMode`'s answer, never the button's.
@@ -1096,6 +1103,21 @@ struct ValueLabel {
 }
 
 // ── Editor panel ────────────────────────────────────────────
+
+/// The left column: where the caret stands, and then the panel about what it
+/// stands on.
+///
+/// A column and not three absolutely-placed nodes, because the relative line
+/// grows with the caret's depth and will fold once it runs out of screen — and
+/// a panel at a fixed `top` cannot answer that. Here it simply flows under
+/// however many lines there turned out to be, and takes no space at all on the
+/// frames it is not shown.
+///
+/// The column wears `EditorChrome` and the panel inside it must not: the panel
+/// writes its own `display`, and being a child is enough to disappear with the
+/// rest of the chrome.
+#[derive(Component)]
+struct EditorColumn;
 
 /// The one panel on the left edge: the node the caret stands on, and what can
 /// be answered about it. It never despawns — `sync_editor_panel` rebuilds its
@@ -3620,28 +3642,65 @@ fn spawn_prompt_hint(options: &mut ChildSpawnerCommands, font: &Handle<Font>, te
 
 // ── Editor panel UI ─────────────────────────────────────────
 
-/// The panel's frame, spawned once and never taken down. Empty at startup —
-/// `sync_editor_panel` fills it. `Button` on the root so `pick_nodes`'
-/// `over_ui` test covers it and a click on the panel doesn't move the caret to
-/// whatever cell lies behind it.
-fn spawn_editor_panel(mut commands: Commands) {
-    commands.spawn((
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(96.0),
-            left: Val::Px(12.0),
-            width: Val::Px(280.0),
-            flex_direction: FlexDirection::Column,
-            padding: UiRect::all(Val::Px(10.0)),
-            border_radius: BorderRadius::all(Val::Px(6.0)),
-            row_gap: Val::Px(6.0),
-            display: Display::None,
-            ..default()
-        },
-        BackgroundColor(Color::srgba(0.10, 0.10, 0.16, 0.9)),
-        Button,
-        EditorPanel,
-    ));
+/// Build the left column: the two address lines, then the panel under them.
+///
+/// `top: 56.0` clears the New/Help row above — 12 px down, and about 33 high
+/// with `chrome_button_node`'s padding around 14 px text.
+///
+/// Spanned from edge to edge rather than given the panel's width, because the
+/// relative line is as long as the caret is deep and there is no reason to
+/// fold it while the screen is still going. The panel states its own 280 and
+/// so keeps it; the lines take what is left, and wrap at the far margin.
+fn spawn_editor_column(mut commands: Commands, ui_font: Res<UiFont>) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(56.0),
+                left: Val::Px(12.0),
+                right: Val::Px(12.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(6.0),
+                ..default()
+            },
+            EditorColumn,
+            EditorChrome,
+        ))
+        .with_children(|column| {
+            // Dimmed: the path is the context the address is read in.
+            column.spawn((
+                Text::new(""),
+                text_font(&ui_font.0, 12.0),
+                TextColor(Color::srgba(0.55, 0.55, 0.65, 0.9)),
+                AddressLine::Relative,
+            ));
+            column.spawn((
+                Text::new(""),
+                text_font(&ui_font.0, 12.0),
+                TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                AddressLine::Absolute,
+            ));
+            // The panel's frame, spawned once and never taken down. Empty at
+            // startup — `sync_editor_panel` fills it. It flows under the lines
+            // rather than standing at a `top` of its own, so however far they
+            // wrapped is how far down it begins. `Button` on the root so
+            // `pick_nodes`' `over_ui` test covers it and a click on the panel
+            // doesn't move the caret to whatever cell lies behind it.
+            column.spawn((
+                Node {
+                    width: Val::Px(280.0),
+                    flex_direction: FlexDirection::Column,
+                    padding: UiRect::all(Val::Px(10.0)),
+                    border_radius: BorderRadius::all(Val::Px(6.0)),
+                    row_gap: Val::Px(6.0),
+                    display: Display::None,
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.10, 0.10, 0.16, 0.9)),
+                Button,
+                EditorPanel,
+            ));
+        });
 }
 
 #[derive(Default, PartialEq, Eq, Clone)]
@@ -6509,22 +6568,6 @@ fn update_world_labels(
     }
 }
 
-fn spawn_selection_display(mut commands: Commands, ui_font: Res<UiFont>) {
-    commands.spawn((
-        Text::new(""),
-        text_font(&ui_font.0, 16.0),
-        TextColor(Color::srgb(0.85, 0.85, 0.9)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(34.0),
-            right: Val::Px(14.0),
-            ..default()
-        },
-        SelectionDisplay,
-        EditorChrome,
-    ));
-}
-
 fn spawn_fps_display(mut commands: Commands, ui_font: Res<UiFont>) {
     commands.spawn((
         Text::new("--"),
@@ -7067,41 +7110,86 @@ fn sync_mode_toggles(
     }
 }
 
-fn spawn_breadcrumb_display(mut commands: Commands, ui_font: Res<UiFont>) {
-    commands.spawn((
-        Text::new("Root"),
-        text_font(&ui_font.0, 12.0),
-        TextColor(Color::srgba(0.55, 0.55, 0.65, 0.9)),
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(58.0),
-            right: Val::Px(14.0),
-            max_width: Val::Px(260.0),
-            overflow: Overflow::clip(),
-            ..default()
-        },
-        BreadcrumbDisplay,
-        EditorChrome,
-    ));
+/// A grid address as the two lines above the panel write one.
+fn cell_text(v: IVec3) -> String {
+    format!("({},{},{})", v.x, v.y, v.z)
 }
 
-fn update_breadcrumb_display(
+/// The way to the caret, written as the chain of offsets it is.
+///
+/// Each segment names the frame its numbers are measured in, and the numbers
+/// are the step from that frame's origin to the next one — the last segment
+/// steps to the caret itself. So the segments sum to the absolute address, and
+/// that is the property worth having: the line can be checked by adding it up.
+///
+/// A nesting level becomes *two* segments, because the way into a branch goes
+/// past a node that `scope.path` does not mention. The path holds only the
+/// Pattern, so its frame is entered as `Match(…)` — the step from the Match
+/// node to the branch's origin — after the enclosing frame has stepped to the
+/// Match node itself. `Root(a) > Match(b) > Branch(c)` therefore reads: `a` to
+/// the Match, `b` on into the branch, `c` to the caret.
+///
+/// A step that is not shaped like that — a path element that is no Pattern, a
+/// Match with no layout position — is written as one segment carrying the
+/// whole offset instead of two. The sum still holds; only the detail is lost.
+fn relative_path_text(state: &GraphState, scope: &CaretScope) -> String {
+    let root = state.root_graph();
+    let mut parts: Vec<String> = Vec::new();
+    for i in 0..scope.path.len() {
+        // Frames alternate: the outermost is the root scope, every one after
+        // it is the branch the previous step led into.
+        let frame = if i == 0 { "Root" } else { "Branch" };
+        let parent = root.resolve_context(&scope.path[..i]);
+        let into_branch =
+            root.scope_offset(&scope.path[..=i]) - root.scope_offset(&scope.path[..i]);
+        let to_match = match parent.graph.nodes.get(&scope.path[i]) {
+            Some(model::node::ENode::Pattern { parent_match, .. }) => parent
+                .layout_nodes
+                .get(parent_match)
+                .map(|ln| ln.pos.round().as_ivec3()),
+            _ => None,
+        };
+        match to_match {
+            Some(to_match) => {
+                parts.push(format!("{}{}", frame, cell_text(to_match)));
+                parts.push(format!("Match{}", cell_text(into_branch - to_match)));
+            }
+            None => parts.push(format!("{}{}", frame, cell_text(into_branch))),
+        }
+    }
+    let innermost = if scope.path.is_empty() {
+        "Root"
+    } else {
+        "Branch"
+    };
+    parts.push(format!("{}{}", innermost, cell_text(scope.local)));
+    parts.join(" > ")
+}
+
+/// Write both lines from one walk of the path.
+///
+/// Only on a change: a `Text` written every frame is a `Text` changed every
+/// frame, and the layout is recomputed for it.
+fn update_address_lines(
     pick: Res<PickState>,
     state: Res<GraphState>,
-    mut text_q: Query<&mut Text, With<BreadcrumbDisplay>>,
+    mut line_q: Query<(&mut Text, &AddressLine)>,
 ) {
-    let Ok(mut text) = text_q.single_mut() else {
-        return;
-    };
-    let Some(scope) = state.scope_of_caret(&pick) else {
-        text.0 = "—".to_string();
-        return;
-    };
-    let mut parts = vec!["Root".to_string()];
-    for id in &scope.path {
-        parts.push(format!("Pattern({})", id));
+    let scope = state.scope_of_caret(&pick);
+    for (mut text, line) in line_q.iter_mut() {
+        let next = match line {
+            // A caret inside no scope volume at all has no path to write —
+            // its absolute address is still a fact, and stays below.
+            AddressLine::Relative => match &scope {
+                Some(scope) => format!("Relative: {}", relative_path_text(&state, scope)),
+                None => "Relative: —".to_string(),
+            },
+            AddressLine::Absolute => format!("Absolute: {}", cell_text(pick.selected_pos)),
+        };
+        if text.0 != next {
+            text.0 = next;
+        }
     }
-    text.0 = parts.join(" > ");
 }
 
 fn pick_nodes(
@@ -7298,55 +7386,6 @@ fn highlight_hovered(
             base.blue * intensity,
             1.0,
         );
-    }
-}
-
-fn update_selection_display(
-    pick: Res<PickState>,
-    state: Res<GraphState>,
-    eval: Res<EvalState>,
-    mut display_q: Query<(&mut Text, &mut TextColor), With<SelectionDisplay>>,
-) {
-    let Ok((mut text, mut color)) = display_q.single_mut() else {
-        return;
-    };
-    let caret = state.caret_graph(&pick);
-    if let Some(id) = caret.and_then(|(layout, local)| layout.node_at(local)) {
-        if let Some(node) = caret.and_then(|(layout, _)| layout.graph.nodes.get(&id)) {
-            // A `none` says only that no value was produced; the why lives in
-            // the run's trace, and this is where the addressed node gets to
-            // tell it. It is read from the snapshot on screen, so stepping
-            // back drops the line again.
-            let reason = match &eval.phase {
-                EvalPhase::Running {
-                    states, current, ..
-                } => states[*current].trace.get(&id),
-                _ => None,
-            };
-            text.0 = format!(
-                "{} : {}{}",
-                render::label_for_node(node, &state.function_declarations),
-                match infer::node_output_type(
-                    &state.root_graph().flattened_graph(),
-                    &id,
-                    &state.function_declarations,
-                ) {
-                    Some(r#type) => r#type.to_string(),
-                    // Sink and Root produce nothing at all.
-                    None => "-".to_string(),
-                },
-                reason
-                    .map(|reason| format!("\n{}", reason))
-                    .unwrap_or_default()
-            );
-            color.0 = Color::WHITE;
-        }
-    } else {
-        text.0 = format!(
-            "({}, {}, {})",
-            pick.selected_pos.x, pick.selected_pos.y, pick.selected_pos.z
-        );
-        color.0 = Color::srgb(0.55, 0.55, 0.6);
     }
 }
 
@@ -8472,11 +8511,9 @@ fn main() {
                 spawn_graph_nodes,
                 spawn_ui,
                 spawn_view_bar,
-                spawn_selection_display,
-                spawn_editor_panel,
+                spawn_editor_column,
                 spawn_run_panel,
                 spawn_fps_display,
-                spawn_breadcrumb_display,
                 spawn_mode_display,
                 // Last: it reads the window's physical size, and the camera
                 // above is what puts the OIT settings there to be read.
@@ -8517,7 +8554,6 @@ fn main() {
                         // to change.
                         .before(handle_editor_keys),
                     highlight_hovered,
-                    update_selection_display,
                     update_grid_material,
                     update_cursor,
                     // Mode and caret before keys before the projection of the
@@ -8559,7 +8595,7 @@ fn main() {
             (
                 update_world_labels,
                 update_fps_display,
-                update_breadcrumb_display,
+                update_address_lines,
                 sync_mode_toggles,
                 blink_caret,
                 // Chained: the click may fold the list, and the sync that draws

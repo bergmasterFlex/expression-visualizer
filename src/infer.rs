@@ -1018,25 +1018,6 @@ pub fn source_anchor_for_input(
         .map(|e| e.to.clone())
 }
 
-/// Type a node produces, i.e. the type of its output anchor. `None` for nodes
-/// that have no output at all (Sink, Root). Used for the selection display.
-pub fn node_output_type(
-    graph: &crate::model::term_graph::TermGraph,
-    node_id: &crate::model::node::Id,
-    function_declarations: &FunctionDeclarations,
-) -> Option<EType> {
-    let output_anchor =
-        graph
-            .nodes
-            .get(node_id)?
-            .anchors()
-            .into_iter()
-            .find_map(|(id, anchor)| {
-                matches!(anchor, crate::model::anchor::EAnchor::Output).then_some(id)
-            })?;
-    anchor_type(graph, &output_anchor, function_declarations)
-}
-
 /// What a run has proved about the graph, as types.
 ///
 /// Evaluation is narrowing. A node that produced `30` has the type `30` from

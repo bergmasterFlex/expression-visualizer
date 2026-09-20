@@ -645,10 +645,9 @@ fn input_name(
 
 /// How a node is named in a diagnostic.
 ///
-/// `render::label_for_node` says the same thing and is what the node wears in
-/// the picture, but it `unwrap`s the function catalogue — so calling it from
-/// here would panic on exactly the graph E5 exists to report. This one answers
-/// for every graph, including the broken ones.
+/// It answers for every graph, including the broken ones — a naming that
+/// reached into the function catalogue and `unwrap`ed it would panic on
+/// exactly the graph E5 exists to report.
 fn label(
     graph: &crate::model::term_graph::TermGraph,
     id: &crate::model::node::Id,
