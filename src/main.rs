@@ -1981,27 +1981,27 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
             row.spawn((
                 Button,
                 chrome_button_node(),
-                BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+                BackgroundColor(CONTROL_REST),
                 NewButton,
             ))
             .with_children(|b| {
                 b.spawn((
                     Text::new("New"),
                     text_font(&ui_font.0, 14.0),
-                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                    TextColor(INK_BRIGHT),
                 ));
             });
             row.spawn((
                 Button,
                 chrome_button_node(),
-                BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+                BackgroundColor(CONTROL_REST),
                 HelpButton,
             ))
             .with_children(|b| {
                 b.spawn((
                     Text::new("Help"),
                     text_font(&ui_font.0, 14.0),
-                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                    TextColor(INK_BRIGHT),
                 ));
             });
         });
@@ -2031,13 +2031,121 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
 }
 
 /// The shape of a button that stands on the scene rather than inside a panel:
-/// the same padding and radius `modal_button_node` has, without the margin a
+/// the same padding and radius `modal_button` has, without the margin a
 /// button in a row of buttons needs — the row here sets its own gap.
 fn chrome_button_node() -> Node {
     Node {
         padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
         border_radius: BorderRadius::all(Val::Px(6.0)),
         ..default()
+    }
+}
+
+/// What a control on the scene rests in, and what it turns under the pointer.
+///
+/// This pair was the de-facto theme long before it had a name — the resting
+/// fill alone stood as a literal in eleven places. Named here because
+/// `paint_hover` has to say it once, and a colour that eleven sites agree on
+/// by coincidence is a colour that will one day disagree.
+const CONTROL_REST: Color = Color::srgba(0.16, 0.16, 0.22, 0.9);
+const CONTROL_HOT: Color = Color::srgba(0.2, 0.2, 0.3, 0.95);
+/// A button inside a modal sits on the modal's own backdrop rather than on the
+/// scene, so it rests and lifts a shade brighter to keep the same contrast.
+const MODAL_REST: Color = Color::srgba(0.18, 0.18, 0.28, 0.95);
+const MODAL_HOT: Color = Color::srgba(0.25, 0.25, 0.35, 0.95);
+/// What a row of a list turns under the pointer. A row rests invisible — the
+/// panel behind it is its colour — so only the lit half is worth a name.
+const ROW_HOT: Color = Color::srgba(0.2, 0.2, 0.3, 0.95);
+/// Nothing at all, spelt as a colour. A row's resting fill, and the one value
+/// that would read as a mistake written as `srgba(0.0, 0.0, 0.0, 0.0)`.
+const FILL_NONE: Color = Color::srgba(0.0, 0.0, 0.0, 0.0);
+
+/// What a control that is on screen but cannot be used is filled and written
+/// in. Being switched off outranks the pointer, which is why this pair is not
+/// part of `HoverFill`: a control with a state needs one writer deciding the
+/// state and the pointer together, and that is what `sync_chrome_buttons` and
+/// `update_step_button_visuals` are.
+const CONTROL_OFF: Color = Color::srgba(0.10, 0.10, 0.13, 0.9);
+const INK_OFF: Color = Color::srgb(0.35, 0.35, 0.4);
+
+/// The three inks, dimmest first: a label at rest beside a lit one, a label
+/// that is the point of its button, and a label under the pointer.
+const INK_DIM: Color = Color::srgb(0.6, 0.6, 0.7);
+const INK_BRIGHT: Color = Color::srgb(0.85, 0.85, 0.9);
+const INK_HOT: Color = Color::srgb(1.0, 1.0, 1.0);
+
+/// What a control is filled with, by whether the pointer stands on it.
+///
+/// A component carrying two colours rather than two constants inside the
+/// system, because the same painter has to serve a bar button that rests
+/// opaque and a list row that rests invisible, and what separates those is two
+/// colours and nothing else.
+///
+/// **Only for controls whose look depends on nothing but the pointer.**
+/// `update_step_button_visuals` and `sync_mode_toggles` decide a fill from a
+/// state *and* the pointer, in one writer each, and say why. Hanging this on
+/// their nodes would put a second writer on the same colour, and the two would
+/// take turns — which is the arrangement those two systems were written to end.
+#[derive(Component, Clone, Copy)]
+struct HoverFill {
+    rest: Color,
+    hot: Color,
+}
+
+/// The same for the text under it, and separate from it on purpose: a row
+/// whose ink says something of its own — a severity, a greyed-out suggestion,
+/// a set of tallies in three colours — keeps its ink and takes only the fill.
+#[derive(Component, Clone, Copy)]
+struct HoverInk {
+    rest: Color,
+    hot: Color,
+}
+
+/// Paint every `HoverFill` by where the pointer is.
+///
+/// `Pressed` reads as `Hovered` and not as a third look: the press is already
+/// answered by whatever the button does, and a control that darkened for the
+/// duration of a click would be reporting the click twice.
+///
+/// The ink goes to *every* child that has one rather than to `children[0]`.
+/// That is what lets the checkbox share this system — its first child is the
+/// swatch, which has no `TextColor` at all — and it is why a control may hold
+/// one label or two without the painter being told which.
+///
+/// Nothing is ordered around this. `Interaction` is written in `PreUpdate`, so
+/// a row spawned during `Update` is at `None` for the rest of its first frame
+/// and takes its colour the moment the focus pass first sees it.
+fn paint_hover(
+    mut control_q: Query<
+        (
+            &Interaction,
+            &HoverFill,
+            &mut BackgroundColor,
+            Option<&HoverInk>,
+            Option<&Children>,
+        ),
+        Changed<Interaction>,
+    >,
+    mut ink_q: Query<&mut TextColor>,
+) {
+    for (interaction, fill, mut bg, ink, children) in control_q.iter_mut() {
+        let hot = matches!(*interaction, Interaction::Hovered | Interaction::Pressed);
+        let wanted = if hot { fill.hot } else { fill.rest };
+        if bg.0 != wanted {
+            bg.0 = wanted;
+        }
+        let (Some(ink), Some(children)) = (ink, children) else {
+            continue;
+        };
+        let wanted = if hot { ink.hot } else { ink.rest };
+        for child in children.iter() {
+            let Ok(mut color) = ink_q.get_mut(child) else {
+                continue;
+            };
+            if color.0 != wanted {
+                color.0 = wanted;
+            }
+        }
     }
 }
 
@@ -2354,17 +2462,30 @@ fn sync_view_menu(
             .with_children(|list| {
                 for entry in ViewEntry::ALL {
                     let chosen = entry == current;
+                    // The chosen row rests lit, so its hover has to lift from
+                    // *there* rather than from nothing: a painter that sent it
+                    // back to transparent would unchoose it on the way out.
+                    let rest = if chosen { ROW_HOT } else { FILL_NONE };
+                    let ink_rest = if chosen { INK_BRIGHT } else { INK_DIM };
                     list.spawn((
                         Node {
                             padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
                             border_radius: BorderRadius::all(Val::Px(3.0)),
                             ..default()
                         },
-                        BackgroundColor(if chosen {
-                            Color::srgba(0.2, 0.2, 0.3, 0.95)
-                        } else {
-                            Color::srgba(0.0, 0.0, 0.0, 0.0)
-                        }),
+                        BackgroundColor(rest),
+                        HoverFill {
+                            rest,
+                            hot: if chosen {
+                                Color::srgba(0.26, 0.26, 0.36, 0.95)
+                            } else {
+                                ROW_HOT
+                            },
+                        },
+                        HoverInk {
+                            rest: ink_rest,
+                            hot: INK_BRIGHT,
+                        },
                         Button,
                         ViewMenuOption(entry),
                         ViewMenuEntity,
@@ -2373,11 +2494,7 @@ fn sync_view_menu(
                         row.spawn((
                             Text::new(entry.label()),
                             text_font(font, 14.0),
-                            TextColor(if chosen {
-                                Color::srgb(0.85, 0.85, 0.9)
-                            } else {
-                                Color::srgb(0.6, 0.6, 0.7)
-                            }),
+                            TextColor(ink_rest),
                         ));
                     });
                 }
@@ -2415,14 +2532,22 @@ fn spawn_view_bar(mut commands: Commands, ui_font: Res<UiFont>) {
                     border_radius: BorderRadius::all(Val::Px(6.0)),
                     ..default()
                 },
-                BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+                BackgroundColor(CONTROL_REST),
+                HoverFill {
+                    rest: CONTROL_REST,
+                    hot: CONTROL_HOT,
+                },
+                HoverInk {
+                    rest: INK_DIM,
+                    hot: INK_BRIGHT,
+                },
                 ViewMenuButton,
             ))
             .with_children(|button| {
                 button.spawn((
                     Text::new("View: Edit Ortho \u{25BE}"),
                     text_font(&font, 14.0),
-                    TextColor(Color::srgb(0.6, 0.6, 0.7)),
+                    TextColor(INK_DIM),
                     ViewMenuLabel,
                 ));
             });
@@ -2457,7 +2582,18 @@ fn spawn_inline_checkbox<C: Bundle, B: Bundle>(
                 column_gap: Val::Px(8.0),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+            BackgroundColor(CONTROL_REST),
+            // The swatch is the first child and carries no `TextColor`, which
+            // is the case `paint_hover` walks every child for: only the label
+            // beside it takes the ink.
+            HoverFill {
+                rest: CONTROL_REST,
+                hot: CONTROL_HOT,
+            },
+            HoverInk {
+                rest: INK_DIM,
+                hot: INK_BRIGHT,
+            },
             component,
         ))
         .with_children(|parent| {
@@ -2474,11 +2610,7 @@ fn spawn_inline_checkbox<C: Bundle, B: Bundle>(
                 BorderColor::all(Color::srgb(0.35, 0.35, 0.5)),
                 swatch,
             ));
-            parent.spawn((
-                Text::new(label),
-                text_font(font, 14.0),
-                TextColor(Color::srgb(0.6, 0.6, 0.7)),
-            ));
+            parent.spawn((Text::new(label), text_font(font, 14.0), TextColor(INK_DIM)));
         });
 }
 
@@ -2636,7 +2768,7 @@ fn spawn_control_button<C: Bundle>(
                 border_radius: BorderRadius::all(Val::Px(6.0)),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+            BackgroundColor(CONTROL_REST),
             component,
             PlayerControlsEntity,
         ))
@@ -3571,11 +3703,7 @@ fn spawn_prompt_rows(
                 column_gap: Val::Px(12.0),
                 ..default()
             },
-            BackgroundColor(if highlighted {
-                Color::srgba(0.2, 0.2, 0.3, 0.95)
-            } else {
-                Color::srgba(0.0, 0.0, 0.0, 0.0)
-            }),
+            BackgroundColor(if highlighted { ROW_HOT } else { FILL_NONE }),
         ));
         // A greyed row is not clickable at all, for the same reason the "… N
         // more" tally is not: what cannot be committed must not be committable
@@ -3583,7 +3711,24 @@ fn spawn_prompt_rows(
         // commits whatever the row carries — and only the *create* actions are
         // checked a second time, inside `insert_node_kind`.
         if suggestion.allowed {
-            entity.insert((Button, InsertPromptOption(suggestion.action.clone())));
+            // A quieter lift than the highlight, and deliberately so: in this
+            // list the full `ROW_HOT` already means *this is what `Enter`
+            // takes*, and a pointer that said the same thing would be a second
+            // answer to a question with one. The highlighted row still lifts,
+            // just barely, so that hovering it is not the one place the
+            // pointer goes unanswered.
+            entity.insert((
+                Button,
+                InsertPromptOption(suggestion.action.clone()),
+                HoverFill {
+                    rest: if highlighted { ROW_HOT } else { FILL_NONE },
+                    hot: if highlighted {
+                        Color::srgba(0.24, 0.24, 0.34, 0.95)
+                    } else {
+                        Color::srgba(0.16, 0.16, 0.24, 0.7)
+                    },
+                },
+            ));
         }
         entity.with_children(|row| {
             row.spawn((
@@ -4225,13 +4370,7 @@ fn spawn_error_modal(commands: &mut Commands, font: &Handle<Font>, msg: String) 
                     ModalEntity,
                 ));
                 panel
-                    .spawn((
-                        Button,
-                        modal_button_node(),
-                        BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
-                        ModalOkButton,
-                        ModalEntity,
-                    ))
+                    .spawn((modal_button(), ModalOkButton, ModalEntity))
                     .with_children(|b| {
                         b.spawn((
                             Text::new("OK"),
@@ -4295,36 +4434,24 @@ fn spawn_confirm_new_modal(commands: &mut Commands, font: &Handle<Font>) {
                         ModalEntity,
                     ))
                     .with_children(|btns| {
-                        btns.spawn((
-                            Button,
-                            modal_button_node(),
-                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
-                            ConfirmNewButton,
-                            ModalEntity,
-                        ))
-                        .with_children(|b| {
-                            b.spawn((
-                                Text::new("Discard"),
-                                text_font(font, 14.0),
-                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
-                                ModalEntity,
-                            ));
-                        });
-                        btns.spawn((
-                            Button,
-                            modal_button_node(),
-                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
-                            ModalCancelButton,
-                            ModalEntity,
-                        ))
-                        .with_children(|b| {
-                            b.spawn((
-                                Text::new("Cancel"),
-                                text_font(font, 14.0),
-                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
-                                ModalEntity,
-                            ));
-                        });
+                        btns.spawn((modal_button(), ConfirmNewButton, ModalEntity))
+                            .with_children(|b| {
+                                b.spawn((
+                                    Text::new("Discard"),
+                                    text_font(font, 14.0),
+                                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                                    ModalEntity,
+                                ));
+                            });
+                        btns.spawn((modal_button(), ModalCancelButton, ModalEntity))
+                            .with_children(|b| {
+                                b.spawn((
+                                    Text::new("Cancel"),
+                                    text_font(font, 14.0),
+                                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                                    ModalEntity,
+                                ));
+                            });
                     });
             });
         });
@@ -4399,21 +4526,15 @@ fn spawn_controls_modal(commands: &mut Commands, font: &Handle<Font>) {
                         ModalEntity,
                     ))
                     .with_children(|btns| {
-                        btns.spawn((
-                            Button,
-                            modal_button_node(),
-                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
-                            ModalOkButton,
-                            ModalEntity,
-                        ))
-                        .with_children(|b| {
-                            b.spawn((
-                                Text::new("OK"),
-                                text_font(font, 14.0),
-                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
-                                ModalEntity,
-                            ));
-                        });
+                        btns.spawn((modal_button(), ModalOkButton, ModalEntity))
+                            .with_children(|b| {
+                                b.spawn((
+                                    Text::new("OK"),
+                                    text_font(font, 14.0),
+                                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                                    ModalEntity,
+                                ));
+                            });
                     });
             });
         });
@@ -4572,34 +4693,22 @@ fn spawn_source_modal(
                         ModalEntity,
                     ))
                     .with_children(|btns| {
-                        btns.spawn((
-                            Button,
-                            modal_button_node(),
-                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
-                            ModalCancelButton,
-                            ModalEntity,
-                        ))
-                        .with_children(|b| {
-                            b.spawn((
-                                Text::new("Cancel"),
-                                text_font(font, 14.0),
-                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
-                            ));
-                        });
-                        btns.spawn((
-                            Button,
-                            modal_button_node(),
-                            BackgroundColor(Color::srgba(0.18, 0.18, 0.28, 0.95)),
-                            ModalEvaluateButton,
-                            ModalEntity,
-                        ))
-                        .with_children(|b| {
-                            b.spawn((
-                                Text::new("Evaluate"),
-                                text_font(font, 14.0),
-                                TextColor(Color::srgb(0.85, 0.85, 0.9)),
-                            ));
-                        });
+                        btns.spawn((modal_button(), ModalCancelButton, ModalEntity))
+                            .with_children(|b| {
+                                b.spawn((
+                                    Text::new("Cancel"),
+                                    text_font(font, 14.0),
+                                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                                ));
+                            });
+                        btns.spawn((modal_button(), ModalEvaluateButton, ModalEntity))
+                            .with_children(|b| {
+                                b.spawn((
+                                    Text::new("Evaluate"),
+                                    text_font(font, 14.0),
+                                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                                ));
+                            });
                     });
             });
         });
@@ -4630,72 +4739,95 @@ fn panel_node() -> Node {
     }
 }
 
-fn modal_button_node() -> Node {
-    Node {
-        padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
-        margin: UiRect::axes(Val::Px(6.0), Val::Px(0.0)),
-        border_radius: BorderRadius::all(Val::Px(6.0)),
-        ..default()
-    }
+/// A button inside a modal: its shape, its fill, and how it answers the
+/// pointer — a bundle rather than a `Node`, because all six of them are the
+/// same button and the three things that made them one were being written out
+/// six times. The margin is what separates it from `chrome_button_node`: a
+/// modal's buttons stand in a row that sets no gap of its own.
+fn modal_button() -> impl Bundle {
+    (
+        Button,
+        Node {
+            padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+            margin: UiRect::axes(Val::Px(6.0), Val::Px(0.0)),
+            border_radius: BorderRadius::all(Val::Px(6.0)),
+            ..default()
+        },
+        BackgroundColor(MODAL_REST),
+        HoverFill {
+            rest: MODAL_REST,
+            hot: MODAL_HOT,
+        },
+        HoverInk {
+            rest: INK_BRIGHT,
+            hot: INK_HOT,
+        },
+    )
 }
 
 /// Ask before resetting. The question is a modal phase like any other, so
 /// everything that already steps aside for a modal steps aside for this one
 /// too; `handle_confirm_new_button` is what carries it out.
 fn handle_new_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (Changed<Interaction>, With<NewButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<NewButton>)>,
     mut eval: ResMut<EvalState>,
 ) {
     if is_evaluating(&eval) {
         return;
     }
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-        match *interaction {
-            Interaction::Pressed => {
-                eval.phase = EvalPhase::ConfirmNew;
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                color.0 = Color::srgb(1.0, 1.0, 1.0);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-        }
+    if interaction_q.iter().any(|i| *i == Interaction::Pressed) {
+        eval.phase = EvalPhase::ConfirmNew;
     }
 }
 
 fn handle_help_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (Changed<Interaction>, With<HelpButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<HelpButton>)>,
     mut eval: ResMut<EvalState>,
 ) {
     if is_evaluating(&eval) {
         return;
     }
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-        match *interaction {
-            Interaction::Pressed => {
-                eval.phase = EvalPhase::ControlsModal;
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                color.0 = Color::srgb(1.0, 1.0, 1.0);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
+    if interaction_q.iter().any(|i| *i == Interaction::Pressed) {
+        eval.phase = EvalPhase::ControlsModal;
+    }
+}
+
+/// The top bar's two buttons, and the one thing they could not say: that a run
+/// has taken them.
+///
+/// Both handlers refuse to act while `is_evaluating`, and the bar is *not*
+/// hidden for it — `sync_editor_chrome` steps aside for a modal or a
+/// screenshot, and a `Running` phase is neither. So they stood there answering
+/// the pointer and doing nothing. A `HoverFill` would have kept that promise;
+/// this keeps the one `update_step_button_visuals` settled on for the
+/// transport row instead: one writer, three states, the switched-off one
+/// first, because it outranks wherever the pointer is.
+///
+/// No `Changed<Interaction>` filter: what turns these grey is the phase, and a
+/// phase moves without the pointer moving with it.
+fn sync_chrome_buttons(
+    eval: Res<EvalState>,
+    mut button_q: Query<
+        (&Interaction, &mut BackgroundColor, &Children),
+        Or<(With<NewButton>, With<HelpButton>)>,
+    >,
+    mut text_color_q: Query<&mut TextColor>,
+) {
+    let enabled = !is_evaluating(&eval);
+    for (interaction, mut bg, children) in button_q.iter_mut() {
+        let (fill, ink) = match (enabled, interaction) {
+            (false, _) => (CONTROL_OFF, INK_OFF),
+            (true, Interaction::Hovered | Interaction::Pressed) => (CONTROL_HOT, INK_HOT),
+            (true, Interaction::None) => (CONTROL_REST, INK_BRIGHT),
+        };
+        if bg.0 != fill {
+            bg.0 = fill;
+        }
+        let Ok(mut color) = text_color_q.get_mut(children[0]) else {
+            continue;
+        };
+        if color.0 != ink {
+            color.0 = ink;
         }
     }
 }
@@ -4707,41 +4839,27 @@ fn handle_help_button(
 /// domains are threaded through rather than reset, so an id minted before the
 /// New can never collide with one minted after it.
 fn handle_confirm_new_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (Changed<Interaction>, With<ConfirmNewButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<ConfirmNewButton>)>,
     mut state: ResMut<GraphState>,
     mut rebuild: ResMut<NeedsRebuild>,
     mut pick: ResMut<PickState>,
     mut eval: ResMut<EvalState>,
 ) {
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-        match *interaction {
-            Interaction::Pressed => {
-                let node_id_domain = state.node_id_domain.clone();
-                let anchor_id_domain = state.anchor_id_domain.clone();
-                let (fresh, new_node_id_domain, new_anchor_id_domain) =
-                    layout::LayoutGraph::new(node_id_domain, anchor_id_domain);
-                *state.root_graph_mut() = fresh;
-                state.node_id_domain = new_node_id_domain;
-                state.anchor_id_domain = new_anchor_id_domain;
-                pick.selected_pos = IVec3::ZERO;
-                state.resettle();
-                rebuild.0 = true;
-                eval.phase = EvalPhase::Idle;
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
-                color.0 = Color::srgb(1.0, 1.0, 1.0);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
+    for interaction in interaction_q.iter() {
+        if *interaction != Interaction::Pressed {
+            continue;
         }
+        let node_id_domain = state.node_id_domain.clone();
+        let anchor_id_domain = state.anchor_id_domain.clone();
+        let (fresh, new_node_id_domain, new_anchor_id_domain) =
+            layout::LayoutGraph::new(node_id_domain, anchor_id_domain);
+        *state.root_graph_mut() = fresh;
+        state.node_id_domain = new_node_id_domain;
+        state.anchor_id_domain = new_anchor_id_domain;
+        pick.selected_pos = IVec3::ZERO;
+        state.resettle();
+        rebuild.0 = true;
+        eval.phase = EvalPhase::Idle;
     }
 }
 
@@ -4767,116 +4885,71 @@ fn sync_editor_chrome(
     }
 }
 
+/// What the button does, and nothing about how it looks: `modal_button` hands
+/// every one of them a `HoverFill`, and `paint_hover` is their only painter. A
+/// modal button is only on screen while its own modal is, so there is no state
+/// here for a look to depend on — which is the whole condition `HoverFill`
+/// states for itself.
 fn handle_modal_ok_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (Changed<Interaction>, With<ModalOkButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<ModalOkButton>)>,
     mut eval: ResMut<EvalState>,
 ) {
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-        match *interaction {
-            Interaction::Pressed => {
-                eval.phase = EvalPhase::Idle;
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
-                color.0 = Color::srgb(1.0, 1.0, 1.0);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-        }
+    if interaction_q.iter().any(|i| *i == Interaction::Pressed) {
+        eval.phase = EvalPhase::Idle;
     }
 }
 
 fn handle_modal_cancel_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (Changed<Interaction>, With<ModalCancelButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<ModalCancelButton>)>,
     mut eval: ResMut<EvalState>,
 ) {
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-        match *interaction {
-            Interaction::Pressed => {
-                eval.phase = EvalPhase::Idle;
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
-                color.0 = Color::srgb(1.0, 1.0, 1.0);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-        }
+    if interaction_q.iter().any(|i| *i == Interaction::Pressed) {
+        eval.phase = EvalPhase::Idle;
     }
 }
 
 fn handle_modal_evaluate_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (Changed<Interaction>, With<ModalEvaluateButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<ModalEvaluateButton>)>,
     mut eval: ResMut<EvalState>,
     state: Res<GraphState>,
     input_q: Query<(&ModalSourceInput, &TextInput)>,
 ) {
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-        match *interaction {
-            Interaction::Pressed => {
-                let graph = state.root_graph().flattened_graph();
-                let mut user_source_values: std::collections::HashMap<
-                    model::node::Id,
-                    eval::EValue,
-                > = std::collections::HashMap::new();
-                let mut parse_errors: Vec<String> = Vec::new();
-                for (m, input) in input_q.iter() {
-                    if let Some(model::node::ENode::Source { r#type, name, .. }) =
-                        graph.nodes.get(&m.node_id)
-                    {
-                        // A Source that declares nothing has nothing to parse
-                        // the answer as. Like a cast with no target, that is a
-                        // half-built node and so an error of the graph, not a
-                        // `none` travelling along an edge.
-                        let Some(r#type) = r#type else {
-                            parse_errors.push(format!("{}: no type declared", name));
-                            continue;
-                        };
-                        match eval::EValue::parse(r#type, &input.value) {
-                            Ok(value) => {
-                                user_source_values.insert(m.node_id.clone(), value);
-                            }
-                            Err(error) => parse_errors.push(format!("{}: {}", name, error)),
-                        }
+    for interaction in interaction_q.iter() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        let graph = state.root_graph().flattened_graph();
+        let mut user_source_values: std::collections::HashMap<model::node::Id, eval::EValue> =
+            std::collections::HashMap::new();
+        let mut parse_errors: Vec<String> = Vec::new();
+        for (m, input) in input_q.iter() {
+            if let Some(model::node::ENode::Source { r#type, name, .. }) =
+                graph.nodes.get(&m.node_id)
+            {
+                // A Source that declares nothing has nothing to parse the
+                // answer as. Like a cast with no target, that is a half-built
+                // node and so an error of the graph, not a `none` travelling
+                // along an edge.
+                let Some(r#type) = r#type else {
+                    parse_errors.push(format!("{}: no type declared", name));
+                    continue;
+                };
+                match eval::EValue::parse(r#type, &input.value) {
+                    Ok(value) => {
+                        user_source_values.insert(m.node_id.clone(), value);
                     }
-                }
-                if !parse_errors.is_empty() {
-                    eval.phase = EvalPhase::ErrorModal(parse_errors.join("\n"));
-                } else {
-                    eval.phase = EvalPhase::Running {
-                        states: vec![eval::State::nothing_yet()],
-                        current: 0,
-                        user_source_values,
-                    };
+                    Err(error) => parse_errors.push(format!("{}: {}", name, error)),
                 }
             }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.25, 0.25, 0.35, 0.95);
-                color.0 = Color::srgb(1.0, 1.0, 1.0);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.18, 0.18, 0.28, 0.95);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
+        }
+        if !parse_errors.is_empty() {
+            eval.phase = EvalPhase::ErrorModal(parse_errors.join("\n"));
+        } else {
+            eval.phase = EvalPhase::Running {
+                states: vec![eval::State::nothing_yet()],
+                current: 0,
+                user_source_values,
+            };
         }
     }
 }
@@ -5259,18 +5332,9 @@ fn update_step_button_visuals(
                  bg: &mut BackgroundColor,
                  text_color: &mut TextColor| {
         let (fill, ink) = match (enabled, interaction) {
-            (false, _) => (
-                Color::srgba(0.10, 0.10, 0.13, 0.9),
-                Color::srgb(0.35, 0.35, 0.4),
-            ),
-            (true, Interaction::Hovered | Interaction::Pressed) => (
-                Color::srgba(0.2, 0.2, 0.3, 0.95),
-                Color::srgb(0.85, 0.85, 0.9),
-            ),
-            (true, Interaction::None) => (
-                Color::srgba(0.16, 0.16, 0.22, 0.9),
-                Color::srgb(0.6, 0.6, 0.7),
-            ),
+            (false, _) => (CONTROL_OFF, INK_OFF),
+            (true, Interaction::Hovered | Interaction::Pressed) => (CONTROL_HOT, INK_BRIGHT),
+            (true, Interaction::None) => (CONTROL_REST, INK_DIM),
         };
         bg.0 = fill;
         text_color.0 = ink;
@@ -6813,15 +6877,29 @@ fn sync_diagnostics_ui(
                 Color::srgb(0.75, 0.75, 0.9)
             }),
             Node {
-                padding: UiRect::axes(Val::Px(0.0), Val::Px(2.0)),
+                // The same 4 px of side padding the rows below carry, so the
+                // lit heading and a lit row stand on the same two edges. It
+                // had none while it was only text: a highlight is a shape, and
+                // a shape that ended at the glyph would read as a misprint.
+                padding: UiRect::axes(Val::Px(4.0), Val::Px(2.0)),
+                border_radius: BorderRadius::all(Val::Px(3.0)),
                 ..default()
             },
+            BackgroundColor(FILL_NONE),
             DiagnosticsEntity,
         ));
         // Only foldable when there is something to fold. An empty heading that
-        // answered to a click would offer to hide nothing.
+        // answered to a click would offer to hide nothing — and so it is also
+        // the one heading that stays dark under the pointer.
         if !tallies.is_empty() {
-            heading.insert((Button, DiagnosticsHeader));
+            heading.insert((
+                Button,
+                DiagnosticsHeader,
+                HoverFill {
+                    rest: FILL_NONE,
+                    hot: ROW_HOT,
+                },
+            ));
         }
         // One span per tally, in its own colour, so the glyph and the count it
         // belongs to are one statement. A span carries its own font: it
@@ -6852,13 +6930,24 @@ fn sync_diagnostics_ui(
                     border_radius: BorderRadius::all(Val::Px(3.0)),
                     ..default()
                 },
-                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.0)),
+                BackgroundColor(FILL_NONE),
                 DiagnosticsEntity,
             ));
-            // Only a row with somewhere to go is a button. One without would
-            // highlight under the pointer and then do nothing.
+            // Only a row with somewhere to go is a button, and only a button
+            // lights up: a row that highlighted under the pointer and then did
+            // nothing would be promising a jump it has no address for. No
+            // `HoverInk` — the glyph carries its severity and the message its
+            // own ink, and a painter that levelled the two would be saying
+            // less than the row already says.
             if let Some(cell) = cell {
-                row.insert((Button, DiagnosticTarget(*cell)));
+                row.insert((
+                    Button,
+                    DiagnosticTarget(*cell),
+                    HoverFill {
+                        rest: FILL_NONE,
+                        hot: ROW_HOT,
+                    },
+                ));
             }
             row.with_children(|row| {
                 row.spawn((
@@ -6981,7 +7070,7 @@ fn spawn_mode_display(mut commands: Commands, ui_font: Res<UiFont>) {
                 row.spawn((
                     Button,
                     segment(radius, Display::Flex),
-                    BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+                    BackgroundColor(CONTROL_REST),
                     ModeToggle(mode),
                 ))
                 .with_children(|half| {
@@ -6998,7 +7087,7 @@ fn spawn_mode_display(mut commands: Commands, ui_font: Res<UiFont>) {
             row.spawn((
                 Button,
                 segment(BorderRadius::all(RADIUS), Display::None),
-                BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+                BackgroundColor(CONTROL_REST),
                 EvalModeLabel,
             ))
             .with_children(|panel| {
@@ -7085,14 +7174,8 @@ fn sync_mode_toggles(
             }
         } else {
             match *interaction {
-                Interaction::Hovered | Interaction::Pressed => (
-                    Color::srgba(0.2, 0.2, 0.3, 0.95),
-                    Color::srgb(0.85, 0.85, 0.9),
-                ),
-                Interaction::None => (
-                    Color::srgba(0.16, 0.16, 0.22, 0.9),
-                    Color::srgb(0.6, 0.6, 0.7),
-                ),
+                Interaction::Hovered | Interaction::Pressed => (CONTROL_HOT, INK_BRIGHT),
+                Interaction::None => (CONTROL_REST, INK_DIM),
             }
         };
         bg.0 = fill;
@@ -8537,6 +8620,7 @@ fn main() {
                         handle_insert_prompt_click,
                         handle_new_button,
                         handle_help_button,
+                        sync_chrome_buttons,
                         // With the other click handlers, not with the modal
                         // ones: it rewrites the graph, and this is the chain
                         // that ends in `rebuild_scene`, so the fresh graph is
@@ -8596,6 +8680,12 @@ fn main() {
                 update_world_labels,
                 update_fps_display,
                 update_address_lines,
+                // Unordered on purpose. `Interaction` is written in
+                // `PreUpdate`, so whatever this paints was decided before any
+                // of the syncs around it ran, and a control respawned during
+                // `Update` takes its colour the next time the focus pass sees
+                // it — one frame, and the same one a click already costs.
+                paint_hover,
                 sync_mode_toggles,
                 blink_caret,
                 // Chained: the click may fold the list, and the sync that draws

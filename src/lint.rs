@@ -83,9 +83,15 @@ impl Severity {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     pub severity: Severity,
-    /// The node it is about. `None` only where the statement is about the
-    /// graph as a whole — nothing is connected to the sink — and there is
-    /// genuinely no cell to go to.
+    /// The node it is about.
+    ///
+    /// Nothing answers `None` any more. It used to be how E1 said *this is
+    /// about the program and not about a place in it* — until the Sink turned
+    /// out to be a place like any other, with an id and a cell, and a row that
+    /// named it could be walked to like every other row. The `Option` stays
+    /// for the same reason [`Severity::Note`] stays: a statement about the
+    /// graph as a whole is a thing a linter may yet want to make, and the
+    /// panel already reads this as an `Option` on its way to a cell.
     pub node: Option<crate::model::node::Id>,
     pub message: String,
 }
@@ -106,7 +112,11 @@ pub fn check(root: &crate::layout::LayoutGraph, decls: &FunctionDeclarations) ->
     if !crate::infer::sink_has_input(&root.graph) {
         out.push(Diagnostic {
             severity: Severity::Error,
-            node: None,
+            // The Sink is a node with a cell, so the one statement about the
+            // program as a whole still has somewhere to send the reader. It is
+            // the root's own sink and not the flattened graph's: `sink_node_id`
+            // survives flattening, but what E1 asks about is the outermost one.
+            node: Some(root.graph.sink_node_id.clone()),
             message: "Nothing is connected to the sink".to_string(),
         });
     }
@@ -221,8 +231,10 @@ fn check_node(
     //
     // The outermost Sink is E1's to report — it is the one unwired input that
     // is about the program rather than about a node in it, and saying it twice
-    // in two wordings would read as two faults. A *branch's* Sink is not
-    // exempt: an arm that produces nothing is an ordinary hole.
+    // in two wordings would read as two faults. E1 now names this very node,
+    // so the two rows would stand at the same address as well: the same hole,
+    // pointed at twice. A *branch's* Sink is not exempt: an arm that produces
+    // nothing is an ordinary hole.
     let inputs = if *id == graph.sink_node_id {
         Vec::new()
     } else {
