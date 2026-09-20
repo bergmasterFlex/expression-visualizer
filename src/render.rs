@@ -212,8 +212,9 @@ pub struct RenderObject {
 /// The texture is the spawner's job, not the renderer's: rasterising one needs
 /// `Assets<Image>`, which only the spawner has. So this hands over the string
 /// and how many cells it has to fill, and the spawner rasterises, caches and
-/// fills in `base_color_texture`. `background` is the body's own colour, baked
-/// into the texture so the face and the body under it are indistinguishable.
+/// fills in `base_color_texture`. The background is the body's own colour,
+/// baked into the texture so the face and the body under it are
+/// indistinguishable.
 pub struct RenderTextFace {
     pub mesh: Mesh,
     pub transform: Transform,
@@ -221,7 +222,96 @@ pub struct RenderTextFace {
     pub material: StandardMaterial,
     pub text: String,
     pub cells: u32,
-    pub background: Color,
+    /// The body's own colour over the patch of it this face covers.
+    pub background: FaceBackground,
+}
+
+/// How many samples of a body's colour field a printed face carries along the
+/// body's length, and how many across its width.
+///
+/// Across is the finer measure of the two relative to what it spans: the face
+/// is one cell wide and the field's one kink across it — where a column's own
+/// colour stops holding and the passage to the next one opens — falls on the
+/// middle, so an odd count puts a sample exactly on it. Along the length the
+/// field only ever curves, so a handful of samples carry it.
+const FACE_BACKGROUND_ALONG: usize = 9;
+const FACE_BACKGROUND_ACROSS: usize = 5;
+
+/// How finely a body's colour field is sampled per cell when its shell is cut.
+///
+/// See `mesh::graded_frustum_shell_mesh` for why the cuts are a sampling rate
+/// and not a set of edges. Four to a cell holds the passage between two
+/// neighbouring colours to within a quarter of a cell before it starts reading
+/// as a fold — and a passage that narrow is close enough to the step it came
+/// from that the difference cannot be told.
+const BODY_FIELD_SAMPLES_PER_CELL: usize = 4;
+
+/// The body's colour under a printed face, sampled on a small grid.
+///
+/// One colour was enough while a body was one colour, and every body but a
+/// function call's still is. A call's roof is not: its inputs run into one
+/// another across it as well as along it, so the face has to carry a patch of
+/// that field rather than one line through it — or it sits on the body as a
+/// visibly different strip, with the seam running the whole length of the name.
+///
+/// `along` runs the body's length, near end to far end, and lands on the
+/// texture's `u`; `across` runs the face's width, the body's −X edge to its +X
+/// one, and lands on the texture's `v`. That is the way round the rectangle's
+/// rotation leaves them — see the `name_face` transforms, which say the same
+/// thing about where the letters point.
+///
+/// Sampled rather than handed over as a function because the spawner caches
+/// these textures and a cache needs a key. The samples *are* the key: two faces
+/// that sample alike are the same face.
+pub struct FaceBackground {
+    pub along: usize,
+    pub across: usize,
+    /// `along * across` colours, row major with `across` varying fastest.
+    pub samples: Vec<Color>,
+}
+
+impl FaceBackground {
+    /// One colour over the whole face.
+    pub fn flat(color: Color) -> Self {
+        Self {
+            along: 1,
+            across: 1,
+            samples: vec![color],
+        }
+    }
+
+    /// The colour at `(along, across)`, both `0..=1`, bilinear between samples.
+    pub fn sample(&self, along: f32, across: f32) -> LinearRgba {
+        let pick = |a: usize, c: usize| {
+            self.samples[a.min(self.along - 1) * self.across + c.min(self.across - 1)].to_linear()
+        };
+        // A single sample on an axis pins every position on it to that sample:
+        // the step is zero and the index clamps, so both ends of the mix are
+        // the same colour.
+        let axis = |t: f32, count: usize| {
+            let x = t.clamp(0.0, 1.0) * (count - 1) as f32;
+            let lower = x.floor();
+            (lower as usize, x - lower)
+        };
+        let (a, fa) = axis(along, self.along);
+        let (c, fc) = axis(across, self.across);
+        pick(a, c)
+            .mix(&pick(a, c + 1), fc)
+            .mix(&pick(a + 1, c).mix(&pick(a + 1, c + 1), fc), fa)
+    }
+
+    /// What a cache keys this background by: the grid it was taken on, and the
+    /// samples as the bytes they will reach the texture as.
+    pub fn key(&self) -> (usize, usize, Vec<[u8; 4]>) {
+        (
+            self.along,
+            self.across,
+            self.samples
+                .iter()
+                .map(|c| c.to_srgba().to_u8_array())
+                .collect(),
+        )
+    }
 }
 
 /// What a printed face is painted with: the gain that carries its texture up
@@ -488,6 +578,36 @@ pub fn strand_color(t: &crate::infer::EType) -> Color {
         // absence of a type.
         _ => Color::srgb(0.5, 0.5, 0.5),
     }
+}
+
+/// Which two cells of a `cells`-wide grid the point at `p` falls between, and
+/// how far across from the first to the second it stands.
+///
+/// `blur` is how wide the passage from one cell to the next is, measured as a
+/// share of the distance between their centres. At `0.0` one colour gives way
+/// to the next in a step, on the boundary the two share. At `1.0` the passage
+/// is the whole way from centre to centre, which is a plain ramp and no grid
+/// left to see. Between the two it is a passage of that width around the
+/// boundary, which is what lets a body start with its inputs apart and let
+/// them run together further along.
+///
+/// The outer half cells answer with one cell twice, so an edge holds its own
+/// colour instead of fading off the end of the grid.
+fn grid_blend(p: f32, cells: usize, blur: f32) -> (usize, usize, f32) {
+    // Measured in cells, with the centres on the whole numbers — so one step
+    // is one cell and the boundary between two of them falls on the half.
+    let x = p * cells as f32 - 0.5;
+    let lower = x.floor();
+    let across = x - lower;
+    let last = cells as isize - 1;
+    (
+        (lower as isize).clamp(0, last) as usize,
+        (lower as isize + 1).clamp(0, last) as usize,
+        // `f32::EPSILON` and not zero: a blur of nothing is a step, and a step
+        // is this ramp made infinitely steep rather than a second case to
+        // write out.
+        (0.5 + (across - 0.5) / blur.max(f32::EPSILON)).clamp(0.0, 1.0),
+    )
 }
 
 /// World-space Y offset of leaf row `index` relative to the anchor's own row.
@@ -1213,7 +1333,9 @@ pub fn layoutnode_to_rendernode(
                 material: face_material(),
                 text: name.clone(),
                 cells: name_depth as u32,
-                background: body_color,
+                // A Source declares one leaf type and its body is that one
+                // colour from end to end, so there is no field to sample.
+                background: FaceBackground::flat(body_color),
             };
             RenderNode {
                 node: Some(RenderObject {
@@ -1498,7 +1620,144 @@ pub fn layoutnode_to_rendernode(
                 far_z,
             );
             let output_world = cell(0, 0, depth + 1);
-            let body_color = Color::srgb(0.5, 0.9, 1.0);
+            // The type each input anchor shows. Hoisted out of the `anchors`
+            // closure below, which used to be the only place it was worked
+            // out: the body is painted from the same answer, and two
+            // hand-written copies of one lookup are exactly the drift the cell
+            // map above warns about.
+            //
+            // A parameter that constrains nothing — `=` and `!=` take any two
+            // values — reads like a TypeCast input: whatever arrives, and a
+            // neutral body when idle.
+            let shown_input_types: Vec<Option<crate::infer::EType>> = input_anchors
+                .iter()
+                .enumerate()
+                .map(|(i_anchor, anchor_id)| {
+                    let declared = function_declaration
+                        .inputs
+                        .get(i_anchor)
+                        .and_then(|param| param.r#type.clone());
+                    declared.or_else(|| {
+                        crate::infer::incoming_anchor_type(
+                            flat_graph,
+                            anchor_id,
+                            function_declarations,
+                        )
+                    })
+                })
+                .collect();
+            // The body wears the types it joins: it starts at the near face in
+            // each input's own colour and arrives at the far face in the
+            // output's, so the frustum's taper — all the inputs narrowing to
+            // the one output — is said in colour as well as in shape. It used
+            // to be one fixed blue, the only body in the picture outside the
+            // palette and so the only one saying nothing about its types.
+            //
+            // Declared types, never what a run has narrowed. The geometry
+            // counts its rows through `infer::anchor_rows`, which is
+            // deliberately blind to `infer::Known`, and a Source's body reads
+            // its own declared type for the same reason: a value passing
+            // through does not change the shape it passed through.
+            let input_leaf_rows: Vec<Vec<crate::infer::EType>> = shown_input_types
+                .iter()
+                .map(|t| t.as_ref().map(ordered_supported_leaves).unwrap_or_default())
+                .collect();
+            let output_leaf_rows = ordered_supported_leaves(&function_declaration.output_type);
+            // A row no type claims — a column shorter than the tallest one, or
+            // an unconstrained parameter with nothing arriving yet. Grey is not
+            // a colour here but the absence of one, and it is the same grey
+            // `plain_anchor_body` draws that very anchor in.
+            let pending = strand_color(&crate::infer::EType::Pending).to_linear();
+            let cell_color = |column: usize, row: usize| {
+                input_leaf_rows
+                    .get(column)
+                    .and_then(|rows| rows.get(row))
+                    .map(|leaf| strand_color(leaf).to_linear())
+                    .unwrap_or(pending)
+            };
+            // What the near face says at `(u, v)`, drawn with edges `blur`
+            // wide: the input grid, blended across columns and down rows at
+            // once.
+            let near_color = |u: f32, v: f32, blur: f32| {
+                let (c0, c1, across) = grid_blend(u, width as usize, blur);
+                let (r0, r1, down) = grid_blend(v, input_rows, blur);
+                let row = |r: usize| cell_color(c0, r).mix(&cell_color(c1, r), across);
+                row(r0).mix(&row(r1), down)
+            };
+            // And the far face, which is one column, so only its rows blend.
+            let far_color = |v: f32, blur: f32| {
+                let row_color = |row: usize| {
+                    output_leaf_rows
+                        .get(row)
+                        .map(|leaf| strand_color(leaf).to_linear())
+                        .unwrap_or(pending)
+                };
+                let (r0, r1, down) = grid_blend(v, output_rows, blur);
+                row_color(r0).mix(&row_color(r1), down)
+            };
+            // The whole field. Each end is exact where it stands and loses its
+            // edges with the distance from it: the inputs arrive as separate
+            // colours and run into one another on the way across, and the
+            // output's rows form out of that as they come up on the anchor
+            // that names them. So the body draws the call itself — several
+            // things going in and one thing coming out — and not only its two
+            // ends with a straight ramp in between.
+            //
+            // The near face's own colour never moves: `grid_blend` leaves the
+            // outer half cells alone, so a column's centre line holds its
+            // colour whatever the blur, and it is the *edges* between columns
+            // that go soft.
+            let body_color_at =
+                |u: f32, v: f32, w: f32| near_color(u, v, w).mix(&far_color(v, 1.0 - w), w);
+            // Where the shell is cut. One count for all three axes because
+            // they are all the same measure — how finely the field is sampled
+            // per cell — and see `mesh::graded_frustum_shell_mesh` for why a
+            // cut list is a sampling rate here rather than a set of edges.
+            let sampled = |cells: usize| {
+                let steps = cells * BODY_FIELD_SAMPLES_PER_CELL;
+                (0..=steps).map(move |k| k as f32 / steps as f32)
+            };
+            let u_cuts: Vec<f32> = sampled(width as usize).collect();
+            // Rows from both faces at once: the near face is `input_rows` tall
+            // and the far one `output_rows`, and a cut either face asks for has
+            // to reach all the way through or the two would not line up along
+            // the sides. `graded_frustum_shell_mesh` sorts and merges them.
+            let v_cuts: Vec<f32> = sampled(input_rows).chain(sampled(output_rows)).collect();
+            let w_cuts: Vec<f32> = sampled(depth as usize).collect();
+            // The patch of roof the name is printed on: one cell of width at
+            // every depth, the body's whole length, along the top row. Read off
+            // the very field the body is built from, so the printed strip and
+            // the roof either side of it cannot come apart.
+            //
+            // One cell of *width* is not one cell of `u`, and that is the whole
+            // of what this has to get right. The body tapers in X toward the
+            // output while the face does not — both faces share the near edge
+            // at `x_min`, and the far one reaches only one cell out from it —
+            // so the grid narrows under a strip that stays put: the face covers
+            // `width` columns' worth of `u` at the far end and one at the near.
+            // Hence the divisor, which is the body's width in cells at `w`.
+            //
+            // The far edge in `u` sits, at the near end, exactly on the boundary
+            // column 0 shares with the next one — which is exactly where the
+            // field steps. So it is read from just inside, the way every quad of
+            // the shell reads its own corners.
+            let columns_at = |w: f32| width as f32 - (width as f32 - 1.0) * w;
+            let name_background = FaceBackground {
+                along: FACE_BACKGROUND_ALONG,
+                across: FACE_BACKGROUND_ACROSS,
+                samples: (0..FACE_BACKGROUND_ALONG)
+                    .flat_map(|a| {
+                        let w = a as f32 / (FACE_BACKGROUND_ALONG - 1) as f32;
+                        (0..FACE_BACKGROUND_ACROSS).map(move |c| {
+                            let across = c as f32 / (FACE_BACKGROUND_ACROSS - 1) as f32;
+                            (across * (1.0 - crate::mesh::FIELD_SAMPLE_INSET), w)
+                        })
+                    })
+                    .map(|(across, w)| {
+                        Color::LinearRgba(body_color_at(across / columns_at(w), 0.0, w))
+                    })
+                    .collect(),
+            };
             // The function's name, printed along the body the way a Source's is
             // — same rectangle, same rotation, same lift.
             //
@@ -1522,13 +1781,32 @@ pub fn layoutnode_to_rendernode(
                 material: face_material(),
                 text: function_declaration.name.clone(),
                 cells: depth as u32,
-                background: body_color,
+                background: name_background,
             };
             RenderNode {
                 node: Some(RenderObject {
-                    mesh: crate::mesh::frustum_8pt_mesh(base_quad, top_quad),
+                    mesh: crate::mesh::graded_frustum_shell_mesh(
+                        base_quad,
+                        top_quad,
+                        &u_cuts,
+                        &v_cuts,
+                        &w_cuts,
+                        |u, v, w| body_color_at(u, v, w).to_f32_array(),
+                    ),
                     material: StandardMaterial {
-                        base_color: body_color,
+                        // White because the colour is in the mesh now, and
+                        // white is the identity of the multiply the shader
+                        // applies to a vertex colour. Its alpha stays at 1.0
+                        // for the same reason: that is the handle `lod::faded`
+                        // takes hold of, and vertex alpha is left alone so the
+                        // grading still has exactly one place to act.
+                        //
+                        // `emissive` would be dead weight, as on a Source's
+                        // body — an unlit material skips the lighting pass that
+                        // would add it. Were this ever made lit, note that
+                        // `highlight_hovered` derives the glow from
+                        // `base_color`, and every call would then glow white.
+                        base_color: Color::WHITE,
                         unlit: true,
                         ..default()
                     },
@@ -1539,20 +1817,9 @@ pub fn layoutnode_to_rendernode(
                     .enumerate()
                     .map(|(i_anchor, anchor_id)| {
                         let input_world = cell(i_anchor as i32, 0, 0);
-                        // A parameter that constrains nothing — `=` and `!=`
-                        // take any two values — reads like a TypeCast input:
-                        // whatever arrives, and a neutral body when idle.
-                        let declared = function_declaration
-                            .inputs
-                            .get(i_anchor)
-                            .and_then(|param| param.r#type.clone());
-                        let shown = declared.or_else(|| {
-                            crate::infer::incoming_anchor_type(
-                                flat_graph,
-                                anchor_id,
-                                function_declarations,
-                            )
-                        });
+                        // Worked out once, above, because the body is painted
+                        // from the same answer.
+                        let shown = shown_input_types[i_anchor].clone();
                         // A parameter owns no literal — a declaration says
                         // what may arrive, never what does — and a written
                         // graph leaves it at that. A run does not: what arrived

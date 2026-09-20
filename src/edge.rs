@@ -509,11 +509,20 @@ const FACE_TEX_CELL_PX: u32 = 128;
 /// range is borrowed from the material instead. sRGB encoding spends most of
 /// its resolution down where the divided values land, so the round trip costs
 /// nothing that can be seen.
+///
+/// The background is a patch of the body's own colour rather than one colour,
+/// because the body it has to disappear into can be a patch. A function call's
+/// body starts at the near face with each input in its own colour and lets them
+/// run into one another on the way to the output, across the roof as well as
+/// along it; a flat background on that reads as a stripe laid over the body
+/// instead of as part of it. Every body that *is* one colour passes a
+/// `FaceBackground::flat`, which samples the same everywhere and costs the same
+/// two mixes.
 pub fn rasterize_face_text(
     font: &FontRef<'_>,
     text: &str,
     cells: u32,
-    background: Color,
+    background: &crate::render::FaceBackground,
     images: &mut Assets<Image>,
 ) -> Handle<Image> {
     let w = (cells.max(1) * FACE_TEX_CELL_PX) as usize;
@@ -524,13 +533,32 @@ pub fn rasterize_face_text(
     // a glyph's coverage has to be mixed — mixing in sRGB, which is what this
     // did before, bends the ramp and leaves the edge of every letter heavier
     // than the coverage actually asked for.
-    let bg_linear = background.to_linear();
-    let stored_bg = LinearRgba::new(
-        bg_linear.red / crate::render::DISPLAY_WHITE,
-        bg_linear.green / crate::render::DISPLAY_WHITE,
-        bg_linear.blue / crate::render::DISPLAY_WHITE,
-        1.0,
-    );
+    //
+    // Mixed in linear for the reason above, and more so now that it varies:
+    // this is a ramp in two directions, and mixed in sRGB it would bulge
+    // toward whichever corner is the lighter.
+    //
+    // `x / (w - 1)` and not `(x + 0.5) / w`: the sampler clamps to edge, so the
+    // outer half texel on each side shows the outermost texel verbatim, and
+    // this is what lands the field's own edges on the face's edges — which is
+    // the whole point, since the body's roof carries those same values right up
+    // to those same planes.
+    let stored_bg = |x: usize, y: usize| {
+        let axis = |i: usize, n: usize| {
+            if n > 1 {
+                i as f32 / (n - 1) as f32
+            } else {
+                0.0
+            }
+        };
+        let sampled = background.sample(axis(x, w), axis(y, h));
+        LinearRgba::new(
+            sampled.red / crate::render::DISPLAY_WHITE,
+            sampled.green / crate::render::DISPLAY_WHITE,
+            sampled.blue / crate::render::DISPLAY_WHITE,
+            1.0,
+        )
+    };
 
     // Coverage per pixel, resolved into colour in one pass at the end. A glyph
     // is drawn span by span and letters can touch, so the strongest coverage
@@ -581,13 +609,19 @@ pub fn rasterize_face_text(
     // Resolve coverage into colour. Each channel runs from the stored
     // background up to a stored 1.0, which the material's gain will carry to
     // `DISPLAY_WHITE` — so a fully covered pixel arrives on screen as #FFFFFF
-    // and an uncovered one as the body's own colour, exactly.
+    // and an uncovered one as the body's own colour, exactly. That holds
+    // whatever the background under a glyph happens to be, which is what lets
+    // the ramp run underneath the letters without touching them.
+    //
+    // `coverage` is row major, so the index split by the width is the texel the
+    // field is read at.
     let mut buf: Vec<u8> = Vec::with_capacity(w * h * 4);
-    for ink in coverage {
+    for (i, ink) in coverage.into_iter().enumerate() {
+        let bg = stored_bg(i % w, i / w);
         let lit = LinearRgba::new(
-            stored_bg.red + (1.0 - stored_bg.red) * ink,
-            stored_bg.green + (1.0 - stored_bg.green) * ink,
-            stored_bg.blue + (1.0 - stored_bg.blue) * ink,
+            bg.red + (1.0 - bg.red) * ink,
+            bg.green + (1.0 - bg.green) * ink,
+            bg.blue + (1.0 - bg.blue) * ink,
             1.0,
         );
         buf.extend_from_slice(&Color::LinearRgba(lit).to_srgba().to_u8_array());

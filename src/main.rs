@@ -1557,6 +1557,13 @@ fn setup_scene(
     ));
 }
 
+/// What one printed body face is cached under within a spawn pass: the word on
+/// it, how many cells it fills, and the sampled patch of body colour baked in
+/// behind it — the grid it was taken on and its samples as bytes, because bytes
+/// are what a colour becomes in the texture and two colours a byte apart make
+/// one face, not two. See `render::FaceBackground::key`.
+type FaceTextureKey = (String, u32, usize, usize, Vec<[u8; 4]>);
+
 /// Spawn the graph node meshes.
 fn spawn_graph_nodes(
     mut commands: Commands,
@@ -1629,12 +1636,16 @@ fn spawn_graph_nodes(
     // see `edge::FONT_BYTES` for why that one bypasses the asset server.
     let glyph_font =
         ab_glyph::FontRef::try_from_slice(edge::FONT_BYTES).expect("bundled font is valid");
-    // Cache body-face textures per (text, cells, colour) within this spawn
+    // Cache body-face textures per (text, cells, colours) within this spawn
     // pass. Local rather than a resource on purpose: a resource would hold
     // strong handles past the rebuild, so renaming a source would leave one
     // dead texture behind per keystroke. Here the only handle lives in the
     // material, which `clear_scene` drops, and the image goes with it.
-    let mut face_tex_cache: std::collections::HashMap<(String, u32, [u8; 4]), Handle<Image>> =
+    //
+    // Both ends of the background ramp are in the key, not just the one the
+    // face used to carry: two calls of the same name over different types
+    // print the same letters on different bodies.
+    let mut face_tex_cache: std::collections::HashMap<FaceTextureKey, Handle<Image>> =
         std::collections::HashMap::new();
     for walked in state.layout_graph.walk_all() {
         // Nothing of a scope the grading has closed over or taken to nothing —
@@ -1715,10 +1726,13 @@ fn spawn_graph_nodes(
         // Text printed onto a body face: the name a Source carries on its top
         // face rather than beside itself.
         for face in render_node.text_faces {
+            let (bg_along, bg_across, bg_samples) = face.background.key();
             let key = (
                 face.text.clone(),
                 face.cells,
-                face.background.to_srgba().to_u8_array(),
+                bg_along,
+                bg_across,
+                bg_samples,
             );
             let texture = face_tex_cache
                 .entry(key)
@@ -1727,7 +1741,7 @@ fn spawn_graph_nodes(
                         &glyph_font,
                         &face.text,
                         face.cells,
-                        face.background,
+                        &face.background,
                         &mut images,
                     )
                 })
