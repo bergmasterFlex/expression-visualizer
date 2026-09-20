@@ -6,6 +6,7 @@ mod eval;
 mod grid;
 mod infer;
 mod layout;
+mod lint;
 mod lod;
 mod mesh;
 mod model;
@@ -816,9 +817,6 @@ fn modal_is_open(eval: &EvalState) -> bool {
 
 #[derive(Component)]
 struct EvaluateButton;
-
-#[derive(Component)]
-struct ScreenshotButton;
 
 /// The standing container the evaluation controls live in, centred on the
 /// bottom edge. It never despawns, so exactly one system writes its `display`
@@ -1730,90 +1728,417 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
     // other buttons it must not also answer to `EditorChrome` — two writers on
     // one `display` flicker on the transition frame.
     spawn_insert_mode_button(&mut commands, &ui_font.0, Vec2::new(12.0, 96.0));
-
-    // Bottom-left, opposite the mode indicator in the bottom-right corner. It
-    // stands where `Evaluate` used to: that one is a control of the *program*
-    // and has moved to the middle with the rest of them, leaving this corner to
-    // the controls that are about the view.
-    //
-    // A word and not a glyph, because its neighbours here are words — and
-    // because the font has no camera in it.
-    spawn_corner_button(
-        &mut commands,
-        &ui_font.0,
-        "Screenshot",
-        ScreenshotButton,
-        Val::Px(12.0),
-        Val::Px(12.0),
-    );
-    // Directly above it: leaving the bound camera has to be an explicit act,
-    // so it gets a control of its own rather than happening by dragging.
-    spawn_corner_button(
-        &mut commands,
-        &ui_font.0,
-        camera_mode_label(camera::CameraMode::Bound),
-        CameraModeButton,
-        Val::Px(12.0),
-        Val::Px(52.0),
-    );
-    // Beside it, clear of the widest camera label.
-    spawn_corner_checkbox(
-        &mut commands,
-        &ui_font.0,
-        "semi ortho",
-        SemiOrthoCheckbox,
-        SemiOrthoCheckboxBox,
-        Val::Px(150.0),
-        Val::Px(52.0),
-    );
-    // Beside `Screenshot`, in the same column as `semi ortho` above it: both
-    // are about what the picture shows rather than about the program in it.
-    spawn_corner_checkbox(
-        &mut commands,
-        &ui_font.0,
-        "Clipping",
-        ClippingCheckbox,
-        ClippingCheckboxBox,
-        Val::Px(150.0),
-        Val::Px(12.0),
-    );
 }
 
-/// Marker for the checkbox that turns the bound mode's convergence on.
+/// Marker on the bottom-right box that holds the problem list and the run
+/// controls. It owns nothing but the frame; the two zones inside it are their
+/// own nodes.
 #[derive(Component)]
-struct SemiOrthoCheckbox;
+struct RunPanel;
 
-/// Marker on that checkbox's 16×16 swatch, which is what carries the state.
+/// The rule between the two zones. Shown only while there is a list above it.
 #[derive(Component)]
-struct SemiOrthoCheckboxBox;
+struct RunPanelRule;
 
-/// A labelled checkbox pinned to a screen corner — a setting rather than a
-/// property of the graph, which is why it is not a prompt. It stands still
-/// instead of being respawned, so it carries its own label, makes the whole row
-/// clickable, and leaves the swatch to a sync system.
+/// One of the four ways of looking at the program.
 ///
-/// The row marker and the swatch marker are separate because the two are read
-/// by different systems: the row answers to `Interaction`, the swatch is what a
-/// sync system paints. One generic each, so a second checkbox does not end up
-/// driven by the first one's sync.
-fn spawn_corner_checkbox<C: Bundle, B: Bundle>(
-    commands: &mut Commands,
+/// Three of them are camera states and the fourth is not, which is the whole
+/// reason they are one control: what the user is choosing between is *what the
+/// screen shows*, and "everything but the program" belongs in that list beside
+/// "from here" and "from anywhere". The three controls this replaced —
+/// `Camera: bound/free`, a `semi ortho` checkbox and a `Screenshot` button —
+/// spread one question over three widgets and two idioms.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewEntry {
+    /// The bound camera, parallel. The default, and the exact picture the
+    /// layout is specified in.
+    EditOrtho,
+    /// The bound camera with the convergence eased in: the same oblique
+    /// picture, the same standoff, depth that converges a little.
+    EditPersp,
+    /// The free camera. Orbit, pan and zoom by hand, and the guarantees of the
+    /// bound mode deliberately suspended.
+    Explore,
+    /// Everything the editor draws about itself, gone. Not a camera state at
+    /// all — it changes nothing about where the view is, only what is left
+    /// standing in it.
+    Screenshot,
+}
+
+impl ViewEntry {
+    const ALL: [ViewEntry; 4] = [
+        ViewEntry::EditOrtho,
+        ViewEntry::EditPersp,
+        ViewEntry::Explore,
+        ViewEntry::Screenshot,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            ViewEntry::EditOrtho => "Edit Ortho",
+            ViewEntry::EditPersp => "Edit Persp",
+            ViewEntry::Explore => "Explore",
+            ViewEntry::Screenshot => "Screenshot",
+        }
+    }
+}
+
+/// Which entry the live state *is*, read rather than remembered.
+///
+/// Nothing stores the selection, and that is what makes the screenshot mode
+/// return by itself: it never touches the camera, so the moment
+/// `end_screenshot_mode` clears `entered_at` the answer falls back to whatever
+/// the camera was already doing. A remembered selection would have to be put
+/// back by hand, and would be wrong the first time something else moved it.
+///
+/// `semi_ortho` is only read in the bound mode — `apply_projection` takes the
+/// free branch whole — so the free camera answers `Explore` whatever it is set
+/// to, and carries the value untouched until the user comes back.
+fn view_entry(orbit: &camera::OrbitCamera, screenshot: &ScreenshotMode) -> ViewEntry {
+    if screenshot.active() {
+        return ViewEntry::Screenshot;
+    }
+    match (orbit.mode, orbit.semi_ortho) {
+        (camera::CameraMode::Free, _) => ViewEntry::Explore,
+        (camera::CameraMode::Bound, true) => ViewEntry::EditPersp,
+        (camera::CameraMode::Bound, false) => ViewEntry::EditOrtho,
+    }
+}
+
+/// Whether the view list is unfolded.
+#[derive(Resource, Default)]
+struct ViewMenuOpen(bool);
+
+/// The row at the bottom-left holding the view control and the clipping
+/// checkbox. Wears `EditorChrome` for everything in it.
+#[derive(Component)]
+struct ViewBar;
+
+/// The button that opens the list, and shows what is chosen.
+#[derive(Component)]
+struct ViewMenuButton;
+
+/// The text inside that button, which is what a sync writes.
+#[derive(Component)]
+struct ViewMenuLabel;
+
+/// The list itself. Carried so a click on its own padding does not read as a
+/// click somewhere else and fold it.
+#[derive(Component)]
+struct ViewMenuPopup;
+
+/// On every node the list is built from, so the sweep that clears it cannot
+/// reach anything else. The same arrangement `PlayerControlsEntity` has.
+#[derive(Component)]
+struct ViewMenuEntity;
+
+/// One row of the list.
+#[derive(Component)]
+struct ViewMenuOption(ViewEntry);
+
+/// Go to a view.
+///
+/// The two camera arms are the ones the camera-mode button used to carry, and
+/// they are unchanged: bound to free matches the free camera's distance to the
+/// scale being looked at, so the caret's plane keeps its size and what happens
+/// is the depth opening up rather than a jump; free to bound is a journey back
+/// to the default view and leaves the scale setting alone.
+///
+/// What is new is that the target is *named* rather than toggled to, so coming
+/// back from `Explore` says which of the two bound pictures it is coming back
+/// to. Going *out* to `Explore` leaves `semi_ortho` alone on purpose: the
+/// blend's near half is built from it, so the transition fades out of the
+/// picture that was actually on screen.
+#[allow(clippy::too_many_arguments)]
+fn apply_view_entry(
+    entry: ViewEntry,
+    orbit: &mut camera::OrbitCamera,
+    tween: &mut camera::CameraTween,
+    screenshot: &mut ScreenshotMode,
+    rebuild: &mut NeedsRebuild,
+    height: f32,
+    caret: Vec3,
+    now: f32,
+) {
+    if entry == ViewEntry::Screenshot {
+        // Not a camera state: the camera is left exactly where it is, and the
+        // rebuild is for the caret, which goes away by not being spawned.
+        screenshot.entered_at = Some(now);
+        rebuild.0 = true;
+        return;
+    }
+    let wanted_semi = match entry {
+        ViewEntry::EditPersp => Some(true),
+        ViewEntry::EditOrtho => Some(false),
+        // Inert while free, and what the return trip fades out of.
+        ViewEntry::Explore | ViewEntry::Screenshot => None,
+    };
+    if let Some(semi) = wanted_semi {
+        orbit.semi_ortho = semi;
+    }
+    let wanted_mode = match entry {
+        ViewEntry::Explore => camera::CameraMode::Free,
+        _ => camera::CameraMode::Bound,
+    };
+    if orbit.mode == wanted_mode {
+        return;
+    }
+    match wanted_mode {
+        camera::CameraMode::Free => {
+            let (theta, phi) = camera::oblique_view_angles();
+            let visible_world = height / orbit.cell_pixels;
+            orbit.free_fov = 2.0 * (visible_world * 0.5 / orbit.radius).atan();
+            orbit.mode = camera::CameraMode::Free;
+            tween.to_view(&*orbit, theta, phi, orbit.radius, orbit.target);
+        }
+        camera::CameraMode::Bound => {
+            let radius = camera::bound_radius(&*orbit, height);
+            orbit.mode = camera::CameraMode::Bound;
+            tween.to_view(
+                &*orbit,
+                camera::RESET_THETA,
+                camera::RESET_PHI,
+                radius,
+                caret,
+            );
+        }
+    }
+}
+
+/// The trigger, a row of options, and folding the list again.
+///
+/// Folding on a click elsewhere is the pattern `text_input_focus` uses, and it
+/// needs the same care: Bevy marks only the topmost node `Pressed`, so a press
+/// on a row leaves the trigger and the list itself at `None`. Everything that
+/// counts as "inside" is therefore asked before the fall-through, and each of
+/// the three answers returns rather than dropping into the next.
+#[allow(clippy::too_many_arguments)]
+fn handle_view_menu_click(
+    trigger_q: Query<&Interaction, (Changed<Interaction>, With<ViewMenuButton>)>,
+    popup_q: Query<&Interaction, (Changed<Interaction>, With<ViewMenuPopup>)>,
+    option_q: Query<(&Interaction, &ViewMenuOption), Changed<Interaction>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window>,
+    pick: Res<PickState>,
+    time: Res<Time>,
+    mut open: ResMut<ViewMenuOpen>,
+    mut orbit: ResMut<camera::OrbitCamera>,
+    mut tween: ResMut<camera::CameraTween>,
+    mut screenshot: ResMut<ScreenshotMode>,
+    mut rebuild: ResMut<NeedsRebuild>,
+) {
+    if let Some(entry) = option_q
+        .iter()
+        .find(|(interaction, _)| **interaction == Interaction::Pressed)
+        .map(|(_, option)| option.0)
+    {
+        let height = windows
+            .single()
+            .map(|window| window.height())
+            .unwrap_or(1080.0);
+        apply_view_entry(
+            entry,
+            &mut orbit,
+            &mut tween,
+            &mut screenshot,
+            &mut rebuild,
+            height,
+            render::cell_center_world(pick.selected_pos.as_vec3()),
+            time.elapsed_secs(),
+        );
+        open.0 = false;
+        return;
+    }
+    if trigger_q.iter().any(|i| *i == Interaction::Pressed) {
+        open.0 = !open.0;
+        return;
+    }
+    // The list's own padding is inside it, and a press there is not a press
+    // somewhere else.
+    if popup_q.iter().any(|i| *i == Interaction::Pressed) {
+        return;
+    }
+    if open.0 && mouse.just_pressed(MouseButton::Left) {
+        open.0 = false;
+    }
+}
+
+/// Write the trigger's caption, and build or clear the list.
+///
+/// The list is a despawned subtree rather than a node whose `display` is
+/// toggled, and that is not a style choice: `sync_start_menu_ui` writes
+/// `Display::Flex` on every `EditorChrome` node whenever a modal closes, so a
+/// folded list that wore the marker would be torn open by something that knows
+/// nothing about it. Under a trigger that wears it, a subtree that is simply
+/// not there cannot be revealed. `PlayerControls` holds its row the same way.
+fn sync_view_menu(
+    mut commands: Commands,
+    open: Res<ViewMenuOpen>,
+    orbit: Res<camera::OrbitCamera>,
+    screenshot: Res<ScreenshotMode>,
+    ui_font: Res<UiFont>,
+    trigger_q: Query<Entity, With<ViewMenuButton>>,
+    content_q: Query<Entity, With<ViewMenuEntity>>,
+    mut label_q: Query<&mut Text, With<ViewMenuLabel>>,
+    mut cache: Local<Option<(bool, bool, bool, bool)>>,
+) {
+    let current = view_entry(&orbit, &screenshot);
+    let caption = format!("View: {} \u{25BE}", current.label());
+    for mut text in label_q.iter_mut() {
+        if text.0 != caption {
+            text.0 = caption.clone();
+        }
+    }
+
+    // `ViewEntry` is not hashable and there are four of them, so the latch is
+    // the open flag beside the three bits that decide which row is lit.
+    let fp = (
+        open.0,
+        orbit.mode == camera::CameraMode::Free,
+        orbit.semi_ortho,
+        screenshot.active(),
+    );
+    if *cache == Some(fp) {
+        return;
+    }
+    *cache = Some(fp);
+
+    for e in content_q.iter() {
+        commands.entity(e).despawn();
+    }
+    if !open.0 {
+        return;
+    }
+    let Ok(trigger) = trigger_q.single() else {
+        return;
+    };
+    let font = &ui_font.0;
+    commands.entity(trigger).with_children(|parent| {
+        parent
+            .spawn((
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(0.0),
+                    // Standing on the trigger's top edge, opening upward —
+                    // there is no room below it.
+                    bottom: Val::Percent(100.0),
+                    margin: UiRect::bottom(Val::Px(6.0)),
+                    min_width: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Column,
+                    padding: UiRect::all(Val::Px(2.0)),
+                    border_radius: BorderRadius::all(Val::Px(4.0)),
+                    border: UiRect::all(Val::Px(1.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.08, 0.08, 0.14, 0.98)),
+                BorderColor::all(Color::srgb(0.25, 0.25, 0.4)),
+                // Above everything that stacks by spawn order — the run panel
+                // is drawn after this one and would otherwise cover it — and
+                // well below the modals, which own the screen outright at 50.
+                GlobalZIndex(10),
+                Button,
+                ViewMenuPopup,
+                ViewMenuEntity,
+            ))
+            .with_children(|list| {
+                for entry in ViewEntry::ALL {
+                    let chosen = entry == current;
+                    list.spawn((
+                        Node {
+                            padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                            border_radius: BorderRadius::all(Val::Px(3.0)),
+                            ..default()
+                        },
+                        BackgroundColor(if chosen {
+                            Color::srgba(0.2, 0.2, 0.3, 0.95)
+                        } else {
+                            Color::srgba(0.0, 0.0, 0.0, 0.0)
+                        }),
+                        Button,
+                        ViewMenuOption(entry),
+                        ViewMenuEntity,
+                    ))
+                    .with_children(|row| {
+                        row.spawn((
+                            Text::new(entry.label()),
+                            text_font(font, 14.0),
+                            TextColor(if chosen {
+                                Color::srgb(0.85, 0.85, 0.9)
+                            } else {
+                                Color::srgb(0.6, 0.6, 0.7)
+                            }),
+                        ));
+                    });
+                }
+            });
+    });
+}
+
+/// The bottom-left row: how to look, and how much to look at.
+///
+/// Both are about the picture rather than about the program, which is why they
+/// stand together and why neither is near the run controls. A flex row rather
+/// than two corner addresses, so the widths settle themselves — the view
+/// caption changes length as the entry does.
+fn spawn_view_bar(mut commands: Commands, ui_font: Res<UiFont>) {
+    let font = ui_font.0.clone();
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(12.0),
+                bottom: Val::Px(12.0),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(8.0),
+                ..default()
+            },
+            ViewBar,
+            EditorChrome,
+        ))
+        .with_children(|bar| {
+            bar.spawn((
+                Button,
+                Node {
+                    padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+                    border_radius: BorderRadius::all(Val::Px(6.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+                ViewMenuButton,
+            ))
+            .with_children(|button| {
+                button.spawn((
+                    Text::new("View: Edit Ortho \u{25BE}"),
+                    text_font(&font, 14.0),
+                    TextColor(Color::srgb(0.6, 0.6, 0.7)),
+                    ViewMenuLabel,
+                ));
+            });
+            spawn_inline_checkbox(
+                bar,
+                &font,
+                "Clipping",
+                ClippingCheckbox,
+                ClippingCheckboxBox,
+            );
+        });
+}
+
+/// The flex twin of the old corner checkbox: the same row, the same swatch, but
+/// a child of a container rather than an address of its own. It carries no
+/// `EditorChrome` — the bar wears that for everything in it.
+fn spawn_inline_checkbox<C: Bundle, B: Bundle>(
+    parent: &mut ChildSpawnerCommands,
     font: &Handle<Font>,
     label: &str,
     component: C,
     swatch: B,
-    left: Val,
-    bottom: Val,
 ) {
-    commands
+    parent
         .spawn((
             Button,
             Node {
-                position_type: PositionType::Absolute,
-                top: Val::Auto,
-                right: Val::Auto,
-                left,
-                bottom,
                 padding: UiRect::axes(Val::Px(10.0), Val::Px(8.0)),
                 border_radius: BorderRadius::all(Val::Px(6.0)),
                 flex_direction: FlexDirection::Row,
@@ -1823,7 +2148,6 @@ fn spawn_corner_checkbox<C: Bundle, B: Bundle>(
             },
             BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
             component,
-            EditorChrome,
         ))
         .with_children(|parent| {
             parent.spawn((
@@ -1847,37 +2171,9 @@ fn spawn_corner_checkbox<C: Bundle, B: Bundle>(
         });
 }
 
+/// The two states a checkbox swatch is painted in.
 const CHECKED_COLOR: Color = Color::srgb(0.133, 0.827, 0.933);
 const UNCHECKED_COLOR: Color = Color::srgba(0.06, 0.06, 0.12, 0.95);
-
-/// Toggle the bound mode's convergence. The projection eases across on its own
-/// clock, so this only flips the intent.
-fn handle_semi_ortho_checkbox(
-    interaction_q: Query<&Interaction, (Changed<Interaction>, With<SemiOrthoCheckbox>)>,
-    mut orbit: ResMut<camera::OrbitCamera>,
-) {
-    for interaction in interaction_q.iter() {
-        if *interaction == Interaction::Pressed {
-            orbit.semi_ortho = !orbit.semi_ortho;
-        }
-    }
-}
-
-fn sync_semi_ortho_checkbox(
-    orbit: Res<camera::OrbitCamera>,
-    mut box_q: Query<&mut BackgroundColor, With<SemiOrthoCheckboxBox>>,
-) {
-    let wanted = if orbit.semi_ortho {
-        CHECKED_COLOR
-    } else {
-        UNCHECKED_COLOR
-    };
-    for mut color in box_q.iter_mut() {
-        if color.0 != wanted {
-            color.0 = wanted;
-        }
-    }
-}
 
 /// Marker for the checkbox that turns the level-of-detail grading on.
 #[derive(Component)]
@@ -1890,7 +2186,7 @@ struct ClippingCheckboxBox;
 /// Toggle the grading. Every opacity it decides is baked into a material at
 /// spawn — a caret move already rebuilds the scene, so nothing follows it per
 /// frame — which is why this has to ask for a rebuild itself, the way
-/// `handle_screenshot_button` does for the caret it removes.
+/// `apply_view_entry` does for the caret the screenshot mode removes.
 fn handle_clipping_checkbox(
     interaction_q: Query<&Interaction, (Changed<Interaction>, With<ClippingCheckbox>)>,
     mut clipping: ResMut<lod::Clipping>,
@@ -1920,86 +2216,97 @@ fn sync_clipping_checkbox(
     }
 }
 
-/// Marker for the button that switches the camera between its two modes.
-#[derive(Component)]
-struct CameraModeButton;
-
-fn camera_mode_label(mode: camera::CameraMode) -> &'static str {
-    match mode {
-        camera::CameraMode::Bound => "Camera: bound",
-        camera::CameraMode::Free => "Camera: free",
-    }
-}
-
-fn spawn_corner_button<C: Bundle>(
-    commands: &mut Commands,
-    font: &Handle<Font>,
-    label: &str,
-    component: C,
-    left: Val,
-    bottom: Val,
-) {
+/// The bottom-right box: what is wrong with the graph, and the controls that
+/// run it — one frame around both.
+///
+/// They used to stand apart, the list a full-width bar near the top of the
+/// bottom edge and the controls centred below it. Which read as two unrelated
+/// things, and they are not: a run does not start while an error stands
+/// (`Diagnostics::blocking`), so the list is the *precondition* of the row
+/// under it. A shared frame with a rule between the two says that; adjacency
+/// alone did not.
+///
+/// Anchored at the bottom, so the box grows upward. The controls therefore keep
+/// their place whatever the list does, and the last error going away does not
+/// move the button the user is reaching for.
+///
+/// One `display` writer per node, which is the whole reason this is three nodes
+/// and not one: `EditorChrome` takes the outer box, and `sync_diagnostics_ui`
+/// takes the section and the rule. `PlayerControls` writes none — its children
+/// come and go instead (`sync_player_controls`).
+fn spawn_run_panel(mut commands: Commands) {
     commands
         .spawn((
-            Button,
             Node {
                 position_type: PositionType::Absolute,
-                top: Val::Auto,
-                right: Val::Auto,
-                left,
-                bottom,
-                padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+                right: Val::Px(14.0),
+                bottom: Val::Px(12.0),
+                flex_direction: FlexDirection::Column,
+                align_items: AlignItems::Stretch,
+                padding: UiRect::all(Val::Px(10.0)),
+                row_gap: Val::Px(6.0),
+                // Fixed, not content-sized. A box that grew with the longest
+                // message would change width every time the list did, and the
+                // controls under it would slide with it — the one thing a row
+                // of buttons must never do. Long messages wrap into it instead.
+                width: Val::Px(420.0),
                 border_radius: BorderRadius::all(Val::Px(6.0)),
+                border: UiRect::all(Val::Px(1.0)),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
-            component,
+            BackgroundColor(Color::srgba(0.10, 0.10, 0.16, 0.9)),
+            BorderColor::all(Color::srgb(0.25, 0.25, 0.4)),
+            // Carried with no handler of its own, so that a click landing on the
+            // box does not fall through and move the caret to whatever cell is
+            // behind it. The two standing panels do the same.
+            Button,
+            RunPanel,
             EditorChrome,
         ))
-        .with_children(|parent| {
-            parent.spawn((
-                Text::new(label),
-                text_font(font, 14.0),
-                TextColor(Color::srgb(0.6, 0.6, 0.7)),
+        .with_children(|panel| {
+            panel.spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(4.0),
+                    ..default()
+                },
+                DiagnosticsPanel,
+            ));
+            // The rule between the two zones. Drawn as a one-pixel box rather
+            // than as a border on either neighbour, because it belongs to the
+            // seam and to neither side of it.
+            //
+            // Always there, like the heading above it: the two zones are what
+            // the box *is*, and a frame that lost a line when the list emptied
+            // would be a different frame.
+            panel.spawn((
+                Node {
+                    height: Val::Px(1.0),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.25, 0.25, 0.4)),
+                RunPanelRule,
+            ));
+            panel.spawn((
+                Node {
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::FlexEnd,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(8.0),
+                    ..default()
+                },
+                PlayerControls,
             ));
         });
 }
 
-/// The standing container the evaluation controls sit in: centred on the bottom
-/// edge, laid out as a row.
-///
-/// Spawned once and never despawned, so `EditorChrome` stays its only `display`
-/// writer. Its contents come and go with the phase — see `sync_player_controls`
-/// — and a container born *while* the chrome is hidden would otherwise come up
-/// visible and stay wrong until the next transition.
-///
-/// `left: 0, right: 0` with `justify_content: Center` is what centres it: the
-/// row spans the window and the buttons gather in its middle, so the row's
-/// width can change without anything having to be measured.
-fn spawn_player_controls(mut commands: Commands) {
-    commands.spawn((
-        Node {
-            position_type: PositionType::Absolute,
-            left: Val::Px(0.0),
-            right: Val::Px(0.0),
-            bottom: Val::Px(12.0),
-            flex_direction: FlexDirection::Row,
-            justify_content: JustifyContent::Center,
-            align_items: AlignItems::Center,
-            column_gap: Val::Px(8.0),
-            ..default()
-        },
-        PlayerControls,
-        EditorChrome,
-    ));
-}
-
 /// One control in that row: a square button wearing a glyph or two.
 ///
-/// The flex twin of `spawn_corner_button` — same colours, same radius, but a
-/// child of the row rather than an address of its own, and wide enough that the
-/// glyphs sit in the middle of it rather than filling it. It carries no
-/// `EditorChrome`: the container wears that for all of them. Colour is not its
+/// A child of the row rather than an address of its own, and wide enough that
+/// the glyphs sit in the middle of it rather than filling it. Same colours and
+/// radius as the view bar's controls, which is what keeps the two ends of the
+/// bottom edge reading as one set. It carries no `EditorChrome`: the run panel
+/// wears that for the whole row. Colour is not its
 /// business either; `update_step_button_visuals` writes the whole row's.
 fn spawn_control_button<C: Bundle>(
     parent: &mut ChildSpawnerCommands,
@@ -3516,90 +3823,6 @@ fn spawn_prompt_body(
         });
 }
 
-/// Switch the camera between bound and free.
-///
-/// Bound → free matches the free camera's distance to the scale the user was
-/// looking at, so the caret's own plane keeps its size across the change and
-/// what happens visually is the depth of the picture opening up rather than a
-/// jump. Free → bound is a journey back to the default view; the scale setting
-/// is the user's and is left alone.
-fn handle_camera_mode_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (Changed<Interaction>, With<CameraModeButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
-    windows: Query<&Window>,
-    pick: Res<PickState>,
-    mut orbit: ResMut<camera::OrbitCamera>,
-    mut tween: ResMut<camera::CameraTween>,
-) {
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-        match *interaction {
-            Interaction::Pressed => {
-                let height = windows
-                    .single()
-                    .map(|window| window.height())
-                    .unwrap_or(1080.0);
-                match orbit.mode {
-                    camera::CameraMode::Bound => {
-                        // Hand the free camera the view it is taking over:
-                        // the same distance, the angles the oblique projection
-                        // implies a viewer would stand at, and the field of
-                        // view that keeps the caret's plane the size it
-                        // already is. What is left to notice on the switch is
-                        // then only the real difference — that the axes stop
-                        // being exactly aligned — instead of a new viewpoint
-                        // burying it.
-                        let (theta, phi) = camera::oblique_view_angles();
-                        let visible_world = height / orbit.cell_pixels;
-                        orbit.free_fov = 2.0 * (visible_world * 0.5 / orbit.radius).atan();
-                        orbit.mode = camera::CameraMode::Free;
-                        tween.to_view(&orbit, theta, phi, orbit.radius, orbit.target);
-                    }
-                    camera::CameraMode::Free => {
-                        let radius = camera::bound_radius(&orbit, height);
-                        orbit.mode = camera::CameraMode::Bound;
-                        tween.to_view(
-                            &orbit,
-                            camera::RESET_THETA,
-                            camera::RESET_PHI,
-                            radius,
-                            render::cell_center_world(pick.selected_pos.as_vec3()),
-                        );
-                    }
-                }
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                color.0 = Color::srgb(0.6, 0.6, 0.7);
-            }
-        }
-    }
-}
-
-/// Keep the mode button's caption on the mode it will show, not the one it
-/// switches to.
-fn sync_camera_mode_button(
-    orbit: Res<camera::OrbitCamera>,
-    button_q: Query<&Children, With<CameraModeButton>>,
-    mut text_q: Query<&mut Text>,
-) {
-    let label = camera_mode_label(orbit.mode);
-    for children in button_q.iter() {
-        if let Ok(mut text) = text_q.get_mut(children[0]) {
-            if text.0 != label {
-                text.0 = label.to_string();
-            }
-        }
-    }
-}
-
 /// Begin a run: the checks a press has to pass, and whichever phase comes of
 /// them — the values modal where there are Sources to answer for, otherwise the
 /// run itself, at step 0.
@@ -3607,15 +3830,27 @@ fn sync_camera_mode_button(
 /// A free function because two buttons start a run now. `▶` takes a step at a
 /// time from here on, `▶▌` goes to the end, but what it takes to *start* is the
 /// same question asked once.
-fn begin_evaluation(eval: &mut EvalState, state: &GraphState) {
+fn begin_evaluation(
+    eval: &mut EvalState,
+    state: &GraphState,
+    diagnostics: &Diagnostics,
+    open: &mut DiagnosticsOpen,
+) {
     if is_evaluating(eval) {
         // Already showing a modal or running — ignore.
         return;
     }
-    if !infer::sink_has_input(&state.root_graph().graph) {
-        eval.phase = EvalPhase::ErrorModal(
-            "Cannot evaluate, because no node is connected to the sink".to_string(),
-        );
+    // What used to be one question asked here — is anything wired to the sink —
+    // is now the whole of what `lint` finds, and it is asked of the graph
+    // standing still rather than discovered a step into the run.
+    //
+    // No modal. A modal names one thing, has to be dismissed before the graph
+    // can be looked at, and would take the list with it; the panel is already
+    // on screen, says all of them at once, and each row goes to the cell it is
+    // about. Unfolding it is the whole of the answer — the press is not
+    // ignored, it is answered somewhere the answer can be acted on.
+    if diagnostics.blocking() {
+        open.0 = true;
         return;
     }
     // Flatten pattern sub-scenes in so eval and var-decl collection see every
@@ -3650,9 +3885,11 @@ fn handle_evaluate_button(
     interaction_q: Query<&Interaction, (Changed<Interaction>, With<EvaluateButton>)>,
     mut eval: ResMut<EvalState>,
     state: Res<GraphState>,
+    diagnostics: Res<Diagnostics>,
+    mut open: ResMut<DiagnosticsOpen>,
 ) {
     if interaction_q.iter().any(|i| *i == Interaction::Pressed) {
-        begin_evaluation(&mut eval, &state);
+        begin_evaluation(&mut eval, &state, &diagnostics, &mut open);
     }
 }
 
@@ -4499,40 +4736,6 @@ fn handle_modal_evaluate_button(
     }
 }
 
-/// Enter the screenshot mode. Only ever entered, never left from here — what
-/// leaves it is using the editor again, which is `end_screenshot_mode`.
-///
-/// The rebuild is for the caret: it is a scene entity like any node, so it goes
-/// away by not being spawned rather than by being hidden.
-fn handle_screenshot_button(
-    mut interaction_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        (Changed<Interaction>, With<ScreenshotButton>),
-    >,
-    mut text_color_q: Query<&mut TextColor>,
-    mut screenshot: ResMut<ScreenshotMode>,
-    mut rebuild: ResMut<NeedsRebuild>,
-    time: Res<Time>,
-) {
-    for (interaction, mut bg, children) in interaction_q.iter_mut() {
-        let mut color = text_color_q.get_mut(children[0]).unwrap();
-        match *interaction {
-            Interaction::Pressed => {
-                screenshot.entered_at = Some(time.elapsed_secs());
-                rebuild.0 = true;
-            }
-            Interaction::Hovered => {
-                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                color.0 = Color::srgb(0.85, 0.85, 0.9);
-            }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                color.0 = Color::srgb(0.6, 0.6, 0.7);
-            }
-        }
-    }
-}
-
 /// End the screenshot mode at the first sign of life.
 ///
 /// The input is not swallowed: it does whatever it normally does, and the mode
@@ -4617,13 +4820,12 @@ fn sync_player_controls(
             spawn_control_button(parent, &ui_font.0, "\u{25B6}\u{258C}", FullRunButton);
             return;
         }
-        // Prev before Exit before Next: the two arrows sit either side of the
-        // step they move, and what stops the run is between them, where the
-        // thing that started it stood.
-        spawn_control_button(parent, &ui_font.0, "\u{25C0}", PrevStepButton);
-        spawn_control_button(parent, &ui_font.0, "\u{25A0}", ExitEvaluationButton);
-        spawn_control_button(parent, &ui_font.0, "\u{25B6}", NextStepButton);
-        spawn_control_button(parent, &ui_font.0, "\u{25B6}\u{258C}", FullRunButton);
+        // Ahead of the buttons, so it reads to the *left* of them. The row is
+        // right-aligned, and a counter on the right would shove every button
+        // sideways the moment "Step 9" became "Step 10". Here it grows into the
+        // empty half of the box and nothing else moves — which is the whole
+        // point of the row being pinned to that edge.
+        //
         // Spawned empty: `update_step_button_visuals` writes it every frame, and
         // it is the only thing that knows which step the row has moved to since.
         parent.spawn((
@@ -4633,6 +4835,13 @@ fn sync_player_controls(
             StepCounterText,
             PlayerControlsEntity,
         ));
+        // Prev before Exit before Next: the two arrows sit either side of the
+        // step they move, and what stops the run is between them, where the
+        // thing that started it stood.
+        spawn_control_button(parent, &ui_font.0, "\u{25C0}", PrevStepButton);
+        spawn_control_button(parent, &ui_font.0, "\u{25A0}", ExitEvaluationButton);
+        spawn_control_button(parent, &ui_font.0, "\u{25B6}", NextStepButton);
+        spawn_control_button(parent, &ui_font.0, "\u{25B6}\u{258C}", FullRunButton);
     });
 }
 
@@ -4717,12 +4926,20 @@ fn handle_full_run_button(
     interaction_q: Query<&Interaction, (Changed<Interaction>, With<FullRunButton>)>,
     mut eval: ResMut<EvalState>,
     state: Res<GraphState>,
+    diagnostics: Res<Diagnostics>,
+    mut open: ResMut<DiagnosticsOpen>,
 ) {
     if !interaction_q.iter().any(|i| *i == Interaction::Pressed) {
         return;
     }
     if matches!(eval.phase, EvalPhase::Idle) {
-        begin_evaluation(&mut eval, &state);
+        begin_evaluation(&mut eval, &state, &diagnostics, &mut open);
+        // A graph that will not run must not be left with a standing wish to
+        // run to its end: the wish would be granted the moment the last hole
+        // was filled, by a press nobody made.
+        if diagnostics.blocking() {
+            return;
+        }
     }
     eval.run_to_end = true;
 }
@@ -4825,6 +5042,7 @@ fn apply_run_to_end(mut eval: ResMut<EvalState>, state: Res<GraphState>) {
 fn update_step_button_visuals(
     eval: Res<EvalState>,
     state: Res<GraphState>,
+    diagnostics: Res<Diagnostics>,
     // One query over the whole row rather than one per button with `Without`
     // filters of each other, which grow as the square of them. Which button an
     // entity is, it says itself; the two that are simply pressable whenever they
@@ -4837,6 +5055,7 @@ fn update_step_button_visuals(
             Has<PrevStepButton>,
             Has<NextStepButton>,
             Has<FullRunButton>,
+            Has<EvaluateButton>,
         ),
         Or<(
             With<EvaluateButton>,
@@ -4851,16 +5070,24 @@ fn update_step_button_visuals(
 ) {
     // Running to the end is the one of the three that can be asked for with no
     // run going: it starts one. The other two only move within a run.
-    let (prev_enabled, next_enabled, full_enabled) = match &eval.phase {
+    // An error standing in the list above these buttons is the one reason a run
+    // cannot start, and now that the list is directly over them it is worth
+    // saying in the buttons too. `begin_evaluation` refuses either way — this
+    // only makes the refusal visible before it is met.
+    //
+    // It bears only on *starting*: inside a run the graph cannot change, so a
+    // diagnostic cannot appear mid-run to grey out the step that is under way.
+    let startable = !diagnostics.blocking();
+    let (prev_enabled, next_enabled, full_enabled, start_enabled) = match &eval.phase {
         EvalPhase::Running {
             states, current, ..
         } => {
             let next_possible = !states[*current].is_evaluated(&state.root_graph().graph);
-            (*current > 0, next_possible, next_possible)
+            (*current > 0, next_possible, next_possible, startable)
         }
-        EvalPhase::Idle => (false, false, true),
+        EvalPhase::Idle => (false, false, startable, startable),
         // A modal owns the screen and the row is hidden behind it anyway.
-        _ => (false, false, false),
+        _ => (false, false, false, false),
     };
     // The index itself: snapshot 0 is a run at rest
     // (`eval::State::nothing_yet`), with the prompt's answers waiting at the
@@ -4903,15 +5130,17 @@ fn update_step_button_visuals(
         bg.0 = fill;
         text_color.0 = ink;
     };
-    for (interaction, mut bg, children, is_prev, is_next, is_full) in row_q.iter_mut() {
-        // `Evaluate` and `Exit` fall through: each is only ever on screen in the
-        // phase it belongs to, and in that phase it can always be pressed.
+    for (interaction, mut bg, children, is_prev, is_next, is_full, is_start) in row_q.iter_mut() {
+        // `Exit` falls through: it is only ever on screen during a run, and a
+        // run can always be left.
         let enabled = if is_prev {
             prev_enabled
         } else if is_next {
             next_enabled
         } else if is_full {
             full_enabled
+        } else if is_start {
+            start_enabled
         } else {
             true
         };
@@ -6260,20 +6489,354 @@ fn update_fps_display(
     };
 }
 
+/// How many diagnostic rows are on screen at once.
+///
+/// The list is sorted worst-first, so a plain prefix window shows the rows
+/// worth reading first — unlike the prompt's window, which has a highlight to
+/// keep in view and so has to slide. What does not fit is *stated*, never
+/// clipped, for the reason `spawn_prompt_rows` states it: a list that silently
+/// ends reads as a list that finished.
+const DIAGNOSTIC_ROWS: usize = 6;
+
+/// Everything wrong with the graph as it stands, recomputed whenever it moves.
+#[derive(Resource, Default)]
+struct Diagnostics(Vec<lint::Diagnostic>);
+
+impl Diagnostics {
+    fn count(&self, severity: lint::Severity) -> usize {
+        self.0.iter().filter(|d| d.severity == severity).count()
+    }
+
+    /// Whether a run may start. The definition of `Error` and nothing more.
+    fn blocking(&self) -> bool {
+        self.count(lint::Severity::Error) > 0
+    }
+}
+
+/// Whether the list is unfolded. Not derived from whether there is anything to
+/// show: a fold the editor opened and closed behind the user's back is a fold
+/// that cannot be trusted. Pressing `▶` on a graph that will not run opens it —
+/// that is the one place anything but a click writes it.
+#[derive(Resource)]
+struct DiagnosticsOpen(bool);
+
+impl Default for DiagnosticsOpen {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
+#[derive(Component)]
+struct DiagnosticsPanel;
+
+/// On every row and heading the panel rebuilds, so the sweep that clears them
+/// cannot reach the other panels' rows. Same reason `NodeEditorEntity` exists.
+#[derive(Component)]
+struct DiagnosticsEntity;
+
+#[derive(Component)]
+struct DiagnosticsHeader;
+
+/// The cell a row points at. Only rows that have one carry it, so a row about
+/// the graph as a whole is not a button that goes nowhere.
+#[derive(Component)]
+struct DiagnosticTarget(IVec3);
+
+#[derive(Default, PartialEq, Eq, Clone)]
+struct DiagnosticsFingerprint {
+    rows: Vec<(lint::Diagnostic, Option<IVec3>)>,
+    open: bool,
+}
+
+/// The cell a node stands on, in the coordinates the caret is addressed in.
+///
+/// The same three steps the click-to-select path takes in `pick_nodes`: the
+/// owner path, the node's position inside that scope, and the scope's own
+/// offset. A node the layout does not hold has no cell, which is why this is an
+/// `Option` rather than an assertion.
+fn cell_of_node(state: &GraphState, id: &model::node::Id) -> Option<IVec3> {
+    let root = state.root_graph();
+    let context = root.context_of_node(id)?;
+    let local = root
+        .resolve_context(&context)
+        .layout_nodes
+        .get(id)?
+        .pos
+        .round()
+        .as_ivec3();
+    Some(local + root.scope_offset(&context))
+}
+
+/// Ask the graph what is wrong with it, once per change.
+///
+/// Keyed on the graph and not on the rebuild: what the linter reads is the
+/// program, and a caret move rebuilds the scene without changing a thing about
+/// it. `lod` is the other way round — it grades by where the caret stands — and
+/// that is why the two are computed in different places.
+fn recompute_diagnostics(state: Res<GraphState>, mut diagnostics: ResMut<Diagnostics>) {
+    if !state.is_changed() {
+        return;
+    }
+    diagnostics.0 = lint::check(state.root_graph(), &state.function_declarations);
+}
+
+/// The colour a severity is drawn in.
+///
+/// The error red is the one the modal already uses. The warning amber is new
+/// and deliberately outside the type palette — a row that reads as a type would
+/// be a row saying something about the value rather than about the graph.
+fn severity_color(severity: lint::Severity) -> Color {
+    match severity {
+        lint::Severity::Error => Color::srgb(0.95, 0.30, 0.30),
+        lint::Severity::Warning => Color::srgb(0.95, 0.70, 0.25),
+        lint::Severity::Note => Color::srgb(0.55, 0.55, 0.65),
+    }
+}
+
+/// The tallies the heading shows, worst first, leaving out what is not there.
+///
+/// Each carries its own severity so the heading can paint it: the glyph is what
+/// says *which* count this is once the list is folded away and the rows that
+/// would have explained it are gone. Without it a folded heading reads "2, 1".
+fn diagnostics_tallies(diagnostics: &Diagnostics) -> Vec<(lint::Severity, String)> {
+    [
+        (lint::Severity::Error, "error"),
+        (lint::Severity::Warning, "warning"),
+        (lint::Severity::Note, "note"),
+    ]
+    .into_iter()
+    .filter_map(|(severity, noun)| {
+        let count = diagnostics.count(severity);
+        (count > 0).then(|| {
+            (
+                severity,
+                format!(
+                    "{} {} {}{}",
+                    severity.glyph(),
+                    count,
+                    noun,
+                    if count == 1 { "" } else { "s" }
+                ),
+            )
+        })
+    })
+    .collect()
+}
+
+fn sync_diagnostics_ui(
+    mut commands: Commands,
+    diagnostics: Res<Diagnostics>,
+    open: Res<DiagnosticsOpen>,
+    state: Res<GraphState>,
+    ui_font: Res<UiFont>,
+    panel_q: Query<Entity, With<DiagnosticsPanel>>,
+    children_q: Query<Entity, With<DiagnosticsEntity>>,
+    mut cache: Local<DiagnosticsFingerprint>,
+) {
+    let rows: Vec<(lint::Diagnostic, Option<IVec3>)> = diagnostics
+        .0
+        .iter()
+        .map(|d| {
+            let cell = d.node.as_ref().and_then(|id| cell_of_node(&state, id));
+            (d.clone(), cell)
+        })
+        .collect();
+    let fp = DiagnosticsFingerprint {
+        rows: rows.clone(),
+        open: open.0,
+    };
+    if *cache == fp {
+        return;
+    }
+    *cache = fp;
+
+    for e in children_q.iter() {
+        commands.entity(e).despawn();
+    }
+    let Ok(panel_entity) = panel_q.single() else {
+        return;
+    };
+
+    let font = &ui_font.0;
+    let tallies = diagnostics_tallies(&diagnostics);
+    let shown = if open.0 {
+        rows.len().min(DIAGNOSTIC_ROWS)
+    } else {
+        0
+    };
+    commands.entity(panel_entity).with_children(|panel| {
+        // The heading stands whether or not there is anything under it. A zone
+        // that came and went would take the frame's proportions with it, and
+        // "nothing is wrong" is worth saying once the reader has learnt to look
+        // here for what is.
+        let mut heading = panel.spawn((
+            Text::new(if tallies.is_empty() {
+                "No problems found".to_string()
+            } else if open.0 {
+                "▾ ".to_string()
+            } else {
+                "▸ ".to_string()
+            }),
+            text_font(font, 13.0),
+            TextColor(if tallies.is_empty() {
+                Color::srgb(0.45, 0.45, 0.55)
+            } else {
+                Color::srgb(0.75, 0.75, 0.9)
+            }),
+            Node {
+                padding: UiRect::axes(Val::Px(0.0), Val::Px(2.0)),
+                ..default()
+            },
+            DiagnosticsEntity,
+        ));
+        // Only foldable when there is something to fold. An empty heading that
+        // answered to a click would offer to hide nothing.
+        if !tallies.is_empty() {
+            heading.insert((Button, DiagnosticsHeader));
+        }
+        // One span per tally, in its own colour, so the glyph and the count it
+        // belongs to are one statement. A span carries its own font: it
+        // inherits nothing from the root but its place in the line.
+        heading.with_children(|line| {
+            for (index, (severity, text)) in tallies.iter().enumerate() {
+                if index > 0 {
+                    line.spawn((
+                        TextSpan::new("  "),
+                        text_font(font, 13.0),
+                        TextColor(Color::srgb(0.75, 0.75, 0.9)),
+                    ));
+                }
+                line.spawn((
+                    TextSpan::new(text.clone()),
+                    text_font(font, 13.0),
+                    TextColor(severity_color(*severity)),
+                ));
+            }
+        });
+
+        for (diagnostic, cell) in rows.iter().take(shown) {
+            let mut row = panel.spawn((
+                Node {
+                    flex_direction: FlexDirection::Row,
+                    column_gap: Val::Px(8.0),
+                    padding: UiRect::axes(Val::Px(4.0), Val::Px(2.0)),
+                    border_radius: BorderRadius::all(Val::Px(3.0)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.0)),
+                DiagnosticsEntity,
+            ));
+            // Only a row with somewhere to go is a button. One without would
+            // highlight under the pointer and then do nothing.
+            if let Some(cell) = cell {
+                row.insert((Button, DiagnosticTarget(*cell)));
+            }
+            row.with_children(|row| {
+                row.spawn((
+                    Text::new(match cell {
+                        Some(cell) => format!(
+                            "{} ({}, {}, {})",
+                            diagnostic.severity.glyph(),
+                            cell.x,
+                            cell.y,
+                            cell.z
+                        ),
+                        None => diagnostic.severity.glyph().to_string(),
+                    }),
+                    text_font(font, 13.0),
+                    TextColor(severity_color(diagnostic.severity)),
+                    Node {
+                        width: Val::Px(96.0),
+                        flex_shrink: 0.0,
+                        ..default()
+                    },
+                ));
+                // No marker on either: `despawn` takes descendants with it, so
+                // the sweep only ever names what hangs directly off the panel.
+                // Marking these too would have it despawn them a second time.
+                row.spawn((
+                    Text::new(diagnostic.message.clone()),
+                    text_font(font, 13.0),
+                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                ));
+            });
+        }
+
+        if open.0 && rows.len() > shown {
+            panel.spawn((
+                Text::new(format!("… {} more", rows.len() - shown)),
+                text_font(font, 12.0),
+                TextColor(Color::srgb(0.35, 0.35, 0.4)),
+                Node {
+                    padding: UiRect::axes(Val::Px(4.0), Val::Px(2.0)),
+                    ..default()
+                },
+                DiagnosticsEntity,
+            ));
+        }
+    });
+}
+
+/// The heading folds the list; a row goes to the cell it is about.
+///
+/// The camera is not moved here. `trigger_camera_focus_on_selection_change`
+/// watches `selected_pos` and tweens on its own, so writing the caret is the
+/// whole of what a row has to do — and the rebuild is asked for because the
+/// caret is a scene entity like any other.
+fn handle_diagnostics_click(
+    header_q: Query<&Interaction, (Changed<Interaction>, With<DiagnosticsHeader>)>,
+    row_q: Query<(&Interaction, &DiagnosticTarget), Changed<Interaction>>,
+    mut open: ResMut<DiagnosticsOpen>,
+    mut pick: ResMut<PickState>,
+    state: Res<GraphState>,
+    mut rebuild: ResMut<NeedsRebuild>,
+) {
+    for interaction in header_q.iter() {
+        if *interaction == Interaction::Pressed {
+            open.0 = !open.0;
+        }
+    }
+    for (interaction, target) in row_q.iter() {
+        if *interaction != Interaction::Pressed {
+            continue;
+        }
+        let wanted = state.root_graph().clamp_to_volume(target.0);
+        if pick.selected_pos != wanted {
+            pick.selected_pos = wanted;
+            rebuild.0 = true;
+        }
+    }
+}
+
+/// The editing mode, centred on the bottom edge.
+///
+/// A row spanning the window with its content centred, which is how the run
+/// controls used to sit here: the width of the word can change without anything
+/// having to be measured. `EditorChrome` goes on the row and `ModeDisplay` stays
+/// on the text, so the one that is hidden and the one that is written are two
+/// different nodes.
 fn spawn_mode_display(mut commands: Commands, ui_font: Res<UiFont>) {
-    commands.spawn((
-        Text::new("NORMAL"),
-        text_font(&ui_font.0, 14.0),
-        TextColor(Color::srgb(0.6, 0.6, 0.7)),
-        Node {
-            position_type: PositionType::Absolute,
-            bottom: Val::Px(16.0),
-            right: Val::Px(14.0),
-            ..default()
-        },
-        ModeDisplay,
-        EditorChrome,
-    ));
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                right: Val::Px(0.0),
+                bottom: Val::Px(16.0),
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            EditorChrome,
+        ))
+        .with_children(|row| {
+            row.spawn((
+                Text::new("NORMAL"),
+                text_font(&ui_font.0, 14.0),
+                TextColor(Color::srgb(0.6, 0.6, 0.7)),
+                ModeDisplay,
+            ));
+        });
 }
 
 /// Blink the INSERT-mode caret on a fixed wall-clock cycle, so it keeps its
@@ -6294,7 +6857,6 @@ fn blink_caret(time: Res<Time>, mut caret_q: Query<&mut Visibility, With<CaretBl
 
 fn update_mode_display(
     mode: Res<EditorMode>,
-    orbit: Res<camera::OrbitCamera>,
     mut text_q: Query<(&mut Text, &mut TextColor), With<ModeDisplay>>,
 ) {
     let Ok((mut text, mut color)) = text_q.single_mut() else {
@@ -6306,14 +6868,12 @@ fn update_mode_display(
         // the graph, so it should be the one that catches the eye.
         EditorMode::Insert => ("INSERT", Color::srgb(0.35, 0.85, 0.55)),
     };
-    // The free camera suspends the guarantees the bound one gives, so it is
-    // worth saying out loud next to the editing mode.
-    let label = match orbit.mode {
-        camera::CameraMode::Bound => label.to_string(),
-        camera::CameraMode::Free => format!("{} · FREE", label),
-    };
+    // Nothing about the camera here any more. The free camera does suspend the
+    // guarantees the bound one gives, and this used to say so — but the view
+    // control now names the view outright, and it stands in the same row a
+    // hand's width to the left. Two sentences about one fact read as two facts.
     if text.0 != label {
-        text.0 = label;
+        text.0 = label.to_string();
     }
     *color = TextColor(tint);
 }
@@ -7704,6 +8264,9 @@ fn main() {
         .init_resource::<PendingNode>()
         .init_resource::<ScreenshotMode>()
         .init_resource::<lod::Clipping>()
+        .init_resource::<Diagnostics>()
+        .init_resource::<DiagnosticsOpen>()
+        .init_resource::<ViewMenuOpen>()
         .add_systems(
             Startup,
             (
@@ -7711,10 +8274,11 @@ fn main() {
                 setup_scene,
                 spawn_graph_nodes,
                 spawn_ui,
+                spawn_view_bar,
                 spawn_selection_display,
                 spawn_node_editor_panel,
                 spawn_insert_prompt_panel,
-                spawn_player_controls,
+                spawn_run_panel,
                 spawn_fps_display,
                 spawn_breadcrumb_display,
                 spawn_mode_display,
@@ -7801,26 +8365,26 @@ fn main() {
                 update_breadcrumb_display,
                 update_mode_display,
                 blink_caret,
+                // Chained: the click may fold the list, and the sync that draws
+                // it has to see the fold in the same frame it was asked for.
+                (
+                    recompute_diagnostics,
+                    handle_diagnostics_click,
+                    sync_diagnostics_ui,
+                )
+                    .chain(),
             ),
         )
         .add_systems(
             Update,
             (
                 handle_evaluate_button,
-                handle_screenshot_button,
-                handle_camera_mode_button,
-                sync_camera_mode_button,
-                // The corner checkboxes, nested into one entry: a tuple of
-                // systems tops out at twenty, and each of these is a pair that
-                // belongs together anyway. Chained inside as well as out, so a
-                // handler still runs before the sync that reads what it wrote.
-                (
-                    handle_semi_ortho_checkbox,
-                    sync_semi_ortho_checkbox,
-                    handle_clipping_checkbox,
-                    sync_clipping_checkbox,
-                )
-                    .chain(),
+                // Chained: the click folds or unfolds the list, and the sync
+                // that draws it has to see the fold in the same frame.
+                (handle_view_menu_click, sync_view_menu).chain(),
+                // Chained for the same reason: a handler runs before the sync
+                // that reads what it wrote.
+                (handle_clipping_checkbox, sync_clipping_checkbox).chain(),
                 handle_modal_ok_button,
                 handle_controls_modal_ok_button,
                 handle_modal_cancel_button,

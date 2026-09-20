@@ -373,7 +373,7 @@ pub fn base_type_of(leaf: &EType) -> EType {
 ///
 /// Degenerate spans contribute nothing, which is the point: no number of
 /// integer literals ever covers the Integer band, however many are named.
-fn spans_cover_band(spans: &[RowSpan]) -> bool {
+pub fn spans_cover_band(spans: &[RowSpan]) -> bool {
     let mut ordered: Vec<&RowSpan> = spans.iter().filter(|s| !s.is_degenerate()).collect();
     ordered.sort_by(|a, b| {
         a.top
