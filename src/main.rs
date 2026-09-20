@@ -425,18 +425,6 @@ struct SceneEntity;
 //Buttons
 #[derive(Component)]
 struct HamburgerButton;
-/// Root of the INSERT-mode prompt, on the left edge under the hamburger — the
-/// same rectangle the node editor panel stands in, which it never shares with
-/// it: a cell either names a property or it doesn't.
-#[derive(Component)]
-struct InsertPromptPanel;
-
-/// Marker on what the prompt respawns on a change — its column, the text row
-/// and the suggestion list. Only those carry it: `despawn` takes their children
-/// with them, and an entity despawned twice warns.
-#[derive(Component, Clone)]
-struct InsertPromptEntity;
-
 /// A clickable suggestion row, so the mouse path into INSERT does not dead-end
 /// at a keyboard-only list.
 #[derive(Component)]
@@ -598,8 +586,9 @@ fn addressed_cell(
 /// (kind, cell) pair, and none for a cell that names nothing.
 ///
 /// This is the whole editing model. A cell names at most one property, so
-/// standing on it and choosing what to change are one act — which is why there
-/// is no property panel offering a node's type and its value at the same time.
+/// standing on it and choosing what to change are one act. The panel does show
+/// a node's other properties beside the addressed one, but only to read: which
+/// one an edit acts on is still the caret's answer and nothing else's.
 #[derive(Clone, PartialEq, Eq)]
 enum EditTarget {
     /// Printed along the body, so the body is where it is typed.
@@ -647,6 +636,34 @@ enum InsertTarget {
     Edit(model::node::Id, EditTarget),
 }
 
+/// Which property one cell of a node stands for.
+///
+/// Every row here names a `Body` or a `Name` cell, and none of them an anchor.
+/// That is the rule rather than how it happens to have come out: an anchor is
+/// where an edge begins, so it cannot also be where a property is answered, and
+/// a cell that names one property is what makes standing on it and choosing
+/// what to change the same act.
+///
+/// Out here rather than inside `insert_target` because the panel asks it of
+/// every cell a node has, not only of the one the caret stands on.
+fn edit_target_of(node: &model::node::ENode, role: &layout::CellRole) -> Option<EditTarget> {
+    match (node, role) {
+        (model::node::ENode::Source { .. }, layout::CellRole::Body) => Some(EditTarget::SourceType),
+        (model::node::ENode::Source { .. }, layout::CellRole::Name) => Some(EditTarget::SourceName),
+        (model::node::ENode::Constant { .. }, layout::CellRole::Body) => {
+            Some(EditTarget::ConstantValue)
+        }
+        (model::node::ENode::TypeCast { .. }, layout::CellRole::Body) => Some(EditTarget::CastType),
+        (model::node::ENode::Pattern { .. }, layout::CellRole::Body) => {
+            Some(EditTarget::PatternType)
+        }
+        (model::node::ENode::Tunnel { .. }, layout::CellRole::Body) => Some(EditTarget::TunnelType),
+        // A FunctionCall's body cells fall through with everything else: the
+        // function is not changeable, so they name nothing. See `EditTarget`.
+        _ => None,
+    }
+}
+
 fn insert_target(state: &GraphState, pick: &PickState) -> InsertTarget {
     let Some((id, role)) = addressed_cell(state, pick) else {
         return InsertTarget::Create;
@@ -657,23 +674,10 @@ fn insert_target(state: &GraphState, pick: &PickState) -> InsertTarget {
     let Some(node) = layout.graph.nodes.get(&id) else {
         return InsertTarget::Create;
     };
-    // Every row here names a `Body` or a `Name` cell, and none of them an
-    // anchor. That is the rule rather than how it happens to have come out: an
-    // anchor is where an edge begins, so it cannot also be where a property is
-    // answered, and a cell that names one property is what makes standing on it
-    // and choosing what to change the same act.
-    let property = match (node, &role) {
-        (model::node::ENode::Source { .. }, layout::CellRole::Body) => EditTarget::SourceType,
-        (model::node::ENode::Source { .. }, layout::CellRole::Name) => EditTarget::SourceName,
-        (model::node::ENode::Constant { .. }, layout::CellRole::Body) => EditTarget::ConstantValue,
-        (model::node::ENode::TypeCast { .. }, layout::CellRole::Body) => EditTarget::CastType,
-        (model::node::ENode::Pattern { .. }, layout::CellRole::Body) => EditTarget::PatternType,
-        (model::node::ENode::Tunnel { .. }, layout::CellRole::Body) => EditTarget::TunnelType,
-        // A FunctionCall's body cells fall through with everything else: the
-        // function is not changeable, so they name nothing. See `EditTarget`.
-        _ => return InsertTarget::Create,
-    };
-    InsertTarget::Edit(id, property)
+    match edit_target_of(node, &role) {
+        Some(property) => InsertTarget::Edit(id, property),
+        None => InsertTarget::Create,
+    }
 }
 
 /// The property the target names, spelled the way it would be typed — which is
@@ -711,6 +715,226 @@ fn property_text(state: &GraphState, node_id: &model::node::Id, target: &EditTar
             .unwrap_or_default(),
         _ => String::new(),
     }
+}
+
+/// What a row of the panel addresses — and what the caret is turned into, so
+/// that finding the row it stands on is a comparison and not a second decision.
+#[derive(Clone, PartialEq, Eq)]
+enum RowAddress {
+    /// A property of a node: the pair `insert_target` answers with.
+    Property(model::node::Id, EditTarget),
+    /// The cell a new arm would be built at — the gap cell of the arm it would
+    /// go below. Named by its cell, because there is no node there yet.
+    ArmGap(IVec3),
+}
+
+/// One row of the panel: what it says, and the cell the caret stands on to
+/// address it. The two are the same address seen from two sides, which is what
+/// lets `TAB` walk the rows by moving the caret.
+#[derive(Clone, PartialEq, Eq)]
+struct PanelRow {
+    address: RowAddress,
+    /// Global. This is where `TAB` puts the caret.
+    cell: IVec3,
+    /// Left column. A gap row has none — it is a line, not a property.
+    label: String,
+    /// Right column. A gap row has none.
+    value: String,
+}
+
+/// What the panel is about: one node, and everything about it that can be
+/// answered.
+#[derive(Clone, PartialEq, Eq)]
+struct PanelSubject {
+    heading: String,
+    rows: Vec<PanelRow>,
+}
+
+/// What the panel calls the node it is about.
+///
+/// The kind and not the node: what a Source is called is its `Name` row's
+/// business, and saying it twice would make the heading jump while the row is
+/// being typed into. A call is the exception that proves it — which function it
+/// calls is the one thing about a call that cannot be changed, so its name is a
+/// fact about the kind rather than a property.
+fn panel_heading(state: &GraphState, node: &model::node::ENode) -> String {
+    match node {
+        model::node::ENode::Source { .. } => "Source".to_string(),
+        model::node::ENode::Constant { .. } => "Constant".to_string(),
+        model::node::ENode::TypeCast { .. } => "TypeCast".to_string(),
+        model::node::ENode::Tunnel { .. } => "Tunnel".to_string(),
+        model::node::ENode::Match { .. } => "Match".to_string(),
+        model::node::ENode::Pattern { .. } => "Pattern".to_string(),
+        model::node::ENode::Sink { .. } => "Sink".to_string(),
+        model::node::ENode::BranchSource { .. } => "Branch source".to_string(),
+        model::node::ENode::Root {} => "Root".to_string(),
+        model::node::ENode::FunctionCall {
+            function_declaration_id,
+            ..
+        } => state
+            .function_declarations
+            .get(function_declaration_id)
+            .map(|declaration| declaration.name.clone())
+            .unwrap_or_else(|| "Call".to_string()),
+    }
+}
+
+/// What the panel calls a property. One word, because the node's own name is
+/// already the heading above it.
+fn property_label(target: &EditTarget) -> &'static str {
+    match target {
+        EditTarget::SourceName => "Name",
+        EditTarget::SourceType
+        | EditTarget::CastType
+        | EditTarget::PatternType
+        | EditTarget::TunnelType => "Type",
+        EditTarget::ConstantValue => "Value",
+    }
+}
+
+/// The caret, said the way a row says it.
+fn caret_row_address(state: &GraphState, pick: &PickState) -> RowAddress {
+    match insert_target(state, pick) {
+        InsertTarget::Edit(id, target) => RowAddress::Property(id, target),
+        InsertTarget::Create => RowAddress::ArmGap(pick.selected_pos),
+    }
+}
+
+/// What the caret's cell makes the panel about: the node it stands on and all
+/// of that node's properties — or, where it stands on an arm of a Match, the
+/// Match and all of its arms, because a Match declares nothing of its own and
+/// its arms are the whole of what there is to say about it.
+///
+/// `None` where the caret stands on no node at all. There is nothing to show
+/// there but the create prompt, and the create prompt is about no node.
+///
+/// One function and two readers: the panel draws these rows and `TAB` walks
+/// them. Were there two lists, `TAB` would land where no row stands.
+fn panel_subject(state: &GraphState, pick: &PickState) -> Option<PanelSubject> {
+    let scope = state.scope_of_caret(pick)?;
+    let root = state.root_graph();
+    let graph = root.resolve_context(&scope.path);
+    let origin = root.scope_offset(&scope.path);
+    // A Pattern's gap cell belongs to the Pattern, so the caret in the space
+    // between two arms lands here too — and is answered with its Match.
+    let id = graph.node_at(scope.local)?;
+    let node = graph.graph.nodes.get(&id)?;
+    match node {
+        model::node::ENode::Pattern { parent_match, .. } => {
+            match_subject(state, graph, origin, parent_match)
+        }
+        _ => node_subject(state, graph, origin, &id, node),
+    }
+}
+
+/// A node and its properties, in the order its cells run — the order the caret
+/// walks them in with `l`, so that `TAB` and the arrow keys agree about what
+/// comes next.
+fn node_subject(
+    state: &GraphState,
+    graph: &layout::LayoutGraph,
+    origin: IVec3,
+    id: &model::node::Id,
+    node: &model::node::ENode,
+) -> Option<PanelSubject> {
+    let ln = graph.layout_nodes.get(id)?;
+    let node_origin = ln.pos.round().as_ivec3() + origin;
+    let mut rows: Vec<PanelRow> = Vec::new();
+    let mut seen: Vec<EditTarget> = Vec::new();
+    for (local, role) in ln.shape.cells() {
+        let Some(target) = edit_target_of(node, role) else {
+            continue;
+        };
+        // A Source's name runs across as many cells as it needs, every one of
+        // them a `Name`. They answer one question between them, so the first is
+        // the row and the rest are that same row.
+        if seen.contains(&target) {
+            continue;
+        }
+        seen.push(target.clone());
+        rows.push(PanelRow {
+            label: property_label(&target).to_string(),
+            value: property_text(state, id, &target),
+            address: RowAddress::Property(id.clone(), target),
+            cell: *local + node_origin,
+        });
+    }
+    Some(PanelSubject {
+        heading: panel_heading(state, node),
+        rows,
+    })
+}
+
+/// A Match and its arms, each followed by the place the next one would go.
+///
+/// The order is `ENode::Match.patterns` and nothing else — the layout hands out
+/// the rows from that list, so what stands higher on screen is what is asked
+/// first, and the panel says the same.
+///
+/// That the gap cell of arm `i` is the place between `i` and `i + 1` is not an
+/// arrangement of the panel's own: `kind_allowed` admits a Pattern only on a
+/// cell belonging to a Pattern, and `plus_pattern_below` puts what is built
+/// there directly below that arm. Which is also why there is no place above the
+/// first arm — there is no arm to be below.
+fn match_subject(
+    state: &GraphState,
+    graph: &layout::LayoutGraph,
+    origin: IVec3,
+    match_id: &model::node::Id,
+) -> Option<PanelSubject> {
+    let model::node::ENode::Match { patterns, .. } = graph.graph.nodes.get(match_id)? else {
+        return None;
+    };
+    let mut rows: Vec<PanelRow> = Vec::new();
+    for (index, pattern_id) in patterns.iter().enumerate() {
+        let Some(ln) = graph.layout_nodes.get(pattern_id) else {
+            continue;
+        };
+        let pattern_origin = ln.pos.round().as_ivec3() + origin;
+        let cell_of = |wanted: layout::CellRole| {
+            ln.shape
+                .cells()
+                .iter()
+                .find(|(_, role)| *role == wanted)
+                .map(|(local, _)| *local + pattern_origin)
+        };
+        if let Some(cell) = cell_of(layout::CellRole::Body) {
+            rows.push(PanelRow {
+                address: RowAddress::Property(pattern_id.clone(), EditTarget::PatternType),
+                cell,
+                label: format!("Pattern {}", index + 1),
+                value: property_text(state, pattern_id, &EditTarget::PatternType),
+            });
+        }
+        if let Some(cell) = cell_of(layout::CellRole::Gap) {
+            rows.push(PanelRow {
+                address: RowAddress::ArmGap(cell),
+                cell,
+                label: String::new(),
+                value: String::new(),
+            });
+        }
+    }
+    Some(PanelSubject {
+        heading: "Match".to_string(),
+        rows,
+    })
+}
+
+/// The cell of the row `TAB` moves to, wrapping at both ends. Standing on no
+/// row at all, the first one is next — that is the way into a panel the caret
+/// is beside rather than on.
+fn tab_step(subject: &PanelSubject, here: &RowAddress, back: bool) -> Option<IVec3> {
+    let len = subject.rows.len();
+    if len == 0 {
+        return None;
+    }
+    let next = match subject.rows.iter().position(|row| &row.address == here) {
+        Some(index) if back => (index + len - 1) % len,
+        Some(index) => (index + 1) % len,
+        None => 0,
+    };
+    Some(subject.rows[next].cell)
 }
 
 /// UI text showing the selected node's info.
@@ -875,15 +1099,20 @@ struct ValueLabel {
     node_id: model::node::Id,
 }
 
-// ── Node editor panel ───────────────────────────────────────
+// ── Editor panel ────────────────────────────────────────────
 
+/// The one panel on the left edge: the node the caret stands on, and what can
+/// be answered about it. It never despawns — `sync_editor_panel` rebuilds its
+/// contents and writes its `display`.
 #[derive(Component)]
-struct NodeEditorPanel;
+struct EditorPanel;
 
-/// Tag on every descendant of the editor panel, which is rebuilt whenever the
-/// addressed cell or what is being typed into it changes.
+/// Tag on each row the panel respawns — the heading, a property's row, an
+/// arm's gap, a loose prompt. Only those carry it, never anything inside one:
+/// `despawn` takes a row's children with it, and an entity despawned twice
+/// warns.
 #[derive(Component, Clone)]
-struct NodeEditorEntity;
+struct EditorPanelEntity;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TypeChoice {
@@ -2324,28 +2553,6 @@ fn spawn_control_button<C: Bundle>(
         });
 }
 
-/// The INSERT prompt's panel, on the left edge under the hamburger. Empty at
-/// startup — `sync_insert_prompt_ui` fills it. `Button` on the root so
-/// `pick_nodes`' `over_ui` test covers it and a click on the panel doesn't
-/// move the caret to whatever cell lies behind it, the same reason
-/// `spawn_node_editor_panel` carries one.
-fn spawn_insert_prompt_panel(mut commands: Commands) {
-    commands.spawn((
-        Node {
-            position_type: PositionType::Absolute,
-            top: Val::Px(96.0),
-            left: Val::Px(12.0),
-            width: Val::Px(280.0),
-            flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(4.0),
-            display: Display::None,
-            ..default()
-        },
-        Button,
-        InsertPromptPanel,
-    ));
-}
-
 fn spawn_hamburger_button(commands: &mut Commands, pos: Vec2) {
     let bar = || Node {
         width: Val::Px(20.0),
@@ -2753,7 +2960,15 @@ fn handle_insert_prompt_click(
             continue;
         }
         if let Some(outcome) = apply_prompt_action(&mut state, &mut pick, &option.0) {
-            commit_outcome(outcome, &mut prompt, &mut pending, &mut mode, &mut rebuild);
+            commit_outcome(
+                &state,
+                &mut pick,
+                outcome,
+                &mut prompt,
+                &mut pending,
+                &mut mode,
+                &mut rebuild,
+            );
         }
     }
 }
@@ -2795,13 +3010,36 @@ fn leave_insert_mode(
     false
 }
 
+/// The next property of the panel after the one the caret stands on, and
+/// nothing else: gaps are skipped, and there is no wrap.
+///
+/// `TAB` walks every row and comes round again, because walking is what it is
+/// for. This is the other thing — what is left to answer after an answer — and
+/// a place to build is not something left to answer, nor is the row that was
+/// just filled in.
+fn next_property_cell(state: &GraphState, pick: &PickState) -> Option<IVec3> {
+    let subject = panel_subject(state, pick)?;
+    let here = caret_row_address(state, pick);
+    let index = subject.rows.iter().position(|row| row.address == here)?;
+    subject
+        .rows
+        .iter()
+        .skip(index + 1)
+        .find(|row| matches!(row.address, RowAddress::Property(..)))
+        .map(|row| row.cell)
+}
+
 /// What follows a committed row, whichever key or click committed it.
 ///
-/// INSERT stays on only while there is something left to say at the caret. A
-/// commit does not move the caret, so what it lands on is the node that was
-/// just built — and for most kinds that node is already finished by the row
-/// that built it.
+/// INSERT stays on while there is anything left to say about the node the
+/// caret stands on — first whatever the new node still owes, then every
+/// property of it that has not been reached yet. A Source is the whole rule in
+/// one: built, it owes a type; typed, the name is next; named, there is nothing
+/// further and INSERT ends. It is `TAB` without the wrap, which is what makes
+/// it an end rather than a round.
 fn commit_outcome(
+    state: &GraphState,
+    pick: &mut PickState,
     outcome: Inserted,
     prompt: &mut InsertPrompt,
     pending: &mut PendingNode,
@@ -2810,16 +3048,9 @@ fn commit_outcome(
 ) {
     prompt.clear();
     rebuild.0 = true;
-    // The outcome alone decides it, and which row was committed says nothing
-    // about it: INSERT stays on exactly while the node that was just built
-    // still owes its one mandatory property, and the caret is standing on the
-    // cell that names it.
-    //
-    // Everything else is complete the moment it appears. A Constant *is* its
-    // literal and a call *is* its function, and both were typed to reach the
-    // row that built them — so the cell the caret is left on holds the answer
-    // that was just given, and staying would do nothing but offer to give it
-    // again. Changing a property is finished for the same reason.
+    // A node that came into the world unfinished has already had the caret put
+    // on the cell that names what it owes, and that cell is where the answer
+    // has to be given — so there is nowhere else to go first.
     let stay = matches!(outcome, Inserted::Pending(_));
     // Answering a property is what finishes a node, so any commit clears the
     // mark — and a new one only ever comes from a `Create`.
@@ -2827,8 +3058,17 @@ fn commit_outcome(
         Inserted::Pending(edit) => Some(edit),
         Inserted::Done => None,
     };
-    if !stay {
-        *mode = EditorMode::Normal;
+    if stay {
+        return;
+    }
+    // Read before the caret is written, so the answer is about where it stood.
+    let next = next_property_cell(state, pick);
+    match next {
+        Some(cell) => pick.selected_pos = state.root_graph().clamp_to_volume(cell),
+        // Nothing further to say about it: a Constant *is* its literal and a
+        // call *is* its function, both already given by the row that built
+        // them, and the last property of a node is the last thing it has.
+        None => *mode = EditorMode::Normal,
     }
 }
 
@@ -3227,93 +3467,6 @@ fn prompt_window(len: usize, selected: usize) -> std::ops::Range<usize> {
     start..start + PROMPT_ROWS
 }
 
-#[derive(Default, PartialEq, Eq, Clone)]
-struct InsertPromptFingerprint {
-    visible: bool,
-    text: String,
-    cursor: usize,
-    selected: Option<usize>,
-    candidates: Vec<Suggestion>,
-}
-
-/// The INSERT prompt: what was typed, and under it the node kinds that name
-/// could still become. Sole writer of the panel's `display`, so the start menu
-/// and the modals are folded in here rather than left to
-/// `EditorChrome`; contents are respawned only when the fingerprint moves, the
-/// way `sync_node_editor_ui` does it.
-fn sync_insert_prompt_ui(
-    mut commands: Commands,
-    mode: Res<EditorMode>,
-    prompt: Res<InsertPrompt>,
-    state: Res<GraphState>,
-    pick: Res<PickState>,
-    start_menu: Res<StartMenu>,
-    eval: Res<EvalState>,
-    screenshot: Res<ScreenshotMode>,
-    ui_font: Res<UiFont>,
-    mut panel_q: Query<(Entity, &mut Node), With<InsertPromptPanel>>,
-    prompt_children_q: Query<Entity, With<InsertPromptEntity>>,
-    mut cache: Local<InsertPromptFingerprint>,
-) {
-    let visible = *mode == EditorMode::Insert
-        // Only where INSERT means "build something". Changing a property that
-        // already stands there happens in the node editor's panel, where the
-        // property is named, and an empty create prompt standing beside it
-        // would claim a choice that is not on offer.
-        && insert_target(&state, &pick) == InsertTarget::Create
-        && !start_menu.showing
-        && !modal_is_open(&eval)
-        && !is_evaluating(&eval)
-        && !screenshot.active();
-    let candidates = if visible {
-        prompt_candidates(&state, &pick, &prompt.text)
-    } else {
-        Vec::new()
-    };
-    let selected = clamped_selection(&candidates, prompt.selected);
-
-    let fp = InsertPromptFingerprint {
-        visible,
-        text: prompt.text.clone(),
-        cursor: prompt.cursor,
-        selected,
-        candidates: candidates.clone(),
-    };
-    if *cache == fp {
-        return;
-    }
-    *cache = fp;
-
-    for e in prompt_children_q.iter() {
-        commands.entity(e).despawn();
-    }
-
-    let Ok((panel_entity, mut panel_node)) = panel_q.single_mut() else {
-        return;
-    };
-    panel_node.display = if visible {
-        Display::Flex
-    } else {
-        Display::None
-    };
-    if !visible {
-        return;
-    }
-
-    let font = &ui_font.0;
-    commands.entity(panel_entity).with_children(|panel| {
-        spawn_prompt_body(
-            panel,
-            font,
-            &prompt.text,
-            prompt.cursor,
-            &candidates,
-            selected,
-            InsertPromptEntity,
-        );
-    });
-}
-
 /// The prompt's suggestion rows, windowed around the highlight. Shared by the
 /// prompt that creates nodes and the ones that change a property: the rows are
 /// the same rows, only the container differs — which is why this takes no
@@ -3425,9 +3578,13 @@ fn spawn_prompt_hint(options: &mut ChildSpawnerCommands, font: &Handle<Font>, te
         });
 }
 
-// ── Node editor UI ──────────────────────────────────────────
+// ── Editor panel UI ─────────────────────────────────────────
 
-fn spawn_node_editor_panel(mut commands: Commands) {
+/// The panel's frame, spawned once and never taken down. Empty at startup —
+/// `sync_editor_panel` fills it. `Button` on the root so `pick_nodes`'
+/// `over_ui` test covers it and a click on the panel doesn't move the caret to
+/// whatever cell lies behind it.
+fn spawn_editor_panel(mut commands: Commands) {
     commands.spawn((
         Node {
             position_type: PositionType::Absolute,
@@ -3443,49 +3600,40 @@ fn spawn_node_editor_panel(mut commands: Commands) {
         },
         BackgroundColor(Color::srgba(0.10, 0.10, 0.16, 0.9)),
         Button,
-        NodeEditorPanel,
+        EditorPanel,
     ));
 }
 
 #[derive(Default, PartialEq, Eq, Clone)]
-struct NodeEditorFingerprint {
-    /// The node and the one property the addressed cell names. Moving between
-    /// two cells of the *same* node changes the property, which is why this is
-    /// not keyed on the node alone.
-    target: Option<(model::node::Id, EditTarget)>,
-    /// What that property says right now. The panel echoes it outside INSERT,
-    /// and a commit can change it under a standing panel.
-    value: String,
-    /// The prompt's text, cursor and highlight, but only while the panel is the
-    /// one drawing it. That is also the bit that catches the NORMAL→INSERT
-    /// switch, where nothing else in here moves.
+struct EditorPanelFingerprint {
+    /// The whole drawn view, values included — every row's text is in here, so
+    /// a commit that changes one under a standing panel moves the fingerprint.
+    subject: Option<PanelSubject>,
+    /// Which row the caret stands on. Moving between two cells of the *same*
+    /// node changes only this, which is why it is not folded into the subject.
+    focus: Option<usize>,
+    /// The prompt's text, cursor and highlight, but only while the panel is
+    /// drawing it. That is also the bit that catches the NORMAL→INSERT switch,
+    /// where nothing else in here moves.
     prompt: Option<(String, usize, Option<usize>)>,
     candidates: Vec<Suggestion>,
     visible: bool,
 }
 
-/// What the panel calls the node, and what it calls the one property the
-/// addressed cell names. A total function of the target, so the panel needs no
-/// second look at the node to write its heading.
-fn target_labels(target: &EditTarget) -> (&'static str, &'static str) {
-    match target {
-        EditTarget::SourceName => ("Source", "Name"),
-        EditTarget::SourceType => ("Source", "Type"),
-        EditTarget::ConstantValue => ("Constant", "Value"),
-        EditTarget::CastType => ("TypeCast", "Type"),
-        EditTarget::PatternType => ("Pattern", "Type"),
-        EditTarget::TunnelType => ("Tunnel", "Type"),
-    }
-}
-
-/// The panel beside the caret: the kind of node the caret stands on, and the
-/// one property its cell names — as a prompt while INSERT is typing into it,
-/// and as plain text otherwise.
+/// The panel beside the caret: the node the caret stands on, every property
+/// that node has, and the addressed one picked out — outlined in NORMAL, typed
+/// into in INSERT.
 ///
-/// One row, never two. A cell names one property, so there is never a second
-/// one to show; the panel that used to offer a node's type and its value at the
-/// same time is what the cell layout exists to replace.
-fn sync_node_editor_ui(
+/// One panel and not two. It also carries the create prompt, because a cell
+/// that names no property is still a cell of the same volume, and standing
+/// there is still standing somewhere: on the gap between two arms of a Match it
+/// is the row that would open, and on an empty cell it is the panel's whole
+/// content.
+///
+/// Sole writer of the panel's `display`, so the start menu and the modals are
+/// folded in here rather than left to `EditorChrome`; contents are respawned
+/// only when the fingerprint moves.
+fn sync_editor_panel(
     mut commands: Commands,
     state: Res<GraphState>,
     pick: Res<PickState>,
@@ -3495,20 +3643,25 @@ fn sync_node_editor_ui(
     mode: Res<EditorMode>,
     prompt: Res<InsertPrompt>,
     ui_font: Res<UiFont>,
-    mut panel_q: Query<(Entity, &mut Node), With<NodeEditorPanel>>,
-    editor_children_q: Query<Entity, With<NodeEditorEntity>>,
-    mut cache: Local<NodeEditorFingerprint>,
+    mut panel_q: Query<(Entity, &mut Node), With<EditorPanel>>,
+    panel_children_q: Query<Entity, With<EditorPanelEntity>>,
+    mut cache: Local<EditorPanelFingerprint>,
 ) {
-    let target = match insert_target(&state, &pick) {
-        InsertTarget::Edit(id, edit) => Some((id, edit)),
-        // A cell that names no property has no panel. What INSERT does there is
-        // build, and the create prompt draws itself — in this panel's very
-        // rectangle, which the two can share because this `match` is what
-        // decides between them: a cell either names a property or it doesn't.
-        InsertTarget::Create => None,
-    };
-    let visible =
-        target.is_some() && !start_menu.showing && !is_evaluating(&eval) && !screenshot.active();
+    let subject = panel_subject(&state, &pick);
+    let here = caret_row_address(&state, &pick);
+    let focus = subject
+        .as_ref()
+        .and_then(|s| s.rows.iter().position(|row| row.address == here));
+    // Where the caret's cell is not a row the panel drew — an empty cell, or a
+    // hole in a node that names nothing — the create prompt stands on its own
+    // at the foot of the panel instead of inside a row.
+    let loose_prompt =
+        *mode == EditorMode::Insert && focus.is_none() && matches!(here, RowAddress::ArmGap(_));
+    let visible = (subject.is_some() || loose_prompt)
+        && !start_menu.showing
+        && !modal_is_open(&eval)
+        && !is_evaluating(&eval)
+        && !screenshot.active();
     let editing = visible && *mode == EditorMode::Insert;
     let candidates = if editing {
         prompt_candidates(&state, &pick, &prompt.text)
@@ -3516,14 +3669,10 @@ fn sync_node_editor_ui(
         Vec::new()
     };
     let selected = clamped_selection(&candidates, prompt.selected);
-    let value = target
-        .as_ref()
-        .map(|(id, edit)| property_text(&state, id, edit))
-        .unwrap_or_default();
 
-    let fp = NodeEditorFingerprint {
-        target: target.clone(),
-        value: value.clone(),
+    let fp = EditorPanelFingerprint {
+        subject: subject.clone(),
+        focus,
         prompt: editing.then(|| (prompt.text.clone(), prompt.cursor, selected)),
         candidates: candidates.clone(),
         visible,
@@ -3533,7 +3682,7 @@ fn sync_node_editor_ui(
     }
     *cache = fp;
 
-    for e in editor_children_q.iter() {
+    for e in panel_children_q.iter() {
         commands.entity(e).despawn();
     }
 
@@ -3545,38 +3694,116 @@ fn sync_node_editor_ui(
     } else {
         Display::None
     };
-    let Some((_, edit)) = target else {
-        return;
-    };
     if !visible {
         return;
     }
 
-    let (kind_label, property_label) = target_labels(&edit);
     let font = &ui_font.0;
     commands.entity(panel_entity).with_children(|panel| {
-        spawn_editor_label(panel, font, kind_label);
-        spawn_labeled_row(panel, font, property_label, |slot| {
+        if let Some(subject) = &subject {
+            spawn_editor_label(panel, font, &subject.heading);
+            for (index, row) in subject.rows.iter().enumerate() {
+                let focused = focus == Some(index);
+                if matches!(row.address, RowAddress::ArmGap(_)) {
+                    // A gap is a row at every arm for `TAB`'s sake; for the eye
+                    // it opens only where the caret is standing in it.
+                    if focused {
+                        spawn_arm_gap(panel, font, editing, &prompt, &candidates, selected);
+                    }
+                    continue;
+                }
+                spawn_labeled_row(panel, font, &row.label, |slot| {
+                    if focused && editing {
+                        spawn_prompt_body(
+                            slot,
+                            font,
+                            &prompt.text,
+                            prompt.cursor,
+                            &candidates,
+                            selected,
+                        );
+                    } else if focused {
+                        // The same box INSERT types in, only quiet: nothing
+                        // moves on the switch, the border lights up and the
+                        // text starts answering.
+                        slot.spawn((
+                            editor_text_input_node(),
+                            BackgroundColor(Color::srgba(0.06, 0.06, 0.12, 0.95)),
+                            BorderColor::all(Color::srgb(0.24, 0.40, 0.46)),
+                        ))
+                        .with_children(|boxed| {
+                            boxed.spawn((
+                                Text::new(row.value.clone()),
+                                text_font(font, 14.0),
+                                TextColor(Color::srgb(0.91, 0.89, 0.87)),
+                            ));
+                        });
+                    } else {
+                        // Dimmer than the addressed row, and no box: it is here
+                        // to be read, and reaching it is what `TAB` is for.
+                        slot.spawn((
+                            Text::new(row.value.clone()),
+                            text_font(font, 14.0),
+                            TextColor(Color::srgb(0.64, 0.63, 0.62)),
+                        ));
+                    }
+                });
+            }
+        }
+        if loose_prompt {
+            panel
+                .spawn((
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        ..default()
+                    },
+                    EditorPanelEntity,
+                ))
+                .with_children(|column| {
+                    spawn_prompt_body(
+                        column,
+                        font,
+                        &prompt.text,
+                        prompt.cursor,
+                        &candidates,
+                        selected,
+                    );
+                });
+        }
+    });
+}
+
+/// The place a new arm would go: the line it would open on, and in INSERT the
+/// prompt that builds it — which on this cell offers nothing but `Pattern`.
+fn spawn_arm_gap(
+    panel: &mut ChildSpawnerCommands,
+    font: &Handle<Font>,
+    editing: bool,
+    prompt: &InsertPrompt,
+    candidates: &[Suggestion],
+    selected: Option<usize>,
+) {
+    panel
+        .spawn((
+            Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(4.0),
+                ..default()
+            },
+            EditorPanelEntity,
+        ))
+        .with_children(|gap| {
+            gap.spawn((
+                Node {
+                    height: Val::Px(1.0),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.133, 0.827, 0.933)),
+            ));
             if editing {
-                spawn_prompt_body(
-                    slot,
-                    font,
-                    &prompt.text,
-                    prompt.cursor,
-                    &candidates,
-                    selected,
-                    NodeEditorEntity,
-                );
-            } else {
-                slot.spawn((
-                    Text::new(value.clone()),
-                    text_font(font, 14.0),
-                    TextColor(Color::srgb(0.91, 0.89, 0.87)),
-                    NodeEditorEntity,
-                ));
+                spawn_prompt_body(gap, font, &prompt.text, prompt.cursor, candidates, selected);
             }
         });
-    });
 }
 
 fn spawn_editor_label(panel: &mut ChildSpawnerCommands, font: &Handle<Font>, text: &str) {
@@ -3584,7 +3811,7 @@ fn spawn_editor_label(panel: &mut ChildSpawnerCommands, font: &Handle<Font>, tex
         Text::new(text),
         text_font(font, 15.0),
         TextColor(Color::srgb(0.75, 0.75, 0.9)),
-        NodeEditorEntity,
+        EditorPanelEntity,
     ));
 }
 
@@ -3602,30 +3829,32 @@ fn spawn_labeled_row(
                 column_gap: Val::Px(8.0),
                 ..default()
             },
-            NodeEditorEntity,
+            EditorPanelEntity,
         ))
         .with_children(|row| {
             row.spawn((
                 Text::new(label.to_string()),
                 text_font(font, 13.0),
                 TextColor(Color::srgb(0.6, 0.6, 0.7)),
+                // A label is one word and stays one line. `min_width` and not
+                // `width`, because an arm's number grows with the arm count and
+                // no fixed column is provably wide enough: the short labels
+                // still line up on the same edge they always did, and a long
+                // one takes the room it needs instead of breaking in half.
+                TextLayout::new_with_no_wrap(),
                 Node {
-                    width: Val::Px(70.0),
+                    min_width: Val::Px(70.0),
                     flex_shrink: 0.0,
                     ..default()
                 },
-                NodeEditorEntity,
             ));
-            row.spawn((
-                Node {
-                    flex_grow: 1.0,
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(6.0),
-                    ..default()
-                },
-                NodeEditorEntity,
-            ))
+            row.spawn(Node {
+                flex_grow: 1.0,
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(6.0),
+                ..default()
+            })
             .with_children(widget);
         });
 }
@@ -3646,10 +3875,10 @@ fn editor_text_input_node() -> Node {
 /// The prompt itself: the line being typed with the caret drawn at the cursor,
 /// and the suggestion rows under it.
 ///
-/// Shared by the prompt that creates nodes and the one that changes a property
-/// — they are the same widget, and only the container and its marker differ,
-/// because the two are despawned by two different syncs and a row tagged for
-/// the other one would be swept away by a rebuild its sync never hears about.
+/// The same widget wherever it stands — in a property's row, on the line where
+/// an arm would open, or alone in a panel that is about no node. It carries no
+/// marker of its own, for the reason `spawn_prompt_rows` carries none: whatever
+/// holds it is already tagged, and `despawn` takes its children with it.
 fn spawn_prompt_body(
     parent: &mut ChildSpawnerCommands,
     font: &Handle<Font>,
@@ -3657,26 +3886,21 @@ fn spawn_prompt_body(
     cursor: usize,
     candidates: &[Suggestion],
     selected: Option<usize>,
-    marker: impl Bundle + Clone,
 ) {
     parent
-        .spawn((
-            Node {
-                flex_direction: FlexDirection::Column,
-                flex_grow: 1.0,
-                min_width: Val::Px(0.0),
-                row_gap: Val::Px(2.0),
-                ..default()
-            },
-            marker.clone(),
-        ))
+        .spawn(Node {
+            flex_direction: FlexDirection::Column,
+            flex_grow: 1.0,
+            min_width: Val::Px(0.0),
+            row_gap: Val::Px(2.0),
+            ..default()
+        })
         .with_children(|column| {
             column
                 .spawn((
                     editor_text_input_node(),
                     BackgroundColor(Color::srgba(0.06, 0.06, 0.12, 0.95)),
                     BorderColor::all(Color::srgb(0.133, 0.827, 0.933)),
-                    marker.clone(),
                 ))
                 .with_children(|row| {
                     let (before, after) = text.split_at(cursor);
@@ -3705,7 +3929,6 @@ fn spawn_prompt_body(
                         ..default()
                     },
                     BackgroundColor(Color::srgba(0.08, 0.08, 0.14, 0.98)),
-                    marker,
                 ))
                 .with_children(|options| {
                     spawn_prompt_rows(options, font, candidates, selected);
@@ -6420,7 +6643,7 @@ impl Default for DiagnosticsOpen {
 struct DiagnosticsPanel;
 
 /// On every row and heading the panel rebuilds, so the sweep that clears them
-/// cannot reach the other panels' rows. Same reason `NodeEditorEntity` exists.
+/// cannot reach the other panels' rows. Same reason `EditorPanelEntity` exists.
 #[derive(Component)]
 struct DiagnosticsEntity;
 
@@ -7602,6 +7825,30 @@ fn handle_editor_keys(
                     break;
                 }
             }
+            // TAB walks the panel's rows, and the caret walks with it — a row
+            // and a cell are one address seen from two sides. Both modes,
+            // because the panel stands in both; in INSERT what was typed and
+            // not committed falls away with the move, the same as on `Escape`,
+            // and `sync_prompt_seed` opens the row it arrives on.
+            (_, bevy::input::keyboard::Key::Tab) if !ev.repeat => {
+                let Some(subject) = panel_subject(&state, &pick) else {
+                    continue;
+                };
+                let here = caret_row_address(&state, &pick);
+                let Some(cell) = tab_step(&subject, &here, shift) else {
+                    continue;
+                };
+                let wanted = state.root_graph().clamp_to_volume(cell);
+                if wanted != pick.selected_pos {
+                    pick.selected_pos = wanted;
+                    // The caret is a scene entity, so where it stands is drawn
+                    // rather than moved.
+                    rebuild.0 = true;
+                    // The rest of the batch was struck against the cell the
+                    // caret was standing on.
+                    break;
+                }
+            }
             (EditorMode::Normal, bevy::input::keyboard::Key::Character(s)) if s.as_str() == "i" => {
                 prompt.clear();
                 *mode = EditorMode::Insert;
@@ -7762,6 +8009,8 @@ fn handle_editor_keys(
                     {
                         if let Some(outcome) = apply_prompt_action(&mut state, &mut pick, &action) {
                             commit_outcome(
+                                &state,
+                                &mut pick,
                                 outcome,
                                 &mut prompt,
                                 &mut pending,
@@ -8269,8 +8518,7 @@ fn main() {
                 spawn_ui,
                 spawn_view_bar,
                 spawn_selection_display,
-                spawn_node_editor_panel,
-                spawn_insert_prompt_panel,
+                spawn_editor_panel,
                 spawn_run_panel,
                 spawn_fps_display,
                 spawn_breadcrumb_display,
@@ -8393,12 +8641,11 @@ fn main() {
         )
         .add_systems(
             Update,
-            (sync_node_editor_ui, sync_insert_prompt_ui)
-                .chain()
-                // Both panels draw what was typed this frame, so they have to
-                // run after the keys landed and after the seed that follows
-                // them — otherwise a prompt shows the previous frame's text
-                // every other frame.
+            sync_editor_panel
+                // The panel draws what was typed this frame, so it has to run
+                // after the keys landed and after the seed that follows them —
+                // otherwise the prompt shows the previous frame's text every
+                // other frame.
                 .after(sync_prompt_seed),
         )
         .run();

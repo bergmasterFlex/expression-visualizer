@@ -357,6 +357,18 @@ impl AABB {
         }
     }
 
+    /// Do the two boxes share at least one cell? Inclusive on both faces, the
+    /// same way `contains` is: these are cells and not real intervals, so
+    /// touching faces are the same cell and not a shared boundary.
+    pub fn intersects(&self, other: &AABB) -> bool {
+        self.min.x <= other.max.x
+            && other.min.x <= self.max.x
+            && self.min.y <= other.max.y
+            && other.min.y <= self.max.y
+            && self.min.z <= other.max.z
+            && other.min.z <= self.max.z
+    }
+
     pub fn contains(&self, p: IVec3) -> bool {
         p.x >= self.min.x
             && p.x <= self.max.x
@@ -1406,18 +1418,33 @@ impl LayoutGraph {
     }
 
     /// Push external nodes out of every multi-cell node footprint, bottom-up.
-    /// Applies to any node whose `node_footprint` has volume > 1 — matches
-    /// and multi-input function calls. Recurses into `sub_layouts` first so
-    /// inner owners settle before their container measures its own footprint.
-    /// At each level, for every such owner: scan `layout_nodes` for
-    /// non-related nodes whose rounded position falls inside the footprint
-    /// and bump them along the axis with the smallest exit distance — +Y for
-    /// Y-overlap, ±X toward the near footprint edge, +Z toward the sub-sink
-    /// side (never −Z; that side faces the parent wall). Every push target is
-    /// clamped to the non-negative octant, so an intruder on the low-X side of
-    /// a footprint touching x=0 is pushed out the high side instead. Uses
-    /// `move_node_delta` for each bump so cascading collisions resolve
-    /// automatically. Iterates until stable (128-step cap).
+    /// Applies to any node whose `node_footprint` has volume > 1, which is
+    /// nearly all of them: a match, a multi-input call, and equally the two
+    /// cells a Tunnel or a Constant claims for what it declares and the anchor
+    /// behind it. Recurses into `sub_layouts` first, so inner owners settle
+    /// before their container measures its own footprint.
+    ///
+    /// At each level, for every such owner: scan `layout_nodes` for non-related
+    /// nodes standing inside the footprint and bump them along the axis with
+    /// the smallest exit distance — +Y for Y-overlap, ±X toward the near
+    /// footprint edge, +Z toward the sub-sink side (never −Z; that side faces
+    /// the parent wall). Every push target is clamped to the non-negative
+    /// octant, so an intruder on the low-X side of a footprint touching x=0 is
+    /// pushed out the high side instead. Uses `move_node_delta` for each bump
+    /// so cascading collisions resolve automatically. Iterates until stable
+    /// (128-step cap).
+    ///
+    /// *Standing inside* means the node's own position, not its cells, and the
+    /// asymmetry is the point: a position is a node's address, and a node is
+    /// only ever built on a free cell — so what was just built keeps the place
+    /// it was asked for and what was already there gives way, rather than the
+    /// new node being shouldered off to somewhere nobody pointed at.
+    ///
+    /// The one exception is an owner that is an entry row, a Source or a
+    /// Tunnel. Those are pinned to Y=0, Z=0 and cannot step aside for anyone,
+    /// so against them a single cell reaching in is enough — which is what a
+    /// call does, one cell per input, when it stands beside one and lays an
+    /// input across it. That one steps sideways rather than going out the back.
     ///
     /// Between the recursion and the intruder pass, every Match at this level
     /// re-spaces its arms (`respace_match_patterns`). By then the branches
@@ -1470,6 +1497,17 @@ impl LayoutGraph {
             } else {
                 vec![]
             };
+            // Whether a cell reaching into this owner is enough to be pushed
+            // out of it, or whether it takes standing in it — see the test
+            // below. True for the two kinds that are an entry row: a Source in
+            // the root scope, a Tunnel one scope in.
+            let entry_row_owner = matches!(
+                layout.graph.nodes.get(owner_id),
+                Some(
+                    crate::model::node::ENode::Source { .. }
+                        | crate::model::node::ENode::Tunnel { .. }
+                )
+            );
             for _ in 0..128 {
                 let Some(bbox) = layout.node_footprint(owner_id) else {
                     break;
@@ -1493,26 +1531,53 @@ impl LayoutGraph {
                     ) {
                         return None;
                     }
-                    let p = ln.pos.round().as_ivec3();
-                    if bbox.contains(p) {
-                        Some((id.clone(), p))
+                    // Two tests, and which one applies is the owner's answer.
+                    //
+                    // A node whose own position stands inside the footprint is
+                    // in the wrong place outright, and that is the rule for
+                    // every owner. It is also an asymmetric rule, deliberately:
+                    // a position is a node's address, a new node is only ever
+                    // built on a free cell, and so what is built stays where it
+                    // was asked for and what was already there gives way. A
+                    // node that merely reaches in with a cell is *not* in the
+                    // wrong place by that rule — both nodes stand on free cells
+                    // and there is nothing to choose between them.
+                    //
+                    // Unless what it reaches into cannot step aside. The entry
+                    // row is furniture — it is where a scope takes its values
+                    // in, and it is pinned to Y=0, Z=0 for exactly that reason
+                    // — so nothing may lie across it, and since it cannot move
+                    // out of the way, the other one does.
+                    let ipos = ln.pos.round().as_ivec3();
+                    let ibox = layout.node_footprint(id)?;
+                    let inside = bbox.contains(ipos);
+                    if inside || (entry_row_owner && bbox.intersects(&ibox)) {
+                        Some((id.clone(), inside, ipos, ibox))
                     } else {
                         None
                     }
                 });
-                let Some((intruder_id, ipos)) = intruder else {
+                let Some((intruder_id, inside, ipos, ibox)) = intruder else {
                     break;
                 };
+                // What the exit is measured from: the cell the node stands on,
+                // where standing there is what is in the way; its whole extent,
+                // where the overlap is a cell of it reaching across a line its
+                // position is nowhere near. Clearing the first is the shorter
+                // move of the two, and it is the one the layout has always
+                // made.
+                let from = if inside { AABB::point(ipos) } else { ibox };
                 // Exit toward the near X edge, unless that would leave the
                 // non-negative octant — then out the far edge.
                 let center_x = (bbox.min.x + bbox.max.x) / 2;
-                let push_x = if ipos.x <= center_x && bbox.min.x - 1 >= 0 {
-                    bbox.min.x - 1 - ipos.x
+                let span_x = from.max.x - from.min.x;
+                let push_x = if from.min.x <= center_x && bbox.min.x - 1 - span_x >= 0 {
+                    bbox.min.x - 1 - from.max.x
                 } else {
-                    bbox.max.x + 1 - ipos.x
+                    bbox.max.x + 1 - from.min.x
                 };
-                let push_y = bbox.max.y + 1 - ipos.y;
-                let push_z = bbox.max.z + 1 - ipos.z;
+                let push_y = bbox.max.y + 1 - from.min.y;
+                let push_z = bbox.max.z + 1 - from.min.z;
                 // Both kinds that stand on an entry row are pinned to Y=0,
                 // Z=0, so only an X-push can succeed. Offering them any other
                 // direction would have `move_node_delta` refuse it and the
@@ -1530,17 +1595,28 @@ impl LayoutGraph {
                 // cannot be carried out, and retrying it would burn the
                 // iteration cap and leave the intruder inside the footprint.
                 let z_blocked = layout.sink_z().is_some_and(|s| bbox.max.z + 1 >= s);
-                // Priority: Z (deeper) → X (sideways) → Y (downward). Y is a
-                // last resort because it crosses row boundaries; XZ keeps
-                // the intruder on the same floor. Sideways is the exit that
-                // always exists: `push_x` is never zero and its target is
+                // Standing *in* a footprint and merely reaching into it are
+                // two different situations, and the way out of them is not the
+                // same. One that is inside comes out the back: it sits where
+                // the owner's body is, and deeper is where the dataflow already
+                // points. One that only reaches in stands beside the owner with
+                // an arm across the line, and stepping sideways is the whole of
+                // what it needs.
+                //
+                // Priority for one standing inside: Z (deeper) → X (sideways)
+                // → Y (downward), and for one only reaching in, X first. Y is
+                // a last resort either way because it crosses row boundaries;
+                // XZ keeps the intruder on the same floor. Sideways is the exit
+                // that always exists: `push_x` is never zero and its target is
                 // clamped into the non-negative octant.
                 let (best_axis, best_dist) = if is_source {
                     (0u8, push_x)
-                } else if push_z != 0 && !z_blocked {
+                } else if inside && push_z != 0 && !z_blocked {
                     (2u8, push_z)
                 } else if push_x != 0 {
                     (0u8, push_x)
+                } else if push_z != 0 && !z_blocked {
+                    (2u8, push_z)
                 } else {
                     (1u8, push_y)
                 };

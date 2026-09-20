@@ -131,9 +131,17 @@ pub fn check(root: &crate::layout::LayoutGraph, decls: &FunctionDeclarations) ->
             // outermost scope and is never wired to anything, and a Pattern is
             // reached through its Match rather than through an edge — neither
             // is dangling for not being on the sink's path.
+            //
+            // A BranchSource is the third, and for a reason of its own: it is
+            // created with its branch rather than by anyone, and a branch is
+            // free not to want the matched value at all — one that builds its
+            // result from a Tunnel or a literal simply never reads it. Unused
+            // is the normal case there, not a mistake to report.
             if !matches!(
                 node,
-                crate::model::node::ENode::Root { .. } | crate::model::node::ENode::Pattern { .. }
+                crate::model::node::ENode::Root { .. }
+                    | crate::model::node::ENode::Pattern { .. }
+                    | crate::model::node::ENode::BranchSource { .. }
             ) {
                 out.push(Diagnostic {
                     severity: Severity::Warning,
