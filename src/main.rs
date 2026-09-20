@@ -427,12 +427,8 @@ struct SceneEntity;
 struct DeleteNodeButton;
 #[derive(Component)]
 struct HamburgerButton;
-/// The one button left of the six former "Add …" ones: it only enters INSERT,
-/// where the kind is typed rather than picked.
-#[derive(Component)]
-struct AddNodeButton;
-
-/// Root of the INSERT-mode prompt, which stands in the "Add" button's slot.
+/// Root of the INSERT-mode prompt, on the left edge under the "Delete Node"
+/// button.
 #[derive(Component)]
 struct InsertPromptPanel;
 
@@ -442,8 +438,8 @@ struct InsertPromptPanel;
 #[derive(Component, Clone)]
 struct InsertPromptEntity;
 
-/// A clickable suggestion row, so the mouse path the "Add" button opens does
-/// not dead-end at a keyboard-only list.
+/// A clickable suggestion row, so the mouse path into INSERT does not dead-end
+/// at a keyboard-only list.
 #[derive(Component)]
 struct InsertPromptOption(PromptAction);
 
@@ -730,9 +726,15 @@ struct FpsDisplay;
 #[derive(Component)]
 struct BreadcrumbDisplay;
 
-/// UI text showing the current `EditorMode`, in the bottom-right corner.
+/// One half of the mode control on the bottom edge: the mode a click on it
+/// asks for. Which half is on is `EditorMode`'s answer, never the button's.
 #[derive(Component)]
-struct ModeDisplay;
+struct ModeToggle(EditorMode);
+
+/// What stands in the mode control's place while an evaluation runs, when the
+/// editing mode is nobody's to set.
+#[derive(Component)]
+struct EvalModeLabel;
 
 /// Marker for the INSERT-mode caret faces, which blink instead of standing
 /// still like the NORMAL-mode outline.
@@ -1722,12 +1724,6 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
         Vec2::new(12.0, 60.0),
         Display::Flex,
     );
-    // The six "Add …" buttons are gone: what is created is typed at the
-    // prompt that takes this slot in INSERT. The button is the mouse's way in
-    // and does nothing but enter that mode. It hides itself, so unlike the
-    // other buttons it must not also answer to `EditorChrome` — two writers on
-    // one `display` flicker on the transition frame.
-    spawn_insert_mode_button(&mut commands, &ui_font.0, Vec2::new(12.0, 96.0));
 }
 
 /// Marker on the bottom-right box that holds the problem list and the run
@@ -2371,34 +2367,7 @@ fn spawn_ui_button<C: Bundle>(
         });
 }
 
-/// The "Add" button. Same look as `spawn_ui_button` produces, minus
-/// `EditorChrome`: `sync_add_button` is its only writer, so the bulk toggle
-/// must not reach it.
-fn spawn_insert_mode_button(commands: &mut Commands, font: &Handle<Font>, pos: Vec2) {
-    commands
-        .spawn((
-            Button,
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(pos.y),
-                left: Val::Px(pos.x),
-                padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
-                border_radius: BorderRadius::all(Val::Px(6.0)),
-                ..default()
-            },
-            BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
-            AddNodeButton,
-        ))
-        .with_children(|parent| {
-            parent.spawn((
-                Text::new("Add"),
-                text_font(font, 14.0),
-                TextColor(Color::srgb(0.6, 0.6, 0.7)),
-            ));
-        });
-}
-
-/// The INSERT prompt's panel, standing in the "Add" button's slot. Empty at
+/// The INSERT prompt's panel, standing under the "Delete Node" button. Empty at
 /// startup — `sync_insert_prompt_ui` fills it. `Button` on the root so
 /// `pick_nodes`' `over_ui` test covers it and a click on the panel doesn't
 /// move the caret to whatever cell lies behind it, the same reason
@@ -2812,76 +2781,51 @@ fn update_delete_button_visuals(
     }
 }
 
-/// The "Add" button does one thing: enter INSERT. What is created is typed
-/// there, so the button no longer knows about node kinds at all.
-fn handle_add_button(
-    interaction_q: Query<&Interaction, (Changed<Interaction>, With<AddNodeButton>)>,
+/// The mode control's two halves are the mouse's way between the modes, and
+/// each half is the key it stands for: entering is what `i` does, leaving is
+/// what `Escape` does, down to the placeholder a cancelled insert drops.
+fn handle_mode_toggle(
+    interaction_q: Query<(&Interaction, &ModeToggle), Changed<Interaction>>,
     eval: Res<EvalState>,
-    mut mode: ResMut<EditorMode>,
+    mut state: ResMut<GraphState>,
+    mut pick: ResMut<PickState>,
     mut prompt: ResMut<InsertPrompt>,
+    mut pending: ResMut<PendingNode>,
+    mut mode: ResMut<EditorMode>,
     mut rebuild: ResMut<NeedsRebuild>,
 ) {
     if is_evaluating(&eval) {
         return;
     }
-    for interaction in interaction_q.iter() {
-        // Guarded so a press doesn't mark `EditorMode` changed for nothing.
-        if *interaction == Interaction::Pressed && *mode != EditorMode::Insert {
-            *mode = EditorMode::Insert;
-            prompt.clear();
-            // The caret is drawn per mode, and it is a scene entity.
-            rebuild.0 = true;
-        }
-    }
-}
-
-/// The "Add" button's only writer: it shows in NORMAL and steps aside for the
-/// prompt in INSERT, plus the usual hover tint. Folding the start menu and the
-/// modals in here rather than wearing `EditorChrome` keeps it at one writer,
-/// the way `sync_node_editor_ui` does for its panel.
-fn sync_add_button(
-    mode: Res<EditorMode>,
-    start_menu: Res<StartMenu>,
-    eval: Res<EvalState>,
-    screenshot: Res<ScreenshotMode>,
-    mut button_q: Query<
-        (&Interaction, &mut Node, &mut BackgroundColor, &Children),
-        With<AddNodeButton>,
-    >,
-    mut text_color_q: Query<&mut TextColor>,
-) {
-    let visible = *mode == EditorMode::Normal
-        && !start_menu.showing
-        && !modal_is_open(&eval)
-        && !is_evaluating(&eval)
-        && !screenshot.active();
-    let desired = if visible {
-        Display::Flex
-    } else {
-        Display::None
-    };
-    for (interaction, mut node, mut bg, children) in button_q.iter_mut() {
-        if node.display != desired {
-            node.display = desired;
-        }
-        let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
+    for (interaction, toggle) in interaction_q.iter() {
+        // Guarded so a press on the half that is already on doesn't mark
+        // `EditorMode` changed for nothing.
+        if *interaction != Interaction::Pressed || toggle.0 == *mode {
             continue;
-        };
-        match *interaction {
-            Interaction::Hovered | Interaction::Pressed => {
-                bg.0 = Color::srgba(0.2, 0.2, 0.3, 0.95);
-                text_color.0 = Color::srgb(0.85, 0.85, 0.9);
+        }
+        match toggle.0 {
+            EditorMode::Insert => {
+                prompt.clear();
+                *mode = EditorMode::Insert;
+                // The caret is drawn per mode, and it is a scene entity.
+                rebuild.0 = true;
             }
-            Interaction::None => {
-                bg.0 = Color::srgba(0.16, 0.16, 0.22, 0.9);
-                text_color.0 = Color::srgb(0.6, 0.6, 0.7);
+            EditorMode::Normal => {
+                leave_insert_mode(
+                    &mut state,
+                    &mut pick,
+                    &mut prompt,
+                    &mut pending,
+                    &mut mode,
+                    &mut rebuild,
+                );
             }
         }
     }
 }
 
 /// Clicking a suggestion is the same act as `Enter` on it — without this the
-/// "Add" button would hand a mouse user a list they cannot use.
+/// mode control would hand a mouse user a list they cannot use.
 fn handle_insert_prompt_click(
     interaction_q: Query<(&Interaction, &InsertPromptOption), Changed<Interaction>>,
     eval: Res<EvalState>,
@@ -2905,6 +2849,43 @@ fn handle_insert_prompt_click(
             commit_outcome(outcome, &mut prompt, &mut pending, &mut mode, &mut rebuild);
         }
     }
+}
+
+/// Leaving INSERT without committing anything — the one act behind `Escape`
+/// and behind a click on the control's NORMAL half.
+///
+/// What was typed is dropped: there is no half-written name worth keeping. And
+/// where what stands under the caret was built a moment ago and is still
+/// waiting for its one mandatory property, dropping what was typed means
+/// dropping the node: a cancelled insert leaves no placeholder behind, and the
+/// caret goes back to the cell it was standing on.
+///
+/// Says whether it did drop one, which is the one case where the graph a
+/// caller was still holding questions about is gone underneath it.
+fn leave_insert_mode(
+    state: &mut GraphState,
+    pick: &mut PickState,
+    prompt: &mut InsertPrompt,
+    pending: &mut PendingNode,
+    mode: &mut EditorMode,
+    rebuild: &mut NeedsRebuild,
+) -> bool {
+    if let Some(edit) = pending.0.take() {
+        if remove_node(state, &edit.node) {
+            pick.selected_pos = state.root_graph().clamp_to_volume(edit.caret_before);
+            prompt.clear();
+            *mode = EditorMode::Normal;
+            rebuild.0 = true;
+            return true;
+        }
+    }
+    prompt.clear();
+    if *mode != EditorMode::Normal {
+        *mode = EditorMode::Normal;
+        // The caret is drawn per mode, and it is a scene entity.
+        rebuild.0 = true;
+    }
+    false
 }
 
 /// What follows a committed row, whichever key or click committed it.
@@ -6808,14 +6789,29 @@ fn handle_diagnostics_click(
     }
 }
 
-/// The editing mode, centred on the bottom edge.
+/// The editing mode, centred on the bottom edge — a control, not a readout.
 ///
 /// A row spanning the window with its content centred, which is how the run
-/// controls used to sit here: the width of the word can change without anything
-/// having to be measured. `EditorChrome` goes on the row and `ModeDisplay` stays
-/// on the text, so the one that is hidden and the one that is written are two
-/// different nodes.
+/// controls used to sit here: what stands in it can change width without
+/// anything having to be measured. The two halves sit flush against each other
+/// and are rounded only on their outer edge, so the pair reads as one widget
+/// with two states rather than as two buttons. No rule between them: one half
+/// is always on, and the fill it carries draws the seam.
+///
+/// The third child is what stands in the same place while an evaluation runs,
+/// alone and rounded all round.
+///
+/// `EditorChrome` goes on the row and stays off the three inside it —
+/// `sync_mode_toggles` is the only writer of their `display`, and two writers
+/// flicker on the transition frame.
 fn spawn_mode_display(mut commands: Commands, ui_font: Res<UiFont>) {
+    const RADIUS: Val = Val::Px(6.0);
+    let segment = |radius: BorderRadius, display: Display| Node {
+        padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+        border_radius: radius,
+        display,
+        ..default()
+    };
     commands
         .spawn((
             Node {
@@ -6830,12 +6826,40 @@ fn spawn_mode_display(mut commands: Commands, ui_font: Res<UiFont>) {
             EditorChrome,
         ))
         .with_children(|row| {
+            for (mode, label, radius) in [
+                (EditorMode::Normal, "NORMAL", BorderRadius::left(RADIUS)),
+                (EditorMode::Insert, "INSERT", BorderRadius::right(RADIUS)),
+            ] {
+                row.spawn((
+                    Button,
+                    segment(radius, Display::Flex),
+                    BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+                    ModeToggle(mode),
+                ))
+                .with_children(|half| {
+                    half.spawn((
+                        Text::new(label),
+                        text_font(&ui_font.0, 14.0),
+                        TextColor(Color::srgb(0.6, 0.6, 0.7)),
+                    ));
+                });
+            }
+            // A bare `Button` for the same reason the panels carry one: it is
+            // what `pick_nodes`' `over_ui` test sees, so a click that lands on
+            // it doesn't reach the cell behind it.
             row.spawn((
-                Text::new("NORMAL"),
-                text_font(&ui_font.0, 14.0),
-                TextColor(Color::srgb(0.6, 0.6, 0.7)),
-                ModeDisplay,
-            ));
+                Button,
+                segment(BorderRadius::all(RADIUS), Display::None),
+                BackgroundColor(Color::srgba(0.16, 0.16, 0.22, 0.9)),
+                EvalModeLabel,
+            ))
+            .with_children(|panel| {
+                panel.spawn((
+                    Text::new("EVALUATE"),
+                    text_font(&ui_font.0, 14.0),
+                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                ));
+            });
         });
 }
 
@@ -6855,27 +6879,87 @@ fn blink_caret(time: Res<Time>, mut caret_q: Query<&mut Visibility, With<CaretBl
     }
 }
 
-fn update_mode_display(
+/// The mode control's only writer: which half is on, which one the mouse is
+/// over, and whether either is offered at all.
+///
+/// Green stays the colour that means INSERT — it only moves from the word into
+/// the half the word stands in. The half that is already on does not answer to
+/// hover: a click on it does nothing, and a control that lights up under the
+/// cursor promises that it would.
+///
+/// Nothing about the camera here any more. The free camera does suspend the
+/// guarantees the bound one gives, and this used to say so — but the view
+/// control now names the view outright, and it stands in the same row a hand's
+/// width to the left. Two sentences about one fact read as two facts.
+fn sync_mode_toggles(
     mode: Res<EditorMode>,
-    mut text_q: Query<(&mut Text, &mut TextColor), With<ModeDisplay>>,
+    eval: Res<EvalState>,
+    mut toggle_q: Query<
+        (
+            &ModeToggle,
+            &Interaction,
+            &mut Node,
+            &mut BackgroundColor,
+            &Children,
+        ),
+        Without<EvalModeLabel>,
+    >,
+    mut eval_label_q: Query<&mut Node, With<EvalModeLabel>>,
+    mut text_color_q: Query<&mut TextColor>,
 ) {
-    let Ok((mut text, mut color)) = text_q.single_mut() else {
-        return;
+    // An evaluation owns the graph, so it owns the mode with it: neither half
+    // is offered, and the word that stands there instead says whose it is.
+    let evaluating = is_evaluating(&eval);
+    let halves = if evaluating {
+        Display::None
+    } else {
+        Display::Flex
     };
-    let (label, tint) = match *mode {
-        EditorMode::Normal => ("NORMAL", Color::srgb(0.6, 0.6, 0.7)),
-        // Green, and brighter than NORMAL: INSERT is the state that changes
-        // the graph, so it should be the one that catches the eye.
-        EditorMode::Insert => ("INSERT", Color::srgb(0.35, 0.85, 0.55)),
-    };
-    // Nothing about the camera here any more. The free camera does suspend the
-    // guarantees the bound one gives, and this used to say so — but the view
-    // control now names the view outright, and it stands in the same row a
-    // hand's width to the left. Two sentences about one fact read as two facts.
-    if text.0 != label {
-        text.0 = label.to_string();
+    for (toggle, interaction, mut node, mut bg, children) in toggle_q.iter_mut() {
+        if node.display != halves {
+            node.display = halves;
+        }
+        let Ok(mut text_color) = text_color_q.get_mut(children[0]) else {
+            continue;
+        };
+        let (fill, tint) = if toggle.0 == *mode {
+            match toggle.0 {
+                EditorMode::Normal => (
+                    Color::srgba(0.28, 0.28, 0.36, 0.95),
+                    Color::srgb(0.85, 0.85, 0.9),
+                ),
+                // Brighter than NORMAL: INSERT is the state that changes the
+                // graph, so it should be the one that catches the eye.
+                EditorMode::Insert => (
+                    Color::srgba(0.16, 0.34, 0.22, 0.95),
+                    Color::srgb(0.35, 0.85, 0.55),
+                ),
+            }
+        } else {
+            match *interaction {
+                Interaction::Hovered | Interaction::Pressed => (
+                    Color::srgba(0.2, 0.2, 0.3, 0.95),
+                    Color::srgb(0.85, 0.85, 0.9),
+                ),
+                Interaction::None => (
+                    Color::srgba(0.16, 0.16, 0.22, 0.9),
+                    Color::srgb(0.6, 0.6, 0.7),
+                ),
+            }
+        };
+        bg.0 = fill;
+        *text_color = TextColor(tint);
     }
-    *color = TextColor(tint);
+    let desired = if evaluating {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    for mut node in eval_label_q.iter_mut() {
+        if node.display != desired {
+            node.display = desired;
+        }
+    }
 }
 
 fn spawn_breadcrumb_display(mut commands: Commands, ui_font: Res<UiFont>) {
@@ -7593,30 +7677,20 @@ fn handle_editor_keys(
         }
         match (*mode, &ev.logical_key) {
             (_, bevy::input::keyboard::Key::Escape) => {
-                // Escape leaves INSERT outright and drops what was typed —
-                // there is no half-written name worth keeping.
-                //
-                // And where what stands under the caret was built a moment ago
-                // and is still waiting for its one mandatory property, dropping
-                // what was typed means dropping the node: a cancelled insert
-                // leaves no placeholder behind, and the caret goes back to the
-                // cell it was standing on.
-                if let Some(edit) = pending.0.take() {
-                    if remove_node(&mut state, &edit.node) {
-                        pick.selected_pos = state.root_graph().clamp_to_volume(edit.caret_before);
-                        prompt.clear();
-                        *mode = EditorMode::Normal;
-                        rebuild.0 = true;
-                        // The rest of the batch was struck against a graph that
-                        // no longer holds what those keys were about.
-                        break;
-                    }
-                }
-                prompt.clear();
-                if *mode != EditorMode::Normal {
-                    *mode = EditorMode::Normal;
-                    // The caret is drawn per mode, and it is a scene entity.
-                    rebuild.0 = true;
+                // Escape leaves INSERT outright, which is the same act the
+                // control's NORMAL half performs.
+                if leave_insert_mode(
+                    &mut state,
+                    &mut pick,
+                    &mut prompt,
+                    &mut pending,
+                    &mut mode,
+                    &mut rebuild,
+                ) {
+                    // A placeholder went with it: the rest of the batch was
+                    // struck against a graph that no longer holds what those
+                    // keys were about.
+                    break;
                 }
             }
             (EditorMode::Normal, bevy::input::keyboard::Key::Character(s)) if s.as_str() == "i" => {
@@ -8302,7 +8376,7 @@ fn main() {
                         // caret comes back a frame late.
                         end_screenshot_mode,
                         handle_delete_node_button,
-                        handle_add_button,
+                        handle_mode_toggle,
                         handle_insert_prompt_click,
                         handle_hamburger_button,
                         handle_start_menu_new_button,
@@ -8313,7 +8387,7 @@ fn main() {
                     )
                         .chain()
                         // A click resolves before the keys of the same frame.
-                        // `handle_add_button` sets the mode and `pick_nodes`
+                        // `handle_mode_toggle` sets the mode and `pick_nodes`
                         // moves the caret, and the keyboard chain projects both
                         // onto the prompt's text at its end — ambiguous, that
                         // projection could run on the state the click was about
@@ -8363,7 +8437,7 @@ fn main() {
                 update_world_labels,
                 update_fps_display,
                 update_breadcrumb_display,
-                update_mode_display,
+                sync_mode_toggles,
                 blink_caret,
                 // Chained: the click may fold the list, and the sync that draws
                 // it has to see the fold in the same frame it was asked for.
@@ -8396,7 +8470,6 @@ fn main() {
                 sync_player_controls,
                 update_step_button_visuals,
                 update_delete_button_visuals,
-                sync_add_button,
                 sync_value_labels,
             )
                 .chain(),
