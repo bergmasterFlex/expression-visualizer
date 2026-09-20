@@ -1385,6 +1385,21 @@ impl LayoutGraph {
 
         let primary_delta = self.jump_delta(&occupancy, &node_id, primary_origin, delta_pos);
 
+        // Layout space is the non-negative octant, and the clamp above speaks
+        // for the moved node alone. Everyone else who moves here moves because
+        // that one asked for it — a sibling arm carried along, a multi-cell
+        // owner riding out of its own cell in the mover's direction — and
+        // nothing clamps those. Stepping out through the origin is a move that
+        // cannot be placed, and no half of it is worth keeping: it is dropped
+        // whole, the way a plan conflict is. Silently, because it is a refusal
+        // and not an anomaly — the same answer the pins above give, and
+        // `settle_footprints` already reads an unchanged position as "refused"
+        // and stops asking.
+        let outside_space = |p: Vec3| {
+            let cell = p.round().as_ivec3();
+            cell.x < 0 || cell.y < 0 || cell.z < 0
+        };
+
         let mut plan: std::collections::HashMap<crate::model::node::Id, Vec3> =
             std::collections::HashMap::new();
         let mut worklist: std::collections::VecDeque<crate::model::node::Id> =
@@ -1395,7 +1410,11 @@ impl LayoutGraph {
                 .get(&id)
                 .map(|ln| ln.pos)
                 .unwrap_or(Vec3::ZERO);
-            plan.insert(id.clone(), origin + d);
+            let target = origin + d;
+            if outside_space(target) {
+                return (self.clone_shape(), primary_origin.round().as_ivec3());
+            }
+            plan.insert(id.clone(), target);
             worklist.push_back(id);
         }
 
@@ -1447,7 +1466,11 @@ impl LayoutGraph {
                     .get(&id)
                     .map(|ln| ln.pos)
                     .unwrap_or(Vec3::ZERO);
-                plan.insert(id.clone(), origin + d);
+                let target = origin + d;
+                if outside_space(target) {
+                    return (self.clone_shape(), primary_origin.round().as_ivec3());
+                }
+                plan.insert(id.clone(), target);
                 worklist.push_back(id);
             }
         }
