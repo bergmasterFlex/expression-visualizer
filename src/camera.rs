@@ -258,7 +258,7 @@ fn orbit_input(
     mut scroll_events: MessageReader<MouseWheel>,
     mut orbit: ResMut<OrbitCamera>,
     mut tween: ResMut<CameraTween>,
-    drag: Res<crate::DragState>,
+    draft: Res<crate::DraftState>,
 ) {
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
 
@@ -295,7 +295,7 @@ fn orbit_input(
     if free
         && mouse_buttons.pressed(MouseButton::Left)
         && total_motion != Vec2::ZERO
-        && drag.active.is_none()
+        && !draft.pointer_active()
     {
         orbit.theta -= total_motion.x * 0.007;
         orbit.phi = (orbit.phi - total_motion.y * 0.007).clamp(0.15, std::f32::consts::PI - 0.15);

@@ -223,6 +223,57 @@ fn anchor_cells(
         .map(|leaf| (IVec3::new(x, leaf as i32, z), role(leaf)))
         .collect()
 }
+
+/// The node-local cells `anchor` claims, read back out of the shape that put
+/// them there.
+///
+/// The inverse of `anchor_cells`, and it has to stay its inverse: the shape is
+/// the one statement about where an anchor is, so this asks the shape rather
+/// than repeating the per-kind Z constants a second time. `InputAnchor`'s
+/// `order_num` is the column index the shape used — a FunctionCall's parameters
+/// are numbered there and every other kind has exactly one input at zero — so
+/// the role can be rebuilt and looked up.
+///
+/// The Tunnel input answers before the lookup, because there is nothing in the
+/// shape to find: see `LayoutGraph::anchor_cells_of` for why it has an address
+/// all the same.
+fn anchor_local_cells(
+    node: &crate::model::node::ENode,
+    shape: &NodeShape,
+    anchor: &crate::model::anchor::Id,
+) -> Option<Vec<IVec3>> {
+    if let crate::model::node::ENode::Tunnel { input_anchor, .. } = node {
+        if input_anchor == anchor {
+            return Some(vec![IVec3::new(0, 0, -1)]);
+        }
+    }
+    let column = match node
+        .anchors()
+        .into_iter()
+        .find(|(id, _)| id == anchor)
+        .map(|(_, kind)| kind)?
+    {
+        crate::model::anchor::EAnchor::Input(input) => Some(input.order_num),
+        crate::model::anchor::EAnchor::Output => None,
+    };
+    let mut cells: Vec<(usize, IVec3)> = shape
+        .cells()
+        .iter()
+        .filter_map(|(cell, role)| match (role, column) {
+            (CellRole::Input { index, leaf }, Some(wanted)) if *index == wanted => {
+                Some((*leaf, *cell))
+            }
+            (CellRole::Output { leaf }, None) => Some((*leaf, *cell)),
+            _ => None,
+        })
+        .collect();
+    if cells.is_empty() {
+        return None;
+    }
+    cells.sort_by_key(|(leaf, _)| *leaf);
+    Some(cells.into_iter().map(|(_, cell)| cell).collect())
+}
+
 #[derive(Debug, Clone)]
 pub struct LayoutEdge {
     pub from_anchor: LayoutAnchor,
@@ -637,6 +688,46 @@ impl LayoutGraph {
         }
         let ln = self.layout_nodes.get(id)?;
         Some(ln.shape.bbox().translated(ln.pos.round().as_ivec3()))
+    }
+
+    /// Every global cell an anchor claims, in row order.
+    ///
+    /// Asked of the root, and answered in the root's coordinates: an anchor is
+    /// reachable from anywhere in the program — an edge may cross into a branch
+    /// — so a scope-local answer would have to be lifted by every caller.
+    ///
+    /// It has to be derived rather than read, because nothing stores it.
+    /// `try_layout_anchor` carries a `pos` that is a stub, and the world
+    /// positions the renderer computes live in a map local to one spawn pass.
+    /// What *is* stored is the node's position and its `NodeShape`, and an
+    /// anchor's cells are the cells of that shape whose role names it.
+    ///
+    /// A Tunnel's input is the exception, and it is answered rather than
+    /// refused. It claims no cell at all: it hangs at node-local `(0, 0, -1)`,
+    /// outside the scope's non-negative address space, which is what keeps the
+    /// caret off it (`clamp_to_volume`). But the caret is not the only thing
+    /// that addresses an anchor — a *target* is addressed too, and a Tunnel
+    /// input is the one way a value crosses into a branch, so it has to be
+    /// aimable. The address it gets is the one the renderer draws it at, so the
+    /// distance measured against it is not a fiction.
+    pub fn anchor_cells_of(&self, anchor: &crate::model::anchor::Id) -> Option<Vec<IVec3>> {
+        let layout_anchor = self.try_layout_anchor(anchor)?;
+        let context = self.context_of_node(&layout_anchor.node_id)?;
+        let graph = self.resolve_context(&context);
+        let layout_node = graph.layout_nodes.get(&layout_anchor.node_id)?;
+        let node = graph.graph.nodes.get(&layout_anchor.node_id)?;
+        let origin = self.scope_offset(&context) + layout_node.pos.round().as_ivec3();
+        let locals = anchor_local_cells(node, &layout_node.shape, anchor)?;
+        Some(locals.into_iter().map(|local| origin + local).collect())
+    }
+
+    /// The cell an anchor is addressed by: its first row, where it begins.
+    ///
+    /// What "how far away is that anchor" means when the question is asked in
+    /// addresses rather than in pixels. One row and not the whole column,
+    /// because a distance wants a point.
+    pub fn anchor_cell(&self, anchor: &crate::model::anchor::Id) -> Option<IVec3> {
+        self.anchor_cells_of(anchor)?.into_iter().next()
     }
 
     /// Build a `grid position -> node id` lookup over all selectable nodes.

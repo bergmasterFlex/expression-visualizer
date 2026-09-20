@@ -112,26 +112,84 @@ pub struct Edge {
     pub source_anchor_id: model::anchor::Id,
 }
 
-/// In-flight drag-to-connect state.
+/// The root of the edge the editor is proposing, as against the ones the graph
+/// holds.
+///
+/// A kind of its own rather than an `Edge`, because what the entity says is
+/// different: `Edge` names the two anchor entities it joins and means "the
+/// graph has this". A draft has no place in the graph yet, and the whole point
+/// of drawing it is that it can still be walked away from.
+#[derive(Component)]
+pub struct DraftEdge;
+
+/// What is aiming a draft edge.
+///
+/// The two ways differ in exactly one thing — what moves the target — so
+/// everything else about a draft is shared between them, down to the rule that
+/// says which anchors it may reach and the one door it is committed through.
+pub enum DraftAim {
+    /// The pointer aims it, by snapping to the nearest candidate on screen.
+    Pointer,
+    /// The caret aims it, by stepping from one candidate to the next.
+    Caret,
+}
+
+/// An edge that is being drawn and has not been made.
 ///
 /// Deliberately holds no `Entity`: `clear_scene` despawns and respawns every
-/// `SceneEntity` on each rebuild, so an entity captured at drag start is
-/// stale the moment anything sets `NeedsRebuild` mid-drag. Anchor identity is
-/// tracked by `AnchorId`, which survives rebuilds.
-pub struct DragInfo {
+/// `SceneEntity` on each rebuild, so an entity captured when the draft began is
+/// stale the moment anything sets `NeedsRebuild`. Anchor identity is tracked by
+/// `model::anchor::Id`, which survives rebuilds — and so is the target, for the
+/// same reason. Neither end holds a world position either: those go stale
+/// across a rebuild too, and the draw pass has them to hand anyway.
+pub struct EdgeDraft {
     pub source_anchor_id: model::anchor::Id,
-    /// `true` if the drag started on an `EAnchor::Output`. Lets the target
-    /// check reject same-kind pairs and lets drag-end store the edge in the
-    /// canonical output → input direction without an graph lookup.
+    /// `true` if the draft began at an `EAnchor::Output`. Lets the candidate
+    /// rule refuse same-kind pairs and lets the commit store the edge in the
+    /// canonical output → input direction without a graph lookup.
     pub source_is_output: bool,
-    pub source_pos: Vec3,
-    pub current_end: Vec3,
+    /// Every global cell the source anchor stands on.
+    ///
+    /// The pointer has to leave them before anything is proposed, and a release
+    /// back inside them is what cancels — one rule stated once, since a draft
+    /// aimed at nothing is a draft with nothing to commit. All of them and not
+    /// just the first: an anchor is as tall as its type has rows, and letting
+    /// go on its second row is letting go on the anchor.
+    pub source_cells: Vec<IVec3>,
     pub target_anchor_id: Option<model::anchor::Id>,
+    pub aim: DraftAim,
 }
 
 #[derive(Resource, Default)]
-pub struct DragState {
-    pub active: Option<DragInfo>,
+pub struct DraftState {
+    pub active: Option<EdgeDraft>,
+}
+
+impl DraftState {
+    /// Whether the pointer is the one aiming. The camera asks, because a drag
+    /// with the mouse is what must not also orbit — a draft the keyboard is
+    /// aiming leaves the mouse free.
+    pub fn pointer_active(&self) -> bool {
+        matches!(
+            self.active,
+            Some(EdgeDraft {
+                aim: DraftAim::Pointer,
+                ..
+            })
+        )
+    }
+
+    /// The edge the draft stands for, in the direction edges are stored.
+    /// `None` while it is aimed at nothing.
+    pub fn wiring(&self) -> Option<(model::anchor::Id, model::anchor::Id)> {
+        let draft = self.active.as_ref()?;
+        let target = draft.target_anchor_id.clone()?;
+        Some(if draft.source_is_output {
+            (draft.source_anchor_id.clone(), target)
+        } else {
+            (target, draft.source_anchor_id.clone())
+        })
+    }
 }
 
 /// Marker for graph node mesh entities (so we can despawn them on rebuild).
@@ -609,14 +667,25 @@ enum EditTarget {
 /// What INSERT mode does at the caret. The mode is one key, but it means
 /// whatever the addressed cell is.
 ///
-/// `Create` is what a cell that names no property falls back to — an empty cell,
-/// an anchor row, a hole in a multi-column node. On an occupied cell that is
-/// already inert, because `kind_allowed` greys every row there; what it keeps
-/// alive is the room-makers, which are the reason to stand on such a cell.
+/// `Create` is what a cell that names nothing falls back to — an empty cell, a
+/// hole in a multi-column node. On an occupied cell that is already inert,
+/// because `kind_allowed` greys every row there; what it keeps alive is the
+/// room-makers, which are the reason to stand on such a cell.
 #[derive(Clone, PartialEq, Eq)]
 enum InsertTarget {
     /// Build something: the prompt offers node kinds, functions and literals.
     Create,
+    /// Wire something: the caret stands on an anchor, and the one thing to do
+    /// there is to draw an edge from it.
+    ///
+    /// This is what `EditTarget`'s rule is the other half of. An anchor is
+    /// where an edge begins, so it cannot also be where a property is answered
+    /// — and having said that, it has to be where an edge *can* be begun, or
+    /// the rule would only have taken something away. The prompt offers no rows
+    /// here and the room-makers go dark: opening a cell behind an anchor is not
+    /// an answer to the question an anchor asks, and `Return` is needed for the
+    /// answer that is.
+    Connect(model::anchor::Id),
     /// Change something that already stands there.
     Edit(model::node::Id, EditTarget),
 }
@@ -649,18 +718,75 @@ fn edit_target_of(node: &model::node::ENode, role: &layout::CellRole) -> Option<
     }
 }
 
+/// Which anchor an anchor cell belongs to.
+///
+/// The mirror of `edit_target_of`, and between them they account for every cell
+/// a node has: one says which property a cell answers, the other which anchor a
+/// cell is part of, and a cell that neither claims is room the node holds open.
+///
+/// No per-kind table here, unlike its twin. The shape numbered the anchors when
+/// it laid them out — `CellRole::Input`'s `index` is the anchor's place in
+/// `input_anchors` — so the role already names the anchor and only has to be
+/// resolved.
+fn anchor_of_role(node: &model::node::ENode, role: &layout::CellRole) -> Option<model::anchor::Id> {
+    match role {
+        layout::CellRole::Output { .. } => node
+            .anchors()
+            .into_iter()
+            .find(|(_, anchor)| matches!(anchor, model::anchor::EAnchor::Output))
+            .map(|(id, _)| id),
+        layout::CellRole::Input { index, .. } => node
+            .input_anchors()
+            .into_iter()
+            .find(|(_, input)| input.order_num == *index)
+            .map(|(id, _)| id),
+        layout::CellRole::Body | layout::CellRole::Name | layout::CellRole::Gap => None,
+    }
+}
+
+/// The anchor the caret stands on, if it stands on one.
+///
+/// `addressed_cell` answers for every node but one. `LayoutGraph::node_at`
+/// passes a Match over, so that standing inside one addresses the arm rather
+/// than the envelope around it — but a Match's own two anchors stand outside
+/// every arm, on cells nothing else claims, and `node_at` answers nothing
+/// there. An anchor the keyboard could not reach would be a hole in the rule
+/// that standing on one means drawing an edge, so where nothing else answers
+/// the Match whose footprint the cell falls in is asked directly.
+///
+/// Narrow by construction: a Match's shape holds its two anchor cells and
+/// nothing else, so `role_at` answers for those two and refuses every other
+/// cell of the envelope — the arms and their volumes included.
+fn anchor_at_caret(state: &GraphState, pick: &PickState) -> Option<model::anchor::Id> {
+    let (layout, local) = state.caret_graph(pick)?;
+    let anchor_of = |id: &model::node::Id| -> Option<model::anchor::Id> {
+        let layout_node = layout.layout_nodes.get(id)?;
+        let role = layout_node
+            .shape
+            .role_at(local - layout_node.pos.round().as_ivec3())?;
+        anchor_of_role(layout.graph.nodes.get(id)?, role)
+    };
+    layout
+        .node_at(local)
+        .and_then(|id| anchor_of(&id))
+        .or_else(|| layout.match_containing(local).and_then(|id| anchor_of(&id)))
+}
+
 fn insert_target(state: &GraphState, pick: &PickState) -> InsertTarget {
-    let Some((id, role)) = addressed_cell(state, pick) else {
-        return InsertTarget::Create;
-    };
-    let Some((layout, _)) = state.caret_graph(pick) else {
-        return InsertTarget::Create;
-    };
-    let Some(node) = layout.graph.nodes.get(&id) else {
-        return InsertTarget::Create;
-    };
-    match edit_target_of(node, &role) {
-        Some(property) => InsertTarget::Edit(id, property),
+    if let Some(((id, role), (layout, _))) =
+        addressed_cell(state, pick).zip(state.caret_graph(pick))
+    {
+        if let Some(property) = layout
+            .graph
+            .nodes
+            .get(&id)
+            .and_then(|node| edit_target_of(node, &role))
+        {
+            return InsertTarget::Edit(id, property);
+        }
+    }
+    match anchor_at_caret(state, pick) {
+        Some(anchor) => InsertTarget::Connect(anchor),
         None => InsertTarget::Create,
     }
 }
@@ -711,6 +837,12 @@ enum RowAddress {
     /// The cell a new arm would be built at — the gap cell of the arm it would
     /// go below. Named by its cell, because there is no node there yet.
     ArmGap(IVec3),
+    /// An anchor cell. No row of the panel stands for one — an anchor answers
+    /// no property, so there is nothing for a row to say about it — and that is
+    /// why it needs a name of its own here rather than falling in with
+    /// `ArmGap`: a gap is where the prompt opens on its own at the foot of the
+    /// panel, and an anchor is where it does not open at all.
+    Connect(model::anchor::Id),
 }
 
 /// One row of the panel: what it says, and the cell the caret stands on to
@@ -781,6 +913,7 @@ fn property_label(target: &EditTarget) -> &'static str {
 fn caret_row_address(state: &GraphState, pick: &PickState) -> RowAddress {
     match insert_target(state, pick) {
         InsertTarget::Edit(id, target) => RowAddress::Property(id, target),
+        InsertTarget::Connect(anchor) => RowAddress::Connect(anchor),
         InsertTarget::Create => RowAddress::ArmGap(pick.selected_pos),
     }
 }
@@ -802,7 +935,24 @@ fn panel_subject(state: &GraphState, pick: &PickState) -> Option<PanelSubject> {
     let origin = root.scope_offset(&scope.path);
     // A Pattern's gap cell belongs to the Pattern, so the caret in the space
     // between two arms lands here too — and is answered with its Match.
-    let id = graph.node_at(scope.local)?;
+    let id = match graph.node_at(scope.local) {
+        Some(id) => id,
+        // A Match's own two anchors stand on cells no arm claims, and `node_at`
+        // passes a Match over precisely so that standing *inside* one addresses
+        // the arm. On those two cells there is no arm to address, and the panel
+        // answers with the Match — standing on its input is standing on it.
+        // Only on those two: a Match's shape holds its anchors and nothing
+        // else, so `role_at` refuses every other cell of the envelope and the
+        // space between arms goes on answering with nothing.
+        None => {
+            let match_id = graph.match_containing(scope.local)?;
+            let layout_node = graph.layout_nodes.get(&match_id)?;
+            layout_node
+                .shape
+                .role_at(scope.local - layout_node.pos.round().as_ivec3())?;
+            return match_subject(state, graph, origin, &match_id);
+        }
+    };
     let node = graph.graph.nodes.get(&id)?;
     match node {
         model::node::ENode::Pattern { parent_match, .. } => {
@@ -1392,6 +1542,7 @@ fn spawn_graph_nodes(
     editor_mode: Res<EditorMode>,
     screenshot: Res<ScreenshotMode>,
     clipping: Res<lod::Clipping>,
+    draft: Res<DraftState>,
 ) {
     // Which volume the caret is in — which is to say which scope, the two being
     // the same question. Fixed for the whole pass: every volume below is graded
@@ -1634,9 +1785,25 @@ fn spawn_graph_nodes(
         });
     }
 
+    // The wiring the editor is proposing, if it is proposing one. Read once
+    // and used twice: the edge it stands for is drawn below, and the edge it
+    // *duplicates* — an input opened on the edge it already carries — is left
+    // out of the loop just here, so the picture holds one ribbon rather than
+    // two in the same place. Which one is left out is the settled one: what
+    // blinks is what is being proposed, and the proposal happens to be what is
+    // already there.
+    let drafted = draft.wiring();
+
     for e in state.root_graph().edges() {
         let src_id = &e.from_anchor.anchor_id;
         let tgt_id = &e.to_anchor.anchor_id;
+
+        if drafted
+            .as_ref()
+            .is_some_and(|(from, to)| from == src_id && to == tgt_id)
+        {
+            continue;
+        }
 
         let Some(&from_world) = anchor_world_positions.get(src_id) else {
             continue;
@@ -1654,21 +1821,9 @@ fn spawn_graph_nodes(
             .unwrap_or(1.0)
             .min(anchor_opacity.get(tgt_id).copied().unwrap_or(1.0));
 
-        let src_type = infer::anchor_type(&flat_graph, src_id, &state.function_declarations)
-            .unwrap_or(infer::EType::Pending);
-        // The row a run settled this edge's source on, if one has. Read once
-        // and used at both ends: the same narrowing has to reach the target's
-        // rows, or a ribbon would leave a row that is no longer drawn or land
-        // on one that is not there.
-        let taken = known.at_output(&flat_graph, src_id);
-        let source_rows = render::drawn_rows(&src_type, taken);
-
-        let curve = edge::EdgeCurve::from_endpoints(from_world, to_world);
-
-        // Spawned before the strands and before anything may leave the loop:
-        // an edge the user wired exists whatever the inferer has to say about
-        // it, and the entity that stands for it should not depend on that
-        // either.
+        // Spawned before the strands and whatever the inferer has to say: an
+        // edge the user wired exists either way, and the entity that stands for
+        // it should not depend on that.
         let edge_root = commands
             .spawn((
                 Edge {
@@ -1681,111 +1836,71 @@ fn spawn_graph_nodes(
                 SceneEntity,
             ))
             .id();
+        spawn_edge_strands(
+            &mut commands,
+            &mut meshes,
+            &mut materials_edge,
+            &flat_graph,
+            &state.function_declarations,
+            &known,
+            src_id,
+            tgt_id,
+            from_world,
+            to_world,
+            edge_root,
+            opacity,
+        );
+    }
 
-        // A source type with no rows — `Pending`, or an anchor the inferer
-        // could not resolve at all — leaves no row for a strand to run along.
-        // Drawn all the same: what is undecided is the type, not the wiring,
-        // and an edge left out reads as an edge never made. One band on the
-        // anchors' own row, wearing the grey `plain_anchor_body` gives either
-        // end, cut across by the pattern that says the type is still open.
-        if source_rows.is_empty() {
-            spawn_pending_ribbon(
+    // The edge the editor is proposing, drawn through the call the wired ones
+    // go through and typed from its source the same way — because what is being
+    // promised is the edge itself. The graph is not touched to draw it, so
+    // nothing re-settles and nothing moves while the far end is walked from
+    // anchor to anchor; only agreeing to it moves the picture.
+    //
+    // It blinks on the caret's own clock, through the `CaretBlink` the caret
+    // faces wear. That rhythm is taken from absolute elapsed time, so the
+    // rebuild each step of the draft costs does not restart it — the draft goes
+    // on blinking evenly while it is being aimed.
+    if let Some((from, to)) = drafted {
+        // An end with no world position is an end inside a volume the grading
+        // has closed over, and a ribbon into a closed box would say something
+        // that cannot be looked at. The same `continue` the wired edges take,
+        // for the same reason — and the case a draft aimed at nothing falls
+        // into as well, which is the Sink asked to reach a program that holds
+        // nothing else.
+        if let (Some(&from_world), Some(&to_world)) = (
+            anchor_world_positions.get(&from),
+            anchor_world_positions.get(&to),
+        ) {
+            let opacity = anchor_opacity
+                .get(&from)
+                .copied()
+                .unwrap_or(1.0)
+                .min(anchor_opacity.get(&to).copied().unwrap_or(1.0));
+            let draft_root = commands
+                .spawn((
+                    DraftEdge,
+                    Transform::IDENTITY,
+                    Visibility::Inherited,
+                    CaretBlink,
+                    SceneEntity,
+                ))
+                .id();
+            spawn_edge_strands(
                 &mut commands,
                 &mut meshes,
                 &mut materials_edge,
+                &flat_graph,
+                &state.function_declarations,
+                &known,
+                &from,
+                &to,
                 from_world,
                 to_world,
-                // A band at both ends: there is nothing to taper into, and a
-                // hairline would spell a value where there is not even a type
-                // yet.
-                whole_row_end(from_world.y, false),
-                whole_row_end(to_world.y, false),
-                Some(edge_root),
+                draft_root,
                 opacity,
             );
-            continue;
-        }
-
-        // A target that constrains nothing renders as tall as what arrives,
-        // so the ribbons must use that same type — otherwise every leaf
-        // would collapse onto the anchor's first row.
-        let tgt_type = infer::anchor_type(&flat_graph, tgt_id, &state.function_declarations)
-            .or_else(|| {
-                infer::incoming_anchor_type(&flat_graph, tgt_id, &state.function_declarations)
-            });
-        let target_rows = tgt_type
-            .as_ref()
-            .map(|t| render::drawn_rows(t, taken))
-            .unwrap_or_default();
-
-        // graph-level literal on the source anchor. When present, the sole
-        // rendered leaf swaps to the thin "value line" style — same rule
-        // the anchor strands follow, via the same lookup.
-        let src_graph_value = infer::anchor_literal(&flat_graph, src_id, &known);
-
-        for (k, leaf) in source_rows.iter() {
-            // Same row offsets the anchor strands use, so each ribbon meets
-            // the strand it continues exactly — the index comes from
-            // `drawn_rows` rather than from the loop, so a narrowed row is met
-            // where the layout still keeps it.
-            let y_src = render::leaf_row_offset(*k);
-            // Which row at the target will accept this strand: the one that
-            // admits it. Asked as subsumption rather than by kind because a
-            // row may be a literal now — a `1` strand belongs on the `1`
-            // row of a `1|2` anchor, not merely on some Integer row.
-            let y_tgt = match target_rows
-                .iter()
-                .find(|(_, target_leaf)| infer::subsumes(target_leaf, leaf))
-            {
-                Some((idx, _)) => render::leaf_row_offset(*idx),
-                // No matching leaf at the target: aim at its first row.
-                None => 0.0,
-            };
-            // A leaf that claims no row of its own — a sum type, or `Pending` —
-            // has no strand to draw.
-            if edge::leaf_kind_of(leaf).is_none() {
-                continue;
-            }
-            // A strand carrying a value is a hairline, a strand carrying a type
-            // is a band. Literally the same question the anchor's own strands ask,
-            // asked through the same function and of the same leaf, so a strand
-            // and the row it lands on cannot end up wearing different shapes.
-            let (height, line_mode) =
-                if render::leaf_is_drawn_as_line(leaf, src_graph_value.as_deref()) {
-                    (edge::RIBBON_LINE_HEIGHT, 1.0)
-                } else {
-                    (render::STRAND_BAND_HEIGHT, 0.0)
-                };
-            let (mesh, arc_total) =
-                edge::build_ribbon_mesh(&curve, from_world.y + y_src, to_world.y + y_tgt, height);
-            commands.spawn((
-                Mesh3d(meshes.add(mesh)),
-                MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
-                    // An edge carries one type from end to end, so both
-                    // colours are the one colour.
-                    band_color_start: render::strand_color(leaf).to_linear(),
-                    band_color_end: render::strand_color(leaf).to_linear(),
-                    time: 0.0,
-                    // Both ends of an ordinary edge wear the same shape, so
-                    // there is nothing for the two line modes to interpolate
-                    // between. The arc length is the real one all the same —
-                    // it is where a fragment *is*, not merely what the modes
-                    // are read against.
-                    line_mode_start: line_mode,
-                    line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
-                    line_mode_end: line_mode,
-                    // Built at a constant height, so the width has nothing to
-                    // ramp between.
-                    height_start: height,
-                    height_end: height,
-                    arc_total,
-                    dash_period: 0.0,
-                    dash_duty: 0.0,
-                    opacity,
-                })),
-                ChildOf(edge_root),
-                SceneEntity,
-            ));
         }
     }
 
@@ -3116,6 +3231,7 @@ fn handle_mode_toggle(
     mut pick: ResMut<PickState>,
     mut prompt: ResMut<InsertPrompt>,
     mut pending: ResMut<PendingNode>,
+    mut draft: ResMut<DraftState>,
     mut mode: ResMut<EditorMode>,
     mut rebuild: ResMut<NeedsRebuild>,
 ) {
@@ -3141,6 +3257,7 @@ fn handle_mode_toggle(
                     &mut pick,
                     &mut prompt,
                     &mut pending,
+                    &mut draft,
                     &mut mode,
                     &mut rebuild,
                 );
@@ -3200,9 +3317,17 @@ fn leave_insert_mode(
     pick: &mut PickState,
     prompt: &mut InsertPrompt,
     pending: &mut PendingNode,
+    draft: &mut DraftState,
     mode: &mut EditorMode,
     rebuild: &mut NeedsRebuild,
 ) -> bool {
+    // An edge being drawn is unmade the way a half-built node is, and by the
+    // same act: leaving INSERT is what cancels whatever INSERT had open. The
+    // pointer's draft goes too — it is the button that would have committed it
+    // and Escape is allowed to overrule a held button.
+    if draft.active.take().is_some() {
+        rebuild.0 = true;
+    }
     if let Some(edit) = pending.0.take() {
         if remove_node(state, &edit.node) {
             pick.selected_pos = state.root_graph().clamp_to_volume(edit.caret_before);
@@ -3295,6 +3420,11 @@ fn commit_outcome(
 fn prompt_candidates(state: &GraphState, pick: &PickState, text: &str) -> Vec<Suggestion> {
     match insert_target(state, pick) {
         InsertTarget::Create => create_candidates(state, pick, text),
+        // A wiring is not a row anything could offer. What the anchor's INSERT
+        // proposes is the blinking edge itself, out in the picture where the
+        // two ends it joins can be seen — a list naming anchors would be the
+        // same statement written worse.
+        InsertTarget::Connect(_) => Vec::new(),
         // A name answers to no list. The one row is the text itself, which
         // keeps what `Return` commits visible in the place it is visible for
         // every other property.
@@ -3878,6 +4008,11 @@ struct EditorPanelFingerprint {
     /// where nothing else in here moves.
     prompt: Option<(String, usize, Option<usize>)>,
     candidates: Vec<Suggestion>,
+    /// Where the edge being drawn has got to, while one is being drawn. Its own
+    /// field because nothing else in here moves when the aim steps: the caret
+    /// has not moved, the node's rows say the same as before, and the panel
+    /// would otherwise stand still while the picture changed under it.
+    connect: Option<String>,
     visible: bool,
 }
 
@@ -3902,6 +4037,7 @@ fn sync_editor_panel(
     screenshot: Res<ScreenshotMode>,
     mode: Res<EditorMode>,
     prompt: Res<InsertPrompt>,
+    draft: Res<DraftState>,
     ui_font: Res<UiFont>,
     mut panel_q: Query<(Entity, &mut Node), With<EditorPanel>>,
     panel_children_q: Query<Entity, With<EditorPanelEntity>>,
@@ -3928,12 +4064,29 @@ fn sync_editor_panel(
         Vec::new()
     };
     let selected = clamped_selection(&candidates, prompt.selected);
+    // Where the edge being drawn is aimed, said the way every other address in
+    // the editor is said. Not a row: a row of the panel names a property, and
+    // an anchor names none — which is the whole reason the caret standing on
+    // one means "wire this" and not "answer that". So it stands under the rows
+    // instead, and only while there is an aim to report.
+    let connect = (editing && matches!(here, RowAddress::Connect(_))).then(|| {
+        draft
+            .active
+            .as_ref()
+            .and_then(|aimed| aimed.target_anchor_id.as_ref())
+            .and_then(|id| state.root_graph().anchor_cell(id))
+            .map(cell_text)
+            // Only the Sink of an otherwise empty program can say this: there
+            // is no producer anywhere for its input to come from.
+            .unwrap_or_else(|| "nothing to reach".to_string())
+    });
 
     let fp = EditorPanelFingerprint {
         subject: subject.clone(),
         focus,
         prompt: editing.then(|| (prompt.text.clone(), prompt.cursor, selected)),
         candidates: candidates.clone(),
+        connect: connect.clone(),
         visible,
     };
     if *cache == fp {
@@ -4008,6 +4161,15 @@ fn sync_editor_panel(
                     }
                 });
             }
+        }
+        if let Some(aim) = &connect {
+            spawn_labeled_row(panel, font, "Edge to", |slot| {
+                slot.spawn((
+                    Text::new(aim.clone()),
+                    text_font(font, 14.0),
+                    TextColor(Color::srgb(0.133, 0.827, 0.933)),
+                ));
+            });
         }
         if loose_prompt {
             panel
@@ -4477,7 +4639,12 @@ fn spawn_confirm_new_modal(commands: &mut Commands, font: &Handle<Font>) {
 fn spawn_controls_modal(commands: &mut Commands, font: &Handle<Font>) {
     let mouse_bindings: &[(&str, &str)] = &[
         ("Left click", "Select node / grid position"),
-        ("Left drag on anchor", "Connect nodes"),
+        (
+            "Left drag from anchor",
+            "Draw an edge — it snaps to the nearest anchor it may reach",
+        ),
+        ("Release on the start anchor", "Cancel the edge being drawn"),
+        ("Right click", "Cancel the edge being drawn"),
         ("Ctrl + Left drag", "Free camera: orbit"),
         ("Ctrl + Right drag", "Free camera: pan"),
         ("Ctrl + Scroll", "Zoom (bound: cell size, free: distance)"),
@@ -4490,16 +4657,27 @@ fn spawn_controls_modal(commands: &mut Commands, font: &Handle<Font>) {
             "Ctrl + Shift + Up/Down",
             "NORMAL: move the selected node vertically",
         ),
-        ("i", "INSERT: build here, or edit what stands here"),
+        (
+            "i",
+            "INSERT: build here, wire the anchor here, or edit what stands here",
+        ),
+        (
+            "Arrow keys, hjkl",
+            "INSERT on an anchor: aim the edge at another anchor",
+        ),
+        (
+            "Shift + Up/Down",
+            "INSERT on an anchor: aim the edge vertically",
+        ),
         ("Up/Down", "INSERT: walk the suggestion list"),
         ("Left/Right, Home/End", "INSERT: move the text cursor"),
         ("Space", "INSERT: open a cell behind the caret"),
         (
             "Return",
-            "INSERT: commit the highlighted row, else open a column (X)",
+            "INSERT: draw the edge, else commit the highlighted row, else open a column (X)",
         ),
         ("Shift + Return", "INSERT: open a row (Y)"),
-        ("Escape", "Leave INSERT"),
+        ("Escape", "Leave INSERT / cancel the edge being drawn"),
     ];
 
     commands
@@ -5613,6 +5791,7 @@ fn rebuild_scene(
     editor_mode: Res<EditorMode>,
     screenshot: Res<ScreenshotMode>,
     clipping: Res<lod::Clipping>,
+    draft: Res<DraftState>,
     mut rebuild: ResMut<NeedsRebuild>,
     _query_scene_entities: Query<Entity, With<SceneEntity>>,
 ) {
@@ -5631,6 +5810,7 @@ fn rebuild_scene(
             editor_mode,
             screenshot,
             clipping,
+            draft,
         );
         rebuild.0 = false;
     }
@@ -5895,6 +6075,150 @@ fn spawn_link_ribbon(
         })),
         SceneEntity,
     ));
+}
+
+/// Everything an edge is made of, from the two anchors it joins.
+///
+/// Shared by the edges the graph holds and by the one the editor is still
+/// proposing. A draft drawn by machinery of its own would be a promise *about*
+/// a picture instead of the picture itself — and the whole reason to draw it at
+/// all is that what is promised can be looked at before it is agreed to.
+///
+/// `parent` is what the strands hang off. The caller owns it, because what the
+/// entity *means* differs: an edge the graph holds carries `Edge`, the draft
+/// carries `DraftEdge` and blinks.
+#[allow(clippy::too_many_arguments)]
+fn spawn_edge_strands(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials_edge: &mut Assets<edge::EdgeMaterial>,
+    flat_graph: &model::term_graph::TermGraph,
+    function_declarations: &std::collections::HashMap<
+        model::function_declaration::FunctionDeclarationId,
+        model::function_declaration::FunctionDeclaration,
+    >,
+    known: &infer::Known,
+    src_id: &model::anchor::Id,
+    tgt_id: &model::anchor::Id,
+    from_world: Vec3,
+    to_world: Vec3,
+    parent: Entity,
+    opacity: f32,
+) {
+    let src_type = infer::anchor_type(flat_graph, src_id, function_declarations)
+        .unwrap_or(infer::EType::Pending);
+    // The row a run settled this edge's source on, if one has. Read once
+    // and used at both ends: the same narrowing has to reach the target's
+    // rows, or a ribbon would leave a row that is no longer drawn or land
+    // on one that is not there.
+    let taken = known.at_output(flat_graph, src_id);
+    let source_rows = render::drawn_rows(&src_type, taken);
+
+    let curve = edge::EdgeCurve::from_endpoints(from_world, to_world);
+
+    // A source type with no rows — `Pending`, or an anchor the inferer
+    // could not resolve at all — leaves no row for a strand to run along.
+    // Drawn all the same: what is undecided is the type, not the wiring,
+    // and an edge left out reads as an edge never made. One band on the
+    // anchors' own row, wearing the grey `plain_anchor_body` gives either
+    // end, cut across by the pattern that says the type is still open.
+    if source_rows.is_empty() {
+        spawn_pending_ribbon(
+            commands,
+            meshes,
+            materials_edge,
+            from_world,
+            to_world,
+            // A band at both ends: there is nothing to taper into, and a
+            // hairline would spell a value where there is not even a type
+            // yet.
+            whole_row_end(from_world.y, false),
+            whole_row_end(to_world.y, false),
+            Some(parent),
+            opacity,
+        );
+        return;
+    }
+
+    // A target that constrains nothing renders as tall as what arrives,
+    // so the ribbons must use that same type — otherwise every leaf
+    // would collapse onto the anchor's first row.
+    let tgt_type = infer::anchor_type(flat_graph, tgt_id, function_declarations)
+        .or_else(|| infer::incoming_anchor_type(flat_graph, tgt_id, function_declarations));
+    let target_rows = tgt_type
+        .as_ref()
+        .map(|t| render::drawn_rows(t, taken))
+        .unwrap_or_default();
+
+    // graph-level literal on the source anchor. When present, the sole
+    // rendered leaf swaps to the thin "value line" style — same rule
+    // the anchor strands follow, via the same lookup.
+    let src_graph_value = infer::anchor_literal(flat_graph, src_id, known);
+
+    for (k, leaf) in source_rows.iter() {
+        // Same row offsets the anchor strands use, so each ribbon meets
+        // the strand it continues exactly — the index comes from
+        // `drawn_rows` rather than from the loop, so a narrowed row is met
+        // where the layout still keeps it.
+        let y_src = render::leaf_row_offset(*k);
+        // Which row at the target will accept this strand: the one that
+        // admits it. Asked as subsumption rather than by kind because a
+        // row may be a literal now — a `1` strand belongs on the `1`
+        // row of a `1|2` anchor, not merely on some Integer row.
+        let y_tgt = match target_rows
+            .iter()
+            .find(|(_, target_leaf)| infer::subsumes(target_leaf, leaf))
+        {
+            Some((idx, _)) => render::leaf_row_offset(*idx),
+            // No matching leaf at the target: aim at its first row.
+            None => 0.0,
+        };
+        // A leaf that claims no row of its own — a sum type, or `Pending` —
+        // has no strand to draw.
+        if edge::leaf_kind_of(leaf).is_none() {
+            continue;
+        }
+        // A strand carrying a value is a hairline, a strand carrying a type
+        // is a band. Literally the same question the anchor's own strands ask,
+        // asked through the same function and of the same leaf, so a strand
+        // and the row it lands on cannot end up wearing different shapes.
+        let (height, line_mode) = if render::leaf_is_drawn_as_line(leaf, src_graph_value.as_deref())
+        {
+            (edge::RIBBON_LINE_HEIGHT, 1.0)
+        } else {
+            (render::STRAND_BAND_HEIGHT, 0.0)
+        };
+        let (mesh, arc_total) =
+            edge::build_ribbon_mesh(&curve, from_world.y + y_src, to_world.y + y_tgt, height);
+        commands.spawn((
+            Mesh3d(meshes.add(mesh)),
+            MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
+                // An edge carries one type from end to end, so both
+                // colours are the one colour.
+                band_color_start: render::strand_color(leaf).to_linear(),
+                band_color_end: render::strand_color(leaf).to_linear(),
+                time: 0.0,
+                // Both ends of an ordinary edge wear the same shape, so
+                // there is nothing for the two line modes to interpolate
+                // between. The arc length is the real one all the same —
+                // it is where a fragment *is*, not merely what the modes
+                // are read against.
+                line_mode_start: line_mode,
+                line_half_thickness: edge::RIBBON_LINE_HALF_THICKNESS_UV,
+                line_mode_end: line_mode,
+                // Built at a constant height, so the width has nothing to
+                // ramp between.
+                height_start: height,
+                height_end: height,
+                arc_total,
+                dash_period: 0.0,
+                dash_duty: 0.0,
+                opacity,
+            })),
+            ChildOf(parent),
+            SceneEntity,
+        ));
+    }
 }
 
 /// Spawn one pending ribbon: the connection is there, the type that would
@@ -7637,6 +7961,8 @@ fn sync_prompt_seed(
     mut prompt: ResMut<InsertPrompt>,
     mut pending: ResMut<PendingNode>,
     mut rebuild: ResMut<NeedsRebuild>,
+    mut draft: ResMut<DraftState>,
+    clipping: Res<lod::Clipping>,
     mut last: Local<Option<(EditorMode, InsertTarget)>>,
 ) {
     let mut target = insert_target(&state, &pick);
@@ -7675,6 +8001,22 @@ fn sync_prompt_seed(
     }
     *last = Some((*mode, target.clone()));
 
+    // A draft the caret was aiming ends here, for the reason a half-built node
+    // does: the cell it was about is not the cell the caret stands on any more.
+    // Only the caret's own — a draft the pointer is aiming belongs to the
+    // button still held down, and the caret move that got here may well be the
+    // click that started it.
+    if matches!(
+        &draft.active,
+        Some(EdgeDraft {
+            aim: DraftAim::Caret,
+            ..
+        })
+    ) {
+        draft.active = None;
+        rebuild.0 = true;
+    }
+
     match (*mode, &target) {
         (EditorMode::Insert, InsertTarget::Edit(id, edit)) => {
             // A node that was built a keystroke ago has nothing to open on, and
@@ -7683,6 +8025,17 @@ fn sync_prompt_seed(
             // `property_text` spells an absent property as the empty string.
             prompt.set_text(property_text(&state, id, edit));
             reselect(&mut prompt, &state, &pick);
+        }
+        // An anchor opens a draft rather than a prompt. Opened here and nowhere
+        // else, because this is the one place that knows the caret has arrived
+        // somewhere new — and it fires on a change of mode or cell and on
+        // nothing else, which is exactly when a draft should begin or end.
+        // Stepping the draft changes neither, so an aim survives.
+        (EditorMode::Insert, InsertTarget::Connect(anchor)) => {
+            prompt.clear();
+            let grading = caret_grading(&state, &pick, &clipping);
+            draft.active = open_caret_draft(&state, &grading, anchor);
+            rebuild.0 = true;
         }
         // A create prompt has nothing to open on, and NORMAL has no prompt at
         // all — both start from empty.
@@ -7889,6 +8242,8 @@ fn handle_editor_keys(
     mut state: ResMut<GraphState>,
     mut pick: ResMut<PickState>,
     mut rebuild: ResMut<NeedsRebuild>,
+    mut draft: ResMut<DraftState>,
+    clipping: Res<lod::Clipping>,
 ) {
     let captured = keyboard_captured(&text_inputs, &eval);
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
@@ -7917,6 +8272,7 @@ fn handle_editor_keys(
                     &mut pick,
                     &mut prompt,
                     &mut pending,
+                    &mut draft,
                     &mut mode,
                     &mut rebuild,
                 ) {
@@ -7967,6 +8323,59 @@ fn handle_editor_keys(
             }
             // NORMAL's own keys belong to `handle_arrow_keys`.
             (EditorMode::Normal, _) => {}
+            // An anchor cell has its own INSERT, and it is the whole of what
+            // INSERT means there: the keys that would walk a text cursor or a
+            // suggestion list aim the edge instead, because there is neither a
+            // text nor a list to walk. Ahead of the prompt's own arms so the
+            // one meaning cannot be shadowed by the other.
+            (EditorMode::Insert, key) if matches!(target, InsertTarget::Connect(_)) => {
+                if ev.repeat {
+                    continue;
+                }
+                if matches!(key, bevy::input::keyboard::Key::Enter) {
+                    // Whether anything was made or not, the anchor has had its
+                    // answer and there is no second property behind it to go on
+                    // to — the same conclusion `commit_outcome` reaches when a
+                    // node has nothing left to say.
+                    if let Some(info) = draft.active.take() {
+                        commit_draft(&mut state, &info);
+                    }
+                    *mode = EditorMode::Normal;
+                    rebuild.0 = true;
+                    break;
+                }
+                let Some(direction) = nav_letter(key).and_then(|dir| caret_delta(dir, shift))
+                else {
+                    continue;
+                };
+                let grading = caret_grading(&state, &pick, &clipping);
+                let Some(info) = draft.active.as_mut() else {
+                    continue;
+                };
+                let candidates = draft_candidates(
+                    &state,
+                    &grading,
+                    &info.source_anchor_id,
+                    info.source_is_output,
+                );
+                // From the far end, or from the anchor itself while the draft
+                // is aimed at nothing — which is only the case when there was
+                // nothing to aim at.
+                let Some(from) = info
+                    .target_anchor_id
+                    .as_ref()
+                    .and_then(|id| state.root_graph().anchor_cell(id))
+                    .or_else(|| info.source_cells.first().copied())
+                else {
+                    continue;
+                };
+                if let Some(next) = step_draft_target(&candidates, from, direction) {
+                    info.target_anchor_id = Some(next);
+                    rebuild.0 = true;
+                    // The rest of the batch was struck against a different aim.
+                    break;
+                }
+            }
             (EditorMode::Insert, key) => match key {
                 bevy::input::keyboard::Key::Character(s) => {
                     // A single press can carry more than one character when a
@@ -8028,7 +8437,7 @@ fn handle_editor_keys(
                 // That guard needs a non-empty text and the room-maker below an
                 // empty one, so the two can never both fire.
                 bevy::input::keyboard::Key::Space
-                    if target != InsertTarget::Create || in_open_quote(&prompt.text) =>
+                    if matches!(target, InsertTarget::Edit(..)) || in_open_quote(&prompt.text) =>
                 {
                     prompt.insert_str(" ");
                     reselect(&mut prompt, &state, &pick);
@@ -8131,6 +8540,164 @@ fn handle_editor_keys(
     }
 }
 
+/// What a keyboard draft opens on, and what it may reach.
+///
+/// An input that already carries an edge opens on that edge's own source, so
+/// the first thing a nav key does is re-point something that is already there
+/// rather than propose something new. That is what makes INSERT on an anchor
+/// one act and not two: creating an edge and changing one are the same act seen
+/// at two different anchors, and the key that starts them is the same key.
+///
+/// An anchor with nothing on it opens on the nearest thing it could reach.
+/// Nearest by address, because the caret navigates by address — measuring in
+/// pixels here would make the proposal depend on where the camera happens to be
+/// standing, and the keyboard is the hand that does not look.
+fn open_caret_draft(
+    state: &GraphState,
+    grading: &lod::Lod,
+    anchor: &model::anchor::Id,
+) -> Option<EdgeDraft> {
+    let root = state.root_graph();
+    let layout_anchor = root.try_layout_anchor(anchor)?;
+    let source_is_output = matches!(layout_anchor.anchor, model::anchor::EAnchor::Output);
+    let source_cells = root.anchor_cells_of(anchor)?;
+    let candidates = draft_candidates(state, grading, anchor, source_is_output);
+    // The edge already arriving here, if this anchor is where one arrives. Only
+    // offered as the opening proposal when it is something the rule would offer
+    // anyway — an edge wired before a node moved may now cross a boundary that
+    // is no longer allowed, and opening on it would propose a wiring that
+    // `commit_draft` then refuses.
+    let standing = incoming_edge_source(root, anchor)
+        .filter(|from| candidates.iter().any(|(id, _)| id == from));
+    let target = standing.or_else(|| {
+        let from = *source_cells.first()?;
+        candidates
+            .iter()
+            .min_by_key(|(_, cell)| (*cell - from).length_squared())
+            .map(|(id, _)| id.clone())
+    });
+    Some(EdgeDraft {
+        source_anchor_id: anchor.clone(),
+        source_is_output,
+        source_cells,
+        target_anchor_id: target,
+        aim: DraftAim::Caret,
+    })
+}
+
+/// The anchor an edge arrives at `anchor` from, if one does.
+///
+/// An input carries at most one — that is the invariant `LayoutGraph::plus_edge`
+/// keeps — so the first answer is the answer.
+fn incoming_edge_source(
+    root: &layout::LayoutGraph,
+    anchor: &model::anchor::Id,
+) -> Option<model::anchor::Id> {
+    root.graph
+        .edges
+        .iter()
+        .find(|(_, edges)| edges.iter().any(|e| e.to == *anchor))
+        .map(|(from, _)| from.clone())
+}
+
+/// The next anchor in a direction: the nearest one whose way lies that way.
+///
+/// "That way" is a 90° cone about the axis, and a right angle is exactly what
+/// makes six keys reach everything. Each candidate is handed to the direction
+/// its offset leans furthest along — the axis whose component is the largest —
+/// so the six cones tile the whole of the space with no gap and nothing left
+/// out. A cone of any other angle would either overlap into ambiguity or leave
+/// the diagonals unreachable, and a diagonal is where half the graph is.
+///
+/// A candidate exactly on a boundary belongs to both cones it lies between,
+/// deliberately: it is equally that way and this way, and which key gets there
+/// first is then a question of distance rather than of a tie-break nobody
+/// could see.
+///
+/// Measured from the **current target**, not from the source. The far end is
+/// what moves, so a step is a step taken by it; measured from the anchor the
+/// draft began at, every direction would answer with the same nearest
+/// candidate over and over.
+///
+/// Integers throughout, so a tie is a tie in fact and not in floating point.
+/// There is no wrap — nothing that way is no move, which is the same answer the
+/// caret gives when it is walked against a face of its volume.
+fn step_draft_target(
+    candidates: &[(model::anchor::Id, IVec3)],
+    from: IVec3,
+    direction: IVec3,
+) -> Option<model::anchor::Id> {
+    candidates
+        .iter()
+        .filter_map(|(id, cell)| {
+            let delta = *cell - from;
+            // `direction` is a unit axis, so this is the offset's component
+            // along it — positive when the candidate lies the way the key
+            // points, and equal to that component's magnitude.
+            let along = delta.dot(direction);
+            if along <= 0 || along < delta.abs().max_element() {
+                return None;
+            }
+            // Nearest outright, and the more aligned of two equally near ones.
+            // Both are wanted: a step should land on what is closest, and where
+            // two are as close the one straighter ahead is the one the key was
+            // pointing at.
+            let sideways = (delta - direction * along).length_squared();
+            Some((delta.length_squared(), sideways, id))
+        })
+        // `min_by_key` keeps the first of equal minima and `draft_candidates`
+        // hands the list over in address order, so two candidates as near and
+        // as straight ahead as each other resolve the same way every time
+        // rather than swapping places between frames.
+        .min_by_key(|(distance, sideways, _)| (*distance, *sideways))
+        .map(|(_, _, id)| id.clone())
+}
+
+/// Direction of each key in layout coordinates, named by its vim letter — the
+/// arrows carry the same four names. Layout `+Y` renders downward and `+Z` runs
+/// source-to-sink, so both are inverted relative to the pre-flip bindings — the
+/// keys still move the caret the same way on screen.
+///
+/// Out here rather than inside `handle_arrow_keys` because a draft edge is
+/// aimed with the same six directions. Which way is up must be one answer: two
+/// tables would let the caret and the draft disagree about it, and the user
+/// would be holding two keyboards.
+fn caret_delta(dir: char, shift: bool) -> Option<IVec3> {
+    match (dir, shift) {
+        ('k', false) => Some(IVec3::new(-1, 0, 0)),
+        ('k', true) => Some(IVec3::new(0, -1, 0)),
+        ('j', false) => Some(IVec3::new(1, 0, 0)),
+        ('j', true) => Some(IVec3::new(0, 1, 0)),
+        ('h', false) => Some(IVec3::new(0, 0, -1)),
+        ('l', false) => Some(IVec3::new(0, 0, 1)),
+        _ => None,
+    }
+}
+
+/// The vim letter a key stands for, whichever of its two names was struck.
+///
+/// `hjkl` is read from the character the layout produced rather than from the
+/// key's position, so the binding follows the letter on a Dvorak or a Neo
+/// keyboard instead of following QWERTY's geometry. The arrows fold onto the
+/// same four, which is what makes them the same four directions under two
+/// names rather than two sets of bindings.
+fn nav_letter(key: &bevy::input::keyboard::Key) -> Option<char> {
+    match key {
+        bevy::input::keyboard::Key::ArrowUp => Some('k'),
+        bevy::input::keyboard::Key::ArrowDown => Some('j'),
+        bevy::input::keyboard::Key::ArrowLeft => Some('h'),
+        bevy::input::keyboard::Key::ArrowRight => Some('l'),
+        bevy::input::keyboard::Key::Character(s) => {
+            let mut chars = s.chars();
+            // Shift reports the uppercase character; the shifted meaning comes
+            // from the modifier, as it does for the arrows.
+            let c = chars.next()?.to_ascii_lowercase();
+            (chars.next().is_none() && matches!(c, 'h' | 'j' | 'k' | 'l')).then_some(c)
+        }
+        _ => None,
+    }
+}
+
 /// Caret navigation in NORMAL: the arrow keys and the vim letters `hjkl`,
 /// which are the same four directions under two names.
 fn handle_arrow_keys(
@@ -8161,38 +8728,14 @@ fn handle_arrow_keys(
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
 
-    // Direction of each key in layout coordinates, named by its vim letter —
-    // the arrows carry the same four names. Layout `+Y` renders downward and
-    // `+Z` runs source-to-sink, so both are inverted relative to the pre-flip
-    // bindings — the keys still move the caret the same way on screen.
-    fn caret_delta(dir: char, shift: bool) -> Option<IVec3> {
-        match (dir, shift) {
-            ('k', false) => Some(IVec3::new(-1, 0, 0)),
-            ('k', true) => Some(IVec3::new(0, -1, 0)),
-            ('j', false) => Some(IVec3::new(1, 0, 0)),
-            ('j', true) => Some(IVec3::new(0, 1, 0)),
-            ('h', false) => Some(IVec3::new(0, 0, -1)),
-            ('l', false) => Some(IVec3::new(0, 0, 1)),
-            _ => None,
-        }
-    }
-
-    // `hjkl` rides alongside the arrows. Like the mode letters in
-    // `handle_editor_keys` they are read from `logical_key`, the character the
-    // layout produced, so the binding follows the letter rather than its
-    // QWERTY position. Repeats are dropped so a held key steps once, the way
-    // `just_pressed` bounds the arrows.
+    // `hjkl` rides alongside the arrows, through the one fold `nav_letter`
+    // performs for the draft as well. Repeats are dropped so a held key steps
+    // once, the way `just_pressed` bounds the arrows.
     let letter = key_events
         .read()
         .filter(|ev| ev.state == bevy::input::ButtonState::Pressed && !ev.repeat)
         .find_map(|ev| match &ev.logical_key {
-            bevy::input::keyboard::Key::Character(s) => {
-                let mut chars = s.chars();
-                // Shift reports the uppercase character; the shifted meaning
-                // comes from the modifier, as it does for the arrows.
-                let c = chars.next()?.to_ascii_lowercase();
-                (chars.next().is_none() && matches!(c, 'h' | 'j' | 'k' | 'l')).then_some(c)
-            }
+            bevy::input::keyboard::Key::Character(_) => nav_letter(&ev.logical_key),
             _ => None,
         });
 
@@ -8316,53 +8859,271 @@ fn anchor_hover_system(
     }
 }
 
-fn draw_drag_preview(drag: Res<DragState>, mut gizmos: Gizmos) {
-    let Some(ref info) = drag.active else { return };
-    let color = if info.target_anchor_id.is_some() {
-        Color::srgb(0.3, 1.0, 0.4) // grün = eingeschnappt
+/// Whether an edge may be offered between these two anchors at all — every
+/// refusal the editor has, asked in one place.
+///
+/// Three questions and they are not interchangeable. The first two are about
+/// this pair: an anchor is not its own counterpart, and a producer only meets a
+/// consumer. The third is about the program's shape and is
+/// `connection_allowed`'s, which speaks of producer → consumer — so the pair is
+/// turned into that direction before it is asked. Left the other way round, a
+/// draft begun at a Tunnel's input and aimed at a Source would read as a
+/// connection *out* of a branch and be refused.
+///
+/// A pair that is **already joined** is deliberately not refused here. That
+/// question belongs to the commit, which is where `anchors_already_connected`
+/// says what it is for — whether there is anything to do. Asked here it would
+/// take the standing edge out of the candidate list, and then an input opened
+/// on the edge it already carries could be stepped away from but never stepped
+/// back to. What the picture does about it is `spawn_graph_nodes`'s: the draft
+/// stands in for the edge it duplicates rather than being drawn on top of it.
+///
+/// One function because both hands use it: the pointer asks it of every anchor
+/// on screen, the caret of every anchor in the program, and the commit asks it
+/// again — a rebuild can sit between the aim and the press.
+fn connection_offered(
+    root: &layout::LayoutGraph,
+    source: &model::anchor::Id,
+    source_is_output: bool,
+    target: &model::anchor::Id,
+    target_is_output: bool,
+) -> bool {
+    if source == target || target_is_output == source_is_output {
+        return false;
+    }
+    let (from, to) = if source_is_output {
+        (source, target)
     } else {
-        Color::srgb(1.0, 0.9, 0.3) // gelb = dragging
+        (target, source)
     };
-    gizmos.line(info.source_pos, info.current_end, color);
+    connection_allowed(root, from, to)
 }
 
-fn drag_start_system(
-    mouse: Res<ButtonInput<MouseButton>>,
-    hovered: Query<(&GlobalTransform, &EAnchor), With<AnchorHovered>>,
-    mut drag: ResMut<DragState>,
-    eval: Res<EvalState>,
-) {
-    if is_evaluating(&eval) {
-        return;
-    }
-    if mouse.just_pressed(MouseButton::Left) {
-        if let Ok((tf, anchor)) = hovered.single() {
-            let pos = tf.translation();
-            drag.active = Some(DragInfo {
-                source_anchor_id: anchor.id(),
-                source_is_output: matches!(anchor, EAnchor::Output { .. }),
-                source_pos: pos,
-                current_end: pos,
-                target_anchor_id: None,
-            });
+/// Every anchor a draft from `source` may reach, with the cell each stands on.
+///
+/// Walked from the model rather than from the spawned entities, because the
+/// caret aims at addresses and an address is a fact about the layout, not about
+/// what happens to be on screen. What *is* taken from the screen is the bound:
+/// a scope the level of detail has closed over draws none of its anchors
+/// (`spawn_graph_nodes` skips it whole), and an anchor that is not drawn is not
+/// something to aim at — a draft would land on it invisibly.
+fn draft_candidates(
+    state: &GraphState,
+    grading: &lod::Lod,
+    source: &model::anchor::Id,
+    source_is_output: bool,
+) -> Vec<(model::anchor::Id, IVec3)> {
+    let root = state.root_graph();
+    let mut out: Vec<(model::anchor::Id, IVec3)> = Vec::new();
+    for walked in root.walk_all() {
+        if grading.hidden(&walked.context) {
+            continue;
+        }
+        let Some(node) = walked
+            .layout_graph
+            .graph
+            .nodes
+            .get(&walked.layout_node.node_id)
+        else {
+            continue;
+        };
+        for (anchor_id, anchor) in node.anchors() {
+            let is_output = matches!(anchor, model::anchor::EAnchor::Output);
+            if !connection_offered(root, source, source_is_output, &anchor_id, is_output) {
+                continue;
+            }
+            let Some(cell) = root.anchor_cell(&anchor_id) else {
+                continue;
+            };
+            out.push((anchor_id, cell));
         }
     }
+    // Ordered by address so the nearest-candidate answers below are the same
+    // from one frame to the next: `walk_all` reads out of hash maps, and a
+    // proposal that reshuffled on a tie would flicker between two anchors
+    // while nothing moved.
+    out.sort_by(|(a_id, a), (b_id, b)| (a.x, a.y, a.z, a_id).cmp(&(b.x, b.y, b.z, b_id)));
+    out
 }
 
+/// The grading the scene was last drawn with, so the candidate walk and the
+/// spawn pass agree about which scopes exist.
+///
+/// Both read it from the caret and the clipping flag, and they have to read the
+/// same answer — an anchor the walk offers but the pass does not draw would be
+/// a target that cannot be seen.
+fn caret_grading(state: &GraphState, pick: &PickState, clipping: &lod::Clipping) -> lod::Lod {
+    lod::Lod::new(
+        state.scope_of_caret(pick).map(|scope| scope.path),
+        clipping.0,
+    )
+}
+
+/// Make the edge the draft stands for. Returns whether the graph changed, so
+/// the caller knows whether to flag a rebuild.
+///
+/// The one door, for the pointer and the caret alike. Edges are always stored
+/// output → input: `edge::EdgeCurve::from_endpoints` derives its tangents from
+/// that direction and the renderer stacks the leaves by source and target.
+///
+/// Every condition is asked again here even though nothing is offered that
+/// would fail them. A rebuild can land between the aim and the press, and a
+/// self-edge collapses the curve into a loop at one anchor — an invariant worth
+/// nailing down at the door rather than trusting the way in.
+fn commit_draft(state: &mut GraphState, draft: &EdgeDraft) -> bool {
+    let Some(target_id) = draft.target_anchor_id.clone() else {
+        return false;
+    };
+    let Some(target) = state.root_graph().try_layout_anchor(&target_id) else {
+        return false;
+    };
+    let target_is_output = matches!(target.anchor, model::anchor::EAnchor::Output);
+    if !connection_offered(
+        state.root_graph(),
+        &draft.source_anchor_id,
+        draft.source_is_output,
+        &target_id,
+        target_is_output,
+    ) {
+        return false;
+    }
+    // Nothing to do, and saying so is the point: an input opened on the edge it
+    // already carries proposes that edge back, and confirming it must leave the
+    // graph exactly as it was. Dropping the edge and putting the identical one
+    // back would re-settle the layout and flicker the whole scene in exchange
+    // for nothing.
+    if anchors_already_connected(state.root_graph(), &draft.source_anchor_id, &target_id) {
+        return false;
+    }
+    let (from, to) = if draft.source_is_output {
+        (draft.source_anchor_id.clone(), target_id)
+    } else {
+        (target_id, draft.source_anchor_id.clone())
+    };
+    let updated = state.root_graph().plus_edge(from, to);
+    *state.root_graph_mut() = updated;
+    // A new edge can grow the target's anchor, which changes its footprint.
+    state.resettle();
+    true
+}
+
+/// Whether the cursor's ray passes through one of the cells the draft began on.
+///
+/// A slab test in layout space rather than a radius in pixels, because the
+/// question is about a cell and a cell is a thing in the world. Everything goes
+/// through `render::world_to_layout` for the reason `pick_nodes` gives: only
+/// that conversion knows `LAYOUT_SCALE` negates Y and Z, and doing the division
+/// by hand here would mirror the test against the picture.
+fn ray_meets_cells(ray: &bevy::math::Ray3d, cells: &[IVec3]) -> bool {
+    cells.iter().any(|cell| ray_meets_cell(ray, *cell))
+}
+
+fn ray_meets_cell(ray: &bevy::math::Ray3d, cell: IVec3) -> bool {
+    let origin = render::world_to_layout(ray.origin);
+    let direction = render::world_to_layout(*ray.direction);
+    let min = cell.as_vec3();
+    let max = min + Vec3::ONE;
+    let mut near = f32::NEG_INFINITY;
+    let mut far = f32::INFINITY;
+    for axis in 0..3 {
+        let o = origin[axis];
+        let d = direction[axis];
+        if d.abs() < 1e-6 {
+            if o < min[axis] || o > max[axis] {
+                return false;
+            }
+            continue;
+        }
+        let t0 = (min[axis] - o) / d;
+        let t1 = (max[axis] - o) / d;
+        near = near.max(t0.min(t1));
+        far = far.min(t0.max(t1));
+    }
+    far >= near.max(0.0)
+}
+
+/// A press on an anchor opens a draft there.
+///
+/// It overrules a draft the caret was aiming, and takes the editor out of
+/// INSERT with it. Pointing at something is a statement about where the work
+/// is, and two drafts at once would be two answers to one question — the same
+/// reason `sync_prompt_seed` unmakes a node the caret walked away from.
+///
+/// No `PendingNode` can be caught up in that: a cell that opens a draft is an
+/// anchor of a node that already stands, and an unfinished node keeps the caret
+/// on the property cell it owes, never on an anchor.
+///
+/// A modal is guarded against as well as a run. `anchor_hover_system` only
+/// knows about `Button`s, and a modal's backdrop is not one — without this an
+/// anchor projecting behind an open dialog would start a drag through it.
+fn drag_start_system(
+    mouse: Res<ButtonInput<MouseButton>>,
+    hovered: Query<&EAnchor, With<AnchorHovered>>,
+    mut draft: ResMut<DraftState>,
+    mut mode: ResMut<EditorMode>,
+    mut rebuild: ResMut<NeedsRebuild>,
+    state: Res<GraphState>,
+    eval: Res<EvalState>,
+) {
+    if is_evaluating(&eval) || modal_is_open(&eval) {
+        return;
+    }
+    if !mouse.just_pressed(MouseButton::Left) {
+        return;
+    }
+    let Ok(anchor) = hovered.single() else {
+        return;
+    };
+    let anchor_id = anchor.id();
+    // No cells, no draft. Every anchor the layout knows has them — including a
+    // Tunnel's input, which is given the address it is drawn at — so this is
+    // the anchor of a node that is not laid out at all, and nothing can be
+    // aimed from there.
+    let Some(source_cells) = state.root_graph().anchor_cells_of(&anchor_id) else {
+        return;
+    };
+    if *mode != EditorMode::Normal {
+        *mode = EditorMode::Normal;
+    }
+    draft.active = Some(EdgeDraft {
+        source_anchor_id: anchor_id,
+        source_is_output: matches!(anchor, EAnchor::Output { .. }),
+        source_cells,
+        target_anchor_id: None,
+        aim: DraftAim::Pointer,
+    });
+    rebuild.0 = true;
+}
+
+/// Aim the pointer's draft: at every moment it stands on the nearest anchor it
+/// could reach, and nothing hangs off the cursor.
+///
+/// Nearest *on screen*, because the pointer is a thing on the screen — the
+/// cursor names a direction into the scene and not a depth, so a distance in
+/// the world would have the draft jumping to whatever happened to lie along the
+/// ray. Without a radius, for the same reason the line no longer follows the
+/// cursor: the draft is always proposing something, and the one case where it
+/// proposes nothing is that there is nothing to propose.
 fn drag_update_system(
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     camera_q: Query<(&Camera, &GlobalTransform)>,
-    hovered: Query<(&GlobalTransform, &EAnchor), With<AnchorHovered>>,
-    mut drag: ResMut<DragState>,
+    anchors: Query<(&EAnchor, &GlobalTransform)>,
+    mut draft: ResMut<DraftState>,
+    mut rebuild: ResMut<NeedsRebuild>,
     eval: Res<EvalState>,
     state: Res<GraphState>,
+    pick: Res<PickState>,
+    clipping: Res<lod::Clipping>,
 ) {
     if is_evaluating(&eval) {
         return;
     }
-    let Some(ref mut info) = drag.active else {
+    let Some(ref mut info) = draft.active else {
         return;
     };
+    if !matches!(info.aim, DraftAim::Pointer) {
+        return;
+    }
 
     let Ok(window) = windows.single() else {
         return;
@@ -8373,60 +9134,65 @@ fn drag_update_system(
     let Ok((camera, cam_tf)) = camera_q.single() else {
         return;
     };
-
-    // Ray durch Cursor
     let Ok(ray) = camera.viewport_to_world(cam_tf, cursor) else {
         return;
     };
 
-    // Schnitt mit Ebene durch source_pos, senkrecht zur Kamera
-    let normal: Vec3 = -*cam_tf.forward();
-    let denom = ray.direction.dot(normal);
-    if denom.abs() > 1e-6 {
-        let t = (info.source_pos - ray.origin).dot(normal) / denom;
-        if t > 0.0 {
-            info.current_end = ray.origin + *ray.direction * t;
+    // Nothing is proposed while the cursor is still over the anchor the draft
+    // began on. That is one rule doing two jobs: snapping starts when the
+    // pointer leaves the cell, and a release back inside it aims at nothing and
+    // therefore makes nothing. Asked fresh each frame rather than latched, so
+    // coming back is as much a way out as never having left.
+    if ray_meets_cells(&ray, &info.source_cells) {
+        if info.target_anchor_id.take().is_some() {
+            rebuild.0 = true;
+        }
+        return;
+    }
+
+    let grading = caret_grading(&state, &pick, &clipping);
+    let offered: std::collections::HashSet<model::anchor::Id> = draft_candidates(
+        &state,
+        &grading,
+        &info.source_anchor_id,
+        info.source_is_output,
+    )
+    .into_iter()
+    .map(|(id, _)| id)
+    .collect();
+
+    let mut closest: Option<(model::anchor::Id, f32)> = None;
+    for (anchor, global_tf) in &anchors {
+        let anchor_id = anchor.id();
+        if !offered.contains(&anchor_id) {
+            continue;
+        }
+        // Same reason as in `update_world_labels`: under the orthographic
+        // projection a point behind the camera still projects, so it would
+        // otherwise become a target.
+        if cam_tf
+            .forward()
+            .dot(global_tf.translation() - cam_tf.translation())
+            <= 0.0
+        {
+            continue;
+        }
+        let Ok(screen_pos) = camera.world_to_viewport(cam_tf, global_tf.translation()) else {
+            continue;
+        };
+        let distance = cursor.distance(screen_pos);
+        if closest.as_ref().map_or(true, |(_, best)| distance < *best) {
+            closest = Some((anchor_id, distance));
         }
     }
 
-    // Snap zu hovering target. Muss jeden Frame zurückgesetzt werden — sonst
-    // hält drag_end an einem längst verlassenen Ziel fest und legt beim Drop
-    // ins Leere trotzdem eine Edge an.
-    info.target_anchor_id = None;
-    if let Ok((tf, anchor)) = hovered.single() {
-        let target_id = anchor.id();
-        // Vergleich über AnchorId, nicht Entity: Entities werden bei jedem
-        // Rebuild neu gespawnt, ein Entity-Vergleich würde den Quell-Anchor
-        // nach einem Rebuild mitten im Drag als gültiges Ziel durchlassen und
-        // eine Self-Edge erzeugen.
-        let is_self = target_id == info.source_anchor_id;
-        // Nur output → input (oder umgekehrt) verbinden.
-        let is_opposite_kind = matches!(anchor, EAnchor::Output { .. }) != info.source_is_output;
-        // Schon verbundene Paare snappen nicht ein, damit die Preview-Linie
-        // gelb bleibt statt eine Verbindung zu versprechen, die drag_end
-        // ohnehin als Duplikat verwirft.
-        let is_duplicate =
-            anchors_already_connected(state.root_graph(), &info.source_anchor_id, &target_id);
-        // Ein Ziel in einem fremden Scope schnappt nur ein, wenn es der Input
-        // eines Tunnels genau eine Ebene tiefer ist. Hier und nicht erst beim
-        // Drop, damit die Preview-Linie gelb bleibt statt eine Verbindung zu
-        // versprechen, die drag_end ohnehin verwirft.
-        //
-        // Vorher in die Richtung gebracht, in der die Kante gespeichert würde:
-        // `connection_allowed` spricht von Erzeuger -> Verbraucher, gezogen
-        // werden darf aber von beiden Enden aus. Ungedreht würde ein Zug, der
-        // am Tunnel-Input beginnt und beim Source endet, als Verbindung aus
-        // dem Branch heraus gelesen und abgelehnt.
-        let (from, to) = if info.source_is_output {
-            (&info.source_anchor_id, &target_id)
-        } else {
-            (&target_id, &info.source_anchor_id)
-        };
-        let is_permitted = connection_allowed(state.root_graph(), from, to);
-        if !is_self && is_opposite_kind && !is_duplicate && is_permitted {
-            info.target_anchor_id = Some(target_id);
-            info.current_end = tf.translation();
-        }
+    let target = closest.map(|(id, _)| id);
+    // Only a change is a rebuild. The cursor moves every frame and the anchor
+    // it is nearest to does not, and redrawing the scene for a proposal that
+    // has not moved would cost the frame the draft was meant to make legible.
+    if target != info.target_anchor_id {
+        info.target_anchor_id = target;
+        rebuild.0 = true;
     }
 }
 
@@ -8436,13 +9202,14 @@ fn drag_update_system(
 /// Not what keeps a pair from being doubled any more — `LayoutGraph::plus_edge`
 /// clears the target input before wiring, so a second edge onto it is not a
 /// thing that can exist. What this still answers is whether there is anything
-/// to do: re-dragging a connection that already stands would drop it and put
+/// to do: re-drafting a connection that already stands would drop it and put
 /// the identical one back, and a rebuild for that is a flicker in exchange for
 /// nothing.
 ///
-/// The reverse direction is checked too because edges recorded before drag-end
-/// started normalising to output → input may still sit the other way around,
-/// and `eval::neighbours_of_anchor` treats both orientations as connected.
+/// The reverse direction is checked too because edges recorded before the
+/// commit started normalising to output → input may still sit the other way
+/// around, and `eval::neighbours_of_anchor` treats both orientations as
+/// connected.
 fn anchors_already_connected(
     layout_graph: &layout::LayoutGraph,
     a: &model::anchor::Id,
@@ -8522,53 +9289,45 @@ fn connection_allowed(
     source_path == target_path
 }
 
+/// End the pointer's draft: the release makes the edge, and the right button
+/// takes the draft away.
+///
+/// A release inside the cell the draft began on makes nothing, and needs no
+/// test of its own to make nothing. Nothing is aimed at while the cursor is
+/// there — `drag_update_system` sees to that — so the draft simply has no
+/// target to commit. One rule, stated once, doing both jobs.
 fn drag_end_system(
     mouse: Res<ButtonInput<MouseButton>>,
-    mut drag: ResMut<DragState>,
-    mut commands: Commands,
+    mut draft: ResMut<DraftState>,
     mut rebuild: ResMut<NeedsRebuild>,
     mut state: ResMut<GraphState>,
     eval: Res<EvalState>,
 ) {
     if is_evaluating(&eval) {
-        drag.active = None;
+        if draft.active.take().is_some() {
+            rebuild.0 = true;
+        }
         return;
     }
-    if mouse.just_released(MouseButton::Left) {
-        if let Some(info) = drag.active.take() {
-            if let Some(target_id) = info.target_anchor_id {
-                // Edges immer output → input speichern: EdgeCurve::from_endpoints
-                // leitet die Tangenten aus dieser Richtung ab, und der Renderer
-                // stapelt die Leaves nach Quelle/Ziel.
-                let (from, to) = if info.source_is_output {
-                    (info.source_anchor_id, target_id)
-                } else {
-                    (target_id, info.source_anchor_id)
-                };
-                // Defensiv: eine Self-Edge kollabiert die Kurve zu einer
-                // Schlaufe am Anchor. drag_update lässt das nicht zu, aber die
-                // Invariante hier nochmal festnageln.
-                // `connection_allowed` wird über die gespeicherte Richtung
-                // gefragt, nicht über die gezogene: die Regel spricht von
-                // Output -> Tunnel-Input, und genau dieses Paar ist `from`,
-                // `to`. Nochmal geprüft wie die beiden Invarianten daneben —
-                // drag_update lässt so ein Ziel nicht einschnappen, aber
-                // zwischen Snap und Drop kann ein Rebuild liegen.
-                if from != to
-                    && !anchors_already_connected(state.root_graph(), &from, &to)
-                    && connection_allowed(state.root_graph(), &from, &to)
-                {
-                    let updated = state.root_graph().plus_edge(from, to);
-                    *state.root_graph_mut() = updated;
-                    // A new edge can grow the target's anchor, which changes
-                    // its footprint.
-                    state.resettle();
-                    rebuild.0 = true;
-                }
-            }
-            // Kein target → Drag wird einfach verworfen
-        }
+    if !draft.pointer_active() {
+        return;
     }
+    if mouse.just_pressed(MouseButton::Right) {
+        draft.active = None;
+        rebuild.0 = true;
+        return;
+    }
+    if !mouse.just_released(MouseButton::Left) {
+        return;
+    }
+    let Some(info) = draft.active.take() else {
+        return;
+    };
+    // The draft is gone either way, so the scene has to be drawn without it.
+    // A draft aimed at nothing — which is what letting go on the anchor it
+    // began at means — simply takes nothing with it.
+    rebuild.0 = true;
+    commit_draft(&mut state, &info);
 }
 
 // ── App entry ───────────────────────────────────────────────
@@ -8596,7 +9355,7 @@ fn main() {
         .init_resource::<GraphState>()
         .init_resource::<NeedsRebuild>()
         .init_resource::<PickState>()
-        .init_resource::<DragState>()
+        .init_resource::<DraftState>()
         .init_resource::<EvalState>()
         .init_resource::<EditorMode>()
         .init_resource::<InsertPrompt>()
@@ -8628,7 +9387,6 @@ fn main() {
             Update,
             (
                 (
-                    draw_drag_preview,
                     animate_nodes,
                     (
                         // First, because the mode it ends is the reason the
