@@ -5775,6 +5775,7 @@ fn sync_value_labels(
             WorldLabel {
                 world_pos,
                 offset: Vec2::new(60.0, 0.0),
+                align: render::LabelAlign::Centered,
             },
             ValueLabel {
                 node_id: id.clone(),
@@ -5883,6 +5884,9 @@ fn sync_eval_rebuild(
 pub struct WorldLabel {
     pub world_pos: Vec3,
     pub offset: Vec2, // screen-space pixel offset
+    /// Which edge of the text box `world_pos` holds in X. Y is always its
+    /// middle — see `render::LabelAlign`.
+    pub align: render::LabelAlign,
 }
 
 /// What a scope's floor carries beyond the plain surface: the component that
@@ -6980,6 +6984,7 @@ fn spawn_world_label(
             WorldLabel {
                 world_pos: render_label.world_pos,
                 offset: render_label.offset,
+                align: render_label.align,
             },
             marker,
         ))
@@ -7005,7 +7010,14 @@ fn update_world_labels(
         let screen = camera.world_to_viewport(cam_gt, label.world_pos);
         if let (true, Ok(screen_pos)) = (in_front, screen) {
             let size = computed.size();
-            node.left = Val::Px(screen_pos.x - size.x / 2.0 + label.offset.x);
+            // Y hangs the box's middle on the point; X hangs whichever edge
+            // the label asked for, so that words meant to stack start
+            // together instead of each spreading about its own centre.
+            let x = match label.align {
+                render::LabelAlign::Centered => screen_pos.x - size.x / 2.0,
+                render::LabelAlign::LeftEdge => screen_pos.x,
+            };
+            node.left = Val::Px(x + label.offset.x);
             node.top = Val::Px(screen_pos.y - size.y / 2.0 + label.offset.y);
             *vis = Visibility::Visible;
         } else {

@@ -310,6 +310,24 @@ pub struct RenderLabel {
     pub font_size: f32,
     pub world_pos: Vec3,
     pub offset: Vec2,
+    pub align: LabelAlign,
+}
+
+/// Which edge of a label's box is hung on the point it is pinned to, in X.
+///
+/// Y is always the box's middle: a word sits on the height it is given. X is
+/// not, because two words of different lengths pinned to the same point read as
+/// a stack only if they start in the same place — centred, a four-character
+/// caption would reach two characters further left than a one-character letter
+/// and the pair would look kicked over rather than stacked.
+#[derive(Clone, Copy)]
+pub enum LabelAlign {
+    /// Centred on the point. What a single word on a row wants: the letter on
+    /// its band, the literal past a tip.
+    Centered,
+    /// Left edge on the point. What a caption wants, so that a word of any
+    /// length starts where the letter under it starts.
+    LeftEdge,
 }
 
 /// Height of a strand drawn as a band, and so also the pitch of the anchor
@@ -350,12 +368,33 @@ const CONSTANT_DOT_RADIUS: f32 = CELL * 0.05;
 /// World-space padding between the tip of the gizmo line and the value
 /// label's projection point.
 const VALUE_LABEL_Z_PADDING: f32 = CELL / 30.0;
-/// Screen-space nudge that carries a Source's index label clear of the type
-/// letter it hangs off, to its right. Measured from the letter rather than from
-/// the cell, because both are glyphs of a fixed pixel size: a gap stated in
-/// pixels then holds at every zoom, while one stated in world units would close
-/// as the camera pulls back.
-const SOURCE_INDEX_LABEL_OFFSET_X: f32 = 18.0;
+/// Size of the word a strand writes: the type's letter across a band, the
+/// literal past a line's tip.
+const STRAND_WORD_FONT_SIZE: f32 = 14.0;
+/// Size of an anchor's caption, a step under the letter it stands over — the
+/// letter is what the strand *is*, the caption only says which one it is.
+const ANCHOR_CAPTION_FONT_SIZE: f32 = 12.0;
+/// How far the words on an anchor stand from the middle of the row they name,
+/// in screen-space pixels: the type's letter this far below it, the caption
+/// this far above.
+///
+/// The letter drops whether or not a caption stands over it. A row of anchors
+/// reads as a row only if every word in it sits on the same line, and tying the
+/// drop to the caption would put the letters of a call's parameters at two
+/// heights depending on which of them the declaration happened to name.
+///
+/// Measured in pixels rather than in world units because both are glyphs of a
+/// fixed pixel size: a gap stated in pixels then holds at every zoom, while one
+/// stated in world units would close as the camera pulls back.
+const ANCHOR_WORD_STACK_HALF: f32 = 8.0;
+/// Advance width of the label font as a fraction of its size. JetBrains Mono is
+/// monospaced at 0.6 em and Bevy's `font_size` *is* the em size — unlike
+/// `ab_glyph`'s `PxScale`, which `edge.rs` has to divide out against the face's
+/// ascent-to-descent span — so every glyph is exactly this wide.
+const MONO_ADVANCE: f32 = 0.6;
+/// Where a type letter's left edge lies relative to the point it is centred
+/// on, and so where a caption flush with it has to start.
+const TYPE_LETTER_HALF_WIDTH: f32 = STRAND_WORD_FONT_SIZE * MONO_ADVANCE * 0.5;
 /// How far a text face floats above the body face it prints on.
 ///
 /// Coplanar is not an option: both surfaces would land in the same depth
@@ -767,17 +806,24 @@ fn build_anchor_strands(
                 // `center` the band branch below gives `i`, `s`, `c` and `b`.
                 // That is the whole of what puts it flush with them: the same
                 // position, not a correction applied to a different one.
-                let (label_text, label_world) = match leaf_value_text(&leaf, graph_value) {
-                    Some(value) => (
-                        value,
-                        Vec3::new(
-                            anchor_world_pos.x,
-                            y_center,
-                            line_tip_z + sign * VALUE_LABEL_Z_PADDING,
+                //
+                // The drop off the middle follows from the same split: a
+                // literal stands past the tip and has nothing over it, while
+                // the letter sits on the middle with the anchor's caption over
+                // it and takes the drop every band's letter takes.
+                let (label_text, label_world, label_offset) =
+                    match leaf_value_text(&leaf, graph_value) {
+                        Some(value) => (
+                            value,
+                            Vec3::new(
+                                anchor_world_pos.x,
+                                y_center,
+                                line_tip_z + sign * VALUE_LABEL_Z_PADDING,
+                            ),
+                            Vec2::ZERO,
                         ),
-                    ),
-                    None => (letter, center),
-                };
+                        None => (letter, center, Vec2::new(0.0, ANCHOR_WORD_STACK_HALF)),
+                    };
                 RenderStrand {
                     band: None,
                     band_label: None,
@@ -797,9 +843,10 @@ fn build_anchor_strands(
                         Lettering::Spelled => Some(RenderLabel {
                             text: label_text,
                             color: Color::WHITE,
-                            font_size: 14.0,
+                            font_size: STRAND_WORD_FONT_SIZE,
                             world_pos: label_world,
-                            offset: Vec2::ZERO,
+                            offset: label_offset,
+                            align: LabelAlign::Centered,
                         }),
                         Lettering::Silent => None,
                     },
@@ -827,9 +874,13 @@ fn build_anchor_strands(
                         Lettering::Spelled => Some(RenderLabel {
                             text: letter,
                             color: Color::WHITE,
-                            font_size: 14.0,
+                            font_size: STRAND_WORD_FONT_SIZE,
                             world_pos: center,
-                            offset: Vec2::ZERO,
+                            // Below the middle of the row, always: see
+                            // `ANCHOR_WORD_STACK_HALF`. Whatever caption the
+                            // anchor carries stands the same distance above it.
+                            offset: Vec2::new(0.0, ANCHOR_WORD_STACK_HALF),
+                            align: LabelAlign::Centered,
                         }),
                         Lettering::Silent => None,
                     },
@@ -1061,24 +1112,30 @@ pub fn layoutnode_to_rendernode(
                 Span::input(),
                 Lettering::Spelled,
             );
-            // Where `build_anchor_strands` puts the first row's type letter: the
-            // label leans into the anchor's own half, toward the body.
+            // The point `build_anchor_strands` centres the first row's type
+            // letter on — the same span, asked the same question, so the
+            // caption cannot land on a plane the letter left.
             let index_label_world = Vec3::new(
                 input_world.x,
                 input_world.y,
-                input_world.z - ANCHOR_HALF_DEPTH,
+                Span::input().z_center(input_world.z),
             );
             let index_label = layout_graph
                 .source_index(&layout_node.node_id)
                 .map(|index| RenderLabel {
                     text: format!("[{}]", index),
-                    // Neutral grey at the small size, the way a FunctionCall's
-                    // input names are drawn: same kind of label, naming an
-                    // anchor beside the letter that types it.
-                    color: Color::srgb(0.5, 0.5, 0.5),
-                    font_size: 12.0,
+                    // White at the small size, the way a FunctionCall's
+                    // parameters are captioned: the same kind of label, naming
+                    // an anchor over the letter that types it. Grey lost it
+                    // against the volume behind it.
+                    color: Color::WHITE,
+                    font_size: ANCHOR_CAPTION_FONT_SIZE,
                     world_pos: index_label_world,
-                    offset: Vec2::new(SOURCE_INDEX_LABEL_OFFSET_X, 0.0),
+                    // Half a line over the middle, where the letter stands
+                    // half a line under it, and starting where the letter
+                    // starts rather than spreading either side of it.
+                    offset: Vec2::new(-TYPE_LETTER_HALF_WIDTH, -ANCHOR_WORD_STACK_HALF),
+                    align: LabelAlign::LeftEdge,
                 });
             // The body wears the type it declares, in the same colour every
             // strand of that type wears. It used to have to force the alpha
@@ -1543,22 +1600,41 @@ pub fn layoutnode_to_rendernode(
                 strands: vec![],
                 objects: vec![],
                 // The function's name is printed on the body now, not floated
-                // over its centre — what is left beside the node is the name of
-                // each parameter, at the anchor it belongs to.
+                // over its centre — what is left beside the node is each
+                // parameter's place in the call, at the anchor it belongs to.
+                //
+                // Index and name both: the name says what the parameter means,
+                // the index says which argument it is — and the index is what
+                // everything but the eye knows the anchor by, its place in
+                // `input_anchors` and so the `order_num` a cell resolves
+                // through.
                 labels: input_anchors
                     .iter()
                     .enumerate()
                     .filter_map(|(i_anchor, _)| {
-                        let name = function_declaration.inputs.get(i_anchor)?.name.clone();
+                        let name = &function_declaration.inputs.get(i_anchor)?.name;
+                        let input_world = cell(i_anchor as i32, 0, 0);
                         Some(RenderLabel {
-                            text: name,
-                            // Neutral grey, subordinate to the name on the body
-                            // and to the centred type letter.
-                            color: Color::srgb(0.5, 0.5, 0.5),
-                            font_size: 12.0,
-                            world_pos: cell(i_anchor as i32, 0, 0),
-                            // Nudge down so the type letter stays free.
-                            offset: Vec2::new(0.0, 14.0),
+                            text: format!("[{}]:{}", i_anchor, name),
+                            // White, like every other word floated beside the
+                            // graph: at this size grey read as a smudge over
+                            // the volume rather than as writing.
+                            color: Color::WHITE,
+                            font_size: ANCHOR_CAPTION_FONT_SIZE,
+                            // On the anchor's own half, which is where the
+                            // letter is: the cell centre is the outward face
+                            // and would put the caption half an anchor in
+                            // front of the word it belongs to.
+                            world_pos: Vec3::new(
+                                input_world.x,
+                                input_world.y,
+                                Span::input().z_center(input_world.z),
+                            ),
+                            // Over the middle the letter stands under, and
+                            // flush with its left edge so the two read as a
+                            // stack however long the name is.
+                            offset: Vec2::new(-TYPE_LETTER_HALF_WIDTH, -ANCHOR_WORD_STACK_HALF),
+                            align: LabelAlign::LeftEdge,
                         })
                     })
                     .collect(),
