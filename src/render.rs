@@ -61,12 +61,19 @@ pub fn layout_range_to_world(min: Vec3, max: Vec3, pad: f32) -> (Vec3, Vec3) {
     (a.min(b), a.max(b))
 }
 
-/// Edge thickness of the NORMAL-mode caret's cell outline, in world units.
-const CARET_EDGE_THICKNESS: f32 = CELL / 60.0;
+/// Thickness of the caret, in world units: the cross-section of the twelve
+/// edges the NORMAL outline is built from, and the depth of the two slabs the
+/// INSERT caret stands on. One value, so the same pointer keeps the same
+/// weight across a mode switch.
+const CARET_THICKNESS: f32 = CELL / 30.0;
 
 /// Alpha of the INSERT-mode caret faces. Nearly solid: the blink is what
 /// keeps the cell behind the caret readable, not the paint.
 const CARET_FACE_ALPHA: f32 = 0.8;
+
+/// Alpha of the NORMAL-mode caret's edges. Carried but not spent — see
+/// `CARET_ALPHA_MODE` — and kept for the same reason the faces keep theirs.
+const CARET_EDGE_ALPHA: f32 = 0.7;
 
 /// Why the caret is opaque, when everything about it says it should blend.
 ///
@@ -118,6 +125,13 @@ pub const DISPLAY_WHITE: f32 = 8.0;
 /// its lower Z. Those are the planes a `Return` resp. `Space` insert opens
 /// along, so the caret shows the corner the new layer would appear at.
 ///
+/// Each is a slab `CARET_THICKNESS` deep rather than a plane, centred on its
+/// face the way the NORMAL outline's edges are centred on theirs — so a mode
+/// switch moves nothing, it only fills in what the outline left open. Half
+/// the thickness is added at every in-plane edge too, which is exactly how
+/// far an outline edge centred on that same corner reaches: the slab ends
+/// flush with the outline rather than stopping short inside it.
+///
 /// `cell` is a layout address, and layout Y and Z are negated on the way to
 /// world space — which is why the origin-facing side is the world *maximum* on
 /// Z and only X reads the way it looks.
@@ -127,6 +141,12 @@ pub fn cell_caret_faces(cell: Vec3) -> Vec<RenderObject> {
     let (lo, hi) = (a.min(b), a.max(b));
     let center = (lo + hi) * 0.5;
     let span = hi - lo;
+    let t = CARET_THICKNESS;
+    // The slab's in-plane extent: the cell's own span with half the thickness
+    // laid on at each of the four edges, which is the same `span + t` outer
+    // measure the NORMAL outline comes to. Only the two axes lying in the
+    // plane are read off this — the third carries the thickness itself.
+    let grown = span + Vec3::splat(t);
     let material = || StandardMaterial {
         base_color: Color::LinearRgba(LinearRgba::new(
             DISPLAY_WHITE,
@@ -143,16 +163,15 @@ pub fn cell_caret_faces(cell: Vec3) -> Vec<RenderObject> {
         ..default()
     };
     vec![
-        // A Rectangle is built in the XY plane, so the YZ face is that quad
-        // turned a quarter turn about Y: its width lands on world Z.
+        // A Cuboid is axis aligned, so each slab is named by which axis carries
+        // the thickness — no quarter turn to put a quad on its side.
         RenderObject {
-            mesh: Rectangle::new(span.z, span.y).mesh().build(),
+            mesh: Cuboid::new(t, grown.y, grown.z).mesh().build(),
             material: material(),
-            transform: Transform::from_translation(Vec3::new(lo.x, center.y, center.z))
-                .with_rotation(Quat::from_rotation_y(std::f32::consts::FRAC_PI_2)),
+            transform: Transform::from_translation(Vec3::new(lo.x, center.y, center.z)),
         },
         RenderObject {
-            mesh: Rectangle::new(span.x, span.y).mesh().build(),
+            mesh: Cuboid::new(grown.x, grown.y, t).mesh().build(),
             material: material(),
             transform: Transform::from_translation(Vec3::new(center.x, center.y, hi.z)),
         },
@@ -169,7 +188,7 @@ pub fn cell_caret_edges(cell: Vec3) -> Vec<RenderObject> {
     let (lo, hi) = (a.min(b), a.max(b));
     let center = (lo + hi) * 0.5;
     let span = hi - lo;
-    let t = CARET_EDGE_THICKNESS;
+    let t = CARET_THICKNESS;
     let mut out = Vec::with_capacity(12);
     for axis in 0..3usize {
         // The two axes the edge is offset along; the edge runs along `axis`.
@@ -187,7 +206,12 @@ pub fn cell_caret_edges(cell: Vec3) -> Vec<RenderObject> {
             out.push(RenderObject {
                 mesh: Cuboid::new(size.x, size.y, size.z).mesh().build(),
                 material: StandardMaterial {
-                    base_color: Color::srgba(0.85, 0.84, 0.80, 0.7),
+                    base_color: Color::LinearRgba(LinearRgba::new(
+                        DISPLAY_WHITE,
+                        DISPLAY_WHITE,
+                        DISPLAY_WHITE,
+                        CARET_EDGE_ALPHA,
+                    )),
                     alpha_mode: CARET_ALPHA_MODE,
                     cull_mode: None,
                     unlit: true,
