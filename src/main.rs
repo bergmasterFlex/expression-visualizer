@@ -9335,18 +9335,22 @@ fn apply_room_insert(
 }
 
 /// Everything the keyboard means to the editor itself, in one pass over the
-/// batch: the mode switch (`i` enters INSERT, `Esc` returns to NORMAL), and
-/// then INSERT's jobs — the room-makers `Space`, `Return` and `Shift+Return`,
-/// which act on the scope the caret addresses and in that scope's local
-/// coordinates, and the prompt, into which every other key writes.
+/// batch: the mode switch, the room-makers, the draft being aimed, and the
+/// prompt.
 ///
-/// What the prompt is *for* is a question about the caret's cell, not about
-/// this system: on a free cell it names what to create, on a cell that stands
-/// for a property it names that property's new value (`insert_target`). The
-/// room-makers belong to the first case alone — where the prompt edits
-/// something that already stands there, making room is not an answer to
-/// anything, and `Space` is simply a character. On a create prompt `Space`
-/// belongs to the prompt for the length of an unclosed quote, and only then.
+/// It no longer decides *which* key means any of that. `keymap::resolve` does,
+/// out of the one table the bar along the bottom edge reads to say what the
+/// keys mean here — so the arms below are reachable only through an `Action`,
+/// and an `Action` comes only from a row that the same predicate put on
+/// screen. What the editor claims and what it does are one statement now. They
+/// were two, and they had already drifted: the old list of the controls never
+/// mentioned `F9`.
+///
+/// So what is left here is what each action *does*, which is graph work and
+/// belongs nowhere else. Where a row is alive — that the room-makers want an
+/// empty create prompt, that `Return` goes to the list the moment a row stands
+/// lit, that an anchor's INSERT is the six directions and nothing else — is
+/// `keymap`'s, written once beside the line that says it on screen.
 ///
 /// Mode switch and prompt have to be **one** system: the key that enters
 /// INSERT is consumed at the very point that flips the mode, so it cannot also
@@ -9358,8 +9362,9 @@ fn apply_room_insert(
 /// `KeyCode`, which names the physical position. A CapsLock remapped to Escape
 /// still reports the CapsLock position, so a `KeyCode::Escape` binding would
 /// never fire for it — and a command letter like `i` would sit wherever QWERTY
-/// puts it, whatever the user actually types. Only Shift, which no message
-/// carries, still comes from `ButtonInput`.
+/// puts it, whatever the user actually types. Only Shift and Ctrl, which no
+/// message carries, still come from `ButtonInput`, and they travel to the
+/// table as `keymap::Mods`.
 ///
 /// While something else owns the keyboard the batch is walked but ignored,
 /// rather than left standing: a message survives two updates, so keys struck
@@ -9382,7 +9387,10 @@ fn handle_editor_keys(
     clipping: Res<lod::Clipping>,
 ) {
     let captured = keyboard_captured(&text_inputs, &eval);
-    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let mods = keymap::Mods {
+        shift: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
+        ctrl: keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight),
+    };
     // `Alt` belongs to `handle_edge_hop_keys` while it is down, and what it
     // does there is read the wiring — never change the mode and never touch
     // the graph. So the letters are walked and dropped, the way they are under
@@ -9390,7 +9398,6 @@ fn handle_editor_keys(
     // on a layout that reports a different character under the modifier, and
     // the one it means here does not include entering INSERT.
     let aiming = alt_held(&keys);
-    let target = insert_target(&state, &pick);
 
     for ev in key_events.read() {
         if ev.state != bevy::input::ButtonState::Pressed {
@@ -9399,21 +9406,36 @@ fn handle_editor_keys(
         if captured || aiming {
             // Nothing in the editor takes the keyboard any more — every
             // property is typed into the prompt, which deliberately is not a
-            // text field — so what is left owning it is the start menu, a modal
-            // and a running evaluation, none of which belong to the editor at
-            // all. The batch is walked rather than left standing, because a
-            // message survives two updates and would otherwise fire once the
-            // guard lifts.
+            // text field — so what is left owning it is a modal and a running
+            // evaluation, neither of which belongs to the editor at all. The
+            // batch is walked rather than left standing, because a message
+            // survives two updates and would otherwise fire once the guard
+            // lifts.
             //
             // `Alt` is the second owner and the only one inside the editor: it
             // is reading the wiring, and this pass would answer the same keys
             // with a mode change or a deletion.
             continue;
         }
-        match (*mode, &ev.logical_key) {
-            (_, bevy::input::keyboard::Key::Escape) => {
-                // Escape leaves INSERT outright, which is the same act the
-                // control's NORMAL half performs.
+        // Asked afresh for every message, and that is not an economy to make.
+        // Half of what decides a key's meaning is written by the key before
+        // it: `"` makes the next `Space` a character inside a string, the
+        // first letter typed takes `Return` away from the room-makers and
+        // gives it to the list, and `i` changes the mode for everything
+        // behind it in the same batch. A context hoisted out of this loop
+        // would answer every key in a burst with the state the burst began in.
+        let context = keymap::context(*mode, &state, &pick, &prompt, &draft, aiming);
+        let Some((action, binding)) = keymap::resolve(&context, &ev.logical_key, mods) else {
+            continue;
+        };
+        // A held key repeats. Which rows may ride the repeats is the table's
+        // to say — typing does, making room does not — but only the message
+        // knows whether this is one.
+        if binding.once && ev.repeat {
+            continue;
+        }
+        match action {
+            keymap::Action::LeaveInsert => {
                 if leave_insert_mode(
                     &mut state,
                     &mut pick,
@@ -9429,17 +9451,17 @@ fn handle_editor_keys(
                     break;
                 }
             }
-            // TAB walks the panel's rows, and the caret walks with it — a row
-            // and a cell are one address seen from two sides. Both modes,
-            // because the panel stands in both; in INSERT what was typed and
-            // not committed falls away with the move, the same as on `Escape`,
-            // and `sync_prompt_seed` opens the row it arrives on.
-            (_, bevy::input::keyboard::Key::Tab) if !ev.repeat => {
+            // The panel's rows and the caret are one address seen from two
+            // sides, so walking one walks the other. Both modes, because the
+            // panel stands in both; in INSERT what was typed and not committed
+            // falls away with the move, the same as on `Escape`, and
+            // `sync_prompt_seed` opens the row it arrives on.
+            keymap::Action::PanelStep => {
                 let Some(subject) = panel_subject(&state, &pick) else {
                     continue;
                 };
                 let here = caret_row_address(&state, &pick);
-                let Some(cell) = tab_step(&subject, &here, shift) else {
+                let Some(cell) = tab_step(&subject, &here, mods.shift) else {
                     continue;
                 };
                 let wanted = state.root_graph().clamp_to_volume(cell);
@@ -9453,14 +9475,20 @@ fn handle_editor_keys(
                     break;
                 }
             }
-            (EditorMode::Normal, bevy::input::keyboard::Key::Character(s)) if s.as_str() == "i" => {
+            // No `break`, and the table says so by leaving this row off
+            // `once`: the mode is flipped and the batch goes on, so the very
+            // next message is resolved against the INSERT this just made. Two
+            // systems, or a break here, would throw the rest of the batch away
+            // and lose the first real keystroke whenever a hitch queued it
+            // together with the `i`.
+            keymap::Action::EnterInsert => {
                 prompt.clear();
                 *mode = EditorMode::Insert;
                 rebuild.0 = true;
             }
-            // Deleting is the one edit NORMAL makes itself. In INSERT the
-            // same key is the prompt's forward delete, an arm below.
-            (EditorMode::Normal, bevy::input::keyboard::Key::Delete) if !ev.repeat => {
+            // Deleting is the one edit NORMAL makes itself. In INSERT the same
+            // key is the prompt's forward delete, an arm below.
+            keymap::Action::DeleteNode => {
                 if delete_node_at_caret(&mut state, &pick) {
                     rebuild.0 = true;
                     // The rest of the batch was struck against a graph that no
@@ -9468,48 +9496,42 @@ fn handle_editor_keys(
                     break;
                 }
             }
-            // NORMAL's own keys belong to `handle_arrow_keys`.
-            (EditorMode::Normal, _) => {}
-            // An anchor cell has its own INSERT, and it is the whole of what
-            // INSERT means there: the keys that would walk a text cursor or a
-            // suggestion list aim the edge instead, because there is neither a
-            // text nor a list to walk. Ahead of the prompt's own arms so the
-            // one meaning cannot be shadowed by the other.
-            (EditorMode::Insert, key) if matches!(target, InsertTarget::Connect(_)) => {
-                if ev.repeat {
-                    continue;
-                }
-                if matches!(key, bevy::input::keyboard::Key::Enter) {
-                    // Whether anything was made or not, the anchor has had its
-                    // answer and there is no second property behind it to go on
-                    // to — the same conclusion `commit_outcome` reaches when a
-                    // node has nothing left to say.
-                    if let Some(info) = draft.active.take() {
-                        commit_draft(&mut state, &info);
-                        // Back to the anchor the edge began at. The caret went
-                        // out to the far end to aim, and what was just wired is
-                        // where the next thing is done — not wherever the aim
-                        // happened to come to rest.
-                        //
-                        // The *anchor*, not the cell it stood on: a new edge
-                        // can grow the anchor it lands on, and the re-settle
-                        // that follows may have pushed the source along. The
-                        // remembered cell is only the fallback for an anchor
-                        // the commit took out of the layout, which nothing
-                        // currently does.
-                        if let DraftAim::Caret { caret_before } = info.aim {
-                            let home = state
-                                .root_graph()
-                                .anchor_cell(&info.source_anchor_id)
-                                .unwrap_or(caret_before);
-                            pick.selected_pos = state.root_graph().clamp_to_volume(home);
-                        }
+            // Whether anything was made or not, the anchor has had its answer
+            // and there is no second property behind it to go on to — the same
+            // conclusion `commit_outcome` reaches when a node has nothing left
+            // to say.
+            keymap::Action::CommitDraft => {
+                if let Some(info) = draft.active.take() {
+                    commit_draft(&mut state, &info);
+                    // Back to the anchor the edge began at. The caret went out
+                    // to the far end to aim, and what was just wired is where
+                    // the next thing is done — not wherever the aim happened
+                    // to come to rest.
+                    //
+                    // The *anchor*, not the cell it stood on: a new edge can
+                    // grow the anchor it lands on, and the re-settle that
+                    // follows may have pushed the source along. The remembered
+                    // cell is only the fallback for an anchor the commit took
+                    // out of the layout, which nothing currently does.
+                    if let DraftAim::Caret { caret_before } = info.aim {
+                        let home = state
+                            .root_graph()
+                            .anchor_cell(&info.source_anchor_id)
+                            .unwrap_or(caret_before);
+                        pick.selected_pos = state.root_graph().clamp_to_volume(home);
                     }
-                    *mode = EditorMode::Normal;
-                    rebuild.0 = true;
-                    break;
                 }
-                let Some(direction) = nav_letter(key).and_then(|dir| caret_delta(dir, shift))
+                *mode = EditorMode::Normal;
+                rebuild.0 = true;
+                break;
+            }
+            // Which way is `caret_delta`'s, as it is for the caret itself: an
+            // anchor cell's INSERT is the six directions meaning the wiring
+            // instead of the grid, and two tables would let the two disagree
+            // about which way is up.
+            keymap::Action::AimDraft => {
+                let Some(direction) =
+                    nav_letter(&ev.logical_key).and_then(|dir| caret_delta(dir, mods.shift))
                 else {
                     continue;
                 };
@@ -9544,166 +9566,139 @@ fn handle_editor_keys(
                     break;
                 }
             }
-            (EditorMode::Insert, key) => match key {
-                bevy::input::keyboard::Key::Character(s) => {
-                    // A single press can carry more than one character when a
-                    // dead key resolves; control characters are not a name.
-                    if !s.is_empty() && !s.chars().any(|c| c.is_control()) {
-                        prompt.insert_str(s.as_str());
-                        reselect(&mut prompt, &state, &pick);
-                    }
-                }
-                // Deleting back to an empty text drops the highlight with it,
-                // which on a create prompt is the other way out of the list:
-                // `Return` goes back to opening a column.
-                bevy::input::keyboard::Key::Backspace => {
-                    if let Some(prev) = prompt.prev_boundary() {
-                        prompt.text.remove(prev);
-                        prompt.cursor = prev;
-                        reselect(&mut prompt, &state, &pick);
-                    }
-                }
-                // Deletes forward, so the cursor does not move.
-                bevy::input::keyboard::Key::Delete => {
-                    if prompt.next_boundary().is_some() {
-                        let at = prompt.cursor;
-                        prompt.text.remove(at);
-                        reselect(&mut prompt, &state, &pick);
-                    }
-                }
-                // The list claims Up and Down; Left and Right are the text's,
-                // which is what makes the prompt usable when it opens on a
-                // value that is already there.
-                bevy::input::keyboard::Key::ArrowLeft => {
-                    if let Some(prev) = prompt.prev_boundary() {
-                        prompt.cursor = prev;
-                    }
-                }
-                bevy::input::keyboard::Key::ArrowRight => {
-                    if let Some(next) = prompt.next_boundary() {
-                        prompt.cursor = next;
-                    }
-                }
-                bevy::input::keyboard::Key::Home => prompt.cursor = 0,
-                bevy::input::keyboard::Key::End => prompt.cursor = prompt.text.len(),
-                bevy::input::keyboard::Key::ArrowDown | bevy::input::keyboard::Key::ArrowUp => {
-                    let delta = if matches!(key, bevy::input::keyboard::Key::ArrowDown) {
-                        1
-                    } else {
-                        -1
-                    };
-                    let candidates = prompt_candidates(&state, &pick, &prompt.text);
-                    prompt.selected = step_selection(&candidates, prompt.selected, delta);
-                }
-                // On a cell that names a property there is no room to make, so
-                // the space bar is simply a character — which is what keeps a
-                // Source name with a space in it typeable.
-                //
-                // Inside an unclosed quote it writes one on a create prompt
-                // too: `Key::Space` is its own variant, so the `Character` arm
-                // never sees one and a string could otherwise not hold one.
-                // That guard needs a non-empty text and the room-maker below an
-                // empty one, so the two can never both fire.
-                bevy::input::keyboard::Key::Space
-                    if matches!(target, InsertTarget::Edit(..)) || in_open_quote(&prompt.text) =>
-                {
-                    prompt.insert_str(" ");
+            // One action for two keys: a character, and the space bar wherever
+            // the table has decided it is a character rather than a room-maker
+            // — on a property cell, and inside a quote that has not closed.
+            // `Key::Space` is its own variant, so the character arm never sees
+            // one and a string could otherwise not hold a space at all.
+            keymap::Action::PromptWrite => {
+                let written = match &ev.logical_key {
+                    bevy::input::keyboard::Key::Space => " ",
+                    bevy::input::keyboard::Key::Character(s) => s.as_str(),
+                    _ => continue,
+                };
+                prompt.insert_str(written);
+                reselect(&mut prompt, &state, &pick);
+            }
+            // Deleting back to an empty text drops the highlight with it,
+            // which on a create prompt is the other way out of the list:
+            // `Return` goes back to opening a column.
+            keymap::Action::PromptBackspace => {
+                if let Some(prev) = prompt.prev_boundary() {
+                    prompt.text.remove(prev);
+                    prompt.cursor = prev;
                     reselect(&mut prompt, &state, &pick);
                 }
-                // The room-makers belong to the prompt that builds: where the
-                // prompt edits a property of a node that already stands there,
-                // making room is not an answer to anything. They are also
-                // bounded to one insert per press — a held key auto-repeats,
-                // and the repeats must not each open a cell.
-                bevy::input::keyboard::Key::Space
-                    if target == InsertTarget::Create && prompt.text.is_empty() && !ev.repeat =>
+            }
+            // Deletes forward, so the cursor does not move.
+            keymap::Action::PromptDelete => {
+                if prompt.next_boundary().is_some() {
+                    let at = prompt.cursor;
+                    prompt.text.remove(at);
+                    reselect(&mut prompt, &state, &pick);
+                }
+            }
+            // The list claims Up and Down; Left and Right are the text's,
+            // which is what makes the prompt usable when it opens on a value
+            // that is already there.
+            keymap::Action::PromptLeft => {
+                if let Some(prev) = prompt.prev_boundary() {
+                    prompt.cursor = prev;
+                }
+            }
+            keymap::Action::PromptRight => {
+                if let Some(next) = prompt.next_boundary() {
+                    prompt.cursor = next;
+                }
+            }
+            keymap::Action::PromptHome => prompt.cursor = 0,
+            keymap::Action::PromptEnd => prompt.cursor = prompt.text.len(),
+            keymap::Action::PromptStep(delta) => {
+                let candidates = prompt_candidates(&state, &pick, &prompt.text);
+                prompt.selected = step_selection(&candidates, prompt.selected, delta);
+            }
+            // The room-makers belong to the prompt that builds: where the
+            // prompt edits a property of a node that already stands there,
+            // making room is not an answer to anything. Which cells they are
+            // allowed in is the table's, and it is the only place that says so
+            // now.
+            keymap::Action::OpenCell => {
+                if apply_room_insert(
+                    &mut state,
+                    &mut pick,
+                    |graph, scope| graph.plus_empty_cell(scope.local),
+                    IVec3::Z,
+                ) {
+                    rebuild.0 = true;
+                }
+                break;
+            }
+            keymap::Action::OpenColumn => {
+                if apply_room_insert(
+                    &mut state,
+                    &mut pick,
+                    |graph, scope| graph.plus_empty_slab(layout::Axis::X, scope.local.x),
+                    IVec3::X,
+                ) {
+                    rebuild.0 = true;
+                }
+                break;
+            }
+            keymap::Action::OpenRow => {
+                if apply_room_insert(
+                    &mut state,
+                    &mut pick,
+                    // Inside a Match a row belongs to the arm stack: it opens
+                    // between two arms and the scope keeps its height, because
+                    // the space is the Match's own and grows its footprint
+                    // rather than the volume. Outside one, the row is the
+                    // scope's and every node behind it steps back.
+                    |graph, scope| match graph.match_containing(scope.local) {
+                        Some(match_id) => graph.plus_arm_row(&match_id, scope.local.y),
+                        None => graph.plus_empty_slab(layout::Axis::Y, scope.local.y),
+                    },
+                    IVec3::Y,
+                ) {
+                    rebuild.0 = true;
+                }
+                break;
+            }
+            // Only where a row stands lit, which is what `committable` says
+            // and what the bar shows. A prompt nothing answers has not been
+            // answered yet, and there is no second meaning for the key to fall
+            // back on the way the create prompt has its column.
+            //
+            // What the commit leaves behind — whether INSERT goes on and
+            // whether a node is owed a property — is `commit_outcome`'s,
+            // because the mouse path has to reach the same conclusion.
+            keymap::Action::CommitRow => {
+                let candidates = prompt_candidates(&state, &pick, &prompt.text);
+                if let Some(choice) = clamped_selection(&candidates, prompt.selected)
+                    .and_then(|selected| candidates.get(selected))
+                    .filter(|suggestion| suggestion.allowed)
+                    .map(|suggestion| suggestion.action.clone())
                 {
-                    if apply_room_insert(
-                        &mut state,
-                        &mut pick,
-                        |graph, scope| graph.plus_empty_cell(scope.local),
-                        IVec3::Z,
-                    ) {
-                        rebuild.0 = true;
-                    }
-                    break;
-                }
-                // `Return` is the newline only while the list has not answered:
-                // a standing highlight — typed to or walked to — takes the key
-                // for the commit below, because that is what a highlight means.
-                // The empty text is still part of the guard beside it: a
-                // half-written name that matches nothing has no highlight
-                // either, and must not open a column behind the typist's back.
-                bevy::input::keyboard::Key::Enter
-                    if target == InsertTarget::Create
-                        && prompt.text.is_empty()
-                        && prompt.selected.is_none()
-                        && !ev.repeat =>
-                {
-                    let inserted = if shift {
-                        apply_room_insert(
-                            &mut state,
+                    if let Some(outcome) = apply_prompt_action(&mut state, &mut pick, &choice) {
+                        commit_outcome(
+                            &state,
                             &mut pick,
-                            // Inside a Match a row belongs to the arm stack:
-                            // it opens between two arms and the scope keeps
-                            // its height, because the space is the Match's own
-                            // and grows its footprint rather than the volume.
-                            // Outside one, the row is the scope's and every
-                            // node behind it steps back.
-                            |graph, scope| match graph.match_containing(scope.local) {
-                                Some(match_id) => graph.plus_arm_row(&match_id, scope.local.y),
-                                None => graph.plus_empty_slab(layout::Axis::Y, scope.local.y),
-                            },
-                            IVec3::Y,
-                        )
-                    } else {
-                        apply_room_insert(
-                            &mut state,
-                            &mut pick,
-                            |graph, scope| graph.plus_empty_slab(layout::Axis::X, scope.local.x),
-                            IVec3::X,
-                        )
-                    };
-                    if inserted {
-                        rebuild.0 = true;
+                            outcome,
+                            &mut prompt,
+                            &mut pending,
+                            &mut mode,
+                            &mut rebuild,
+                        );
                     }
-                    break;
                 }
-                bevy::input::keyboard::Key::Enter if !ev.repeat => {
-                    // Commit the highlighted row — and with no highlight,
-                    // nothing: a prompt that nothing answers has not been
-                    // answered yet, and there is no second meaning for the key
-                    // to fall back on the way the create prompt has its column.
-                    //
-                    // What the commit leaves behind — whether INSERT goes on
-                    // and whether a node is owed a property — is
-                    // `commit_outcome`'s, because the mouse path has to reach
-                    // the same conclusion.
-                    let candidates = prompt_candidates(&state, &pick, &prompt.text);
-                    if let Some(action) = clamped_selection(&candidates, prompt.selected)
-                        .and_then(|selected| candidates.get(selected))
-                        .filter(|suggestion| suggestion.allowed)
-                        .map(|suggestion| suggestion.action.clone())
-                    {
-                        if let Some(outcome) = apply_prompt_action(&mut state, &mut pick, &action) {
-                            commit_outcome(
-                                &state,
-                                &mut pick,
-                                outcome,
-                                &mut prompt,
-                                &mut pending,
-                                &mut mode,
-                                &mut rebuild,
-                            );
-                        }
-                    }
-                    break;
-                }
-                // A space outside an open quote is in no name the list holds,
-                // and there is no undo: a stray one mid-typing must neither
-                // land in the text nor reshape the graph.
-                _ => {}
-            },
+                break;
+            }
+            // NORMAL's own six keys, and the `Alt` layer's. They resolve here
+            // because the table is one table, and they are answered by
+            // `handle_arrow_keys` and `handle_edge_hop_keys` — which read the
+            // same messages on cursors of their own. Falling through rather
+            // than breaking: nothing was touched, so the rest of the batch is
+            // still about the graph it was struck against.
+            keymap::Action::CaretStep | keymap::Action::ShoveNode | keymap::Action::Hop => {}
         }
     }
 }
@@ -9930,6 +9925,18 @@ fn nav_letter(key: &bevy::input::keyboard::Key) -> Option<char> {
 
 /// Caret navigation in NORMAL: the arrow keys and the vim letters `hjkl`,
 /// which are the same four directions under two names.
+///
+/// Whether the six keys may act here is `keymap::resolve`'s, as it is for
+/// every other system that reads the keyboard — so a direction the bar does
+/// not list is a direction the caret does not take, and `Ctrl` shoving a node
+/// rather than moving the caret is one row in the table rather than an `if`
+/// buried here.
+///
+/// *Which way* each key points stays `caret_delta`'s, and deliberately: the
+/// caret and a draft edge are aimed with the same six directions, and two
+/// tables would let them disagree about which way is up. The table says a key
+/// may move something; `caret_delta` says where to.
+#[allow(clippy::too_many_arguments)]
 fn handle_arrow_keys(
     keys: Res<ButtonInput<KeyCode>>,
     mut key_events: MessageReader<KeyboardInput>,
@@ -9939,6 +9946,8 @@ fn handle_arrow_keys(
     mut rebuild: ResMut<NeedsRebuild>,
     eval: Res<EvalState>,
     mode: Res<EditorMode>,
+    prompt: Res<InsertPrompt>,
+    draft: Res<DraftState>,
 ) {
     // INSERT mode freezes the caret: the keys belong to NORMAL, and moving
     // a node (Ctrl+key) is a NORMAL operation too. The letters are dropped
@@ -9965,8 +9974,10 @@ fn handle_arrow_keys(
     if alt_held(&keys) {
         return;
     }
-    let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
-    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let mods = keymap::Mods {
+        shift: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
+        ctrl: keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight),
+    };
 
     // `hjkl` rides alongside the arrows, through the one fold `nav_letter`
     // performs for the draft as well. Repeats are dropped so a held key steps
@@ -9974,30 +9985,45 @@ fn handle_arrow_keys(
     let letter = key_events
         .read()
         .filter(|ev| ev.state == bevy::input::ButtonState::Pressed && !ev.repeat)
-        .find_map(|ev| match &ev.logical_key {
-            bevy::input::keyboard::Key::Character(_) => nav_letter(&ev.logical_key),
-            _ => None,
-        });
+        .find(|ev| {
+            matches!(ev.logical_key, bevy::input::keyboard::Key::Character(_))
+                && nav_letter(&ev.logical_key).is_some()
+        })
+        .map(|ev| ev.logical_key.clone());
 
+    // The arrows come from `ButtonInput`, which carries no key to hand the
+    // table — so the one the press stands for is named here. The table is
+    // asked about a key either way, because a binding that held for the letter
+    // and not for the arrow beside it would be two bindings wearing one row.
     let arrow = if keys.just_pressed(KeyCode::ArrowUp) {
-        Some('k')
+        Some(bevy::input::keyboard::Key::ArrowUp)
     } else if keys.just_pressed(KeyCode::ArrowDown) {
-        Some('j')
+        Some(bevy::input::keyboard::Key::ArrowDown)
     } else if keys.just_pressed(KeyCode::ArrowLeft) {
-        Some('h')
+        Some(bevy::input::keyboard::Key::ArrowLeft)
     } else if keys.just_pressed(KeyCode::ArrowRight) {
-        Some('l')
+        Some(bevy::input::keyboard::Key::ArrowRight)
     } else {
         None
     };
 
-    let delta = arrow.or(letter).and_then(|dir| caret_delta(dir, shift));
-
-    let Some(delta) = delta else {
+    let Some(struck) = arrow.or(letter) else {
+        return;
+    };
+    // `Alt` is off by the guard above, so the context is NORMAL's.
+    let context = keymap::context(*mode, &state, &pick, &prompt, &draft, false);
+    let shoving = match keymap::resolve(&context, &struck, mods) {
+        Some((keymap::Action::ShoveNode, _)) => true,
+        Some((keymap::Action::CaretStep, _)) => false,
+        // Every other action in the table belongs to another system, and a key
+        // no row claims moves nothing.
+        _ => return,
+    };
+    let Some(delta) = nav_letter(&struck).and_then(|dir| caret_delta(dir, mods.shift)) else {
         return;
     };
 
-    if ctrl {
+    if shoving {
         // Move the node under the current selection (if any) and keep
         // the selection anchored to it — the effective position may differ
         // from `selected + delta` when the move jumped over a match.
@@ -10357,6 +10383,8 @@ fn handle_edge_hop_keys(
     eval: Res<EvalState>,
     mode: Res<EditorMode>,
     clipping: Res<lod::Clipping>,
+    prompt: Res<InsertPrompt>,
+    draft: Res<DraftState>,
 ) {
     // The gates the caret's own keys go through, and the key itself. A run
     // owns the graph, INSERT owns the keyboard, a focused field owns the
@@ -10387,22 +10415,40 @@ fn handle_edge_hop_keys(
     let letter = key_events
         .read()
         .filter(|ev| ev.state == bevy::input::ButtonState::Pressed && !ev.repeat)
-        .find_map(|ev| match &ev.logical_key {
-            bevy::input::keyboard::Key::Character(_) => nav_letter(&ev.logical_key),
-            _ => None,
-        });
+        .find(|ev| {
+            matches!(ev.logical_key, bevy::input::keyboard::Key::Character(_))
+                && nav_letter(&ev.logical_key).is_some()
+        })
+        .map(|ev| ev.logical_key.clone());
     let arrow = if keys.just_pressed(KeyCode::ArrowUp) {
-        Some('k')
+        Some(bevy::input::keyboard::Key::ArrowUp)
     } else if keys.just_pressed(KeyCode::ArrowDown) {
-        Some('j')
+        Some(bevy::input::keyboard::Key::ArrowDown)
     } else if keys.just_pressed(KeyCode::ArrowLeft) {
-        Some('h')
+        Some(bevy::input::keyboard::Key::ArrowLeft)
     } else if keys.just_pressed(KeyCode::ArrowRight) {
-        Some('l')
+        Some(bevy::input::keyboard::Key::ArrowRight)
     } else {
         None
     };
-    let direction = arrow.or(letter);
+    // The table decides whether the keyboard is the wiring's right now, and no
+    // more than that: which of the six a hop then follows, and to where, is
+    // worked out below from the anchor and its rows, and cannot be said in a
+    // row of a table. So every `Alt` row answers every direction, and what
+    // this gate really refuses is a key no row claims at all.
+    //
+    // `None` is also the ordinary case — `Alt` held with nothing struck — and
+    // the reach below reads it as the request for a preview that it is.
+    let direction = arrow.or(letter).and_then(|struck| {
+        let context = keymap::context(*mode, &state, &pick, &prompt, &draft, true);
+        let mods = keymap::Mods { shift, ctrl: false };
+        matches!(
+            keymap::resolve(&context, &struck, mods),
+            Some((keymap::Action::Hop, _))
+        )
+        .then(|| nav_letter(&struck))
+        .flatten()
+    });
 
     let here = anchor_row_at_caret(&state, &pick);
     // Which anchor is being reached from is the caret's answer and nothing
