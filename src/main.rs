@@ -3006,7 +3006,7 @@ fn spawn_view_bar(mut commands: Commands, ui_font: Res<UiFont>) {
             Node {
                 position_type: PositionType::Absolute,
                 left: Val::Px(12.0),
-                bottom: Val::Px(BOTTOM_CHROME_MARGIN + KEY_BAR_HEIGHT),
+                bottom: Val::Px(BOTTOM_CHROME_MARGIN),
                 flex_direction: FlexDirection::Row,
                 align_items: AlignItems::Center,
                 column_gap: Val::Px(8.0),
@@ -3050,7 +3050,6 @@ fn spawn_view_bar(mut commands: Commands, ui_font: Res<UiFont>) {
                 ClippingCheckboxBox,
             );
             spawn_inline_checkbox(bar, &font, "Guides", GuidesCheckbox, GuidesCheckboxBox);
-            spawn_inline_checkbox(bar, &font, "Keys", KeysCheckbox, KeysCheckboxBox);
         });
 }
 
@@ -3126,63 +3125,6 @@ struct GuidesCheckbox;
 /// Marker on that checkbox's swatch.
 #[derive(Component)]
 struct GuidesCheckboxBox;
-
-/// Marker for the checkbox that spells the keys out along the bottom edge.
-#[derive(Component)]
-struct KeysCheckbox;
-
-/// Marker on that checkbox's swatch.
-#[derive(Component)]
-struct KeysCheckboxBox;
-
-/// Whether the bar says what the keys mean, or only which mode the editor is
-/// in.
-///
-/// On by default: the list is for the hand that does not know the keys yet,
-/// and that hand is not the one that would go looking for a checkbox to turn
-/// it on. Off, the bar keeps standing — the mode is a control and does not
-/// come and go — it simply has nothing beside it, and everything above it
-/// drops by the height the entries were taking.
-#[derive(Resource)]
-struct ShowKeys(bool);
-
-impl Default for ShowKeys {
-    fn default() -> Self {
-        Self(true)
-    }
-}
-
-/// Toggle whether the keys are spelled out.
-///
-/// No rebuild, unlike `handle_clipping_checkbox`: nothing about the bar is
-/// baked into the scene, and `sync_key_bar` redraws it from the resource on
-/// the next frame anyway.
-fn handle_keys_checkbox(
-    interaction_q: Query<&Interaction, (Changed<Interaction>, With<KeysCheckbox>)>,
-    mut show: ResMut<ShowKeys>,
-) {
-    for interaction in interaction_q.iter() {
-        if *interaction == Interaction::Pressed {
-            show.0 = !show.0;
-        }
-    }
-}
-
-fn sync_keys_checkbox(
-    show: Res<ShowKeys>,
-    mut box_q: Query<&mut BackgroundColor, With<KeysCheckboxBox>>,
-) {
-    let wanted = if show.0 {
-        CHECKED_COLOR
-    } else {
-        UNCHECKED_COLOR
-    };
-    for mut color in box_q.iter_mut() {
-        if color.0 != wanted {
-            color.0 = wanted;
-        }
-    }
-}
 
 /// Toggle the guides.
 ///
@@ -3274,7 +3216,7 @@ fn spawn_run_panel(mut commands: Commands) {
             Node {
                 position_type: PositionType::Absolute,
                 right: Val::Px(14.0),
-                bottom: Val::Px(BOTTOM_CHROME_MARGIN + KEY_BAR_HEIGHT),
+                bottom: Val::Px(BOTTOM_CHROME_MARGIN),
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Stretch,
                 padding: UiRect::all(Val::Px(10.0)),
@@ -8119,75 +8061,26 @@ fn handle_diagnostics_click(
     }
 }
 
-/// How tall the bar along the bottom edge stands, and with it where every
-/// other bottom-anchored surface begins.
-///
-/// Fixed, and not sized to its content. A bar whose height followed the number
-/// of entries would move the view bar and the run panel on every caret step —
-/// the same thing `spawn_run_panel` refuses for its own width, and for the same
-/// reason: a control that slides is a control the hand cannot reach without
-/// looking. Two lines of entries are reserved whether or not they are filled,
-/// and what will not fit is clipped.
-const KEY_BAR_HEIGHT: f32 = 56.0;
-
-/// What the bar shrinks to with the keys turned off: the mode pill alone, and
-/// nothing beside it.
-const KEY_BAR_HEIGHT_BARE: f32 = 44.0;
-
-/// The gap every bottom-anchored surface keeps above the bar.
+/// The gap every bottom-anchored surface keeps from the bottom edge.
 const BOTTOM_CHROME_MARGIN: f32 = 12.0;
 
-/// Past this many entries the bar says so rather than quietly dropping them.
-/// No context reaches it; it is here so that one added later cannot lie.
-const KEY_BAR_MAX_ROWS: usize = 14;
-
-/// Marker for the bar itself — the one node that stands, and the parent the
-/// entries are rebuilt under.
-#[derive(Component)]
-struct KeyBar;
-
-/// Sweep marker, on direct children of the bar only. `despawn` takes
-/// descendants, so anything deeper goes with its parent.
+/// The editing mode, centred on the bottom edge — a control, not a readout.
 ///
-/// The mode pill deliberately does not carry it: it is a control and must
-/// survive every rebuild, while everything beside it is a readout of a place
-/// the caret has since left.
-#[derive(Component)]
-struct KeyBarEntity;
-
-/// The drawn view, so that a rebuild happens when what is on screen would
-/// differ and at no other time.
+/// It spent a while inside a bar along that edge, beside the list of what the
+/// keys mean. The list has moved to a panel on the right that folds away, and
+/// the mode could not go with it: a control that disappears when a readout is
+/// folded is a control the user has to unfold something to reach.
 ///
-/// The rows as drawn rather than the `keymap::Context` they came from, for the
-/// reason `EditorPanelFingerprint` gives: a fingerprint of the input silently
-/// stops working the day a row's text depends on something the input does not
-/// carry. `&'static str` pairs throughout, so this compares pointers and
-/// lengths and never copies a screenful of text.
-#[derive(Default, PartialEq, Eq)]
-struct KeyBarFingerprint {
-    place: &'static str,
-    rows: Vec<(&'static str, &'static str, keymap::Group)>,
-    /// Folded away, the bar draws only the pill. In the fingerprint rather
-    /// than tested before it, so that turning the keys off and on again is a
-    /// change the latch sees even though the rows either side of it match.
-    shown: bool,
-}
-
-/// The bottom edge: which mode the editor is in, where the caret is standing,
-/// and what the keys mean there.
+/// A row spanning the window with its content centred, so what stands in it
+/// can change width without anything being measured. The two halves sit flush
+/// and are rounded only on their outer edge, so the pair reads as one widget
+/// with two states rather than as two buttons. No rule between them: one half
+/// is always on, and the fill it carries draws the seam.
 ///
-/// The mode pill used to float on its own, centred above this edge. It moved in
-/// here because the two say the same kind of thing — the pill names the mode,
-/// the heading beside it names the place within that mode, and the entries name
-/// what the keys do in it. Three readings of one question, and they belong in
-/// one frame.
-///
-/// `EditorChrome` goes on the bar and on nothing inside it. `sync_editor_chrome`
-/// is the sole writer of `display` on every carrier of it, so a modal or the
-/// screenshot mode takes the whole bar away for free — which is right: a modal
-/// owns the screen, and nothing behind it is a place the keys still mean
-/// anything.
-fn spawn_key_bar(mut commands: Commands, ui_font: Res<UiFont>) {
+/// `EditorChrome` goes on the row and stays off the three inside it —
+/// `sync_mode_toggles` is the only writer of their `display`, and two writers
+/// flicker on the frame they disagree.
+fn spawn_mode_display(mut commands: Commands, ui_font: Res<UiFont>) {
     const RADIUS: Val = Val::Px(6.0);
     let segment = |radius: BorderRadius, display: Display| Node {
         padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
@@ -8201,89 +8094,204 @@ fn spawn_key_bar(mut commands: Commands, ui_font: Res<UiFont>) {
                 position_type: PositionType::Absolute,
                 left: Val::Px(0.0),
                 right: Val::Px(0.0),
-                bottom: Val::Px(0.0),
-                height: Val::Px(KEY_BAR_HEIGHT),
+                bottom: Val::Px(16.0),
                 flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                column_gap: Val::Px(12.0),
-                padding: UiRect::axes(Val::Px(12.0), Val::Px(6.0)),
-                border: UiRect::top(Val::Px(1.0)),
-                // What will not fit is cut off rather than drawn outside the
-                // height everything above this is standing on.
-                overflow: Overflow::clip(),
+                justify_content: JustifyContent::Center,
                 ..default()
             },
-            // The popup fill, not the panel fill: this comes and goes with the
-            // caret, it is not a surface that stands.
-            BackgroundColor(Color::srgba(0.08, 0.08, 0.14, 0.98)),
-            BorderColor::all(Color::srgb(0.25, 0.25, 0.4)),
-            // Above the run panel, which is spawned later and would otherwise
-            // cover it. Well below the modals, which own 50.
-            GlobalZIndex(10),
-            // Carried with no handler, so a click on the bar does not fall
-            // through and move the caret to whatever cell is behind it. The
-            // standing panels do the same.
-            Button,
-            KeyBar,
             EditorChrome,
         ))
-        .with_children(|bar| {
-            // The two halves sit flush and are rounded only on their outer
-            // edge, so the pair reads as one widget with two states rather than
-            // as two buttons. No rule between them: one half is always on, and
-            // the fill it carries draws the seam.
-            bar.spawn(Node {
-                flex_direction: FlexDirection::Row,
-                align_items: AlignItems::Center,
-                flex_shrink: 0.0,
-                ..default()
-            })
-            .with_children(|pill| {
-                for (mode, label, radius) in [
-                    (EditorMode::Normal, "NORMAL", BorderRadius::left(RADIUS)),
-                    (EditorMode::Insert, "INSERT", BorderRadius::right(RADIUS)),
-                ] {
-                    pill.spawn((
-                        Button,
-                        segment(radius, Display::Flex),
-                        BackgroundColor(CONTROL_REST),
-                        ModeToggle(mode),
-                    ))
-                    .with_children(|half| {
-                        half.spawn((
-                            Text::new(label),
-                            text_font(&ui_font.0, 14.0),
-                            TextColor(Color::srgb(0.6, 0.6, 0.7)),
-                        ));
-                    });
-                }
-                // What stands in the same place while an evaluation runs,
-                // alone and rounded all round.
-                pill.spawn((
+        .with_children(|row| {
+            for (mode, label, radius) in [
+                (EditorMode::Normal, "NORMAL", BorderRadius::left(RADIUS)),
+                (EditorMode::Insert, "INSERT", BorderRadius::right(RADIUS)),
+            ] {
+                row.spawn((
                     Button,
-                    segment(BorderRadius::all(RADIUS), Display::None),
+                    segment(radius, Display::Flex),
                     BackgroundColor(CONTROL_REST),
-                    EvalModeLabel,
+                    ModeToggle(mode),
                 ))
-                .with_children(|panel| {
-                    panel.spawn((
-                        Text::new("EVALUATE"),
+                .with_children(|half| {
+                    half.spawn((
+                        Text::new(label),
                         text_font(&ui_font.0, 14.0),
-                        TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                        TextColor(Color::srgb(0.6, 0.6, 0.7)),
                     ));
                 });
+            }
+            // What stands in the same place while an evaluation runs, alone
+            // and rounded all round. A bare `Button` for the reason the panels
+            // carry one: it is what `pick_cells`' `over_ui` test sees, so a
+            // click that lands on it doesn't reach the cell behind it.
+            row.spawn((
+                Button,
+                segment(BorderRadius::all(RADIUS), Display::None),
+                BackgroundColor(CONTROL_REST),
+                EvalModeLabel,
+            ))
+            .with_children(|panel| {
+                panel.spawn((
+                    Text::new("EVALUATE"),
+                    text_font(&ui_font.0, 14.0),
+                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                ));
             });
         });
 }
 
-/// Write what the keys mean where the caret is standing.
+/// Where the panel's top edge sits: the height of the `Relative:` line
+/// opposite it, which is also clear of the FPS readout standing at y=8.
+const WHICH_KEY_TOP: f32 = 56.0;
+
+/// Wider than the run panel below it, and deliberately so. Two columns of key
+/// and sentence do not fit in that panel's 420: after the key column there
+/// would be fifteen characters left for the sentence, and nothing worth saying
+/// is fifteen characters long. 560 leaves 264 per column.
+const WHICH_KEY_WIDTH: f32 = 560.0;
+
+/// The air kept between this panel and the run panel below, so the two read as
+/// two surfaces rather than one seam.
+const WHICH_KEY_GAP: f32 = 12.0;
+
+/// One row: 12px text on the default 1.2 line height, plus the gap to the next.
 ///
-/// Rebuilds the bar's children whenever the drawn view would differ, the way
-/// every list here does: fingerprint, latch, sweep, respawn. It never touches
-/// the bar's own `display` — that belongs to `sync_editor_chrome` alone, and
-/// two writers of one field flicker on the frame they disagree.
+/// Forced onto every row rather than left to the text, which is what makes the
+/// arithmetic below exact. A row that were sometimes one line and sometimes
+/// two would turn `rows_per_page` into a guess, and a page that guesses wrong
+/// clips — which is the thing this panel exists to stop doing.
+const WHICH_KEY_ROW_HEIGHT: f32 = 17.0;
+
+/// The key column. `Ctrl+h j k l` is the longest entry and measures 86px at
+/// 12px in JetBrains Mono.
+const WHICH_KEY_KEY_WIDTH: f32 = 88.0;
+
+/// What the panel spends on itself before the first row: the padding top and
+/// bottom, the header, the gap under it, and each column's own heading.
+const WHICH_KEY_CHROME_HEIGHT: f32 = 20.0 + 17.0 + 6.0 + 17.0;
+
+/// How long a page stands before the next one comes.
+const WHICH_KEY_PAGE_SECONDS: f32 = 5.0;
+
+/// Marker for the panel itself — the one node that stands, and the parent the
+/// rest is rebuilt under.
+#[derive(Component)]
+struct WhichKeyPanel;
+
+/// Sweep marker, on direct children of the panel only. `despawn` takes
+/// descendants, so anything deeper goes with its parent.
+#[derive(Component)]
+struct WhichKeyEntity;
+
+/// The header, which is also the fold.
+#[derive(Component)]
+struct WhichKeyHeader;
+
+/// Whether the list is unfolded.
+///
+/// Open to begin with, for the reason the diagnostics list is: what it says is
+/// for the hand that does not know the keys yet, and that hand is not the one
+/// that would go looking for a way to show it. Nothing but a click on the
+/// header writes it — a fold the editor opened and closed behind the user's
+/// back is a fold that cannot be trusted.
+#[derive(Resource)]
+struct WhichKeyOpen(bool);
+
+impl Default for WhichKeyOpen {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
+/// Which page this moment shows.
+///
+/// Free-running and stateless, so a rebuild does not restart the rhythm — the
+/// same reason `caret_blink_lit` takes its phase from the wall clock rather
+/// than from a timer that would have to be kept somewhere.
+fn which_key_page(now: f32) -> usize {
+    (now / WHICH_KEY_PAGE_SECONDS) as usize
+}
+
+/// The drawn view, so a rebuild happens when what is on screen would differ
+/// and at no other time.
+///
+/// The rows as drawn rather than the `keymap::Context` they came from, for the
+/// reason `EditorPanelFingerprint` gives. The page numbers are in here too:
+/// the rows either side of a turn are different rows, but the *heading* counts
+/// them, and a heading that went stale would say 1/2 on the second page.
+#[derive(Default, PartialEq, Eq)]
+struct WhichKeyFingerprint {
+    mode: &'static str,
+    place: &'static str,
+    keys: Vec<(&'static str, &'static str)>,
+    mouse: Vec<(&'static str, &'static str)>,
+    open: bool,
+    /// Page and page count, keys first and mouse second.
+    pages: (usize, usize, usize, usize),
+}
+
+/// The right-hand column's upper half: what the keys mean where the caret is
+/// standing.
+///
+/// It folds like the problems list below it, and takes whatever height is left
+/// between the two — so folding the problems away gives this more to say. That
+/// is the one thing here that is measured rather than stated, and the comment
+/// in `sync_which_key` says what it costs.
+fn spawn_which_key(mut commands: Commands) {
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(WHICH_KEY_TOP),
+            right: Val::Px(12.0),
+            width: Val::Px(WHICH_KEY_WIDTH),
+            flex_direction: FlexDirection::Column,
+            align_items: AlignItems::Stretch,
+            padding: UiRect::all(Val::Px(10.0)),
+            row_gap: Val::Px(6.0),
+            border_radius: BorderRadius::all(Val::Px(6.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.10, 0.10, 0.16, 0.9)),
+        BorderColor::all(Color::srgb(0.25, 0.25, 0.4)),
+        // Above the run panel, which is spawned later and would otherwise
+        // cover it. Well below the modals, which own 50.
+        GlobalZIndex(10),
+        // Carried with no handler, so a click on the panel does not fall
+        // through and move the caret to whatever cell is behind it.
+        Button,
+        WhichKeyPanel,
+        EditorChrome,
+    ));
+}
+
+/// The header folds the list. The rows answer to nothing — they are a readout.
+fn handle_which_key_click(
+    header_q: Query<&Interaction, (Changed<Interaction>, With<WhichKeyHeader>)>,
+    mut open: ResMut<WhichKeyOpen>,
+) {
+    for interaction in header_q.iter() {
+        if *interaction == Interaction::Pressed {
+            open.0 = !open.0;
+        }
+    }
+}
+
+/// Write what the keys mean here, in as many rows as there is room for.
+///
+/// The height is taken rather than given: the run panel is anchored to the
+/// bottom and sized by its content, so what is free between the two is the
+/// window less that panel, less this panel's own top. `ComputedNode` measures
+/// it, which costs a frame — the panel catches up with a fold of the problems
+/// list one frame after it happens. That is affordable precisely because both
+/// folds are clicks and neither is a caret step.
+///
+/// What will not fit is not clipped but turned: each column pages on its own,
+/// so the mouse column with three entries stands still while the keyboard
+/// column with twelve turns. Paging them together would leave the mouse column
+/// empty on page two, with nothing to say and no reason to be blank.
 #[allow(clippy::too_many_arguments)]
-fn sync_key_bar(
+fn sync_which_key(
     mut commands: Commands,
     mode: Res<EditorMode>,
     state: Res<GraphState>,
@@ -8291,162 +8299,206 @@ fn sync_key_bar(
     prompt: Res<InsertPrompt>,
     draft: Res<DraftState>,
     keys: Res<ButtonInput<KeyCode>>,
-    show: Res<ShowKeys>,
+    open: Res<WhichKeyOpen>,
+    time: Res<Time>,
     ui_font: Res<UiFont>,
-    bar_q: Query<Entity, With<KeyBar>>,
-    content_q: Query<Entity, With<KeyBarEntity>>,
-    mut cache: Local<KeyBarFingerprint>,
+    windows: Query<&Window>,
+    run_q: Query<&ComputedNode, With<RunPanel>>,
+    panel_q: Query<Entity, With<WhichKeyPanel>>,
+    content_q: Query<Entity, With<WhichKeyEntity>>,
+    mut cache: Local<WhichKeyFingerprint>,
 ) {
     let context = keymap::context(*mode, &state, &pick, &prompt, &draft, alt_held(&keys));
-    // Folded away, the question is not asked at all: no place to name, no rows
-    // to list, and the pill left standing on its own.
-    let place = if show.0 { keymap::place(&context) } else { "" };
-    let rows: Vec<(&'static str, &'static str, keymap::Group)> = if show.0 {
-        keymap::live(&context)
-            .take(KEY_BAR_MAX_ROWS)
-            .map(|binding| (binding.keys, binding.says, binding.group))
-            .collect()
-    } else {
-        Vec::new()
+    let mode_word = match *mode {
+        EditorMode::Normal => "NORMAL",
+        EditorMode::Insert => "INSERT",
     };
-    let clipped = show.0 && keymap::live(&context).count() > rows.len();
-    if cache.place == place && cache.rows == rows && cache.shown == show.0 {
+    let place = keymap::place(&context);
+
+    // `ComputedNode` measures in physical pixels; `Window` and `Node` are in
+    // logical ones, so the two only compare through the scale factor. The same
+    // conversion `update_hover_address` makes for the cursor.
+    let window_height = windows
+        .single()
+        .map(|window| window.height())
+        .unwrap_or(1080.0);
+    let run_height = run_q
+        .single()
+        .map(|computed| computed.size().y * computed.inverse_scale_factor)
+        .unwrap_or(0.0);
+    let free = window_height - BOTTOM_CHROME_MARGIN - run_height - WHICH_KEY_GAP - WHICH_KEY_TOP;
+    // At least one row, whatever the window does. A panel that resolved to
+    // zero rows would fold itself without being asked, and a negative `free`
+    // on a window dragged very short would otherwise reach the cast below.
+    let rows_per_page = ((free - WHICH_KEY_CHROME_HEIGHT) / WHICH_KEY_ROW_HEIGHT)
+        .floor()
+        .max(1.0) as usize;
+
+    let (mouse_all, keys_all): (Vec<_>, Vec<_>) = keymap::live(&context)
+        .map(|binding| (binding.keys, binding.says, binding.group))
+        .partition(|(_, _, group)| *group == keymap::Group::Pointer);
+    let strip = |rows: Vec<(&'static str, &'static str, keymap::Group)>| {
+        rows.into_iter()
+            .map(|(key, says, _)| (key, says))
+            .collect::<Vec<_>>()
+    };
+    let (mouse_all, keys_all) = (strip(mouse_all), strip(keys_all));
+
+    let tick = which_key_page(time.elapsed_secs());
+    let paged = |rows: &[(&'static str, &'static str)]| {
+        let pages = rows.len().div_ceil(rows_per_page).max(1);
+        let page = tick % pages;
+        let shown = rows
+            .iter()
+            .skip(page * rows_per_page)
+            .take(rows_per_page)
+            .copied()
+            .collect::<Vec<_>>();
+        (shown, page, pages)
+    };
+    let (keys_shown, keys_page, keys_pages) = paged(&keys_all);
+    let (mouse_shown, mouse_page, mouse_pages) = paged(&mouse_all);
+
+    let fingerprint = WhichKeyFingerprint {
+        mode: mode_word,
+        place,
+        keys: if open.0 { keys_shown } else { Vec::new() },
+        mouse: if open.0 { mouse_shown } else { Vec::new() },
+        open: open.0,
+        pages: (keys_page, keys_pages, mouse_page, mouse_pages),
+    };
+    if *cache == fingerprint {
         return;
     }
-    // The bar is asked for before the latch is written, so that a frame in
-    // which it is somehow not there yet is a frame to try again on rather than
-    // the one frame that was going to draw it.
-    let Ok(bar) = bar_q.single() else {
+    // The panel is asked for before the latch is written, so a frame in which
+    // it is somehow not there yet is a frame to try again on rather than the
+    // one frame that was going to draw it.
+    let Ok(panel) = panel_q.single() else {
         return;
-    };
-    *cache = KeyBarFingerprint {
-        place,
-        rows: rows.clone(),
-        shown: show.0,
     };
     for entity in content_q.iter() {
         commands.entity(entity).despawn();
     }
+
     let font = ui_font.0.clone();
-    commands.entity(bar).with_children(|bar| {
-        if rows.is_empty() {
+    let heading = |label: &str, page: usize, pages: usize| {
+        if pages > 1 {
+            format!("{label}  {}/{}", page + 1, pages)
+        } else {
+            label.to_string()
+        }
+    };
+    let header = if place.is_empty() {
+        format!("{} {mode_word}", if open.0 { "▾" } else { "▸" })
+    } else {
+        format!("{} {mode_word} · {place}", if open.0 { "▾" } else { "▸" })
+    };
+    let columns = [
+        (
+            heading("Keys", keys_page, keys_pages),
+            fingerprint.keys.clone(),
+        ),
+        (
+            heading("Mouse", mouse_page, mouse_pages),
+            fingerprint.mouse.clone(),
+        ),
+    ];
+    *cache = fingerprint;
+
+    commands.entity(panel).with_children(|panel| {
+        panel.spawn((
+            Text::new(header),
+            text_font(&font, 13.0),
+            TextColor(Color::srgb(0.75, 0.75, 0.9)),
+            Node {
+                // The same side padding the rows carry, so the lit header and
+                // a row stand on the same two edges.
+                padding: UiRect::axes(Val::Px(4.0), Val::Px(2.0)),
+                border_radius: BorderRadius::all(Val::Px(3.0)),
+                ..default()
+            },
+            BackgroundColor(FILL_NONE),
+            Button,
+            WhichKeyHeader,
+            HoverFill {
+                rest: FILL_NONE,
+                hot: ROW_HOT,
+            },
+            WhichKeyEntity,
+        ));
+        if !open.0 {
             return;
         }
-        bar.spawn((
-            Node {
-                width: Val::Px(1.0),
-                height: Val::Px(28.0),
-                flex_shrink: 0.0,
-                ..default()
-            },
-            BackgroundColor(Color::srgb(0.25, 0.25, 0.4)),
-            KeyBarEntity,
-        ));
-        if !place.is_empty() {
-            bar.spawn((
-                Text::new(place),
-                text_font(&font, 13.0),
-                TextColor(INK_BRIGHT),
+        panel
+            .spawn((
                 Node {
-                    flex_shrink: 0.0,
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::FlexStart,
+                    column_gap: Val::Px(12.0),
                     ..default()
                 },
-                KeyBarEntity,
-            ));
-        }
-        bar.spawn((
-            Node {
-                flex_direction: FlexDirection::Row,
-                flex_wrap: FlexWrap::Wrap,
-                align_content: AlignContent::Center,
-                align_items: AlignItems::Center,
-                flex_grow: 1.0,
-                column_gap: Val::Px(18.0),
-                row_gap: Val::Px(2.0),
-                ..default()
-            },
-            KeyBarEntity,
-        ))
-        .with_children(|list| {
-            let mut previous: Option<keymap::Group> = None;
-            for (key, says, group) in rows.iter() {
-                // A rule wherever the kind of thing changes, so that walking
-                // the grid, wiring, and typing do not read as one list.
-                if previous.is_some_and(|last| last != *group) {
-                    list.spawn((
-                        Node {
-                            width: Val::Px(1.0),
-                            height: Val::Px(12.0),
-                            ..default()
-                        },
-                        BackgroundColor(Color::srgb(0.25, 0.25, 0.4)),
-                    ));
+                WhichKeyEntity,
+            ))
+            .with_children(|body| {
+                for (label, rows) in columns {
+                    body.spawn(Node {
+                        flex_direction: FlexDirection::Column,
+                        // Equal halves, whatever either one holds: a column
+                        // sized by its longest sentence would move the other
+                        // every time the caret found a different place.
+                        flex_basis: Val::Px(0.0),
+                        flex_grow: 1.0,
+                        min_width: Val::Px(0.0),
+                        ..default()
+                    })
+                    .with_children(|column| {
+                        column.spawn((
+                            Text::new(label),
+                            text_font(&font, 12.0),
+                            TextColor(INK_OFF),
+                            Node {
+                                height: Val::Px(WHICH_KEY_ROW_HEIGHT),
+                                padding: UiRect::left(Val::Px(4.0)),
+                                ..default()
+                            },
+                        ));
+                        for (key, says) in rows {
+                            column
+                                .spawn(Node {
+                                    flex_direction: FlexDirection::Row,
+                                    align_items: AlignItems::Center,
+                                    column_gap: Val::Px(6.0),
+                                    height: Val::Px(WHICH_KEY_ROW_HEIGHT),
+                                    padding: UiRect::left(Val::Px(4.0)),
+                                    // Stated, not grown into: the arithmetic
+                                    // above counted on this row being one row.
+                                    overflow: Overflow::clip(),
+                                    ..default()
+                                })
+                                .with_children(|row| {
+                                    row.spawn((
+                                        Text::new(key),
+                                        text_font(&font, 12.0),
+                                        // The key column's ink, the same the
+                                        // Controls modal printed bindings in.
+                                        TextColor(Color::srgb(0.9, 0.9, 0.7)),
+                                        Node {
+                                            width: Val::Px(WHICH_KEY_KEY_WIDTH),
+                                            flex_shrink: 0.0,
+                                            ..default()
+                                        },
+                                    ));
+                                    row.spawn((
+                                        Text::new(says),
+                                        text_font(&font, 12.0),
+                                        TextColor(INK_DIM),
+                                    ));
+                                });
+                        }
+                    });
                 }
-                previous = Some(*group);
-                list.spawn(Node {
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(6.0),
-                    ..default()
-                })
-                .with_children(|entry| {
-                    entry.spawn((
-                        Text::new(*key),
-                        text_font(&font, 12.0),
-                        // The key column's ink, the same the Controls modal
-                        // printed its bindings in.
-                        TextColor(Color::srgb(0.9, 0.9, 0.7)),
-                    ));
-                    entry.spawn((Text::new(*says), text_font(&font, 12.0), TextColor(INK_DIM)));
-                });
-            }
-            if clipped {
-                list.spawn((
-                    Text::new("\u{2026}"),
-                    text_font(&font, 12.0),
-                    TextColor(INK_OFF),
-                ));
-            }
-        });
+            });
     });
-}
-
-/// Where the bottom edge is, and with it where everything standing on it
-/// begins.
-///
-/// One writer for three nodes, because they are answering one question: the
-/// bar is as tall as the keys make it, and the view bar and the run panel
-/// stand that much higher. Split across three systems it would be three places
-/// for the same constant to be remembered.
-///
-/// Only `height` and `bottom` — `sync_editor_chrome` is the sole writer of
-/// `display` on these same nodes, and those are different fields.
-///
-/// The two heights are constants and the bar is clipped to whichever is in
-/// force, so nothing here is measured and nothing moves except when the
-/// checkbox is clicked. A bar that measured its own content would move the run
-/// panel every time the caret found a place with one row fewer.
-fn sync_bottom_chrome(
-    show: Res<ShowKeys>,
-    mut bar_q: Query<&mut Node, With<KeyBar>>,
-    mut standing_q: Query<&mut Node, (Or<(With<ViewBar>, With<RunPanel>)>, Without<KeyBar>)>,
-    mut last: Local<Option<bool>>,
-) {
-    if *last == Some(show.0) {
-        return;
-    }
-    *last = Some(show.0);
-    let height = if show.0 {
-        KEY_BAR_HEIGHT
-    } else {
-        KEY_BAR_HEIGHT_BARE
-    };
-    for mut node in bar_q.iter_mut() {
-        node.height = Val::Px(height);
-    }
-    for mut node in standing_q.iter_mut() {
-        node.bottom = Val::Px(BOTTOM_CHROME_MARGIN + height);
-    }
 }
 
 /// Which half of the blink the given moment falls in.
@@ -11363,7 +11415,7 @@ fn main() {
         .init_resource::<Diagnostics>()
         .init_resource::<DiagnosticsOpen>()
         .init_resource::<ViewMenuOpen>()
-        .init_resource::<ShowKeys>()
+        .init_resource::<WhichKeyOpen>()
         .add_systems(
             Startup,
             (
@@ -11381,7 +11433,8 @@ fn main() {
                 spawn_run_panel,
                 spawn_fps_display,
                 spawn_hover_address,
-                spawn_key_bar,
+                spawn_mode_display,
+                spawn_which_key,
                 // Last: it reads the window's physical size, and the camera
                 // above is what puts the OIT settings there to be read.
                 log_oit_budget,
@@ -11493,10 +11546,10 @@ fn main() {
                 // the same trade `paint_hover` above makes for itself. Ordering
                 // it against `handle_editor_keys` would tie it to a chain it
                 // shares nothing else with.
-                // Chained: the bar decides its own height, and the surfaces
-                // standing on it have to be told in the same frame or they
-                // overlap it for one.
-                (sync_key_bar, sync_bottom_chrome).chain(),
+                // Chained: the click may fold the panel, and the sync that
+                // draws it has to see the fold in the same frame it was asked
+                // for — the same argument the diagnostics pair below makes.
+                (handle_which_key_click, sync_which_key).chain(),
                 // Chained: the click may fold the list, and the sync that draws
                 // it has to see the fold in the same frame it was asked for.
                 (
@@ -11518,7 +11571,6 @@ fn main() {
                 // that reads what it wrote.
                 (handle_clipping_checkbox, sync_clipping_checkbox).chain(),
                 (handle_guides_checkbox, sync_guides_checkbox).chain(),
-                (handle_keys_checkbox, sync_keys_checkbox).chain(),
                 handle_modal_ok_button,
                 handle_modal_cancel_button,
                 handle_modal_evaluate_button,

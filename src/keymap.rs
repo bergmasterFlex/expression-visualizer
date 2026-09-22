@@ -316,11 +316,15 @@ fn always(_: &Context) -> bool {
     true
 }
 
-/// The pointer's own rows, and only where they are not noise: while something
-/// is being typed the hand is not on the mouse, and a row about dragging would
-/// be taking the place of one about the key being struck.
+/// The pointer's own rows, wherever a drag is not already under way.
+///
+/// It used to ask for NORMAL as well, and that was never true of the editor —
+/// clicking, dragging an anchor and orbiting all work in INSERT. It was true
+/// of the bar this list used to live in, where a mouse row took the place of a
+/// key row. The panel has a column of its own for them, so the condition can
+/// go back to being about the pointer.
 fn pointing(c: &Context) -> bool {
-    !c.drafting && c.mode == crate::EditorMode::Normal
+    !c.drafting
 }
 
 fn dragging(c: &Context) -> bool {
@@ -479,23 +483,23 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "j k  \u{2191}\u{2193}",
-        says: "to the next column",
+        says: "step to the next column",
         group: Group::Move,
         when: normal,
         acts: act_caret_column,
         once: true,
     },
     Binding {
-        keys: "Shift+j k",
-        says: "to the next row",
+        keys: "Shift+jk",
+        says: "step to the next row",
         group: Group::Move,
         when: normal,
         acts: act_caret_row,
         once: true,
     },
     Binding {
-        keys: "Ctrl+h j k l",
-        says: "shove the node",
+        keys: "Ctrl+hjkl",
+        says: "shove the node it is on",
         group: Group::Move,
         when: normal,
         acts: act_shove,
@@ -520,14 +524,14 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "Alt+h l",
-        says: "across the edge, or through",
+        says: "across an edge or node",
         group: Group::Wire,
         when: walking_anchor,
         acts: act_hop,
         once: true,
     },
     Binding {
-        keys: "Alt+Shift+j k",
+        keys: "Alt+Shift+jk",
         says: "choose which edge",
         group: Group::Wire,
         when: walking_output,
@@ -536,15 +540,15 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "Alt+j k",
-        says: "between this call's inputs",
+        says: "between the inputs",
         group: Group::Wire,
         when: walking_input,
         acts: act_hop,
         once: true,
     },
     Binding {
-        keys: "Alt+h j k l",
-        says: "reach for the nearest anchor",
+        keys: "Alt+hjkl",
+        says: "reach nearest anchor",
         group: Group::Wire,
         when: walking_open,
         acts: act_hop,
@@ -552,15 +556,15 @@ pub static BINDINGS: &[Binding] = &[
     },
     // ── Aiming an edge ──
     Binding {
-        keys: "h j k l  \u{2190}\u{2192}\u{2191}\u{2193}",
-        says: "aim the edge",
+        keys: "hjkl \u{2190}\u{2192}\u{2191}\u{2193}",
+        says: "aim at another anchor",
         group: Group::Wire,
         when: insert_wire,
         acts: act_aim,
         once: true,
     },
     Binding {
-        keys: "Shift+j k",
+        keys: "Shift+jk",
         says: "aim it up and down",
         group: Group::Wire,
         when: insert_wire,
@@ -569,7 +573,7 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "Return",
-        says: "draw the edge",
+        says: "draw it, and go back",
         group: Group::Wire,
         when: insert_wire,
         acts: act_commit_draft,
@@ -578,7 +582,7 @@ pub static BINDINGS: &[Binding] = &[
     // ── Building ──
     Binding {
         keys: "i",
-        says: "build, wire or edit here",
+        says: "build, wire or edit",
         group: Group::Mode,
         when: normal,
         // Not `once`: the arm flips the mode and falls through to the rest of
@@ -589,7 +593,7 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "Delete",
-        says: "take this node out",
+        says: "take it out, edges too",
         group: Group::Build,
         when: normal,
         acts: act_delete_node,
@@ -597,7 +601,7 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "type",
-        says: "name what to build",
+        says: "name what to build here",
         group: Group::Build,
         when: insert_build,
         acts: act_type,
@@ -621,7 +625,7 @@ pub static BINDINGS: &[Binding] = &[
     // `Space`.
     Binding {
         keys: "Space",
-        says: "open a cell behind",
+        says: "open a cell behind here",
         group: Group::Build,
         when: making_room,
         acts: act_open_cell,
@@ -629,7 +633,7 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "Return",
-        says: "open a column",
+        says: "open a column (X)",
         group: Group::Build,
         when: opening_slab,
         acts: act_open_column,
@@ -637,7 +641,7 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "Shift+Return",
-        says: "open a row",
+        says: "open a row (Y)",
         group: Group::Build,
         when: opening_slab,
         acts: act_open_row,
@@ -654,7 +658,7 @@ pub static BINDINGS: &[Binding] = &[
     // ── The prompt ──
     Binding {
         keys: "\u{2191}\u{2193}",
-        says: "walk the list",
+        says: "walk the suggestions",
         group: Group::Text,
         when: insert_text,
         acts: act_walk_list,
@@ -666,7 +670,7 @@ pub static BINDINGS: &[Binding] = &[
     // ever sat between them.
     Binding {
         keys: "Space",
-        says: "a space, inside the string",
+        says: "a space in the string",
         group: Group::Text,
         when: quoting,
         acts: act_space_writes,
@@ -682,7 +686,7 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "\u{2190}\u{2192} Home End",
-        says: "move the cursor",
+        says: "move the text cursor",
         group: Group::Text,
         when: insert_text,
         acts: act_cursor,
@@ -698,7 +702,7 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "Delete",
-        says: "rub out ahead",
+        says: "rub out ahead of it",
         group: Group::Text,
         when: insert_text,
         acts: act_forward_delete,
@@ -707,7 +711,7 @@ pub static BINDINGS: &[Binding] = &[
     // ── Leaving ──
     Binding {
         keys: "Escape",
-        says: "let the edge go, and leave INSERT",
+        says: "let it go, leave INSERT",
         group: Group::Mode,
         when: insert_wire,
         acts: act_leave,
@@ -715,7 +719,7 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "Escape",
-        says: "leave INSERT",
+        says: "leave INSERT, drop it",
         group: Group::Mode,
         when: insert_text,
         acts: act_leave,
@@ -760,7 +764,7 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "Right click",
-        says: "cancel \u{2014} as does a release at the start",
+        says: "cancel the edge",
         group: Group::Pointer,
         when: dragging,
         acts: act_none,
@@ -768,15 +772,26 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "Click",
-        says: "put the caret there, wheel picks deeper",
+        says: "put the caret there",
         group: Group::Pointer,
         when: pointing,
         acts: act_none,
         once: false,
     },
     Binding {
-        keys: "Drag an anchor",
-        says: "draw an edge",
+        keys: "Drag anchor",
+        says: "draw an edge from it",
+        group: Group::Pointer,
+        when: pointing,
+        acts: act_none,
+        once: false,
+    },
+    // Its own row again. It shared one with the click while the bar had no
+    // line to spare, and stepping the pick through what stands behind the
+    // cursor is not something a reader guesses from a row about clicking.
+    Binding {
+        keys: "Wheel",
+        says: "pick what is behind",
         group: Group::Pointer,
         when: pointing,
         acts: act_none,
@@ -784,7 +799,7 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         keys: "Ctrl+drag",
-        says: "orbit \u{2014} wheel zooms, right pans",
+        says: "orbit; right drag pans",
         group: Group::Pointer,
         when: pointing,
         acts: act_none,
