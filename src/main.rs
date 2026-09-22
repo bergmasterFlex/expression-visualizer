@@ -4,6 +4,7 @@ mod depth_cue;
 mod edge;
 mod eval;
 mod grid;
+mod guide;
 mod infer;
 mod layout;
 mod lint;
@@ -749,6 +750,22 @@ impl PickIndex {
             min: a.min.min(b.min),
             max: a.max.max(b.max),
         })
+    }
+
+    /// The innermost drawn volume holding `cell`, if one does.
+    ///
+    /// Innermost is smallest: scopes nest, so a volume standing inside another
+    /// is wholly contained by it, and the one with the fewest cells is the one
+    /// the address belongs to. The same answer `LayoutGraph::scope_at` reaches
+    /// by counting path depth, asked of what was drawn rather than of the graph.
+    fn volume_at(&self, cell: IVec3) -> Option<&PickVolume> {
+        self.volumes
+            .iter()
+            .filter(|volume| volume.contains(cell))
+            .min_by_key(|volume| {
+                let span = volume.max - volume.min + IVec3::ONE;
+                (span.x as i64) * (span.y as i64) * (span.z as i64)
+            })
     }
 
     /// True where `cell` lies in some volume that was drawn.
@@ -2648,8 +2665,8 @@ fn view_entry(orbit: &camera::OrbitCamera, screenshot: &ScreenshotMode) -> ViewE
 #[derive(Resource, Default)]
 struct ViewMenuOpen(bool);
 
-/// The row at the bottom-left holding the view control and the clipping
-/// checkbox. Wears `EditorChrome` for everything in it.
+/// The row at the bottom-left holding the view control and the two checkboxes
+/// beside it. Wears `EditorChrome` for everything in it.
 #[derive(Component)]
 struct ViewBar;
 
@@ -2978,6 +2995,7 @@ fn spawn_view_bar(mut commands: Commands, ui_font: Res<UiFont>) {
                 ClippingCheckbox,
                 ClippingCheckboxBox,
             );
+            spawn_inline_checkbox(bar, &font, "Guides", GuidesCheckbox, GuidesCheckboxBox);
         });
 }
 
@@ -3045,6 +3063,47 @@ struct ClippingCheckbox;
 /// Marker on that checkbox's swatch.
 #[derive(Component)]
 struct ClippingCheckboxBox;
+
+/// Marker for the checkbox that turns the carets' guides on.
+#[derive(Component)]
+struct GuidesCheckbox;
+
+/// Marker on that checkbox's swatch.
+#[derive(Component)]
+struct GuidesCheckboxBox;
+
+/// Toggle the guides.
+///
+/// No rebuild, unlike its neighbour: the guides are persistent entities that
+/// `update_guides` places afresh every frame, so turning them off is a matter
+/// of the next frame not placing them. Nothing about them is baked into the
+/// scene for a rebuild to have to unbake.
+fn handle_guides_checkbox(
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<GuidesCheckbox>)>,
+    mut guides: ResMut<guide::Guides>,
+) {
+    for interaction in interaction_q.iter() {
+        if *interaction == Interaction::Pressed {
+            guides.0 = !guides.0;
+        }
+    }
+}
+
+fn sync_guides_checkbox(
+    guides: Res<guide::Guides>,
+    mut box_q: Query<&mut BackgroundColor, With<GuidesCheckboxBox>>,
+) {
+    let wanted = if guides.0 {
+        CHECKED_COLOR
+    } else {
+        UNCHECKED_COLOR
+    };
+    for mut color in box_q.iter_mut() {
+        if color.0 != wanted {
+            color.0 = wanted;
+        }
+    }
+}
 
 /// Toggle the grading. Every opacity it decides is baked into a material at
 /// spawn — a caret move already rebuilds the scene, so nothing follows it per
@@ -6063,6 +6122,200 @@ fn animate_nodes(time: Res<Time>, mut query: Query<(&NodeEntity, &mut Transform)
         transform.scale = Vec3::splat(pulse);
     }
     */
+}
+
+/// One of the twelve dashed guides: six leaving the caret, six the pointer.
+///
+/// A caret says which cell is addressed; its guides say where that cell *is* —
+/// how far it stands from each wall of its own scope, on all three axes at
+/// once. That is the question a lone box several cells deep in a volume cannot
+/// answer, and the one the wheel makes worth asking.
+///
+/// Persistent, like the pointer's outline and for the same reason: the hovered
+/// cell changes with the mouse. The caret's six are persistent too, though its
+/// cell only moves on a rebuild — one system placing all twelve is simpler than
+/// two saying the same thing in two places.
+#[derive(Component)]
+struct GuideLine {
+    /// 0 = X, 1 = Y, 2 = Z.
+    axis: usize,
+    /// Running toward the volume's greater face rather than its lesser one.
+    greater: bool,
+    /// Following the pointer rather than the caret.
+    hover: bool,
+}
+
+/// The cell a guide ends on, filled in that guide's colour.
+///
+/// A separate entity and not a child of the line: a guide's transform is
+/// stretched along one axis, and anything hanging off it would be stretched
+/// with it.
+#[derive(Component)]
+struct GuideTile {
+    axis: usize,
+    greater: bool,
+    hover: bool,
+}
+
+/// Build all twelve guides and their twelve tiles once, and hide them.
+fn spawn_guides(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<guide::GuideMaterial>>,
+    mut tile_materials: ResMut<Assets<StandardMaterial>>,
+    mut kept: ResMut<PersistentAssets>,
+) {
+    let mesh = meshes.add(render::guide_mesh());
+    kept.meshes.insert(mesh.id());
+    let tile_meshes: Vec<Handle<Mesh>> = (0..3)
+        .map(|axis| {
+            let handle = meshes.add(render::guide_tile_mesh(axis));
+            kept.meshes.insert(handle.id());
+            handle
+        })
+        .collect();
+
+    // Three axes, two carets. A guide's colour and the axis its dashes are
+    // counted along are both fixed for its whole life, so six materials serve
+    // all twelve lines — the pair leaving a cell in either direction along one
+    // axis differ only by their transform.
+    //
+    // `Assets<GuideMaterial>` is not one of the registries `clear_scene` wipes,
+    // so unlike the mesh these need no protecting.
+    for (hover, level) in [(false, render::DISPLAY_WHITE), (true, render::HOVER_GREY)] {
+        // Divided by the alpha it will be blended at, so what lands on screen
+        // is the guide's own brightness rather than a fraction of it: a tile is
+        // meant to read as its line does, filled in.
+        //
+        // `Assets<StandardMaterial>` *is* one of the registries `clear_scene`
+        // wipes, unlike the guides' own, so this one has to be kept.
+        let fill = level / render::GUIDE_TILE_ALPHA;
+        let tile_material = tile_materials.add(StandardMaterial {
+            base_color: Color::LinearRgba(LinearRgba::new(
+                fill,
+                fill,
+                fill,
+                render::GUIDE_TILE_ALPHA,
+            )),
+            alpha_mode: AlphaMode::Blend,
+            cull_mode: None,
+            unlit: true,
+            ..default()
+        });
+        kept.materials.insert(tile_material.id());
+        for (axis, along) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().enumerate() {
+            let material = materials.add(guide::GuideMaterial::along(along, level));
+            for greater in [false, true] {
+                commands.spawn((
+                    Mesh3d(mesh.clone()),
+                    MeshMaterial3d(material.clone()),
+                    Transform::default(),
+                    Visibility::Hidden,
+                    GuideLine {
+                        axis,
+                        greater,
+                        hover,
+                    },
+                ));
+                commands.spawn((
+                    Mesh3d(tile_meshes[axis].clone()),
+                    MeshMaterial3d(tile_material.clone()),
+                    Transform::default(),
+                    Visibility::Hidden,
+                    GuideTile {
+                        axis,
+                        greater,
+                        hover,
+                    },
+                ));
+            }
+        }
+    }
+}
+
+/// Stretch each guide from its caret's cell to the face of the volume that
+/// cell stands in.
+///
+/// A cell in no drawn volume has no walls to measure against, so its guides go
+/// off screen rather than running to the world origin — the same reading the
+/// picker takes when it drops a cell outside every volume.
+fn update_guides(
+    pick: Res<PickState>,
+    index: Res<PickIndex>,
+    screenshot: Res<ScreenshotMode>,
+    guides: Res<guide::Guides>,
+    mut guide_q: Query<(&GuideLine, &mut Transform, &mut Visibility), Without<GuideTile>>,
+    mut tile_q: Query<(&GuideTile, &mut Transform, &mut Visibility), Without<GuideLine>>,
+) {
+    // Switched off, or in screenshot mode where neither caret is drawn and so
+    // neither has anything to lead away from.
+    let (caret, hover) = if screenshot.active() || !guides.0 {
+        (None, None)
+    } else {
+        (
+            Some(pick.selected_pos),
+            pick.active().map(|candidate| candidate.cell),
+        )
+    };
+    for (guide, mut transform, mut visibility) in guide_q.iter_mut() {
+        let cell = if guide.hover { hover } else { caret };
+        place_guide(
+            &mut transform,
+            &mut visibility,
+            resolve_guide(&index, cell, guide.axis, guide.greater, false),
+        );
+    }
+    for (tile, mut transform, mut visibility) in tile_q.iter_mut() {
+        let cell = if tile.hover { hover } else { caret };
+        place_guide(
+            &mut transform,
+            &mut visibility,
+            resolve_guide(&index, cell, tile.axis, tile.greater, true),
+        );
+    }
+}
+
+/// Where a guide's line or its tile stands, or `None` where that direction has
+/// nothing to show.
+///
+/// Both go through `render`'s own pair, which share a span helper — so a line
+/// and the tile closing it can never disagree about whether the direction
+/// exists, and a tile is never left hanging where its line was dropped.
+fn resolve_guide(
+    index: &PickIndex,
+    cell: Option<IVec3>,
+    axis: usize,
+    greater: bool,
+    tile: bool,
+) -> Option<Transform> {
+    let cell = cell?;
+    let volume = index.volume_at(cell)?;
+    if tile {
+        render::cell_guide_tile(cell, volume.min, volume.max, axis, greater)
+    } else {
+        render::cell_guide(cell, volume.min, volume.max, axis, greater)
+    }
+}
+
+/// Put one guide part where it belongs, or take it off screen.
+fn place_guide(transform: &mut Transform, visibility: &mut Visibility, placed: Option<Transform>) {
+    match placed {
+        Some(next) => {
+            // Guarded, like the carets': written every frame, and a
+            // `Transform` written is a `Transform` changed.
+            if *transform != next {
+                *transform = next;
+            }
+            if *visibility != Visibility::Visible {
+                *visibility = Visibility::Visible;
+            }
+        }
+        None => {
+            if *visibility != Visibility::Hidden {
+                *visibility = Visibility::Hidden;
+            }
+        }
+    }
 }
 
 /// Build the pointer's caret once, at the cell origin, and hide it.
@@ -10168,6 +10421,7 @@ fn main() {
             FrameTimeDiagnosticsPlugin::default(),
         ))
         .add_plugins(grid::GridPlugin)
+        .add_plugins(guide::GuidePlugin)
         .add_plugins(edge::EdgePlugin)
         .add_plugins(depth_cue::DepthCuePlugin)
         .init_resource::<GraphState>()
@@ -10182,6 +10436,7 @@ fn main() {
         .init_resource::<PendingNode>()
         .init_resource::<ScreenshotMode>()
         .init_resource::<lod::Clipping>()
+        .init_resource::<guide::Guides>()
         .init_resource::<Diagnostics>()
         .init_resource::<DiagnosticsOpen>()
         .init_resource::<ViewMenuOpen>()
@@ -10190,9 +10445,11 @@ fn main() {
             (
                 load_ui_font,
                 setup_scene,
-                // Before the first spawn pass, so `PersistentAssets` is filled
-                // in before anything can wipe the registries.
+                // Both fill `PersistentAssets`, and both stand before the
+                // first spawn pass so it is filled in before anything can wipe
+                // the registries.
                 spawn_hover_caret,
+                spawn_guides,
                 spawn_graph_nodes,
                 spawn_ui,
                 spawn_view_bar,
@@ -10238,6 +10495,7 @@ fn main() {
                         // boost; a caret outline one frame behind the mouse is
                         // a lag anyone can see.
                         update_hover_caret,
+                        update_guides,
                         update_hover_address,
                         update_cursor,
                     )
@@ -10319,6 +10577,7 @@ fn main() {
                 // Chained for the same reason: a handler runs before the sync
                 // that reads what it wrote.
                 (handle_clipping_checkbox, sync_clipping_checkbox).chain(),
+                (handle_guides_checkbox, sync_guides_checkbox).chain(),
                 handle_modal_ok_button,
                 handle_modal_cancel_button,
                 handle_modal_evaluate_button,

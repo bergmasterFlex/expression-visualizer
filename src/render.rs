@@ -204,6 +204,126 @@ pub const HOVER_GREY: f32 = 0.25;
 /// caret already addresses.
 pub const HOVER_CARET_INSET: f32 = 0.88;
 
+/// Thickness of a guide line.
+///
+/// The caret's own, so a guide reads as something leaving the caret rather than
+/// as a thing standing in its own right.
+const GUIDE_THICKNESS: f32 = CARET_THICKNESS;
+
+/// The unit cube every guide is made of.
+///
+/// One mesh for all twelve of them: a dashed line's pattern is the shader's,
+/// counted in world units, so stretching the cube to length leaves the dashes
+/// the size they were. Geometry dashes would mean rebuilding a mesh every time
+/// the pointer crossed a cell.
+pub fn guide_mesh() -> Mesh {
+    Cuboid::new(1.0, 1.0, 1.0).mesh().build()
+}
+
+/// Alpha the tile closing a guide is filled with.
+///
+/// A fill and not an outline, so it still reads as a marked cell from the far
+/// end of a long volume. Blended rather than opaque, so the grid lines under it
+/// survive — which costs an OIT slot per tile, and is why there are only ever
+/// twelve of them.
+pub const GUIDE_TILE_ALPHA: f32 = 0.55;
+
+/// The one-cell quad closing a guide, facing along `axis`.
+///
+/// Three meshes and no rotation: the plane carries its own normal, and an
+/// entity's axis never changes once it is spawned. Both half-sizes are the
+/// same, so which in-plane axis `Plane3d` maps them onto does not arise.
+pub fn guide_tile_mesh(axis: usize) -> Mesh {
+    let normal = match axis {
+        0 => Vec3::X,
+        1 => Vec3::Y,
+        _ => Vec3::Z,
+    };
+    Plane3d::new(normal, Vec2::splat(CELL * 0.5)).mesh().build()
+}
+
+/// The stretch of `axis` a guide covers, in layout coordinates: from the cell's
+/// own face to the volume's, on whichever side is asked for.
+///
+/// `None` where the two are the same face — a cell standing at the volume's own
+/// edge has nothing to point at on that side. Both the line and the tile ask
+/// through here, so neither can come to a different answer about whether that
+/// direction exists at all.
+fn guide_span(
+    cell: IVec3,
+    min: IVec3,
+    max: IVec3,
+    axis: usize,
+    greater: bool,
+) -> Option<(f32, f32)> {
+    // In layout addresses the cell spans `[c, c+1]` on this axis and the volume
+    // spans `[min, max+1]`, so a guide runs from one face to the other.
+    let span = if greater {
+        ((cell[axis] + 1) as f32, (max[axis] + 1) as f32)
+    } else {
+        (cell[axis] as f32, min[axis] as f32)
+    };
+    (span.0 != span.1).then_some(span)
+}
+
+/// Where to stand `guide_mesh` so it becomes the guide leaving `cell` along
+/// `axis`, toward either the greater or the lesser face of the volume
+/// `min..=max` (inclusive cell addresses).
+///
+/// It starts at the cell's own face rather than at its centre, so the guide
+/// begins where the caret ends instead of running through it.
+pub fn cell_guide(
+    cell: IVec3,
+    min: IVec3,
+    max: IVec3,
+    axis: usize,
+    greater: bool,
+) -> Option<Transform> {
+    let (from, to) = guide_span(cell, min, max, axis, greater)?;
+    let centre = cell.as_vec3() + Vec3::splat(0.5);
+    let mut near = centre;
+    near[axis] = from;
+    let mut far = centre;
+    far[axis] = to;
+    // Both ends through `layout_to_world`, never a length scaled by hand:
+    // `LAYOUT_SCALE` negates Y and Z, so a span measured in layout and then
+    // scaled would come out mirrored on two axes out of the three.
+    let (near, far) = (layout_to_world(near), layout_to_world(far));
+    let mut scale = Vec3::splat(GUIDE_THICKNESS);
+    scale[axis] = (far[axis] - near[axis]).abs();
+    Some(Transform::from_translation((near + far) * 0.5).with_scale(scale))
+}
+
+/// Where to stand `guide_tile_mesh` so it covers the cell the guide ends on.
+///
+/// Lifted off the volume's face by `BODY_FACE_LIFT`, toward the inside. Four of
+/// the six sides have a grid surface standing exactly there — the floor, the
+/// back wall and the two Z faces — and a quad sharing a plane with one would
+/// z-fight it. The lift is taken in layout and converted afterwards, so "toward
+/// the inside" needs no case for the two axes `LAYOUT_SCALE` negates.
+///
+/// The other two sides have no surface at all: `spawn_volume_surfaces` leaves
+/// the volume open at `+X` and above. The tile stands there regardless, marking
+/// where the volume ends rather than what is drawn there — which is the whole
+/// of what the guide was measuring to.
+pub fn cell_guide_tile(
+    cell: IVec3,
+    min: IVec3,
+    max: IVec3,
+    axis: usize,
+    greater: bool,
+) -> Option<Transform> {
+    let (_, face) = guide_span(cell, min, max, axis, greater)?;
+    let mut at = cell.as_vec3() + Vec3::splat(0.5);
+    let inward = if greater {
+        -BODY_FACE_LIFT
+    } else {
+        BODY_FACE_LIFT
+    };
+    at[axis] = face + inward;
+    Some(Transform::from_translation(layout_to_world(at)))
+}
+
 /// Offset from a cell's origin corner to its centre, in world orientation.
 ///
 /// `layout_to_world` answers with the corner (cell `N` covers `[N, N+1)`), and
