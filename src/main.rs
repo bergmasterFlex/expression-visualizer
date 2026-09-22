@@ -8207,17 +8207,75 @@ const WHICH_KEY_WIDTH: f32 = 560.0;
 /// two surfaces rather than one seam.
 const WHICH_KEY_GAP: f32 = 12.0;
 
-/// One row: 12px text on the default 1.2 line height, plus the gap to the next.
+/// One *line* of text: 12px on the default 1.2 line height, plus the air to
+/// the next. Slightly over the 14.4 a line really takes, and deliberately —
+/// every estimate below rounds against itself, so a page holds a little less
+/// than it could rather than a little more than it can.
 ///
-/// Forced onto every row rather than left to the text, which is what makes the
-/// arithmetic below exact. A row that were sometimes one line and sometimes
-/// two would turn `rows_per_page` into a guess, and a page that guesses wrong
-/// clips — which is the thing this panel exists to stop doing.
+/// A row is one of these or two. It was forced to one for a while, with the
+/// overflow clipped, and that is exactly how a sentence a character too long
+/// came to be cut in half: the row would not grow and the text had nowhere to
+/// go. Rows are measured now and left to wrap.
 const WHICH_KEY_ROW_HEIGHT: f32 = 17.0;
 
-/// The key column. `Ctrl+h j k l` is the longest entry and measures 86px at
-/// 12px in JetBrains Mono.
-const WHICH_KEY_KEY_WIDTH: f32 = 88.0;
+/// How many lines a sentence takes in the column beside its key.
+///
+/// Counted in characters, while the text engine breaks on words — so this is
+/// an estimate, and it can be one line out on a sentence that breaks early.
+/// That is affordable because nothing depends on it being exact any more: it
+/// decides how much goes on a page, not how much is drawn, and a row that
+/// needs the space takes it.
+fn which_key_lines(says: &str) -> usize {
+    let per_line = (WHICH_KEY_SAYS_WIDTH / WHICH_KEY_CHAR_WIDTH) as usize;
+    says.chars().count().div_ceil(per_line.max(1)).max(1)
+}
+
+/// Break a column into pages of at most `lines` text lines each.
+///
+/// Whole rows only: a key on one page and its sentence on the next would be
+/// two halves of a statement, and neither half says anything. A row longer
+/// than a whole page therefore gets a page of its own and overruns it, which
+/// is the honest failure — the alternative is cutting it, and that is the bug
+/// this replaced.
+fn which_key_pages(
+    rows: &[(&'static str, &'static str)],
+    lines: usize,
+) -> Vec<Vec<(&'static str, &'static str)>> {
+    let mut pages: Vec<Vec<(&'static str, &'static str)>> = Vec::new();
+    let mut page: Vec<(&'static str, &'static str)> = Vec::new();
+    let mut used = 0;
+    for row in rows {
+        let height = which_key_lines(row.1);
+        if used + height > lines && !page.is_empty() {
+            pages.push(std::mem::take(&mut page));
+            used = 0;
+        }
+        used += height;
+        page.push(*row);
+    }
+    // The empty page is the one a column with nothing to say still needs, so
+    // that `tick % pages.len()` has something to divide by.
+    if !page.is_empty() || pages.is_empty() {
+        pages.push(page);
+    }
+    pages
+}
+
+/// The key column. `Alt+Shift+jk ↑↓` is the longest entry and measures 108px
+/// at 12px in JetBrains Mono — the arrows every vim letter also answers to are
+/// part of the binding and belong beside it.
+const WHICH_KEY_KEY_WIDTH: f32 = 112.0;
+
+/// One column of the two, derived rather than stated so it cannot disagree
+/// with the panel it is half of.
+const WHICH_KEY_COLUMN_WIDTH: f32 = (WHICH_KEY_WIDTH - 20.0 - 12.0) / 2.0;
+
+/// JetBrains Mono sets every glyph on 0.6em, which at 12px is this.
+const WHICH_KEY_CHAR_WIDTH: f32 = 7.2;
+
+/// What is left for the sentence beside the key, after the gap between them
+/// and the row's own left padding.
+const WHICH_KEY_SAYS_WIDTH: f32 = WHICH_KEY_COLUMN_WIDTH - WHICH_KEY_KEY_WIDTH - 6.0 - 4.0;
 
 /// What the panel spends on itself before the first row: the padding top and
 /// bottom, the header, the gap under it, and each column's own heading.
@@ -8380,10 +8438,10 @@ fn sync_which_key(
         .map(|computed| computed.size().y * computed.inverse_scale_factor)
         .unwrap_or(0.0);
     let free = window_height - BOTTOM_CHROME_MARGIN - run_height - WHICH_KEY_GAP - WHICH_KEY_TOP;
-    // At least one row, whatever the window does. A panel that resolved to
-    // zero rows would fold itself without being asked, and a negative `free`
-    // on a window dragged very short would otherwise reach the cast below.
-    let rows_per_page = ((free - WHICH_KEY_CHROME_HEIGHT) / WHICH_KEY_ROW_HEIGHT)
+    // At least one line, whatever the window does. A panel that resolved to
+    // zero would fold itself without being asked, and a negative `free` on a
+    // window dragged very short would otherwise reach the cast below.
+    let lines_per_page = ((free - WHICH_KEY_CHROME_HEIGHT) / WHICH_KEY_ROW_HEIGHT)
         .floor()
         .max(1.0) as usize;
 
@@ -8399,15 +8457,10 @@ fn sync_which_key(
 
     let tick = which_key_page(time.elapsed_secs());
     let paged = |rows: &[(&'static str, &'static str)]| {
-        let pages = rows.len().div_ceil(rows_per_page).max(1);
-        let page = tick % pages;
-        let shown = rows
-            .iter()
-            .skip(page * rows_per_page)
-            .take(rows_per_page)
-            .copied()
-            .collect::<Vec<_>>();
-        (shown, page, pages)
+        let pages = which_key_pages(rows, lines_per_page);
+        let page = tick % pages.len();
+        let count = pages.len();
+        (pages.into_iter().nth(page).unwrap_or_default(), page, count)
     };
     let (keys_shown, keys_page, keys_pages) = paged(&keys_all);
     let (mouse_shown, mouse_page, mouse_pages) = paged(&mouse_all);
@@ -8496,6 +8549,7 @@ fn sync_which_key(
                 for (label, rows) in columns {
                     body.spawn(Node {
                         flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(3.0),
                         // Equal halves, whatever either one holds: a column
                         // sized by its longest sentence would move the other
                         // every time the caret found a different place.
@@ -8519,13 +8573,16 @@ fn sync_which_key(
                             column
                                 .spawn(Node {
                                     flex_direction: FlexDirection::Row,
-                                    align_items: AlignItems::Center,
+                                    // Top-aligned, not centred: where the
+                                    // sentence takes two lines the key belongs
+                                    // beside the first of them.
+                                    align_items: AlignItems::FlexStart,
                                     column_gap: Val::Px(6.0),
-                                    height: Val::Px(WHICH_KEY_ROW_HEIGHT),
+                                    // A floor and not a ceiling. A one-line
+                                    // row stands as tall as the rest; a
+                                    // two-line row takes what it needs.
+                                    min_height: Val::Px(WHICH_KEY_ROW_HEIGHT),
                                     padding: UiRect::left(Val::Px(4.0)),
-                                    // Stated, not grown into: the arithmetic
-                                    // above counted on this row being one row.
-                                    overflow: Overflow::clip(),
                                     ..default()
                                 })
                                 .with_children(|row| {
@@ -8545,6 +8602,13 @@ fn sync_which_key(
                                         Text::new(says),
                                         text_font(&font, 12.0),
                                         TextColor(INK_DIM),
+                                        // Stated rather than grown into, so
+                                        // the text wraps exactly where
+                                        // `which_key_lines` counted on it to.
+                                        Node {
+                                            width: Val::Px(WHICH_KEY_SAYS_WIDTH),
+                                            ..default()
+                                        },
                                     ));
                                 });
                         }
