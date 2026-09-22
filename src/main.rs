@@ -6,6 +6,7 @@ mod eval;
 mod grid;
 mod guide;
 mod infer;
+mod keymap;
 mod layout;
 mod lint;
 mod lod;
@@ -602,10 +603,6 @@ struct HoverCaret;
 /// never one click away.
 #[derive(Component)]
 struct NewButton;
-
-/// Opens the controls list. Nothing is destroyed on the way, so it acts at once.
-#[derive(Component)]
-struct HelpButton;
 
 /// A clickable suggestion row, so the mouse path into INSERT does not dead-end
 /// at a keyboard-only list.
@@ -1430,7 +1427,6 @@ enum EvalPhase {
     #[default]
     Idle,
     ErrorModal(String),
-    ControlsModal,
     /// The question before a New. It carries nothing: the reset reads the
     /// graph state when it runs, and the only thing this phase remembers is
     /// that the question is on screen.
@@ -1482,10 +1478,7 @@ fn is_evaluating(eval: &EvalState) -> bool {
 fn modal_is_open(eval: &EvalState) -> bool {
     matches!(
         eval.phase,
-        EvalPhase::ErrorModal(_)
-            | EvalPhase::ControlsModal
-            | EvalPhase::ConfirmNew
-            | EvalPhase::SourcePrompt { .. }
+        EvalPhase::ErrorModal(_) | EvalPhase::ConfirmNew | EvalPhase::SourcePrompt { .. }
     )
 }
 
@@ -2501,19 +2494,6 @@ fn spawn_ui(mut commands: Commands, ui_font: Res<UiFont>) {
                     TextColor(INK_BRIGHT),
                 ));
             });
-            row.spawn((
-                Button,
-                chrome_button_node(),
-                BackgroundColor(CONTROL_REST),
-                HelpButton,
-            ))
-            .with_children(|b| {
-                b.spawn((
-                    Text::new("Help"),
-                    text_font(&ui_font.0, 14.0),
-                    TextColor(INK_BRIGHT),
-                ));
-            });
         });
 
     // Centred by a full-width row rather than by a guessed offset, so it stays
@@ -3026,7 +3006,7 @@ fn spawn_view_bar(mut commands: Commands, ui_font: Res<UiFont>) {
             Node {
                 position_type: PositionType::Absolute,
                 left: Val::Px(12.0),
-                bottom: Val::Px(12.0),
+                bottom: Val::Px(BOTTOM_CHROME_MARGIN + KEY_BAR_HEIGHT),
                 flex_direction: FlexDirection::Row,
                 align_items: AlignItems::Center,
                 column_gap: Val::Px(8.0),
@@ -3070,6 +3050,7 @@ fn spawn_view_bar(mut commands: Commands, ui_font: Res<UiFont>) {
                 ClippingCheckboxBox,
             );
             spawn_inline_checkbox(bar, &font, "Guides", GuidesCheckbox, GuidesCheckboxBox);
+            spawn_inline_checkbox(bar, &font, "Keys", KeysCheckbox, KeysCheckboxBox);
         });
 }
 
@@ -3145,6 +3126,63 @@ struct GuidesCheckbox;
 /// Marker on that checkbox's swatch.
 #[derive(Component)]
 struct GuidesCheckboxBox;
+
+/// Marker for the checkbox that spells the keys out along the bottom edge.
+#[derive(Component)]
+struct KeysCheckbox;
+
+/// Marker on that checkbox's swatch.
+#[derive(Component)]
+struct KeysCheckboxBox;
+
+/// Whether the bar says what the keys mean, or only which mode the editor is
+/// in.
+///
+/// On by default: the list is for the hand that does not know the keys yet,
+/// and that hand is not the one that would go looking for a checkbox to turn
+/// it on. Off, the bar keeps standing — the mode is a control and does not
+/// come and go — it simply has nothing beside it, and everything above it
+/// drops by the height the entries were taking.
+#[derive(Resource)]
+struct ShowKeys(bool);
+
+impl Default for ShowKeys {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
+/// Toggle whether the keys are spelled out.
+///
+/// No rebuild, unlike `handle_clipping_checkbox`: nothing about the bar is
+/// baked into the scene, and `sync_key_bar` redraws it from the resource on
+/// the next frame anyway.
+fn handle_keys_checkbox(
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<KeysCheckbox>)>,
+    mut show: ResMut<ShowKeys>,
+) {
+    for interaction in interaction_q.iter() {
+        if *interaction == Interaction::Pressed {
+            show.0 = !show.0;
+        }
+    }
+}
+
+fn sync_keys_checkbox(
+    show: Res<ShowKeys>,
+    mut box_q: Query<&mut BackgroundColor, With<KeysCheckboxBox>>,
+) {
+    let wanted = if show.0 {
+        CHECKED_COLOR
+    } else {
+        UNCHECKED_COLOR
+    };
+    for mut color in box_q.iter_mut() {
+        if color.0 != wanted {
+            color.0 = wanted;
+        }
+    }
+}
 
 /// Toggle the guides.
 ///
@@ -3236,7 +3274,7 @@ fn spawn_run_panel(mut commands: Commands) {
             Node {
                 position_type: PositionType::Absolute,
                 right: Val::Px(14.0),
-                bottom: Val::Px(12.0),
+                bottom: Val::Px(BOTTOM_CHROME_MARGIN + KEY_BAR_HEIGHT),
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Stretch,
                 padding: UiRect::all(Val::Px(10.0)),
@@ -4878,7 +4916,6 @@ enum ModalKind {
     #[default]
     None,
     Error,
-    Controls,
     ConfirmNew,
     SourcePrompt,
 }
@@ -4886,7 +4923,6 @@ enum ModalKind {
 fn modal_kind(phase: &EvalPhase) -> ModalKind {
     match phase {
         EvalPhase::ErrorModal(_) => ModalKind::Error,
-        EvalPhase::ControlsModal => ModalKind::Controls,
         EvalPhase::ConfirmNew => ModalKind::ConfirmNew,
         EvalPhase::SourcePrompt { .. } => ModalKind::SourcePrompt,
         _ => ModalKind::None,
@@ -4914,9 +4950,6 @@ fn sync_modal_ui(
     match &eval.phase {
         EvalPhase::ErrorModal(msg) => {
             spawn_error_modal(&mut commands, &ui_font.0, msg.clone());
-        }
-        EvalPhase::ControlsModal => {
-            spawn_controls_modal(&mut commands, &ui_font.0);
         }
         EvalPhase::ConfirmNew => {
             spawn_confirm_new_modal(&mut commands, &ui_font.0);
@@ -5078,174 +5111,6 @@ fn spawn_confirm_new_modal(commands: &mut Commands, font: &Handle<Font>) {
                     });
             });
         });
-}
-
-fn spawn_controls_modal(commands: &mut Commands, font: &Handle<Font>) {
-    let mouse_bindings: &[(&str, &str)] = &[
-        ("Left click", "Select node / grid position"),
-        (
-            "Left drag from anchor",
-            "Draw an edge — it snaps to the nearest anchor it may reach",
-        ),
-        ("Release on the start anchor", "Cancel the edge being drawn"),
-        ("Right click", "Cancel the edge being drawn"),
-        ("Ctrl + Left drag", "Free camera: orbit"),
-        ("Ctrl + Right drag", "Free camera: pan"),
-        ("Ctrl + Scroll", "Zoom (bound: cell size, free: distance)"),
-    ];
-    let key_bindings: &[(&str, &str)] = &[
-        ("Arrow keys", "NORMAL: move selection along the grid"),
-        ("Shift + Up/Down", "NORMAL: move selection vertically"),
-        ("Ctrl + Arrow", "NORMAL: move the selected node"),
-        (
-            "Ctrl + Shift + Up/Down",
-            "NORMAL: move the selected node vertically",
-        ),
-        (
-            "Alt (held)",
-            "NORMAL: light the strand the next hop would follow",
-        ),
-        (
-            "Alt + Left/Right, hl",
-            "NORMAL: hop along the wiring — across an edge, or through a node",
-        ),
-        (
-            "Alt + Up/Down",
-            "NORMAL on an input: step between the inputs of one call",
-        ),
-        (
-            "Alt + Up/Down, + Shift",
-            "NORMAL on an output: choose which of its edges to hop along",
-        ),
-        (
-            "i",
-            "INSERT: build here, wire the anchor here, or edit what stands here",
-        ),
-        (
-            "Arrow keys, hjkl",
-            "INSERT on an anchor: aim the edge at another anchor",
-        ),
-        (
-            "Shift + Up/Down",
-            "INSERT on an anchor: aim the edge vertically",
-        ),
-        ("Up/Down", "INSERT: walk the suggestion list"),
-        ("Left/Right, Home/End", "INSERT: move the text cursor"),
-        ("Space", "INSERT: open a cell behind the caret"),
-        (
-            "Return",
-            "INSERT: draw the edge, else commit the highlighted row, else open a column (X)",
-        ),
-        ("Shift + Return", "INSERT: open a row (Y)"),
-        ("Escape", "Leave INSERT / cancel the edge being drawn"),
-    ];
-
-    commands
-        .spawn((
-            backdrop_node(),
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
-            GlobalZIndex(50),
-            ModalEntity,
-        ))
-        .with_children(|root| {
-            root.spawn((
-                panel_node(),
-                BackgroundColor(Color::srgba(0.10, 0.10, 0.16, 0.98)),
-                BorderColor::all(Color::srgb(0.25, 0.25, 0.4)),
-                ModalEntity,
-            ))
-            .with_children(|panel| {
-                panel.spawn((
-                    Text::new("Controls"),
-                    text_font(font, 20.0),
-                    TextColor(Color::srgb(0.95, 0.95, 1.0)),
-                    Node {
-                        margin: UiRect::all(Val::Px(12.0)),
-                        align_self: AlignSelf::Center,
-                        ..default()
-                    },
-                    ModalEntity,
-                ));
-
-                spawn_controls_section(panel, font, "Mouse", mouse_bindings);
-                spawn_controls_section(panel, font, "Keyboard", key_bindings);
-
-                panel
-                    .spawn((
-                        Node {
-                            flex_direction: FlexDirection::Row,
-                            justify_content: JustifyContent::Center,
-                            margin: UiRect::all(Val::Px(8.0)),
-                            ..default()
-                        },
-                        ModalEntity,
-                    ))
-                    .with_children(|btns| {
-                        btns.spawn((modal_button(), ModalOkButton, ModalEntity))
-                            .with_children(|b| {
-                                b.spawn((
-                                    Text::new("OK"),
-                                    text_font(font, 14.0),
-                                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
-                                    ModalEntity,
-                                ));
-                            });
-                    });
-            });
-        });
-}
-
-fn spawn_controls_section(
-    panel: &mut ChildSpawnerCommands,
-    font: &Handle<Font>,
-    title: &str,
-    rows: &[(&str, &str)],
-) {
-    panel.spawn((
-        Text::new(title),
-        text_font(font, 15.0),
-        TextColor(Color::srgb(0.75, 0.75, 0.9)),
-        Node {
-            margin: UiRect {
-                left: Val::Px(12.0),
-                right: Val::Px(12.0),
-                top: Val::Px(8.0),
-                bottom: Val::Px(4.0),
-            },
-            ..default()
-        },
-        ModalEntity,
-    ));
-    for (binding, desc) in rows {
-        panel
-            .spawn((
-                Node {
-                    flex_direction: FlexDirection::Row,
-                    align_items: AlignItems::Center,
-                    margin: UiRect::axes(Val::Px(12.0), Val::Px(2.0)),
-                    ..default()
-                },
-                ModalEntity,
-            ))
-            .with_children(|row| {
-                row.spawn((
-                    Text::new(*binding),
-                    text_font(font, 14.0),
-                    TextColor(Color::srgb(0.9, 0.9, 0.7)),
-                    Node {
-                        width: Val::Px(200.0),
-                        ..default()
-                    },
-                    ModalEntity,
-                ));
-                row.spawn((
-                    Text::new(*desc),
-                    text_font(font, 14.0),
-                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
-                    ModalEntity,
-                ));
-            });
-    }
 }
 
 fn spawn_source_modal(
@@ -5435,37 +5300,24 @@ fn handle_new_button(
     }
 }
 
-fn handle_help_button(
-    interaction_q: Query<&Interaction, (Changed<Interaction>, With<HelpButton>)>,
-    mut eval: ResMut<EvalState>,
-) {
-    if is_evaluating(&eval) {
-        return;
-    }
-    if interaction_q.iter().any(|i| *i == Interaction::Pressed) {
-        eval.phase = EvalPhase::ControlsModal;
-    }
-}
-
-/// The top bar's two buttons, and the one thing they could not say: that a run
-/// has taken them.
+/// The top bar's one button, and the thing it could not say: that a run has
+/// taken it.
 ///
-/// Both handlers refuse to act while `is_evaluating`, and the bar is *not*
-/// hidden for it — `sync_editor_chrome` steps aside for a modal or a
-/// screenshot, and a `Running` phase is neither. So they stood there answering
-/// the pointer and doing nothing. A `HoverFill` would have kept that promise;
-/// this keeps the one `update_step_button_visuals` settled on for the
-/// transport row instead: one writer, three states, the switched-off one
-/// first, because it outranks wherever the pointer is.
+/// Help stood beside it until the bar along the bottom edge took the job over.
+/// What is left is New, and the argument is unchanged: its handler refuses to
+/// act while `is_evaluating`, and the bar is *not* hidden for it —
+/// `sync_editor_chrome` steps aside for a modal or a screenshot, and a
+/// `Running` phase is neither. So it stood there answering the pointer and
+/// doing nothing. A `HoverFill` would have kept that promise; this keeps the
+/// one `update_step_button_visuals` settled on for the transport row instead:
+/// one writer, three states, the switched-off one first, because it outranks
+/// wherever the pointer is.
 ///
-/// No `Changed<Interaction>` filter: what turns these grey is the phase, and a
+/// No `Changed<Interaction>` filter: what turns it grey is the phase, and a
 /// phase moves without the pointer moving with it.
 fn sync_chrome_buttons(
     eval: Res<EvalState>,
-    mut button_q: Query<
-        (&Interaction, &mut BackgroundColor, &Children),
-        Or<(With<NewButton>, With<HelpButton>)>,
-    >,
+    mut button_q: Query<(&Interaction, &mut BackgroundColor, &Children), With<NewButton>>,
     mut text_color_q: Query<&mut TextColor>,
 ) {
     let enabled = !is_evaluating(&eval);
@@ -8267,22 +8119,75 @@ fn handle_diagnostics_click(
     }
 }
 
-/// The editing mode, centred on the bottom edge — a control, not a readout.
+/// How tall the bar along the bottom edge stands, and with it where every
+/// other bottom-anchored surface begins.
 ///
-/// A row spanning the window with its content centred, which is how the run
-/// controls used to sit here: what stands in it can change width without
-/// anything having to be measured. The two halves sit flush against each other
-/// and are rounded only on their outer edge, so the pair reads as one widget
-/// with two states rather than as two buttons. No rule between them: one half
-/// is always on, and the fill it carries draws the seam.
+/// Fixed, and not sized to its content. A bar whose height followed the number
+/// of entries would move the view bar and the run panel on every caret step —
+/// the same thing `spawn_run_panel` refuses for its own width, and for the same
+/// reason: a control that slides is a control the hand cannot reach without
+/// looking. Two lines of entries are reserved whether or not they are filled,
+/// and what will not fit is clipped.
+const KEY_BAR_HEIGHT: f32 = 56.0;
+
+/// What the bar shrinks to with the keys turned off: the mode pill alone, and
+/// nothing beside it.
+const KEY_BAR_HEIGHT_BARE: f32 = 44.0;
+
+/// The gap every bottom-anchored surface keeps above the bar.
+const BOTTOM_CHROME_MARGIN: f32 = 12.0;
+
+/// Past this many entries the bar says so rather than quietly dropping them.
+/// No context reaches it; it is here so that one added later cannot lie.
+const KEY_BAR_MAX_ROWS: usize = 14;
+
+/// Marker for the bar itself — the one node that stands, and the parent the
+/// entries are rebuilt under.
+#[derive(Component)]
+struct KeyBar;
+
+/// Sweep marker, on direct children of the bar only. `despawn` takes
+/// descendants, so anything deeper goes with its parent.
 ///
-/// The third child is what stands in the same place while an evaluation runs,
-/// alone and rounded all round.
+/// The mode pill deliberately does not carry it: it is a control and must
+/// survive every rebuild, while everything beside it is a readout of a place
+/// the caret has since left.
+#[derive(Component)]
+struct KeyBarEntity;
+
+/// The drawn view, so that a rebuild happens when what is on screen would
+/// differ and at no other time.
 ///
-/// `EditorChrome` goes on the row and stays off the three inside it —
-/// `sync_mode_toggles` is the only writer of their `display`, and two writers
-/// flicker on the transition frame.
-fn spawn_mode_display(mut commands: Commands, ui_font: Res<UiFont>) {
+/// The rows as drawn rather than the `keymap::Context` they came from, for the
+/// reason `EditorPanelFingerprint` gives: a fingerprint of the input silently
+/// stops working the day a row's text depends on something the input does not
+/// carry. `&'static str` pairs throughout, so this compares pointers and
+/// lengths and never copies a screenful of text.
+#[derive(Default, PartialEq, Eq)]
+struct KeyBarFingerprint {
+    place: &'static str,
+    rows: Vec<(&'static str, &'static str, keymap::Group)>,
+    /// Folded away, the bar draws only the pill. In the fingerprint rather
+    /// than tested before it, so that turning the keys off and on again is a
+    /// change the latch sees even though the rows either side of it match.
+    shown: bool,
+}
+
+/// The bottom edge: which mode the editor is in, where the caret is standing,
+/// and what the keys mean there.
+///
+/// The mode pill used to float on its own, centred above this edge. It moved in
+/// here because the two say the same kind of thing — the pill names the mode,
+/// the heading beside it names the place within that mode, and the entries name
+/// what the keys do in it. Three readings of one question, and they belong in
+/// one frame.
+///
+/// `EditorChrome` goes on the bar and on nothing inside it. `sync_editor_chrome`
+/// is the sole writer of `display` on every carrier of it, so a modal or the
+/// screenshot mode takes the whole bar away for free — which is right: a modal
+/// owns the screen, and nothing behind it is a place the keys still mean
+/// anything.
+fn spawn_key_bar(mut commands: Commands, ui_font: Res<UiFont>) {
     const RADIUS: Val = Val::Px(6.0);
     let segment = |radius: BorderRadius, display: Display| Node {
         padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
@@ -8296,49 +8201,252 @@ fn spawn_mode_display(mut commands: Commands, ui_font: Res<UiFont>) {
                 position_type: PositionType::Absolute,
                 left: Val::Px(0.0),
                 right: Val::Px(0.0),
-                bottom: Val::Px(16.0),
+                bottom: Val::Px(0.0),
+                height: Val::Px(KEY_BAR_HEIGHT),
                 flex_direction: FlexDirection::Row,
-                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(12.0),
+                padding: UiRect::axes(Val::Px(12.0), Val::Px(6.0)),
+                border: UiRect::top(Val::Px(1.0)),
+                // What will not fit is cut off rather than drawn outside the
+                // height everything above this is standing on.
+                overflow: Overflow::clip(),
                 ..default()
             },
+            // The popup fill, not the panel fill: this comes and goes with the
+            // caret, it is not a surface that stands.
+            BackgroundColor(Color::srgba(0.08, 0.08, 0.14, 0.98)),
+            BorderColor::all(Color::srgb(0.25, 0.25, 0.4)),
+            // Above the run panel, which is spawned later and would otherwise
+            // cover it. Well below the modals, which own 50.
+            GlobalZIndex(10),
+            // Carried with no handler, so a click on the bar does not fall
+            // through and move the caret to whatever cell is behind it. The
+            // standing panels do the same.
+            Button,
+            KeyBar,
             EditorChrome,
         ))
-        .with_children(|row| {
-            for (mode, label, radius) in [
-                (EditorMode::Normal, "NORMAL", BorderRadius::left(RADIUS)),
-                (EditorMode::Insert, "INSERT", BorderRadius::right(RADIUS)),
-            ] {
-                row.spawn((
+        .with_children(|bar| {
+            // The two halves sit flush and are rounded only on their outer
+            // edge, so the pair reads as one widget with two states rather than
+            // as two buttons. No rule between them: one half is always on, and
+            // the fill it carries draws the seam.
+            bar.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                flex_shrink: 0.0,
+                ..default()
+            })
+            .with_children(|pill| {
+                for (mode, label, radius) in [
+                    (EditorMode::Normal, "NORMAL", BorderRadius::left(RADIUS)),
+                    (EditorMode::Insert, "INSERT", BorderRadius::right(RADIUS)),
+                ] {
+                    pill.spawn((
+                        Button,
+                        segment(radius, Display::Flex),
+                        BackgroundColor(CONTROL_REST),
+                        ModeToggle(mode),
+                    ))
+                    .with_children(|half| {
+                        half.spawn((
+                            Text::new(label),
+                            text_font(&ui_font.0, 14.0),
+                            TextColor(Color::srgb(0.6, 0.6, 0.7)),
+                        ));
+                    });
+                }
+                // What stands in the same place while an evaluation runs,
+                // alone and rounded all round.
+                pill.spawn((
                     Button,
-                    segment(radius, Display::Flex),
+                    segment(BorderRadius::all(RADIUS), Display::None),
                     BackgroundColor(CONTROL_REST),
-                    ModeToggle(mode),
+                    EvalModeLabel,
                 ))
-                .with_children(|half| {
-                    half.spawn((
-                        Text::new(label),
+                .with_children(|panel| {
+                    panel.spawn((
+                        Text::new("EVALUATE"),
                         text_font(&ui_font.0, 14.0),
-                        TextColor(Color::srgb(0.6, 0.6, 0.7)),
+                        TextColor(Color::srgb(0.85, 0.85, 0.9)),
                     ));
                 });
-            }
-            // A bare `Button` for the same reason the panels carry one: it is
-            // what `pick_cells`' `over_ui` test sees, so a click that lands on
-            // it doesn't reach the cell behind it.
-            row.spawn((
-                Button,
-                segment(BorderRadius::all(RADIUS), Display::None),
-                BackgroundColor(CONTROL_REST),
-                EvalModeLabel,
-            ))
-            .with_children(|panel| {
-                panel.spawn((
-                    Text::new("EVALUATE"),
-                    text_font(&ui_font.0, 14.0),
-                    TextColor(Color::srgb(0.85, 0.85, 0.9)),
-                ));
             });
         });
+}
+
+/// Write what the keys mean where the caret is standing.
+///
+/// Rebuilds the bar's children whenever the drawn view would differ, the way
+/// every list here does: fingerprint, latch, sweep, respawn. It never touches
+/// the bar's own `display` — that belongs to `sync_editor_chrome` alone, and
+/// two writers of one field flicker on the frame they disagree.
+#[allow(clippy::too_many_arguments)]
+fn sync_key_bar(
+    mut commands: Commands,
+    mode: Res<EditorMode>,
+    state: Res<GraphState>,
+    pick: Res<PickState>,
+    prompt: Res<InsertPrompt>,
+    draft: Res<DraftState>,
+    keys: Res<ButtonInput<KeyCode>>,
+    show: Res<ShowKeys>,
+    ui_font: Res<UiFont>,
+    bar_q: Query<Entity, With<KeyBar>>,
+    content_q: Query<Entity, With<KeyBarEntity>>,
+    mut cache: Local<KeyBarFingerprint>,
+) {
+    let context = keymap::context(*mode, &state, &pick, &prompt, &draft, alt_held(&keys));
+    // Folded away, the question is not asked at all: no place to name, no rows
+    // to list, and the pill left standing on its own.
+    let place = if show.0 { keymap::place(&context) } else { "" };
+    let rows: Vec<(&'static str, &'static str, keymap::Group)> = if show.0 {
+        keymap::live(&context)
+            .take(KEY_BAR_MAX_ROWS)
+            .map(|binding| (binding.keys, binding.says, binding.group))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let clipped = show.0 && keymap::live(&context).count() > rows.len();
+    if cache.place == place && cache.rows == rows && cache.shown == show.0 {
+        return;
+    }
+    // The bar is asked for before the latch is written, so that a frame in
+    // which it is somehow not there yet is a frame to try again on rather than
+    // the one frame that was going to draw it.
+    let Ok(bar) = bar_q.single() else {
+        return;
+    };
+    *cache = KeyBarFingerprint {
+        place,
+        rows: rows.clone(),
+        shown: show.0,
+    };
+    for entity in content_q.iter() {
+        commands.entity(entity).despawn();
+    }
+    let font = ui_font.0.clone();
+    commands.entity(bar).with_children(|bar| {
+        if rows.is_empty() {
+            return;
+        }
+        bar.spawn((
+            Node {
+                width: Val::Px(1.0),
+                height: Val::Px(28.0),
+                flex_shrink: 0.0,
+                ..default()
+            },
+            BackgroundColor(Color::srgb(0.25, 0.25, 0.4)),
+            KeyBarEntity,
+        ));
+        if !place.is_empty() {
+            bar.spawn((
+                Text::new(place),
+                text_font(&font, 13.0),
+                TextColor(INK_BRIGHT),
+                Node {
+                    flex_shrink: 0.0,
+                    ..default()
+                },
+                KeyBarEntity,
+            ));
+        }
+        bar.spawn((
+            Node {
+                flex_direction: FlexDirection::Row,
+                flex_wrap: FlexWrap::Wrap,
+                align_content: AlignContent::Center,
+                align_items: AlignItems::Center,
+                flex_grow: 1.0,
+                column_gap: Val::Px(18.0),
+                row_gap: Val::Px(2.0),
+                ..default()
+            },
+            KeyBarEntity,
+        ))
+        .with_children(|list| {
+            let mut previous: Option<keymap::Group> = None;
+            for (key, says, group) in rows.iter() {
+                // A rule wherever the kind of thing changes, so that walking
+                // the grid, wiring, and typing do not read as one list.
+                if previous.is_some_and(|last| last != *group) {
+                    list.spawn((
+                        Node {
+                            width: Val::Px(1.0),
+                            height: Val::Px(12.0),
+                            ..default()
+                        },
+                        BackgroundColor(Color::srgb(0.25, 0.25, 0.4)),
+                    ));
+                }
+                previous = Some(*group);
+                list.spawn(Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(6.0),
+                    ..default()
+                })
+                .with_children(|entry| {
+                    entry.spawn((
+                        Text::new(*key),
+                        text_font(&font, 12.0),
+                        // The key column's ink, the same the Controls modal
+                        // printed its bindings in.
+                        TextColor(Color::srgb(0.9, 0.9, 0.7)),
+                    ));
+                    entry.spawn((Text::new(*says), text_font(&font, 12.0), TextColor(INK_DIM)));
+                });
+            }
+            if clipped {
+                list.spawn((
+                    Text::new("\u{2026}"),
+                    text_font(&font, 12.0),
+                    TextColor(INK_OFF),
+                ));
+            }
+        });
+    });
+}
+
+/// Where the bottom edge is, and with it where everything standing on it
+/// begins.
+///
+/// One writer for three nodes, because they are answering one question: the
+/// bar is as tall as the keys make it, and the view bar and the run panel
+/// stand that much higher. Split across three systems it would be three places
+/// for the same constant to be remembered.
+///
+/// Only `height` and `bottom` — `sync_editor_chrome` is the sole writer of
+/// `display` on these same nodes, and those are different fields.
+///
+/// The two heights are constants and the bar is clipped to whichever is in
+/// force, so nothing here is measured and nothing moves except when the
+/// checkbox is clicked. A bar that measured its own content would move the run
+/// panel every time the caret found a place with one row fewer.
+fn sync_bottom_chrome(
+    show: Res<ShowKeys>,
+    mut bar_q: Query<&mut Node, With<KeyBar>>,
+    mut standing_q: Query<&mut Node, (Or<(With<ViewBar>, With<RunPanel>)>, Without<KeyBar>)>,
+    mut last: Local<Option<bool>>,
+) {
+    if *last == Some(show.0) {
+        return;
+    }
+    *last = Some(show.0);
+    let height = if show.0 {
+        KEY_BAR_HEIGHT
+    } else {
+        KEY_BAR_HEIGHT_BARE
+    };
+    for mut node in bar_q.iter_mut() {
+        node.height = Val::Px(height);
+    }
+    for mut node in standing_q.iter_mut() {
+        node.bottom = Val::Px(BOTTOM_CHROME_MARGIN + height);
+    }
 }
 
 /// Which half of the blink the given moment falls in.
@@ -9188,6 +9296,17 @@ fn keyboard_captured(text_inputs: &Query<&TextInput>, eval: &EvalState) -> bool 
     modal_is_open(eval) || is_evaluating(eval) || text_inputs.iter().any(|input| input.focused)
 }
 
+/// Whether `Alt` is down, and with it whether the six navigation keys read the
+/// wiring instead of walking the grid.
+///
+/// Asked by the three systems that divide the keyboard between them and by the
+/// bar that says which of them owns it. It was written out four times before,
+/// which is three places for the left key to be remembered and the right one
+/// forgotten.
+fn alt_held(keys: &ButtonInput<KeyCode>) -> bool {
+    keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight)
+}
+
 /// Apply an insert that makes room and let the caret ride it, so it keeps
 /// addressing whatever it pointed at. An insert the layout refuses — it would
 /// have to cut a node in half — leaves the graph untouched, which is what the
@@ -9270,7 +9389,7 @@ fn handle_editor_keys(
     // `captured`. Without it `Alt` and a letter would mean two things at once
     // on a layout that reports a different character under the modifier, and
     // the one it means here does not include entering INSERT.
-    let aiming = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
+    let aiming = alt_held(&keys);
     let target = insert_target(&state, &pick);
 
     for ev in key_events.read() {
@@ -9843,7 +9962,7 @@ fn handle_arrow_keys(
     // No `clear()` on the way out, unlike the guard above: the messages are
     // the other system's to read, and each `MessageReader` walks the stream on
     // a cursor of its own.
-    if keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight) {
+    if alt_held(&keys) {
         return;
     }
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
@@ -10243,7 +10362,7 @@ fn handle_edge_hop_keys(
     // owns the graph, INSERT owns the keyboard, a focused field owns the
     // letters — and the grip goes with any of them, so nothing is left lit on
     // a picture the user has moved on from.
-    let held = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
+    let held = alt_held(&keys);
     if !held
         || is_evaluating(&eval)
         || *mode != EditorMode::Normal
@@ -11198,6 +11317,7 @@ fn main() {
         .init_resource::<Diagnostics>()
         .init_resource::<DiagnosticsOpen>()
         .init_resource::<ViewMenuOpen>()
+        .init_resource::<ShowKeys>()
         .add_systems(
             Startup,
             (
@@ -11215,7 +11335,7 @@ fn main() {
                 spawn_run_panel,
                 spawn_fps_display,
                 spawn_hover_address,
-                spawn_mode_display,
+                spawn_key_bar,
                 // Last: it reads the window's physical size, and the camera
                 // above is what puts the OIT settings there to be read.
                 log_oit_budget,
@@ -11236,7 +11356,6 @@ fn main() {
                         handle_mode_toggle,
                         handle_insert_prompt_click,
                         handle_new_button,
-                        handle_help_button,
                         sync_chrome_buttons,
                         // With the other click handlers, not with the modal
                         // ones: it rewrites the graph, and this is the chain
@@ -11323,6 +11442,15 @@ fn main() {
                 // paints is decided by a resource and by the wall clock, not
                 // by anything else in this set.
                 paint_edge_hop,
+                // Unordered against the key systems on purpose: the bar only
+                // reads, and reading a frame late costs a frame of a readout —
+                // the same trade `paint_hover` above makes for itself. Ordering
+                // it against `handle_editor_keys` would tie it to a chain it
+                // shares nothing else with.
+                // Chained: the bar decides its own height, and the surfaces
+                // standing on it have to be told in the same frame or they
+                // overlap it for one.
+                (sync_key_bar, sync_bottom_chrome).chain(),
                 // Chained: the click may fold the list, and the sync that draws
                 // it has to see the fold in the same frame it was asked for.
                 (
@@ -11344,6 +11472,7 @@ fn main() {
                 // that reads what it wrote.
                 (handle_clipping_checkbox, sync_clipping_checkbox).chain(),
                 (handle_guides_checkbox, sync_guides_checkbox).chain(),
+                (handle_keys_checkbox, sync_keys_checkbox).chain(),
                 handle_modal_ok_button,
                 handle_modal_cancel_button,
                 handle_modal_evaluate_button,
