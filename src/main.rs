@@ -111,6 +111,33 @@ pub struct Edge {
     pub from_anchor: Entity,
     pub to_anchor: Entity,
     pub source_anchor_id: model::anchor::Id,
+    /// The anchor the edge arrives at. Its twin above named only where the
+    /// edge begins, which was enough while nothing asked *which* edge an
+    /// entity was — an edge is named by both of its ends, and a producer
+    /// feeding three consumers is three edges sharing a source.
+    pub target_anchor_id: model::anchor::Id,
+}
+
+/// One strand of an edge: the run of a single type from one anchor's row to
+/// the row that accepts it at the other.
+///
+/// A strand is what a hop follows, so it has to be findable by the two things
+/// a hop names — which row it leaves and which row it lands on. Both are
+/// recorded here rather than re-derived, because the row a strand lands on is
+/// the answer to a subsumption question (see `spawn_edge_strands`), and asking
+/// it twice in two places is asking for the two answers to drift.
+#[derive(Component)]
+pub struct EdgeStrand {
+    /// Row of the edge's source anchor this strand leaves from.
+    pub source_row: usize,
+    /// Row of the target anchor it lands on.
+    pub target_row: usize,
+    /// The colour it wears when nothing is reaching for it.
+    ///
+    /// Kept rather than looked up again: the hop paints over it and has to put
+    /// it back, and by then the inferer may be answering something else about
+    /// a graph that has moved on. What is restored is what was drawn.
+    pub color: LinearRgba,
 }
 
 /// The root of the edge the editor is proposing, as against the ones the graph
@@ -208,6 +235,51 @@ impl DraftState {
         } else {
             (target, draft.source_anchor_id.clone())
         })
+    }
+}
+
+/// The edge the caret is reaching along, while `Alt` is held.
+///
+/// A draft aims at an edge that is not there; this aims at one that is. The
+/// two are separate for that reason alone — nothing here is ever committed,
+/// and nothing here touches the graph. `Alt` is a way of *reading* the
+/// wiring: what it draws is a promise about where the next keystroke would
+/// land, and letting go of the key takes the promise back without having
+/// changed anything.
+///
+/// Anchor ids and no entity and no world position, for the reason `EdgeDraft`
+/// gives: `clear_scene` makes every entity stale on the next rebuild, while an
+/// anchor id survives one.
+///
+/// It is cleared whenever `Alt` lifts or the caret comes to rest somewhere
+/// else, so the grip is always on what the caret is standing on *now*.
+#[derive(Resource, Default)]
+struct EdgeHop {
+    /// The anchor the caret stands on — where the reach begins.
+    from: Option<model::anchor::Id>,
+    /// The row of `from` the caret stands on, and with it the type the reach
+    /// follows: a hop lands on the row at the far end that admits this one.
+    row: usize,
+    /// The far end of the edge currently picked out of however many leave
+    /// `from`. `None` where `from` carries no edge at all.
+    to: Option<model::anchor::Id>,
+}
+
+impl EdgeHop {
+    /// The grip, if one is held.
+    fn held(&self) -> Option<(&model::anchor::Id, &model::anchor::Id)> {
+        Some((self.from.as_ref()?, self.to.as_ref()?))
+    }
+
+    /// Let go. Not `Default::default()` spelled out: a release has to leave
+    /// `row` at rest too, and a field added later should be caught by the
+    /// compiler here rather than quietly keep its value across a release.
+    fn release(&mut self) {
+        *self = Self {
+            from: None,
+            row: 0,
+            to: None,
+        };
     }
 }
 
@@ -2127,6 +2199,7 @@ fn spawn_graph_nodes(
                     from_anchor: *anchor_entities.get(src_id).unwrap(),
                     to_anchor: *anchor_entities.get(tgt_id).unwrap(),
                     source_anchor_id: src_id.clone(),
+                    target_anchor_id: tgt_id.clone(),
                 },
                 Transform::IDENTITY,
                 Visibility::Inherited,
@@ -5028,6 +5101,22 @@ fn spawn_controls_modal(commands: &mut Commands, font: &Handle<Font>) {
             "NORMAL: move the selected node vertically",
         ),
         (
+            "Alt (held)",
+            "NORMAL: light the strand the next hop would follow",
+        ),
+        (
+            "Alt + Left/Right, hl",
+            "NORMAL: hop along the wiring — across an edge, or through a node",
+        ),
+        (
+            "Alt + Up/Down",
+            "NORMAL on an input: step between the inputs of one call",
+        ),
+        (
+            "Alt + Up/Down, + Shift",
+            "NORMAL on an output: choose which of its edges to hop along",
+        ),
+        (
             "i",
             "INSERT: build here, wire the anchor here, or edit what stands here",
         ),
@@ -6859,14 +6948,15 @@ fn spawn_edge_strands(
         // admits it. Asked as subsumption rather than by kind because a
         // row may be a literal now — a `1` strand belongs on the `1`
         // row of a `1|2` anchor, not merely on some Integer row.
-        let y_tgt = match target_rows
+        let target_row = match target_rows
             .iter()
             .find(|(_, target_leaf)| infer::subsumes(target_leaf, leaf))
         {
-            Some((idx, _)) => render::leaf_row_offset(*idx),
+            Some((idx, _)) => *idx,
             // No matching leaf at the target: aim at its first row.
-            None => 0.0,
+            None => 0,
         };
+        let y_tgt = render::leaf_row_offset(target_row);
         // A leaf that claims no row of its own — a sum type, or `Pending` —
         // has no strand to draw.
         if edge::leaf_kind_of(leaf).is_none() {
@@ -6884,13 +6974,16 @@ fn spawn_edge_strands(
         };
         let (mesh, arc_total) =
             edge::build_ribbon_mesh(&curve, from_world.y + y_src, to_world.y + y_tgt, height);
+        // An edge carries one type from end to end, so both ends of the
+        // ribbon are the one colour — and it is bound here rather than
+        // called for twice, because the strand has to be able to say later
+        // what colour it was.
+        let color = render::strand_color(leaf).to_linear();
         commands.spawn((
             Mesh3d(meshes.add(mesh)),
             MeshMaterial3d(materials_edge.add(edge::EdgeMaterial {
-                // An edge carries one type from end to end, so both
-                // colours are the one colour.
-                band_color_start: render::strand_color(leaf).to_linear(),
-                band_color_end: render::strand_color(leaf).to_linear(),
+                band_color_start: color,
+                band_color_end: color,
                 time: 0.0,
                 // Both ends of an ordinary edge wear the same shape, so
                 // there is nothing for the two line modes to interpolate
@@ -6909,6 +7002,11 @@ fn spawn_edge_strands(
                 dash_duty: 0.0,
                 opacity,
             })),
+            EdgeStrand {
+                source_row: *k,
+                target_row,
+                color,
+            },
             ChildOf(parent),
             SceneEntity,
         ));
@@ -8242,11 +8340,21 @@ fn spawn_mode_display(mut commands: Commands, ui_font: Res<UiFont>) {
         });
 }
 
+/// Which half of the blink the given moment falls in.
+///
+/// Wall-clock and stated once, because more than one thing blinks and they
+/// have to blink *together*: the INSERT caret and the draft edge do it by
+/// being hidden and shown, and the strand a hop is reaching along does it by
+/// changing colour where it stands. Two clocks would have the editor winking
+/// at itself.
+fn caret_blink_lit(now: f32) -> bool {
+    (now / CARET_BLINK_SECONDS) as i64 % 2 == 0
+}
+
 /// Blink the INSERT-mode caret on a fixed wall-clock cycle, so it keeps its
 /// rhythm across scene rebuilds instead of restarting on every caret move.
 fn blink_caret(time: Res<Time>, mut caret_q: Query<&mut Visibility, With<CaretBlink>>) {
-    let lit = (time.elapsed_secs() / CARET_BLINK_SECONDS) as i64 % 2 == 0;
-    let desired = if lit {
+    let desired = if caret_blink_lit(time.elapsed_secs()) {
         Visibility::Inherited
     } else {
         Visibility::Hidden
@@ -8254,6 +8362,69 @@ fn blink_caret(time: Res<Time>, mut caret_q: Query<&mut Visibility, With<CaretBl
     for mut visibility in caret_q.iter_mut() {
         if *visibility != desired {
             *visibility = desired;
+        }
+    }
+}
+
+/// Paint the strand the caret is reaching along, and put every other one back.
+///
+/// The strand itself changes colour rather than a white one being laid over
+/// it. Two ribbons built from the same curve are coplanar, and two coplanar
+/// surfaces have no settled order — the mark would have flickered against the
+/// thing it was marking. What is seen is the same picture either way: the
+/// strand wears the caret's white on the lit half of the blink and its own
+/// type's colour on the other, so the type it carries is never hidden for
+/// longer than a caret is.
+///
+/// Asked afresh every frame of every strand, rather than remembered. That is
+/// what makes it survive a rebuild: the entities are respawned with their own
+/// colours and this simply paints again. It is also why `EdgeStrand` carries
+/// the colour to go back to — there is no "before" to restore, only what the
+/// strand says it is.
+fn paint_edge_hop(
+    time: Res<Time>,
+    hop: Res<EdgeHop>,
+    mut materials_edge: ResMut<Assets<edge::EdgeMaterial>>,
+    edges: Query<(&Edge, &Children)>,
+    strands: Query<(&EdgeStrand, &MeshMaterial3d<edge::EdgeMaterial>)>,
+) {
+    let lit = caret_blink_lit(time.elapsed_secs());
+    // The caret's own white, so that what the caret addresses and what it is
+    // reaching along are said in one colour. `DISPLAY_WHITE` overdrives the
+    // tonemapper to a true #FFFFFF; only the RGB is read here, since the
+    // strand cuts fragments away rather than blending them.
+    let white = LinearRgba::rgb(
+        render::DISPLAY_WHITE,
+        render::DISPLAY_WHITE,
+        render::DISPLAY_WHITE,
+    );
+    for (edge, children) in &edges {
+        // A grip names its two ends without saying which way round the edge
+        // records them, so both orders are asked. Which one answers decides
+        // which of a strand's two row numbers the grip's row is compared
+        // against: the caret stands at one end, and a strand leaves one row
+        // and lands on another.
+        let at_source = hop.held().is_some_and(|(from, to)| {
+            from == &edge.source_anchor_id && to == &edge.target_anchor_id
+        });
+        let at_target = hop.held().is_some_and(|(from, to)| {
+            from == &edge.target_anchor_id && to == &edge.source_anchor_id
+        });
+        for child in children.iter() {
+            let Ok((strand, material)) = strands.get(child) else {
+                continue;
+            };
+            let marked = lit
+                && ((at_source && strand.source_row == hop.row)
+                    || (at_target && strand.target_row == hop.row));
+            let wanted = if marked { white } else { strand.color };
+            let Some(material) = materials_edge.get_mut(&material.0) else {
+                continue;
+            };
+            if material.band_color_start != wanted {
+                material.band_color_start = wanted;
+                material.band_color_end = wanted;
+            }
         }
     }
 }
@@ -9092,13 +9263,20 @@ fn handle_editor_keys(
 ) {
     let captured = keyboard_captured(&text_inputs, &eval);
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    // `Alt` belongs to `handle_edge_hop_keys` while it is down, and what it
+    // does there is read the wiring — never change the mode and never touch
+    // the graph. So the letters are walked and dropped, the way they are under
+    // `captured`. Without it `Alt` and a letter would mean two things at once
+    // on a layout that reports a different character under the modifier, and
+    // the one it means here does not include entering INSERT.
+    let aiming = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
     let target = insert_target(&state, &pick);
 
     for ev in key_events.read() {
         if ev.state != bevy::input::ButtonState::Pressed {
             continue;
         }
-        if captured {
+        if captured || aiming {
             // Nothing in the editor takes the keyboard any more — every
             // property is typed into the prompt, which deliberately is not a
             // text field — so what is left owning it is the start menu, a modal
@@ -9106,6 +9284,10 @@ fn handle_editor_keys(
             // all. The batch is walked rather than left standing, because a
             // message survives two updates and would otherwise fire once the
             // guard lifts.
+            //
+            // `Alt` is the second owner and the only one inside the editor: it
+            // is reading the wiring, and this pass would answer the same keys
+            // with a mode change or a deletion.
             continue;
         }
         match (*mode, &ev.logical_key) {
@@ -9653,6 +9835,16 @@ fn handle_arrow_keys(
         key_events.clear();
         return;
     }
+    // `Alt` takes the same six keys and means the wiring instead of the grid —
+    // `handle_edge_hop_keys` has them, and a step of one cell taken alongside
+    // a hop of a whole edge would be the caret answering two keys at once.
+    //
+    // No `clear()` on the way out, unlike the guard above: the messages are
+    // the other system's to read, and each `MessageReader` walks the stream on
+    // a cursor of its own.
+    if keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight) {
+        return;
+    }
     let ctrl = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
     let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
 
@@ -9719,6 +9911,570 @@ fn handle_arrow_keys(
             pick.selected_pos = target;
             rebuild.0 = true;
         }
+    }
+}
+
+/// The anchor the caret stands on and which of its rows, if it stands on one.
+///
+/// The row and not the anchor alone, because an anchor is a column — one cell
+/// per leaf of the type it carries (`layout::anchor_cells`) — so which cell
+/// the caret is on is which *type* it is on. Everything `Alt` does reads that:
+/// a hop lands on the row at the far end that admits this one.
+///
+/// Found by matching the caret's cell against the anchor's own list rather
+/// than by reading `CellRole`'s `leaf`. The two agree everywhere the second
+/// answers, and only the first answers for a Tunnel's input — which claims no
+/// cell of any shape and is resolved through `LayoutGraph::tunnel_input_at`
+/// instead.
+fn anchor_row_at_caret(state: &GraphState, pick: &PickState) -> Option<(model::anchor::Id, usize)> {
+    let anchor = anchor_at_caret(state, pick)?;
+    let cells = state.root_graph().anchor_cells_of(&anchor)?;
+    Some((
+        anchor,
+        cells
+            .iter()
+            .position(|cell| *cell == pick.selected_pos)
+            .unwrap_or(0),
+    ))
+}
+
+/// The rows an anchor draws, each paired with the row index it owns.
+///
+/// The renderer's own answer — `spawn_edge_strands` asks it of both ends of
+/// every edge — so that a hop lands where the strand it followed does. The
+/// fallback matters as much as the question: an input that constrains nothing,
+/// a Sink's or a Match's or a TypeCast's, declares no type at all, and its
+/// rows are the rows of whatever is wired into it.
+///
+/// Nothing is narrowed by a run, because `Alt` is not offered during one. What
+/// a run leaves on an anchor is a row it took; the rows here are the rows the
+/// graph as written has.
+fn anchor_rows(
+    flat_graph: &model::term_graph::TermGraph,
+    function_declarations: &std::collections::HashMap<
+        model::function_declaration::FunctionDeclarationId,
+        model::function_declaration::FunctionDeclaration,
+    >,
+    anchor: &model::anchor::Id,
+) -> Vec<(usize, infer::EType)> {
+    infer::anchor_type(flat_graph, anchor, function_declarations)
+        .or_else(|| infer::incoming_anchor_type(flat_graph, anchor, function_declarations))
+        .map(|t| render::drawn_rows(&t, None))
+        .unwrap_or_default()
+}
+
+/// The leaf type one row of an anchor carries — the type a hop from that row
+/// follows.
+fn row_leaf(
+    flat_graph: &model::term_graph::TermGraph,
+    function_declarations: &std::collections::HashMap<
+        model::function_declaration::FunctionDeclarationId,
+        model::function_declaration::FunctionDeclaration,
+    >,
+    anchor: &model::anchor::Id,
+    row: usize,
+) -> Option<infer::EType> {
+    anchor_rows(flat_graph, function_declarations, anchor)
+        .into_iter()
+        .find(|(index, _)| *index == row)
+        .map(|(_, leaf)| leaf)
+}
+
+/// Which row of `anchor` admits `leaf`, and its first row where none does.
+///
+/// The rule the ribbons are drawn by, read out of `spawn_edge_strands` so the
+/// caret and the strand cannot answer differently. Asked as subsumption rather
+/// than by kind because a row may be a literal: a `1` belongs on the `1` row
+/// of a `1|2` anchor and not merely on some Integer row.
+///
+/// Giving up is deliberate and is what "the first row" means. A jump follows
+/// the caret's type where the far end has it; where it has not, the jump still
+/// happens — refusing to move would leave the key doing nothing at exactly the
+/// moment the wiring is worth looking at.
+fn admitting_row(
+    flat_graph: &model::term_graph::TermGraph,
+    function_declarations: &std::collections::HashMap<
+        model::function_declaration::FunctionDeclarationId,
+        model::function_declaration::FunctionDeclaration,
+    >,
+    anchor: &model::anchor::Id,
+    leaf: &infer::EType,
+) -> usize {
+    anchor_rows(flat_graph, function_declarations, anchor)
+        .into_iter()
+        .find(|(_, row)| infer::subsumes(row, leaf))
+        .map_or(0, |(index, _)| index)
+}
+
+/// The same rule read backwards: which row of `from` is the one whose strand
+/// lands on row `row` of `to`.
+///
+/// Hopping against the flow — from an input back to whatever feeds it — needs
+/// the inverse of `admitting_row`, and takes it by asking the forward question
+/// of every row rather than by stating a second rule. There is one rule about
+/// which row meets which, and it is written down once.
+fn row_landing_on(
+    flat_graph: &model::term_graph::TermGraph,
+    function_declarations: &std::collections::HashMap<
+        model::function_declaration::FunctionDeclarationId,
+        model::function_declaration::FunctionDeclaration,
+    >,
+    from: &model::anchor::Id,
+    to: &model::anchor::Id,
+    row: usize,
+) -> usize {
+    anchor_rows(flat_graph, function_declarations, from)
+        .into_iter()
+        .find(|(_, leaf)| admitting_row(flat_graph, function_declarations, to, leaf) == row)
+        .map_or(0, |(index, _)| index)
+}
+
+/// Whether the scope an anchor stands in is one the grading has closed over.
+///
+/// A hop into a volume that is not drawn would put the caret where nothing can
+/// be looked at. The same question `draft_candidates` asks of every anchor it
+/// offers, asked here of one.
+fn anchor_is_hidden(
+    root: &layout::LayoutGraph,
+    grading: &lod::Lod,
+    anchor: &model::anchor::Id,
+) -> bool {
+    root.try_layout_anchor(anchor)
+        .and_then(|layout_anchor| root.context_of_node(&layout_anchor.node_id))
+        .is_none_or(|context| grading.hidden(&context))
+}
+
+/// Every anchor an edge reaches from `anchor`, with the cell it is addressed
+/// by, in address order.
+///
+/// One list whichever end the caret is standing at. An output may feed as many
+/// consumers as it likes, and the list is then the choice `Alt` offers; an
+/// input carries at most one incoming edge — the invariant
+/// `LayoutGraph::plus_edge` keeps — so the list is one long or empty and there
+/// is nothing to choose.
+///
+/// Sorted for the reason `draft_candidates` is sorted: the edge table is a
+/// hash map, and a choice that reshuffled on a tie would have the editor
+/// pointing at a different edge from one frame to the next while nothing
+/// moved.
+fn hop_candidates(
+    state: &GraphState,
+    grading: &lod::Lod,
+    anchor: &model::anchor::Id,
+    is_output: bool,
+) -> Vec<(model::anchor::Id, IVec3)> {
+    let root = state.root_graph();
+    let ends: Vec<model::anchor::Id> = if is_output {
+        root.graph
+            .edges
+            .get(anchor)
+            .map(|edges| edges.iter().map(|e| e.to.clone()).collect())
+            .unwrap_or_default()
+    } else {
+        incoming_edge_source(root, anchor).into_iter().collect()
+    };
+    let mut out: Vec<(model::anchor::Id, IVec3)> = ends
+        .into_iter()
+        .filter(|id| !anchor_is_hidden(root, grading, id))
+        .filter_map(|id| root.anchor_cell(&id).map(|cell| (id, cell)))
+        .collect();
+    out.sort_by(|(a_id, a), (b_id, b)| (a.x, a.y, a.z, a_id).cmp(&(b.x, b.y, b.z, b_id)));
+    out
+}
+
+/// Every anchor the caret could be put on, with the cell it is addressed by.
+///
+/// `draft_candidates` without the question of whether an edge may join them:
+/// moving to an anchor proposes nothing, so every anchor that is drawn is one
+/// the caret may stand on. What it is for is the caret that is standing on no
+/// anchor at all, where `Alt` has no wiring to follow and reaches for the
+/// nearest anchor that way instead.
+fn reachable_anchors(state: &GraphState, grading: &lod::Lod) -> Vec<(model::anchor::Id, IVec3)> {
+    let root = state.root_graph();
+    let mut out: Vec<(model::anchor::Id, IVec3)> = Vec::new();
+    for walked in root.walk_all() {
+        if grading.hidden(&walked.context) {
+            continue;
+        }
+        let Some(node) = walked
+            .layout_graph
+            .graph
+            .nodes
+            .get(&walked.layout_node.node_id)
+        else {
+            continue;
+        };
+        for (anchor_id, _) in node.anchors() {
+            let Some(cell) = root.anchor_cell(&anchor_id) else {
+                continue;
+            };
+            out.push((anchor_id, cell));
+        }
+    }
+    out.sort_by(|(a_id, a), (b_id, b)| (a.x, a.y, a.z, a_id).cmp(&(b.x, b.y, b.z, b_id)));
+    out
+}
+
+/// Put the caret on one row of an anchor.
+///
+/// It stays where it is when that cell lies outside the volume the caret may
+/// walk — the same test every other caret move goes through, and the same
+/// answer: a move against a face is no move at all. A row the anchor does not
+/// have falls back to its first, which is the type rule giving up rather than
+/// the hop.
+fn land_caret_on(
+    state: &GraphState,
+    pick: &mut PickState,
+    rebuild: &mut NeedsRebuild,
+    anchor: &model::anchor::Id,
+    row: usize,
+) {
+    let Some(cells) = state.root_graph().anchor_cells_of(anchor) else {
+        return;
+    };
+    let Some(cell) = cells.get(row).or_else(|| cells.first()).copied() else {
+        return;
+    };
+    if state.root_graph().clamp_to_volume(cell) != cell {
+        return;
+    }
+    if pick.selected_pos != cell {
+        pick.selected_pos = cell;
+        rebuild.0 = true;
+    }
+}
+
+/// The candidate a fresh grip opens on.
+///
+/// The first whose far end carries the caret's own type, and the first
+/// outright where none does. "First" is the address order `hop_candidates`
+/// hands the list over in, so the edge `Alt` points at the moment it is
+/// pressed is the same edge every time.
+fn default_hop_target(
+    flat_graph: &model::term_graph::TermGraph,
+    function_declarations: &std::collections::HashMap<
+        model::function_declaration::FunctionDeclarationId,
+        model::function_declaration::FunctionDeclaration,
+    >,
+    leaf: Option<&infer::EType>,
+    candidates: &[(model::anchor::Id, IVec3)],
+) -> Option<model::anchor::Id> {
+    let carries = |id: &model::anchor::Id| match leaf {
+        Some(leaf) => anchor_rows(flat_graph, function_declarations, id)
+            .iter()
+            .any(|(_, row)| infer::subsumes(row, leaf)),
+        None => false,
+    };
+    candidates
+        .iter()
+        .find(|(id, _)| carries(id))
+        .or_else(|| candidates.first())
+        .map(|(id, _)| id.clone())
+}
+
+/// The candidate one step on from `current`, wrapping round the end.
+///
+/// What is left when the cone `step_draft_target` casts finds nothing that
+/// way. Two consumers standing at the same X and the same Y differ only in
+/// depth, and no key aims at depth while `Alt` is held — `h` and `l` are the
+/// hop itself. Without a wrap they would be a choice that cannot be made.
+fn wrap_hop_target(
+    candidates: &[(model::anchor::Id, IVec3)],
+    current: Option<&model::anchor::Id>,
+    forward: bool,
+) -> Option<model::anchor::Id> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let at = current
+        .and_then(|id| candidates.iter().position(|(other, _)| other == id))
+        .unwrap_or(0);
+    let len = candidates.len();
+    let next = if forward {
+        (at + 1) % len
+    } else {
+        (at + len - 1) % len
+    };
+    candidates.get(next).map(|(id, _)| id.clone())
+}
+
+/// Walking the wiring: `Alt` and the six nav keys move the caret along the
+/// edges the graph holds, rather than across the cells it occupies.
+///
+/// Held alone, `Alt` says which edge the next key would take — the strand it
+/// would run along wears the caret's white on the blink (`paint_edge_hop`).
+/// That is the whole of what holding it does: nothing is proposed, nothing is
+/// committed, and letting go leaves the graph exactly as it was.
+///
+/// The directions are the ones every other part of the editor uses, out of the
+/// one table (`caret_delta`, `nav_letter`), but what they mean here is the
+/// wiring and not the grid:
+///
+/// * `h`/`l` hop. Against the flow, `h` leaves an input for whatever feeds it
+///   and leaves an output for its own node's input; along the flow, `l` is the
+///   mirror of that. So the two keys read the same way they always did — back
+///   toward the sources, on toward the sink — while the step they take is a
+///   whole edge or a whole node instead of a cell.
+/// * `k`/`j` at an input step between the inputs of one call, which stand in a
+///   row along +X: exactly the axis those two keys already move on.
+/// * `k`/`j` at an output, with or without `Shift`, change *which* edge is
+///   pointed at. An output may feed many consumers and an input is fed by at
+///   most one, so the choice exists at exactly one of the two ends and the two
+///   meanings never meet.
+///
+/// A caret standing on no anchor has no wiring to follow, and there `Alt`
+/// reaches for the nearest anchor the key points at — the same 90° cone
+/// `step_draft_target` casts for a draft, over every anchor that is drawn.
+#[allow(clippy::too_many_arguments)]
+fn handle_edge_hop_keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut key_events: MessageReader<KeyboardInput>,
+    text_inputs: Query<&TextInput>,
+    state: Res<GraphState>,
+    mut pick: ResMut<PickState>,
+    mut hop: ResMut<EdgeHop>,
+    mut rebuild: ResMut<NeedsRebuild>,
+    eval: Res<EvalState>,
+    mode: Res<EditorMode>,
+    clipping: Res<lod::Clipping>,
+) {
+    // The gates the caret's own keys go through, and the key itself. A run
+    // owns the graph, INSERT owns the keyboard, a focused field owns the
+    // letters — and the grip goes with any of them, so nothing is left lit on
+    // a picture the user has moved on from.
+    let held = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
+    if !held
+        || is_evaluating(&eval)
+        || *mode != EditorMode::Normal
+        || keyboard_captured(&text_inputs, &eval)
+    {
+        if hop.from.is_some() {
+            hop.release();
+        }
+        key_events.clear();
+        return;
+    }
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+
+    // Read before anything is worked out, so the messages are drained on every
+    // frame the guard above let through — a message survives two updates, and
+    // one left standing would fire against a graph that has moved on.
+    //
+    // Repeats dropped so a held key steps once, the way `just_pressed` bounds
+    // the arrows — and the arrows alongside the letters, since `Alt` plus a
+    // letter reports a different character on some layouts while an arrow is
+    // an arrow everywhere.
+    let letter = key_events
+        .read()
+        .filter(|ev| ev.state == bevy::input::ButtonState::Pressed && !ev.repeat)
+        .find_map(|ev| match &ev.logical_key {
+            bevy::input::keyboard::Key::Character(_) => nav_letter(&ev.logical_key),
+            _ => None,
+        });
+    let arrow = if keys.just_pressed(KeyCode::ArrowUp) {
+        Some('k')
+    } else if keys.just_pressed(KeyCode::ArrowDown) {
+        Some('j')
+    } else if keys.just_pressed(KeyCode::ArrowLeft) {
+        Some('h')
+    } else if keys.just_pressed(KeyCode::ArrowRight) {
+        Some('l')
+    } else {
+        None
+    };
+    let direction = arrow.or(letter);
+
+    let here = anchor_row_at_caret(&state, &pick);
+    // Which anchor is being reached from is the caret's answer and nothing
+    // else's, so the grip is re-taken the moment the caret comes to rest
+    // somewhere else — including after a hop of its own. Only `to` is allowed
+    // to be something the user chose, which is why it is the one field a step
+    // between candidates writes.
+    let (anchor, row) = match &here {
+        Some((anchor, row)) => (Some(anchor.clone()), *row),
+        None => (None, 0),
+    };
+    let regrip = hop.from != anchor || hop.row != row;
+    // A frame in which the caret has not moved and no key was struck has
+    // nothing to decide. The grip already says what is lit, and it says it
+    // until one of those two things happens.
+    if !regrip && direction.is_none() {
+        return;
+    }
+
+    let flat_graph = state.root_graph().flattened_graph();
+    let function_declarations = &state.function_declarations;
+    let grading = caret_grading(&state, &pick, &clipping);
+
+    if regrip {
+        let is_output = anchor.as_ref().is_some_and(|id| {
+            matches!(
+                flat_graph.anchors.get(id),
+                Some(model::anchor::EAnchor::Output)
+            )
+        });
+        let candidates = anchor
+            .as_ref()
+            .map(|id| hop_candidates(&state, &grading, id, is_output))
+            .unwrap_or_default();
+        let leaf = anchor
+            .as_ref()
+            .and_then(|id| row_leaf(&flat_graph, function_declarations, id, row));
+        hop.to = default_hop_target(
+            &flat_graph,
+            function_declarations,
+            leaf.as_ref(),
+            &candidates,
+        );
+        hop.from = anchor;
+        hop.row = row;
+    }
+
+    let Some(direction) = direction else {
+        return;
+    };
+
+    // Nothing under the caret to follow: reach for the nearest anchor the key
+    // points at. All six directions here, because there is no flow to be along
+    // or against — only a graph to get back into.
+    let Some((anchor, row)) = here else {
+        let Some(delta) = caret_delta(direction, shift) else {
+            return;
+        };
+        let anchors = reachable_anchors(&state, &grading);
+        if let Some(target) = step_draft_target(&anchors, pick.selected_pos, delta) {
+            land_caret_on(&state, &mut pick, &mut rebuild, &target, 0);
+        }
+        return;
+    };
+
+    let is_output = matches!(
+        flat_graph.anchors.get(&anchor),
+        Some(model::anchor::EAnchor::Output)
+    );
+    let leaf = row_leaf(&flat_graph, function_declarations, &anchor, row);
+
+    match direction {
+        // Along the wiring. Which of the two a key means depends on which end
+        // of a node the caret is at: from an output, going on means crossing
+        // an edge and going back means the node's own input; from an input it
+        // is the other way round. `Shift` names the Y axis everywhere else and
+        // names nothing here, so it is refused rather than ignored.
+        'h' | 'l' if !shift => {
+            let onward = direction == 'l';
+            if onward == is_output {
+                // Across the edge that is pointed at.
+                let Some(target) = hop.to.clone() else {
+                    return;
+                };
+                let landing = if is_output {
+                    admitting_row(
+                        &flat_graph,
+                        function_declarations,
+                        &target,
+                        leaf.as_ref().unwrap_or(&infer::EType::Pending),
+                    )
+                } else {
+                    // Back along the strand: which row of the producer is the
+                    // one that lands here.
+                    row_landing_on(&flat_graph, function_declarations, &target, &anchor, row)
+                };
+                land_caret_on(&state, &mut pick, &mut rebuild, &target, landing);
+            } else {
+                // Through the node, to its anchor at the other end. A call has
+                // several inputs and only one output, so only the way in has a
+                // choice to make — and it is made by type, the way every other
+                // choice under `Alt` is.
+                let Some(node_id) = flat_graph.anchor_to_node.get(&anchor) else {
+                    return;
+                };
+                let Some(node) = flat_graph.nodes.get(node_id) else {
+                    return;
+                };
+                let target = if is_output {
+                    let inputs = node.input_anchors();
+                    leaf.as_ref()
+                        .and_then(|leaf| {
+                            inputs.iter().find(|(id, _)| {
+                                anchor_rows(&flat_graph, function_declarations, id)
+                                    .iter()
+                                    .any(|(_, offered)| infer::subsumes(offered, leaf))
+                            })
+                        })
+                        .or_else(|| inputs.first())
+                        .map(|(id, _)| id.clone())
+                } else {
+                    node.anchors()
+                        .into_iter()
+                        .find(|(_, kind)| matches!(kind, model::anchor::EAnchor::Output))
+                        .map(|(id, _)| id)
+                };
+                let Some(target) = target else {
+                    return;
+                };
+                let landing = admitting_row(
+                    &flat_graph,
+                    function_declarations,
+                    &target,
+                    leaf.as_ref().unwrap_or(&infer::EType::Pending),
+                );
+                land_caret_on(&state, &mut pick, &mut rebuild, &target, landing);
+            }
+        }
+        // Across the wiring, at whichever end has something to go across.
+        'k' | 'j' => {
+            if is_output {
+                // Which edge of the several leaving here is pointed at. The
+                // caret does not move: what changes is the promise about where
+                // it would go, and the strand wearing white says so.
+                let candidates = hop_candidates(&state, &grading, &anchor, true);
+                if candidates.len() < 2 {
+                    return;
+                }
+                let Some(delta) = caret_delta(direction, shift) else {
+                    return;
+                };
+                let stepped = hop
+                    .to
+                    .as_ref()
+                    .and_then(|id| state.root_graph().anchor_cell(id))
+                    .and_then(|cell| step_draft_target(&candidates, cell, delta))
+                    .or_else(|| wrap_hop_target(&candidates, hop.to.as_ref(), direction == 'j'));
+                if stepped.is_some() {
+                    hop.to = stepped;
+                }
+            } else if !shift {
+                // Between the inputs of one call, which stand in a row along
+                // +X in the order the function declares its parameters.
+                let Some(node_id) = flat_graph.anchor_to_node.get(&anchor) else {
+                    return;
+                };
+                let Some(node) = flat_graph.nodes.get(node_id) else {
+                    return;
+                };
+                let inputs = node.input_anchors();
+                let Some(at) = inputs.iter().position(|(id, _)| *id == anchor) else {
+                    return;
+                };
+                let next = if direction == 'j' {
+                    at + 1
+                } else {
+                    at.wrapping_sub(1)
+                };
+                let Some((target, _)) = inputs.get(next) else {
+                    return;
+                };
+                let landing = admitting_row(
+                    &flat_graph,
+                    function_declarations,
+                    target,
+                    leaf.as_ref().unwrap_or(&infer::EType::Pending),
+                );
+                let target = target.clone();
+                land_caret_on(&state, &mut pick, &mut rebuild, &target, landing);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -10430,6 +11186,7 @@ fn main() {
         .init_resource::<PickIndex>()
         .init_resource::<PersistentAssets>()
         .init_resource::<DraftState>()
+        .init_resource::<EdgeHop>()
         .init_resource::<EvalState>()
         .init_resource::<EditorMode>()
         .init_resource::<InsertPrompt>()
@@ -10521,6 +11278,9 @@ fn main() {
                         sync_prompt_seed,
                     )
                         .chain(),
+                    // Before the grid's own six keys, and the reason those
+                    // six stand down while `Alt` is held: one key, one move.
+                    handle_edge_hop_keys,
                     handle_arrow_keys,
                     trigger_camera_focus_on_selection_change,
                 ),
@@ -10557,6 +11317,11 @@ fn main() {
                 paint_hover,
                 sync_mode_toggles,
                 blink_caret,
+                // On the same clock as the caret's own blink, and unordered
+                // beside it for the same reason `paint_hover` is: what it
+                // paints is decided by a resource and by the wall clock, not
+                // by anything else in this set.
+                paint_edge_hop,
                 // Chained: the click may fold the list, and the sync that draws
                 // it has to see the fold in the same frame it was asked for.
                 (
