@@ -53,7 +53,8 @@ pub struct OrbitCamera {
     /// Draw the bound mode with a little convergence instead of none. A
     /// parallel projection is exact but flat; a shallow perspective keeps the
     /// axis mapping and hands the eye back the depth cue it normally gets for
-    /// free.
+    /// free. On by default: the flat picture is the one you ask for, not the
+    /// one you start in.
     pub semi_ortho: bool,
     /// The same, as a position between the two, on the same clock.
     pub semi_blend: f32,
@@ -73,8 +74,8 @@ impl Default for OrbitCamera {
             mode: CameraMode::Bound,
             cell_pixels: DEFAULT_CELL_PIXELS,
             blend: 0.0,
-            semi_ortho: false,
-            semi_blend: 0.0,
+            semi_ortho: true,
+            semi_blend: 1.0,
             free_fov: FREE_FOV,
         }
     }

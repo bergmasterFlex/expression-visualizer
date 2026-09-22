@@ -2679,12 +2679,13 @@ struct RunPanelRule;
 /// spread one question over three widgets and two idioms.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewEntry {
-    /// The bound camera, parallel. The default, and the exact picture the
-    /// layout is specified in.
-    EditOrtho,
-    /// The bound camera with the convergence eased in: the same oblique
-    /// picture, the same standoff, depth that converges a little.
-    EditPersp,
+    /// The bound camera with the convergence eased in: the oblique picture at
+    /// its usual standoff, depth that converges a little. The default.
+    Default,
+    /// The bound camera, parallel. The exact picture the layout is specified
+    /// in, and the one to come back to when a measurement has to be read off
+    /// the screen rather than looked at.
+    Ortho,
     /// The free camera. Orbit, pan and zoom by hand, and the guarantees of the
     /// bound mode deliberately suspended.
     Explore,
@@ -2696,16 +2697,16 @@ enum ViewEntry {
 
 impl ViewEntry {
     const ALL: [ViewEntry; 4] = [
-        ViewEntry::EditOrtho,
-        ViewEntry::EditPersp,
+        ViewEntry::Default,
+        ViewEntry::Ortho,
         ViewEntry::Explore,
         ViewEntry::Screenshot,
     ];
 
     fn label(self) -> &'static str {
         match self {
-            ViewEntry::EditOrtho => "Edit Ortho",
-            ViewEntry::EditPersp => "Edit Persp",
+            ViewEntry::Default => "Default",
+            ViewEntry::Ortho => "ortho",
             ViewEntry::Explore => "Explore",
             ViewEntry::Screenshot => "Screenshot",
         }
@@ -2729,8 +2730,8 @@ fn view_entry(orbit: &camera::OrbitCamera, screenshot: &ScreenshotMode) -> ViewE
     }
     match (orbit.mode, orbit.semi_ortho) {
         (camera::CameraMode::Free, _) => ViewEntry::Explore,
-        (camera::CameraMode::Bound, true) => ViewEntry::EditPersp,
-        (camera::CameraMode::Bound, false) => ViewEntry::EditOrtho,
+        (camera::CameraMode::Bound, true) => ViewEntry::Default,
+        (camera::CameraMode::Bound, false) => ViewEntry::Ortho,
     }
 }
 
@@ -2797,8 +2798,8 @@ fn apply_view_entry(
         return;
     }
     let wanted_semi = match entry {
-        ViewEntry::EditPersp => Some(true),
-        ViewEntry::EditOrtho => Some(false),
+        ViewEntry::Default => Some(true),
+        ViewEntry::Ortho => Some(false),
         // Inert while free, and what the return trip fades out of.
         ViewEntry::Explore | ViewEntry::Screenshot => None,
     };
@@ -3055,7 +3056,7 @@ fn spawn_view_bar(mut commands: Commands, ui_font: Res<UiFont>) {
             ))
             .with_children(|button| {
                 button.spawn((
-                    Text::new("View: Edit Ortho \u{25BE}"),
+                    Text::new("View: Default \u{25BE}"),
                     text_font(&font, 14.0),
                     TextColor(INK_DIM),
                     ViewMenuLabel,
