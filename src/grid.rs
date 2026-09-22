@@ -14,8 +14,7 @@ pub struct GridConfig {
     pub half_extent: f32,
     /// Distance (in world units) from origin where the grid starts fading out.
     pub fade_start: f32,
-    /// Distance where the grid becomes fully transparent. Also the radius
-    /// within which grid cells can be hovered/clicked.
+    /// Distance where the grid becomes fully transparent.
     pub fade_end: f32,
 }
 
@@ -53,15 +52,6 @@ pub struct GridMaterial {
     pub fade_end: f32,
     #[uniform(0)]
     pub line_thickness: f32,
-    /// Plane coordinates (see `axis_u`) of the hovered cell's center.
-    #[uniform(0)]
-    pub hover_pos: Vec2,
-    /// 1.0 when a grid cell is hovered, 0.0 otherwise.
-    #[uniform(0)]
-    pub hover_active: f32,
-    /// Padding to keep the uniform block 16-byte aligned.
-    #[uniform(0)]
-    pub _pad: f32,
     /// Plane coordinates of the outer boundary min corner.
     #[uniform(0)]
     pub border_min: Vec2,
@@ -121,8 +111,8 @@ impl GridMaterial {
     /// because a caret move rebuilds the scene, the reading `lod` already
     /// takes.
     ///
-    /// Hover, border and footprints start off — only a scope's own floor fills
-    /// them in, per frame.
+    /// Border and footprints start off — only a scope's own floor fills them
+    /// in, per frame.
     pub fn scope_surface(axis_u: Vec3, axis_v: Vec3, fade: f32, fog_origin: Vec3) -> Self {
         Self {
             plane_color: LinearRgba::new(0.07, 0.07, 0.1, 0.55 * fade),
@@ -131,9 +121,6 @@ impl GridMaterial {
             fade_start: crate::render::CELL * 5.0,
             fade_end: crate::render::CELL * 34.0,
             line_thickness: 1.5,
-            hover_pos: Vec2::ZERO,
-            hover_active: 0.0,
-            _pad: 0.0,
             border_min: Vec2::ZERO,
             border_max: Vec2::ZERO,
             border_color: LinearRgba::WHITE,
@@ -225,9 +212,6 @@ fn spawn_grid(
             fade_start: config.fade_start,
             fade_end: config.fade_end,
             line_thickness: 0.6,
-            hover_pos: Vec2::ZERO,
-            hover_active: 0.0,
-            _pad: 0.0,
             border_min: Vec2::ZERO,
             border_max: Vec2::ZERO,
             border_color: LinearRgba::WHITE,

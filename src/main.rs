@@ -217,18 +217,16 @@ struct NodeEntity {
 }
 
 /// Marker for a per-graph grid mesh (one per root graph / Pattern sub-graph).
-/// Carries just enough info to map a raycast hit back to a local grid cell
-/// in the owning LayoutGraph.
+///
+/// It used to carry the offset and bounds a raycast hit was mapped back
+/// through. Picking reads `PickIndex` now, which is written where the mesh is,
+/// so the only thing left to say is *which* scope this floor belongs to — and
+/// the one reader of that is the border marking the caret's own.
 #[derive(Component, Clone)]
 struct ScopeGridEntity {
     /// Owner path from the root graph down to this graph's LayoutGraph.
     /// Empty = the root graph itself; each further element names a Pattern.
     context: Vec<model::node::Id>,
-    /// Accumulated grid-space offset of this graph's origin from the root.
-    origin_offset: Vec3,
-    /// Local grid-space bounds this grid currently spans (inclusive).
-    min: IVec3,
-    max: IVec3,
 }
 
 /// Flag resource that signals the scene needs rebuilding.
@@ -498,6 +496,33 @@ struct Suggestion {
 #[derive(Component)]
 struct SceneEntity;
 
+/// Asset ids `clear_scene` must leave where they are.
+///
+/// The rebuild wipes `Assets<Mesh>` and `Assets<StandardMaterial>` whole rather
+/// than tracking what the scene put in them. That is what makes it cheap, and
+/// it is also what makes it total: `Assets::remove` does not care that a live
+/// handle still points at the asset, so anything drawn from outside the
+/// rebuild's reach simply stops being drawn on the first keystroke, silently.
+///
+/// Anything that has to survive *between* rebuilds says so here. The pointer's
+/// caret is the first thing that does; there is no reason it should be the
+/// last, which is why this names ids rather than naming the caret.
+#[derive(Resource, Default)]
+struct PersistentAssets {
+    meshes: std::collections::HashSet<AssetId<Mesh>>,
+    materials: std::collections::HashSet<AssetId<StandardMaterial>>,
+}
+
+/// The outline standing on the cell the pointer is on, as against the one
+/// standing on the cell the caret is on.
+///
+/// A single entity with the twelve edges as children, spawned once and moved,
+/// rather than rebuilt the way every other scene entity is. Hover follows the
+/// mouse, and a rebuild per cell crossed would be a full teardown of the scene
+/// several times a second.
+#[derive(Component)]
+struct HoverCaret;
+
 //Buttons
 /// Asks for a fresh graph. What it opens is the confirmation, not the reset —
 /// the reset itself is the only editor action that cannot be undone, so it is
@@ -542,10 +567,23 @@ struct PickState {
     /// Currently selected grid cell, as a global address. Never negative,
     /// and never outside the graph volume — see `LayoutGraph::clamp_to_volume`.
     selected_pos: IVec3,
-    /// Node under the cursor (ray-sphere hit), if any.
-    hovered_node: Option<model::node::Id>,
-    /// graph grid cell under the cursor (ray hit on an `ScopeGridEntity`), if any.
-    hovered_grid: Option<HoveredGrid>,
+    /// Every cell the pointer's ray crosses inside a drawn volume, front to
+    /// back, the empty ones included. Rebuilt each frame, and empty while the
+    /// pointer is over UI, under a modal, or off the graph altogether.
+    candidates: Vec<PickCandidate>,
+    /// The frontmost candidate something was actually drawn on — what the
+    /// pointer means before the wheel has been asked anything.
+    ///
+    /// `None` where the ray crosses nothing but empty cells, and then the
+    /// pointer means nothing: an empty cell stays reachable, but only by asking
+    /// for it.
+    default_index: Option<usize>,
+    /// How far the wheel has stepped back from the default.
+    ///
+    /// Any movement of the cursor puts it back to zero. A step is an answer to
+    /// the picture that was standing when it was made, and moving the mouse
+    /// makes a different picture.
+    wheel_offset: i32,
     /// Cursor position at the last left-mouse press. Used to distinguish
     /// click vs drag — a release within `CLICK_MOVE_THRESHOLD` of this
     /// counts as a click and updates the selection; further movement is
@@ -558,28 +596,171 @@ struct PickState {
     press_over_ui: bool,
 }
 
-/// Populated when the cursor is over a per-graph grid mesh.
+/// One cell on the pointer's ray, and what stands on it.
 #[derive(Clone)]
-struct HoveredGrid {
-    /// Global grid address of the hovered cell.
-    global_pos: IVec3,
-    /// Entity of the `ScopeGridEntity` mesh that was hit — used so the hover
-    /// shader wash flips only on the graph grid actually under the cursor.
-    entity: Entity,
-    /// World XZ of the hovered cell's center. Fed to the grid shader's
-    /// `hover_pos` uniform.
-    world_center: Vec2,
+struct PickCandidate {
+    cell: IVec3,
+    kind: PickKind,
 }
 
 impl Default for PickState {
     fn default() -> Self {
         Self {
             selected_pos: IVec3::ZERO,
-            hovered_node: None,
-            hovered_grid: None,
+            candidates: Vec::new(),
+            default_index: None,
+            wheel_offset: 0,
             press_cursor: None,
             press_over_ui: false,
         }
+    }
+}
+
+impl PickState {
+    /// Forget what the pointer was on. Not the same as pointing at nothing —
+    /// the wheel's step goes too, because the list it was counting into is
+    /// gone.
+    fn forget_candidates(&mut self) {
+        self.candidates.clear();
+        self.default_index = None;
+        self.wheel_offset = 0;
+    }
+
+    /// Hold the wheel's step inside the list it is counting into.
+    ///
+    /// Without this the offset runs on past the end while `active` quietly
+    /// clamps the index it derives — so five steps past the back face cost five
+    /// dead steps coming back, and the wheel reads as broken for exactly as
+    /// long as it took to overshoot.
+    fn clamp_wheel(&mut self) {
+        if self.candidates.is_empty() {
+            self.wheel_offset = 0;
+            return;
+        }
+        let last = self.candidates.len() as i32 - 1;
+        self.wheel_offset = match self.default_index {
+            Some(default) => self
+                .wheel_offset
+                .clamp(-(default as i32), last - default as i32),
+            // With no default, offset 0 means pointing at nothing and 1..=len
+            // steps in from the front — so one further than the list is long.
+            None => self.wheel_offset.clamp(0, last + 1),
+        };
+    }
+
+    /// The candidate the pointer is on: the default, stepped by the wheel.
+    ///
+    /// Clamped and never wrapped. The wheel is a linear gesture, and running
+    /// off the back face to reappear at the front reads as a fault rather than
+    /// as an answer.
+    ///
+    /// With no default — a ray crossing nothing but empty cells — the wheel
+    /// still steps in, from the front. Not asking then means not pointing at
+    /// anything, which is the honest reading of a ray through empty space.
+    fn active(&self) -> Option<&PickCandidate> {
+        if self.candidates.is_empty() {
+            return None;
+        }
+        let last = self.candidates.len() as i32 - 1;
+        let index = match self.default_index {
+            Some(default) => (default as i32 + self.wheel_offset).clamp(0, last),
+            None if self.wheel_offset > 0 => (self.wheel_offset - 1).min(last),
+            None => return None,
+        };
+        self.candidates.get(index as usize)
+    }
+}
+
+/// What the pointer finds standing on a cell.
+///
+/// Anchors are held apart from bodies rather than folded into the node they
+/// belong to. A press on an anchor cell opens an edge draft and a press on a
+/// body cell does not, so the two cannot be one answer.
+///
+/// `Empty` is a cell of a drawn volume that nothing claims. It is not a hit —
+/// nothing points at it by default — but the wheel reaches it, which is the
+/// whole reason it is in the list at all.
+#[derive(Clone, PartialEq)]
+enum PickKind {
+    Node(model::node::Id),
+    Anchor(model::anchor::Id),
+    /// A cell addressed by a bounding-plane tile that was drawn.
+    Surface,
+    Empty,
+}
+
+impl PickKind {
+    /// Whether something was drawn here. The default hover lands on the
+    /// frontmost of these, and the pointer icon follows the same line.
+    fn is_hit(&self) -> bool {
+        !matches!(self, PickKind::Empty)
+    }
+}
+
+/// A scope volume, in global cell addresses, both corners inclusive.
+#[derive(Clone)]
+struct PickVolume {
+    min: IVec3,
+    max: IVec3,
+}
+
+impl PickVolume {
+    fn contains(&self, cell: IVec3) -> bool {
+        cell.cmpge(self.min).all() && cell.cmple(self.max).all()
+    }
+}
+
+/// What the last spawn pass actually put on screen, addressed by cell.
+///
+/// Built inside `spawn_graph_nodes` and nowhere else, out of the same
+/// `lod::Lod` and behind the same skips the spawning itself takes. That is the
+/// whole point: "drawn" and "addressable" stay one statement instead of two
+/// that have to be kept in step. The same reading the floor's Y already takes
+/// — derived where the mesh is built rather than carried beside it and left to
+/// drift.
+///
+/// Ids and never `Entity`s. A rebuild hands out fresh entities (see the note on
+/// `EdgeDraft`), and this index does not outlive a rebuild either: it is
+/// replaced by one, wholesale.
+#[derive(Resource, Default)]
+struct PickIndex {
+    /// Global cell -> what stands on it. Anchors are written after nodes, so an
+    /// anchor cell of a node reads as the anchor — the reading
+    /// `anchor_at_caret` takes. That collision is a decision, not an accident
+    /// of `HashMap::insert`.
+    occupants: std::collections::HashMap<IVec3, PickKind>,
+    /// One per volume whose four surfaces were built. Presence *is* the whole
+    /// of "this volume can be pointed at" — no flag, because a flag would be a
+    /// second copy of `spawn_volume_surfaces`'s own condition, free to drift.
+    volumes: Vec<PickVolume>,
+    /// Volumes the grading left nothing of, or nothing but a closed box.
+    ///
+    /// Needed because they are *nested*: a sealed branch's cells still lie
+    /// inside its parent's bounds, and the parent is drawn. Without saying so
+    /// outright, the ray would report the inside of an opaque box as ordinary
+    /// empty cells of the scope around it.
+    blocked: Vec<PickVolume>,
+}
+
+impl PickIndex {
+    /// Hull over every drawn volume: where a ray walk starts and stops.
+    fn bounds(&self) -> Option<PickVolume> {
+        self.volumes.iter().cloned().reduce(|a, b| PickVolume {
+            min: a.min.min(b.min),
+            max: a.max.max(b.max),
+        })
+    }
+
+    /// True where `cell` lies in some volume that was drawn.
+    fn is_drawn(&self, cell: IVec3) -> bool {
+        self.volumes.iter().any(|v| v.contains(cell))
+    }
+
+    /// True where `cell` is inside something opaque or absent. Suppresses tiles
+    /// as well as occupants: a floor tile coincident with the inside of a
+    /// closed box is behind that box from every direction there is.
+    fn is_blocked(&self, cell: IVec3) -> bool {
+        self.blocked.iter().any(|v| v.contains(cell))
     }
 }
 
@@ -1565,6 +1746,28 @@ fn setup_scene(
 type FaceTextureKey = (String, u32, usize, usize, Vec<[u8; 4]>);
 
 /// Spawn the graph node meshes.
+/// Every cell a node claims, lifted to global addresses.
+///
+/// The shape and not `node_footprint`, which is the bounding box around it. Two
+/// reasons, and the second is the one that matters: a shape names exactly the
+/// cells `NodeShape::role_at` will answer for, so what the pointer offers and
+/// what an edit can do stay the same set. And a Match's footprint is an
+/// *envelope* — `match_footprint` reaches over every arm and every branch
+/// volume inside it — so indexing footprints would have the Match swallow every
+/// cell of every branch it holds. Its own cells it keeps, because those are in
+/// its shape.
+///
+/// Anchor cells are in here too, as the node. They are overwritten by the
+/// anchor pass, which asks `anchor_cells_of` — and that is also where the
+/// Tunnel's input arrives, the one anchor cell no shape contains.
+fn node_cells_global(shape: &layout::NodeShape, origin: IVec3) -> Vec<IVec3> {
+    shape
+        .cells()
+        .iter()
+        .map(|(local, _)| origin + *local)
+        .collect()
+}
+
 fn spawn_graph_nodes(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -1580,7 +1783,13 @@ fn spawn_graph_nodes(
     screenshot: Res<ScreenshotMode>,
     clipping: Res<lod::Clipping>,
     draft: Res<DraftState>,
+    mut pick_index: ResMut<PickIndex>,
 ) {
+    // The pointer's reading of the scene is written here, beside the scene
+    // itself, and replaced whole every time it is. Everything below that skips
+    // a node or a volume skips it here too, by standing in the same branch —
+    // which is the only way "drawn" and "addressable" stay one statement.
+    *pick_index = PickIndex::default();
     // Which volume the caret is in — which is to say which scope, the two being
     // the same question. Fixed for the whole pass: every volume below is graded
     // by how far it sits from this one, outward to nothing and inward to a
@@ -1660,6 +1869,16 @@ fn spawn_graph_nodes(
         let layout_node = walked.layout_node;
         let node_id = &layout_node.node_id;
         let node = walked.layout_graph.graph.nodes.get(node_id).unwrap();
+
+        // Past the `hidden` check above and nowhere else, so a node the grading
+        // dropped is as unreachable to the pointer as it is invisible.
+        let node_origin = (walked.extra_offset + layout_node.pos).round().as_ivec3();
+        for cell in node_cells_global(&layout_node.shape, node_origin) {
+            pick_index
+                .occupants
+                .insert(cell, PickKind::Node(node_id.clone()));
+        }
+
         match node {
             model::node::ENode::Pattern { .. } => {
                 declared_band_positions.insert(
@@ -1798,6 +2017,23 @@ fn spawn_graph_nodes(
                         body.transform,
                         SceneEntity,
                     ));
+                }
+
+                // The cells this anchor answers for, over the node's own.
+                //
+                // Asked of the root, which answers in the root's coordinates —
+                // already the frame this index is in. It is also where the
+                // Tunnel input's exception lives: its one cell belongs to the
+                // scope *outside* its own and stands in no shape, so asking
+                // here is the whole of folding that case in. Without it the one
+                // way into a branch would be the one cell the pointer cannot
+                // reach.
+                if let Some(cells) = state.root_graph().anchor_cells_of(&anchor_id) {
+                    for cell in cells {
+                        pick_index
+                            .occupants
+                            .insert(cell, PickKind::Anchor(anchor_id.clone()));
+                    }
                 }
 
                 // The anchor itself is now mesh-less: screen-space hover picking
@@ -1983,6 +2219,16 @@ fn spawn_graph_nodes(
         // is the whole of what is left of it, and `spawn_volume_surfaces` leaves
         // out the four surfaces once nothing of the volume survives.
         if grading.dropped(&walked_graph.context) {
+            // Blocked, for the reason `spawn_volume_surfaces` gives at its own
+            // guard. Reachable outside a sealed ancestor too: the second arm of
+            // `Lod::dropped` fires one level inside a scope that is still
+            // drawn, so this leaves a hole in a floor the pointer can otherwise
+            // reach straight through.
+            let dropped_offset = walked_graph.extra_offset.round().as_ivec3();
+            pick_index.blocked.push(PickVolume {
+                min: bounds.min + dropped_offset,
+                max: bounds.max + dropped_offset,
+            });
             continue;
         }
         let offset = walked_graph.extra_offset;
@@ -2049,15 +2295,13 @@ fn spawn_graph_nodes(
             InteractiveFloor {
                 scope: ScopeGridEntity {
                     context: walked_graph.context.clone(),
-                    origin_offset: offset,
-                    min: bounds.min,
-                    max: bounds.max,
                 },
                 border_min: Vec2::new(border_lo.x, border_lo.z),
                 border_max: Vec2::new(border_hi.x, border_hi.z),
                 footprints,
                 footprint_count,
             },
+            &mut pick_index,
         );
     }
 
@@ -4031,7 +4275,7 @@ fn spawn_editor_column(mut commands: Commands, ui_font: Res<UiFont>) {
             // startup — `sync_editor_panel` fills it. It flows under the lines
             // rather than standing at a `top` of its own, so however far they
             // wrapped is how far down it begins. `Button` on the root so
-            // `pick_nodes`' `over_ui` test covers it and a click on the panel
+            // `pick_cells`' `over_ui` test covers it and a click on the panel
             // doesn't move the caret to whatever cell lies behind it.
             column.spawn((
                 Node {
@@ -5821,12 +6065,107 @@ fn animate_nodes(time: Res<Time>, mut query: Query<(&NodeEntity, &mut Transform)
     */
 }
 
+/// Build the pointer's caret once, at the cell origin, and hide it.
+///
+/// The twelve edges become children, so the whole outline moves by the parent's
+/// translation alone. They come out cell-local for free: `layout_to_world` is a
+/// componentwise scale and therefore linear, so building them at cell `(0,0,0)`
+/// and translating by `layout_to_world(cell)` is the same geometry as building
+/// them at `cell`.
+///
+/// One material for all twelve — they are identical, and twelve copies would be
+/// twelve draw batches saying the same thing. Every id is registered as
+/// persistent, or the first rebuild would drop the assets out from under it.
+fn spawn_hover_caret(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut kept: ResMut<PersistentAssets>,
+) {
+    let edges = render::cell_caret_edges_at(Vec3::ZERO, render::HOVER_GREY);
+    let Some(first) = edges.first() else {
+        return;
+    };
+    let material = materials.add(first.material.clone());
+    kept.materials.insert(material.id());
+
+    // Children hang off the cell's *centre* rather than its origin corner, so
+    // the inset below shrinks the outline in place instead of dragging it
+    // toward the corner.
+    let centre = render::cell_centre_offset();
+    commands
+        .spawn((
+            HoverCaret,
+            Transform::from_scale(Vec3::splat(render::HOVER_CARET_INSET)),
+            Visibility::Hidden,
+        ))
+        .with_children(|parent| {
+            for edge in &edges {
+                let mesh = meshes.add(edge.mesh.clone());
+                kept.meshes.insert(mesh.id());
+                parent.spawn((
+                    Mesh3d(mesh),
+                    MeshMaterial3d(material.clone()),
+                    edge.transform
+                        .with_translation(edge.transform.translation - centre),
+                ));
+            }
+        });
+}
+
+/// Move the pointer's caret onto the cell the pointer is on, or take it off
+/// screen.
+///
+/// Drawn on every cell the pointer can reach, the addressed one included. It
+/// used to be held back where the two coincided, on the grounds that a second
+/// mark on the cell the caret already stands on says nothing — but stepping the
+/// wheel onto that cell then looked exactly like a step that did nothing, and
+/// the cell read as missing from the list it is plainly in. The inset is what
+/// answers the z-fighting that reasoning was really about.
+///
+/// Screenshot mode is the one case left: the caret itself is not built there
+/// either, because the editor takes no picture of its own.
+fn update_hover_caret(
+    pick: Res<PickState>,
+    screenshot: Res<ScreenshotMode>,
+    mut caret_q: Query<(&mut Transform, &mut Visibility), With<HoverCaret>>,
+) {
+    let target = if screenshot.active() {
+        None
+    } else {
+        pick.active().map(|candidate| candidate.cell)
+    };
+    let Ok((mut transform, mut visibility)) = caret_q.single_mut() else {
+        return;
+    };
+    match target {
+        Some(cell) => {
+            let translation =
+                render::layout_to_world(cell.as_vec3()) + render::cell_centre_offset();
+            // Guarded, both of them: these are written every frame, and a
+            // `Transform` written is a `Transform` changed.
+            if transform.translation != translation {
+                transform.translation = translation;
+            }
+            if *visibility != Visibility::Visible {
+                *visibility = Visibility::Visible;
+            }
+        }
+        None => {
+            if *visibility != Visibility::Hidden {
+                *visibility = Visibility::Hidden;
+            }
+        }
+    }
+}
+
 fn clear_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     state: Res<GraphState>,
     rebuild: ResMut<NeedsRebuild>,
+    kept: Res<PersistentAssets>,
     query_ast_entities: Query<Entity, With<SceneEntity>>,
 ) {
     if rebuild.0 {
@@ -5834,17 +6173,30 @@ fn clear_scene(
             commands.entity(entity).despawn();
         }
 
+        // Everything the scene put here goes, and only what said it would
+        // outlive the rebuild stays — see `PersistentAssets` for why that has
+        // to be stated rather than inferred from who still holds a handle.
         let mesh_ids: Vec<_> = meshes.ids().collect();
         for id in mesh_ids {
-            meshes.remove(id);
+            if !kept.meshes.contains(&id) {
+                meshes.remove(id);
+            }
         }
 
         let mat_ids: Vec<_> = materials.ids().collect();
         for id in mat_ids {
-            materials.remove(id);
+            if !kept.materials.contains(&id) {
+                materials.remove(id);
+            }
         }
     }
 }
+/// Forward the whole spawn pass, once, when something has asked for it.
+///
+/// Note this sits at exactly sixteen system parameters, which is Bevy's limit
+/// for one system. Anything `spawn_graph_nodes` needs next has to arrive
+/// bundled rather than as a parameter of its own — or this wrapper has to go,
+/// in favour of a run condition on `spawn_graph_nodes` itself.
 fn rebuild_scene(
     commands: Commands,
     meshes: ResMut<Assets<Mesh>>,
@@ -5860,8 +6212,8 @@ fn rebuild_scene(
     screenshot: Res<ScreenshotMode>,
     clipping: Res<lod::Clipping>,
     draft: Res<DraftState>,
+    pick_index: ResMut<PickIndex>,
     mut rebuild: ResMut<NeedsRebuild>,
-    _query_scene_entities: Query<Entity, With<SceneEntity>>,
 ) {
     if rebuild.0 {
         spawn_graph_nodes(
@@ -5879,6 +6231,7 @@ fn rebuild_scene(
             screenshot,
             clipping,
             draft,
+            pick_index,
         );
         rebuild.0 = false;
     }
@@ -5971,6 +6324,7 @@ fn spawn_volume_surfaces(
     shell: f32,
     fog_origin: Vec3,
     floor: InteractiveFloor,
+    index: &mut PickIndex,
 ) {
     let size_x = (max.x - min.x + 1) as f32 * render::LAYOUT_SCALE.x.abs();
     let size_y = (max.y - min.y + 1) as f32 * render::LAYOUT_SCALE.y.abs();
@@ -6013,12 +6367,28 @@ fn spawn_volume_surfaces(
         ));
     }
 
+    // What the pointer may reach into, decided here and not asked a second time
+    // anywhere else. The volume goes on one list or the other and the guard
+    // below is the only thing that chooses, so there is no copy of this
+    // condition left to fall out of step with it.
+    let lifted = PickVolume {
+        min: min + offset.round().as_ivec3(),
+        max: max + offset.round().as_ivec3(),
+    };
+
     // Nothing of the volume itself survives the grading. With no floor there is
     // also no way to click into it, which is the point: what is not drawn is not
     // edited either.
+    //
+    // Blocked rather than merely absent, because a volume is nested: its cells
+    // still lie inside the bounds of the scope around it, and that one may well
+    // be drawn. Saying only "not here" would leave the inside of a closed box
+    // reading as ordinary empty cells of its parent.
     if fade <= 0.0 {
+        index.blocked.push(lifted);
         return;
     }
+    index.volumes.push(lifted);
 
     // ── The floor: the lower bounding edge of the volume's last row, so what
     // stands in it stands *on* it rather than hanging under it.
@@ -7052,6 +7422,105 @@ fn update_world_labels(
     }
 }
 
+/// How far from the cursor the hovered address sits, in logical pixels. Clear
+/// of the pointer itself without drifting off the thing it names.
+const HOVER_ADDRESS_OFFSET: Vec2 = Vec2::new(16.0, 16.0);
+
+/// The address of the cell under the pointer, set down beside the cursor.
+///
+/// The grey outline says which cell is meant, but a box standing several cells
+/// deep in a volume looks much like the same box one cell nearer — and the
+/// wheel makes exactly that difference reachable. The three numbers are what
+/// tell them apart.
+///
+/// Beside the cursor rather than beside the cell: under a projection whose rays
+/// are near enough parallel, stepping along one barely moves where it lands on
+/// screen, so a label anchored to the cell would sit still while saying
+/// something new. Anchored to the hand, it is always where the eye already is.
+#[derive(Component)]
+struct HoverAddress;
+
+fn spawn_hover_address(mut commands: Commands, ui_font: Res<UiFont>) {
+    commands.spawn((
+        Text::new(""),
+        text_font(&ui_font.0, 12.0),
+        // The same ink the panel's own `Absolute:` line is written in, because
+        // it is the same fact, read off the pointer instead of off the caret.
+        TextColor(Color::srgb(0.85, 0.85, 0.9)),
+        BackgroundColor(Color::srgba(0.06, 0.06, 0.12, 0.95)),
+        Node {
+            position_type: PositionType::Absolute,
+            padding: UiRect::axes(Val::Px(6.0), Val::Px(3.0)),
+            ..default()
+        },
+        Visibility::Hidden,
+        HoverAddress,
+    ));
+}
+
+/// Follow the cursor with the hovered cell's address.
+///
+/// Flipped to the other side of the cursor where it would otherwise run off the
+/// window, so the one place it is most needed — the far edge of a wide volume —
+/// is not the one place it is cut off.
+fn update_hover_address(
+    pick: Res<PickState>,
+    screenshot: Res<ScreenshotMode>,
+    windows: Query<&Window>,
+    mut label_q: Query<(&mut Text, &mut Node, &mut Visibility, &ComputedNode), With<HoverAddress>>,
+) {
+    let Ok((mut text, mut node, mut visibility, computed)) = label_q.single_mut() else {
+        return;
+    };
+    let cell = if screenshot.active() {
+        None
+    } else {
+        pick.active().map(|candidate| candidate.cell)
+    };
+    let cursor = windows
+        .single()
+        .ok()
+        .and_then(|window| window.cursor_position().map(|at| (window, at)));
+
+    let (Some(cell), Some((window, at))) = (cell, cursor) else {
+        if *visibility != Visibility::Hidden {
+            *visibility = Visibility::Hidden;
+        }
+        return;
+    };
+
+    // Only on a change, for the reason `update_address_lines` gives: a `Text`
+    // written every frame is a `Text` changed every frame, and the layout is
+    // recomputed for it.
+    let next = cell_text(cell);
+    if text.0 != next {
+        text.0 = next;
+    }
+
+    // `ComputedNode` measures in physical pixels; the cursor and `Node` are in
+    // logical ones, so the two only compare through the scale factor.
+    let size = computed.size() * computed.inverse_scale_factor;
+    let mut left = at.x + HOVER_ADDRESS_OFFSET.x;
+    if left + size.x > window.width() {
+        left = at.x - HOVER_ADDRESS_OFFSET.x - size.x;
+    }
+    let mut top = at.y + HOVER_ADDRESS_OFFSET.y;
+    if top + size.y > window.height() {
+        top = at.y - HOVER_ADDRESS_OFFSET.y - size.y;
+    }
+
+    let (left, top) = (Val::Px(left.max(0.0)), Val::Px(top.max(0.0)));
+    if node.left != left {
+        node.left = left;
+    }
+    if node.top != top {
+        node.top = top;
+    }
+    if *visibility != Visibility::Visible {
+        *visibility = Visibility::Visible;
+    }
+}
+
 fn spawn_fps_display(mut commands: Commands, ui_font: Res<UiFont>) {
     commands.spawn((
         Text::new("--"),
@@ -7163,7 +7632,7 @@ struct DiagnosticsFingerprint {
 
 /// The cell a node stands on, in the coordinates the caret is addressed in.
 ///
-/// The same three steps the click-to-select path takes in `pick_nodes`: the
+/// The same three steps the click-to-select path takes in `pick_cells`: the
 /// owner path, the node's position inside that scope, and the scope's own
 /// offset. A node the layout does not hold has no cell, which is why this is an
 /// `Option` rather than an assertion.
@@ -7502,7 +7971,7 @@ fn spawn_mode_display(mut commands: Commands, ui_font: Res<UiFont>) {
                 });
             }
             // A bare `Button` for the same reason the panels carry one: it is
-            // what `pick_nodes`' `over_ui` test sees, so a click that lands on
+            // what `pick_cells`' `over_ui` test sees, so a click that lands on
             // it doesn't reach the cell behind it.
             row.spawn((
                 Button,
@@ -7695,23 +8164,59 @@ fn update_address_lines(
     }
 }
 
-fn pick_nodes(
+/// What the pointer is on, as an ordered list of cells rather than a single hit.
+///
+/// The ray is walked cell by cell through the volumes that were drawn, and the
+/// list it yields is the whole answer: the frontmost cell something stands on
+/// is what the pointer means, and the wheel steps back along the same list into
+/// whatever is behind it — empty cells included, which is the one thing a
+/// raycast against the meshes could never offer, there being nothing there to
+/// hit.
+///
+/// `PickIndex` is what makes "drawn" and "addressable" the same statement; this
+/// only reads it. Note it is written at the tail of the rebuild chain and read
+/// at the head of this one, so on the frame after a rebuild the pointer answers
+/// against the previous layout. That is exactly what the old node query did —
+/// its transforms were a deferred flush behind too — and one frame of it is not
+/// worth a reorder.
+fn pick_cells(
     camera_q: Query<(&Camera, &GlobalTransform), With<camera::OrbitCameraTag>>,
     windows: Query<&Window>,
     mouse: Res<ButtonInput<MouseButton>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut wheel: MessageReader<MouseWheel>,
     mut pick: ResMut<PickState>,
-    node_q: Query<(&NodeEntity, &Transform)>,
-    grid_q: Query<(Entity, &ScopeGridEntity)>,
-    state: Res<GraphState>,
+    index: Res<PickIndex>,
     eval: Res<EvalState>,
     ui_interactions: Query<&Interaction, With<Button>>,
     mut rebuild: ResMut<NeedsRebuild>,
+    mut last_cursor: Local<Option<Vec2>>,
+    mut wheel_acc: Local<f32>,
 ) {
-    // A modal owns the screen, and what was hovered or half-pressed under it
-    // is not what the user will be looking at when it closes.
+    // Always drained, whether or not it will be spent — the same reason
+    // `camera::orbit_input` drains unconditionally, so a queue does not hand
+    // over a stale gesture later. Scaled the way the camera scales it: a
+    // trackpad sends `Pixel` in swarms, and one step per event would fly
+    // through thirty cells on a flick.
+    let mut scrolled = 0.0;
+    for ev in wheel.read() {
+        scrolled += match ev.unit {
+            bevy::input::mouse::MouseScrollUnit::Line => ev.y * 1.2,
+            bevy::input::mouse::MouseScrollUnit::Pixel => ev.y * 0.01,
+        };
+    }
+    // Ctrl is the camera's. Dropping the accumulator rather than keeping it
+    // means a zoom does not leave a step behind to be taken later.
+    if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
+        *wheel_acc = 0.0;
+    } else {
+        *wheel_acc += scrolled;
+    }
+
+    // A modal owns the screen, and what was hovered or half-pressed under it is
+    // not what the user will be looking at when it closes.
     if modal_is_open(&eval) {
-        pick.hovered_node = None;
-        pick.hovered_grid = None;
+        pick.forget_candidates();
         pick.press_cursor = None;
         pick.press_over_ui = false;
         return;
@@ -7723,100 +8228,48 @@ fn pick_nodes(
         return;
     };
     let Some(cursor) = window.cursor_position() else {
-        pick.hovered_node = None;
-        pick.hovered_grid = None;
+        pick.forget_candidates();
         return;
     };
 
-    let Ok(ray) = camera.viewport_to_world(cam_gt, cursor) else {
-        pick.hovered_node = None;
-        pick.hovered_grid = None;
-        return;
-    };
-
-    // Cursor sitting over any UI element (button, dropdown, input, checkbox,
-    // or the editor panel background) suppresses grid hover and click-to-select.
+    // Cursor sitting over any UI element (button, dropdown, input, checkbox, or
+    // the editor panel background) suppresses hover and click-to-select. The
+    // one gate for it: the anchor pass used to keep a second copy.
     let over_ui = ui_interactions
         .iter()
         .any(|i| matches!(*i, Interaction::Hovered | Interaction::Pressed));
 
-    // Ray-sphere test against nodes, at a fraction of a cell.
-    let radius = render::CELL * 0.35;
-    let mut closest: Option<(model::node::Id, f32)> = None;
-    if !over_ui {
-        for (node_ent, transform) in node_q.iter() {
-            let center = transform.translation;
-            let oc = ray.origin - center;
-            let b = oc.dot(*ray.direction);
-            let c = oc.dot(oc) - radius * radius;
-            let disc = b * b - c;
-            if disc >= 0.0 {
-                let t = -b - disc.sqrt();
-                if t > 0.0 && closest.as_ref().map_or(true, |(_, tc)| t < *tc) {
-                    closest = Some((node_ent.node_id.clone(), t));
-                }
-            }
-        }
+    // Moving the mouse is a new question, so the wheel's answer to the old one
+    // is dropped. Half a pixel, so a cursor that has not actually moved does
+    // not undo a step through floating-point noise.
+    if last_cursor.is_none_or(|last| last.distance(cursor) > 0.5) {
+        pick.wheel_offset = 0;
+        *wheel_acc = 0.0;
     }
-    pick.hovered_node = closest.as_ref().map(|(id, _)| id.clone());
+    *last_cursor = Some(cursor);
 
-    // Ray-plane test against each spawned graph grid. Each graph grid is its
-    // scope's floor — one row-edge below the scope's last row, at its own Y —
-    // and spans a rectangle in local grid coords. Pick the closest rect hit.
-    //
-    // Every conversion goes through `render::layout_to_world` /
-    // `world_to_layout` because LAYOUT_SCALE negates Y and Z — dividing by a
-    // bare 3.0 here would mirror the picking against the rendering.
-    let mut grid_hit: Option<HoveredGrid> = None;
-    let mut best_t = f32::INFINITY;
-    if !over_ui && closest.is_none() {
-        for (entity, ag) in grid_q.iter() {
-            let origin_world = render::layout_to_world(ag.origin_offset);
-            let denom = ray.direction.y;
-            if denom.abs() < 1e-4 {
-                continue;
-            }
-            // The plane the user can see is the floor, not the address plane
-            // the scope's origin sits on, and the ray has to meet the surface
-            // that is actually there. Derived from `max` rather than carried on
-            // the component, so it cannot drift from where the mesh is spawned.
-            let floor_world_y = render::layout_to_world(
-                ag.origin_offset + Vec3::new(0.0, (ag.max.y + 1) as f32, 0.0),
-            )
-            .y;
-            let t = (floor_world_y - ray.origin.y) / denom;
-            if t <= 0.0 || t >= best_t {
-                continue;
-            }
-            let hit = ray.origin + *ray.direction * t;
-            // Cells are corner-anchored — cell N covers [N, N+1) — so the
-            // containing cell is the floor, not the nearest address.
-            //
-            // Read off the scope's origin and not off the plane: the plane's Y
-            // says *which* grid was hit, the origin says which cell of it. Only
-            // X and Z are taken, so the Y this leaves behind is never read.
-            let local = render::world_to_layout(hit - origin_world);
-            let local_x = local.x.floor() as i32;
-            let local_z = local.z.floor() as i32;
-            if local_x < ag.min.x || local_x > ag.max.x {
-                continue;
-            }
-            if local_z < ag.min.z || local_z > ag.max.z {
-                continue;
-            }
-            // The cell a floor belongs to is the one standing on it: the
-            // volume's last row, which is the row the plane bounds from below.
-            let cell_local = IVec3::new(local_x, ag.max.y, local_z);
-            let center_world = render::cell_center_world(cell_local.as_vec3() + ag.origin_offset);
-            best_t = t;
-            grid_hit = Some(HoveredGrid {
-                global_pos: cell_local + ag.origin_offset.round().as_ivec3(),
-                entity,
-                world_center: Vec2::new(center_world.x, center_world.z),
-            });
-        }
+    // Whole steps only; the remainder stays for the next frame.
+    let steps = *wheel_acc as i32;
+    if steps != 0 {
+        *wheel_acc -= steps as f32;
+        // Scrolling away from the user goes deeper into the picture.
+        pick.wheel_offset += steps;
     }
-    pick.hovered_grid = grid_hit.clone();
+
+    if over_ui {
+        pick.forget_candidates();
+    } else {
+        let candidates = camera
+            .viewport_to_world(cam_gt, cursor)
+            .ok()
+            .map(|ray| ray_candidates(&ray, &index))
+            .unwrap_or_default();
+        pick.default_index = candidates.iter().position(|c| c.kind.is_hit());
+        pick.candidates = candidates;
+        // After the list, not before: what the offset may be depends on how
+        // long the list turned out.
+        pick.clamp_wheel();
+    }
 
     const CLICK_MOVE_THRESHOLD: f32 = 5.0;
     if mouse.just_pressed(MouseButton::Left) {
@@ -7832,32 +8285,98 @@ fn pick_nodes(
         pick.press_cursor = None;
         pick.press_over_ui = false;
         if is_click && !press_over_ui && !over_ui {
-            if let Some((node_id, _)) = closest {
-                // Lift the node's scope-local position into a global address.
-                if let Some(ctx) = state.root_graph().context_of_node(&node_id) {
-                    let owning_graph = state.root_graph().resolve_context(&ctx);
-                    if let Some(ln) = owning_graph.layout_nodes.get(&node_id) {
-                        let new_pos =
-                            ln.pos.round().as_ivec3() + state.root_graph().scope_offset(&ctx);
-                        if pick.selected_pos != new_pos {
-                            pick.selected_pos = new_pos;
-                            rebuild.0 = true;
-                        }
-                    }
-                }
-            } else if let Some(hit) = grid_hit {
-                if pick.selected_pos != hit.global_pos {
-                    pick.selected_pos = hit.global_pos;
+            // The cell that was pointed at, and not the origin cell of whatever
+            // stands on it. A click used to lift a node hit back to the node's
+            // own address, which put the caret somewhere the user had not
+            // clicked whenever a node spanned more than one cell. A cell names
+            // at most one property — that is what `role_at` says — so the cell
+            // under the pointer is the whole of what a click can mean.
+            //
+            // No clamp: every candidate is inside a volume that was drawn, so
+            // it is inside the root volume already.
+            // Read out before the write: an `if let` holds its scrutinee's
+            // borrow across the whole block, and `active` borrows `pick`.
+            let clicked = pick.active().map(|candidate| candidate.cell);
+            if let Some(cell) = clicked {
+                if pick.selected_pos != cell {
+                    pick.selected_pos = cell;
                     rebuild.0 = true;
                 }
             }
-            // Click into truly empty space (no graph grid hit) leaves the
-            // selection unchanged.
         }
     }
 }
 
-fn highlight_hovered(
+/// The ordered candidate list for one ray: the walk for order and for the empty
+/// cells, the plane tests for which of them a tile addresses.
+fn ray_candidates(ray: &bevy::math::Ray3d, index: &PickIndex) -> Vec<PickCandidate> {
+    let Some(bounds) = index.bounds() else {
+        return Vec::new();
+    };
+    let origin = render::world_to_layout(ray.origin);
+    // A direction converted the same way as a point: `LAYOUT_SCALE` is a sign
+    // flip on two axes and nothing else, so ray parameters carry over exactly.
+    let direction = render::world_to_layout(*ray.direction);
+
+    let Some((enter, exit)) = ray_box_span(
+        origin,
+        direction,
+        bounds.min.as_vec3(),
+        bounds.max.as_vec3() + Vec3::ONE,
+    ) else {
+        return Vec::new();
+    };
+    if exit < 0.0 {
+        return Vec::new();
+    }
+
+    // Which cells a tile addresses is a question about the cell, not about when
+    // the ray got there. Gathered as a set first, and deliberately not carried
+    // as a flag on the ordered stream: a ray looking down at a floor enters
+    // that last row from above and crosses the floor plane on its way *out*, so
+    // the walk reaches the cell first and the plane hit second. Letting the
+    // earlier of the two decide would have that tile read as empty space.
+    let surfaces: std::collections::HashSet<IVec3> = index
+        .volumes
+        .iter()
+        .flat_map(|volume| ray_surface_hits(origin, direction, volume))
+        .collect();
+
+    // The walk alone orders the list, which is all it was ever needed for: a
+    // plane crossing inside the bounds is a point on the ray, so the cell it
+    // falls in is a cell the walk goes through anyway.
+    let mut seen = std::collections::HashSet::<IVec3>::new();
+    let mut out = Vec::new();
+    for (_, cell) in ray_cell_walk(origin, direction, enter.max(0.0), exit) {
+        // A cell inside a branch is inside its parent too, so a nested volume
+        // can hand the same address over twice.
+        if !seen.insert(cell) {
+            continue;
+        }
+        if index.is_blocked(cell) {
+            continue;
+        }
+        let kind = match index.occupants.get(&cell) {
+            Some(kind) => kind.clone(),
+            None if surfaces.contains(&cell) => PickKind::Surface,
+            // An empty cell is only worth offering where a volume was drawn
+            // around it. Outside every one of them there is no cell, only
+            // space.
+            None if index.is_drawn(cell) => PickKind::Empty,
+            None => continue,
+        };
+        out.push(PickCandidate { cell, kind });
+    }
+    out
+}
+
+/// Lift the node the caret stands on out of the picture.
+///
+/// Selection only. What the *pointer* is on is said by the grey caret standing
+/// on that cell and by nothing else — one mark for one question, where there
+/// used to be a node glow, a shader wash on the floor, and nothing at all for
+/// the two walls and the far face.
+fn highlight_selected(
     pick: Res<PickState>,
     state: Res<GraphState>,
     node_q: Query<(&NodeEntity, &MeshMaterial3d<StandardMaterial>)>,
@@ -7872,16 +8391,9 @@ fn highlight_hovered(
         };
 
         let base = render::emissive_color(mat.base_color);
-        let is_hovered = pick.hovered_node.as_ref() == Some(&node_ent.node_id);
         let is_selected = selected_node.as_ref() == Some(&node_ent.node_id);
 
-        let intensity = if is_hovered {
-            4.0
-        } else if is_selected {
-            2.5
-        } else {
-            1.0
-        };
+        let intensity = if is_selected { 2.5 } else { 1.0 };
 
         mat.emissive = LinearRgba::new(
             base.red * intensity,
@@ -7896,36 +8408,19 @@ fn update_grid_material(
     pick: Res<PickState>,
     state: Res<GraphState>,
     screenshot: Res<ScreenshotMode>,
-    grid_q: Query<(
-        Entity,
-        &ScopeGridEntity,
-        &MeshMaterial3d<grid::GridMaterial>,
-    )>,
+    grid_q: Query<(&ScopeGridEntity, &MeshMaterial3d<grid::GridMaterial>)>,
     mut materials: ResMut<Assets<grid::GridMaterial>>,
 ) {
-    // Both of these say where something *is* rather than what the program does
-    // — the border where the caret stands, the highlight where the pointer
-    // does. In screenshot mode neither is on screen to be pointed at, so
-    // neither marks anything.
+    // The border says where something *is* rather than what the program does.
+    // In screenshot mode there is nothing on screen to point at, so it marks
+    // nothing.
     let marking = !screenshot.active();
     // The bordered grid is the one the caret addresses.
     let caret_path = state.scope_of_caret(&pick).map(|s| s.path);
-    let hit_entity = pick.hovered_grid.as_ref().map(|h| h.entity);
-    let hit_center = pick
-        .hovered_grid
-        .as_ref()
-        .map(|h| h.world_center)
-        .unwrap_or(Vec2::ZERO);
-    for (entity, scope_grid, mat_handle) in grid_q.iter() {
+    for (scope_grid, mat_handle) in grid_q.iter() {
         let Some(mat) = materials.get_mut(&mat_handle.0) else {
             continue;
         };
-        if marking && Some(entity) == hit_entity {
-            mat.hover_pos = hit_center;
-            mat.hover_active = 1.0;
-        } else {
-            mat.hover_active = 0.0;
-        }
         mat.border_active =
             if marking && Some(scope_grid.context.as_slice()) == caret_path.as_deref() {
                 1.0
@@ -7947,11 +8442,19 @@ fn update_cursor(
     };
     commands
         .entity(entity)
-        .insert(if pick.hovered_node.is_some() {
-            CursorIcon::System(SystemCursorIcon::Pointer)
-        } else {
-            CursorIcon::System(SystemCursorIcon::Default)
-        });
+        // The same line the grey caret is drawn on, so the icon and the
+        // outline cannot say different things: a pointer where something was
+        // drawn, and nothing where the ray is only passing through.
+        .insert(
+            if pick
+                .active()
+                .is_some_and(|candidate| candidate.kind.is_hit())
+            {
+                CursorIcon::System(SystemCursorIcon::Pointer)
+            } else {
+                CursorIcon::System(SystemCursorIcon::Default)
+            },
+        );
 }
 
 fn text_input_focus(
@@ -8966,68 +9469,44 @@ fn handle_arrow_keys(
     }
 }
 
+/// Mark the anchor the pointer is on, for `drag_start_system` to open a draft
+/// from.
+///
+/// Read straight off the cell pick, where it used to be a separate search for
+/// the nearest anchor within 25 screen pixels. The grey caret is what forced
+/// the change: while nothing marked the hovered anchor, a press drafting from
+/// an anchor one cell over was a disagreement nobody could see. Now the outline
+/// stands on a cell, and a press has to mean that cell or the editor is
+/// breaking a promise it just made on screen.
+///
+/// Exactness costs less reach here than it sounds. An anchor owns whole cells —
+/// `anchor_cells_of` answers with a column, one cell per type row — and
+/// `MIN_CELL_PIXELS` bounds how small a cell gets in the bound camera. Where a
+/// cell really is too small to aim at, the wheel is the way in, and it is a
+/// better way than whichever anchor happened to project nearest.
+///
+/// Two patches go with the old method. The `over_ui` guard is gone because the
+/// picker holds that gate now, in one place; and so is the behind-the-camera
+/// dot test, which existed only because an orthographic projection still
+/// projects a point standing behind the viewer. A ray walk has no such case.
 fn anchor_hover_system(
     mut commands: Commands,
-    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
-    camera_q: Query<(&Camera, &GlobalTransform)>,
-    anchors: Query<(Entity, &GlobalTransform), With<EAnchor>>,
+    pick: Res<PickState>,
+    anchors: Query<(Entity, &EAnchor)>,
     existing_hovers: Query<Entity, With<AnchorHovered>>,
-    ui_interactions: Query<&Interaction, With<Button>>,
 ) {
-    // Alle vorherigen Hovers entfernen
     for e in &existing_hovers {
         commands.entity(e).remove::<AnchorHovered>();
     }
 
-    // Anchor-Hover ist rein screen-space (Distanz zum projizierten Anchor) und
-    // weiß nichts von davorliegenden UI-Panels. Ohne diesen Guard startet ein
-    // Klick auf einen Button/eine Dropdown-Option einen Drag, sobald zufällig
-    // ein Anchor in Cursor-Nähe projiziert wird. Gleiches Muster wie in
-    // `pick_nodes`.
-    let over_ui = ui_interactions
-        .iter()
-        .any(|i| matches!(*i, Interaction::Hovered | Interaction::Pressed));
-    if over_ui {
-        return;
-    }
-
-    let Ok(window) = windows.single() else {
+    let Some(PickKind::Anchor(hovered_id)) = pick.active().map(|candidate| &candidate.kind) else {
         return;
     };
-    let Some(cursor) = window.cursor_position() else {
-        return;
-    };
-    let Ok((camera, cam_tf)) = camera_q.single() else {
-        return;
-    };
-
-    let mut closest: Option<(Entity, f32)> = None;
-
-    for (entity, global_tf) in &anchors {
-        // Same reason as in `update_world_labels`: under the orthographic
-        // projection a point behind the camera still projects, so it would
-        // otherwise become a hover target.
-        if cam_tf
-            .forward()
-            .dot(global_tf.translation() - cam_tf.translation())
-            <= 0.0
-        {
-            continue;
+    for (entity, anchor) in &anchors {
+        if anchor.id() == *hovered_id {
+            commands.entity(entity).insert(AnchorHovered);
+            return;
         }
-        let Ok(screen_pos) = camera.world_to_viewport(cam_tf, global_tf.translation()) else {
-            continue;
-        };
-
-        let dist = cursor.distance(screen_pos);
-        if dist < 25.0 {
-            if closest.map_or(true, |(_, d)| dist < d) {
-                closest = Some((entity, dist));
-            }
-        }
-    }
-
-    if let Some((entity, _)) = closest {
-        commands.entity(entity).insert(AnchorHovered);
     }
 }
 
@@ -9202,7 +9681,7 @@ fn commit_draft(state: &mut GraphState, draft: &EdgeDraft) -> bool {
 ///
 /// A slab test in layout space rather than a radius in pixels, because the
 /// question is about a cell and a cell is a thing in the world. Everything goes
-/// through `render::world_to_layout` for the reason `pick_nodes` gives: only
+/// through `render::world_to_layout` for the reason `pick_cells` gives: only
 /// that conversion knows `LAYOUT_SCALE` negates Y and Z, and doing the division
 /// by hand here would mirror the test against the picture.
 fn ray_meets_cells(ray: &bevy::math::Ray3d, cells: &[IVec3]) -> bool {
@@ -9212,16 +9691,161 @@ fn ray_meets_cells(ray: &bevy::math::Ray3d, cells: &[IVec3]) -> bool {
 fn ray_meets_cell(ray: &bevy::math::Ray3d, cell: IVec3) -> bool {
     let origin = render::world_to_layout(ray.origin);
     let direction = render::world_to_layout(*ray.direction);
-    let min = cell.as_vec3();
-    let max = min + Vec3::ONE;
+    ray_box_span(
+        origin,
+        direction,
+        cell.as_vec3(),
+        cell.as_vec3() + Vec3::ONE,
+    )
+    .is_some_and(|(near, far)| far >= near.max(0.0))
+}
+
+/// How many cells one ray may be walked through before the walk gives up.
+///
+/// Not a budget — a graph that deep is not a thing — but a backstop. A
+/// direction that degenerates under the projection would otherwise step
+/// forever, and a hung frame is a worse answer than a short list.
+const MAX_WALK_STEPS: usize = 512;
+
+/// Every cell the ray crosses between `t0` and `t1`, front to back, each with
+/// the parameter it is entered at. Layout space throughout, where a cell is the
+/// unit box standing at its own address.
+///
+/// Amanatides–Woo, and not a raycast against the meshes, for a reason that is
+/// about the feature and not about speed: the cells that matter most here are
+/// the ones nothing was drawn in. An empty cell has no triangle to be hit, and
+/// it is exactly what the wheel steps through. That the walk is also cheaper —
+/// a step per cell crossed rather than a test per object in the scene — is a
+/// convenience on top.
+fn ray_cell_walk(origin: Vec3, direction: Vec3, t0: f32, t1: f32) -> Vec<(f32, IVec3)> {
+    let mut out = Vec::new();
+    // Nudged past the face, or the first `floor` lands on whichever side of the
+    // boundary the rounding happens to fall.
+    let entry = origin + direction * (t0 + 1e-4);
+    let mut cell = entry.floor().as_ivec3();
+
+    let mut step = IVec3::ZERO;
+    let mut t_max = Vec3::INFINITY;
+    let mut t_delta = Vec3::INFINITY;
+    for axis in 0..3 {
+        let d = direction[axis];
+        if d.abs() < 1e-9 {
+            continue;
+        }
+        step[axis] = if d > 0.0 { 1 } else { -1 };
+        t_delta[axis] = 1.0 / d.abs();
+        // Distance to the face the ray leaves this cell by, on this axis.
+        let boundary = if d > 0.0 {
+            (cell[axis] + 1) as f32
+        } else {
+            cell[axis] as f32
+        };
+        t_max[axis] = (boundary - origin[axis]) / d;
+    }
+
+    let mut t = t0.max(0.0);
+    for _ in 0..MAX_WALK_STEPS {
+        if t > t1 {
+            break;
+        }
+        out.push((t, cell));
+        // Advance along whichever axis reaches its next face first.
+        let axis = if t_max.x < t_max.y && t_max.x < t_max.z {
+            0
+        } else if t_max.y < t_max.z {
+            1
+        } else {
+            2
+        };
+        if !t_max[axis].is_finite() {
+            break;
+        }
+        t = t_max[axis];
+        cell[axis] += step[axis];
+        t_max[axis] += t_delta[axis];
+    }
+    out
+}
+
+/// Where the ray meets the bounding planes a volume actually draws, as the cell
+/// each tile addresses.
+///
+/// Analytic, and not read off the face the walk enters a cell by. The two agree
+/// where the ray *enters* a cell through the surface, and part where it leaves
+/// through one — looking down on a floor from above, the ray crosses it on its
+/// way out of the last row, which the walk has long since entered from
+/// somewhere else. Asking the plane directly has no such case, and the planes
+/// are drawn double-sided (`cull_mode = None`), so meeting one from either
+/// side is a hit either way.
+///
+/// The four formulas mirror `spawn_volume_surfaces` exactly: each plane is a
+/// face of a boundary cell, and the cell it addresses is the one standing on
+/// it.
+fn ray_surface_hits(origin: Vec3, direction: Vec3, volume: &PickVolume) -> Vec<IVec3> {
+    let mut out = Vec::new();
+    // The volume spans [min, max+1] as a solid; a tile's two free coordinates
+    // have to land inside that.
+    let lo = volume.min.as_vec3();
+    let hi = volume.max.as_vec3() + Vec3::ONE;
+    // A hit exactly on the far edge floors to one past the last cell.
+    let clamp_cell = |v: f32, min: i32, max: i32| (v.floor() as i32).clamp(min, max);
+
+    // (axis the plane is pinned on, its coordinate, the cell coordinate on that
+    // axis) — floor, back wall, near Z face, far Z face.
+    let planes = [
+        (1usize, (volume.max.y + 1) as f32, volume.max.y),
+        (0usize, volume.min.x as f32, volume.min.x),
+        (2usize, volume.min.z as f32, volume.min.z),
+        (2usize, (volume.max.z + 1) as f32, volume.max.z),
+    ];
+    for (axis, plane, pinned) in planes {
+        let d = direction[axis];
+        if d.abs() < 1e-6 {
+            continue;
+        }
+        let t = (plane - origin[axis]) / d;
+        if t <= 0.0 {
+            continue;
+        }
+        let hit = origin + direction * t;
+        let mut cell = IVec3::ZERO;
+        cell[axis] = pinned;
+        let mut inside = true;
+        for other in 0..3 {
+            if other == axis {
+                continue;
+            }
+            if hit[other] < lo[other] || hit[other] > hi[other] {
+                inside = false;
+                break;
+            }
+            cell[other] = clamp_cell(hit[other], volume.min[other], volume.max[other]);
+        }
+        if inside {
+            out.push(cell);
+        }
+    }
+    out
+}
+
+/// The span of ray parameters over which the ray is inside the box, in layout
+/// space. `None` where it never is.
+///
+/// Both ends may come back negative. Clamping to the half-line in front of the
+/// origin is left to the caller because the two callers want different things:
+/// a draft asks whether a cell is on the ray at all, and the walk asks where to
+/// start stepping.
+fn ray_box_span(origin: Vec3, direction: Vec3, min: Vec3, max: Vec3) -> Option<(f32, f32)> {
     let mut near = f32::NEG_INFINITY;
     let mut far = f32::INFINITY;
     for axis in 0..3 {
         let o = origin[axis];
         let d = direction[axis];
         if d.abs() < 1e-6 {
+            // Parallel to this pair of faces: either always between them or
+            // never, and no `t` to be had either way.
             if o < min[axis] || o > max[axis] {
-                return false;
+                return None;
             }
             continue;
         }
@@ -9230,7 +9854,10 @@ fn ray_meets_cell(ray: &bevy::math::Ray3d, cell: IVec3) -> bool {
         near = near.max(t0.min(t1));
         far = far.min(t0.max(t1));
     }
-    far >= near.max(0.0)
+    if far < near {
+        return None;
+    }
+    Some((near, far))
 }
 
 /// A press on an anchor opens a draft there.
@@ -9546,6 +10173,8 @@ fn main() {
         .init_resource::<GraphState>()
         .init_resource::<NeedsRebuild>()
         .init_resource::<PickState>()
+        .init_resource::<PickIndex>()
+        .init_resource::<PersistentAssets>()
         .init_resource::<DraftState>()
         .init_resource::<EvalState>()
         .init_resource::<EditorMode>()
@@ -9561,12 +10190,16 @@ fn main() {
             (
                 load_ui_font,
                 setup_scene,
+                // Before the first spawn pass, so `PersistentAssets` is filled
+                // in before anything can wipe the registries.
+                spawn_hover_caret,
                 spawn_graph_nodes,
                 spawn_ui,
                 spawn_view_bar,
                 spawn_editor_column,
                 spawn_run_panel,
                 spawn_fps_display,
+                spawn_hover_address,
                 spawn_mode_display,
                 // Last: it reads the window's physical size, and the camera
                 // above is what puts the OIT settings there to be read.
@@ -9596,19 +10229,28 @@ fn main() {
                         // on screen in the frame it was asked for.
                         handle_confirm_new_button,
                         sync_editor_chrome,
-                        pick_nodes,
+                        pick_cells,
+                        // Both read what `pick_cells` has just decided, and
+                        // both have to be *in* the chain to do it. A plain
+                        // tuple carries no ordering, so out here they were free
+                        // to run first and answer with last frame's pick. That
+                        // went unnoticed while the answer was an emissive
+                        // boost; a caret outline one frame behind the mouse is
+                        // a lag anyone can see.
+                        update_hover_caret,
+                        update_hover_address,
+                        update_cursor,
                     )
                         .chain()
                         // A click resolves before the keys of the same frame.
-                        // `handle_mode_toggle` sets the mode and `pick_nodes`
+                        // `handle_mode_toggle` sets the mode and `pick_cells`
                         // moves the caret, and the keyboard chain projects both
                         // onto the prompt's text at its end — ambiguous, that
                         // projection could run on the state the click was about
                         // to change.
                         .before(handle_editor_keys),
-                    highlight_hovered,
+                    highlight_selected,
                     update_grid_material,
-                    update_cursor,
                     // Mode and caret before keys before the projection of the
                     // two back onto the prompt's text. The last link has to be
                     // last: it re-seeds the prompt when the addressed property

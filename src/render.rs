@@ -183,6 +183,42 @@ pub fn cell_caret_faces(cell: Vec3) -> Vec<RenderObject> {
 /// encloses the addressed cell space itself rather than marking a point, and
 /// is drawn whether or not a node occupies the cell.
 pub fn cell_caret_edges(cell: Vec3) -> Vec<RenderObject> {
+    cell_caret_edges_at(cell, DISPLAY_WHITE)
+}
+
+/// The grey the pointer's own caret wears.
+///
+/// Deliberately not a fraction of `DISPLAY_WHITE`. That figure is an overdrive
+/// — 8.0 linear is what arrives as #FFFFFF *after* the tonemapper, and the
+/// curve is nearly flat up there, so any fraction of it large enough to be
+/// worth writing would still come out white. Grey lives below 1.0, where the
+/// curve still has a slope to it.
+pub const HOVER_GREY: f32 = 0.25;
+
+/// How much the pointer's outline is drawn inside the cell it marks.
+///
+/// Both carets are opaque cuboids of identical geometry, so standing them on
+/// the same cell would z-fight. Holding the pointer's back a little answers
+/// that without hiding it — and where the two do coincide, a smaller box nested
+/// inside the caret's reads as exactly what it is: the pointer on the cell the
+/// caret already addresses.
+pub const HOVER_CARET_INSET: f32 = 0.88;
+
+/// Offset from a cell's origin corner to its centre, in world orientation.
+///
+/// `layout_to_world` answers with the corner (cell `N` covers `[N, N+1)`), and
+/// anything that has to be scaled or rotated in place needs the middle. Derived
+/// rather than written out, so the axis negation in `LAYOUT_SCALE` stays stated
+/// in exactly one place.
+pub fn cell_centre_offset() -> Vec3 {
+    layout_to_world(Vec3::splat(0.5))
+}
+
+/// `cell_caret_edges` at a chosen brightness, which is the one thing the
+/// pointer's outline and the caret's differ by: same twelve edges, same
+/// thickness, same opaque reading — see `CARET_ALPHA_MODE`, whose argument is
+/// about draw order and holds for whichever of the two is nearer.
+pub fn cell_caret_edges_at(cell: Vec3, level: f32) -> Vec<RenderObject> {
     let a = layout_to_world(cell);
     let b = layout_to_world(cell + Vec3::ONE);
     let (lo, hi) = (a.min(b), a.max(b));
@@ -207,9 +243,9 @@ pub fn cell_caret_edges(cell: Vec3) -> Vec<RenderObject> {
                 mesh: Cuboid::new(size.x, size.y, size.z).mesh().build(),
                 material: StandardMaterial {
                     base_color: Color::LinearRgba(LinearRgba::new(
-                        DISPLAY_WHITE,
-                        DISPLAY_WHITE,
-                        DISPLAY_WHITE,
+                        level,
+                        level,
+                        level,
                         CARET_EDGE_ALPHA,
                     )),
                     alpha_mode: CARET_ALPHA_MODE,

@@ -14,10 +14,6 @@ struct GridParams {
     fade_start: f32,
     fade_end: f32,
     line_thickness: f32,
-    // Plane coordinates (see `axis_u`) of the hovered cell's center.
-    hover_pos: vec2<f32>,
-    hover_active: f32,
-    _pad: f32,
     // Plane coordinates of the outer boundary.
     border_min: vec2<f32>,
     border_max: vec2<f32>,
@@ -114,22 +110,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         color = vec4<f32>(
             mix(color.rgb, params.border_color.rgb, on_border),
             max(color.a, on_border * params.border_color.a),
-        );
-    }
-
-    // Hover feedback: fill the hovered cell (side = spacing) with a soft
-    // wash, anti-aliased against fwidth so it stays crisp at oblique angles.
-    if params.hover_active > 0.5 {
-        let d = abs(world_pos - params.hover_pos);
-        let half_cell = params.spacing * 0.5;
-        let aa = max(fwidth(world_pos.x), fwidth(world_pos.y));
-        let mask_x = 1.0 - smoothstep(half_cell - aa, half_cell + aa, d.x);
-        let mask_y = 1.0 - smoothstep(half_cell - aa, half_cell + aa, d.y);
-        let cell = mask_x * mask_y;
-        let fill_alpha = cell * 0.28;
-        color = vec4<f32>(
-            mix(color.rgb, params.line_color.rgb, fill_alpha),
-            color.a + fill_alpha,
         );
     }
 
