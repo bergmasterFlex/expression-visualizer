@@ -103,23 +103,22 @@ pub struct DepthCue {
     pub edge_strength: f32,
     /// Separation, in cells, at which a single neighbour counts as fully nearer.
     pub edge_depth: f32,
-    /// Which of [`MODE_OFF`], [`MODE_CUE`], [`MODE_DEPTH`] the pass draws.
+    /// Which of [`MODE_OFF`], [`MODE_CUE`] the pass draws.
     pub mode: u32,
 }
 
 /// Pass the frame through untouched.
 ///
-/// The pass still runs and still blits in this mode, which is deliberate: every
-/// mode travels the same ping-pong path, so anything that changes in the
-/// picture when F9 is struck is the cue and never the plumbing.
+/// The pass still runs and still blits in this mode, which is deliberate: both
+/// modes travel the same ping-pong path, so anything that changes in the
+/// picture when the cue is switched off is the cue and never the plumbing.
 pub const MODE_OFF: u32 = 0;
 /// Depth darkening at both scales — the cue proper.
 pub const MODE_CUE: u32 = 1;
-/// The linearised depth itself, as one contour band per cell. Not a cue but a
-/// way to see what the cue is reading.
-pub const MODE_DEPTH: u32 = 2;
-/// What F9 walks through, in order, wrapping at the end.
-const MODES: [u32; 3] = [MODE_OFF, MODE_CUE, MODE_DEPTH];
+// A third mode drew the linearised depth itself, as one contour band per cell
+// — not a cue but a way to see what the cue was reading. It was scaffolding
+// for building this pass and had no reader left once the pass was right, so it
+// is gone from here and from the shader together.
 
 // Defaults, gathered here because they are the knobs worth turning and nothing
 // else in the module is.
@@ -147,10 +146,17 @@ const EDGE_STRENGTH: f32 = 0.45;
 const EDGE_DEPTH: f32 = 0.5;
 
 impl Default for DepthCue {
-    /// Off, and with a projection that will be overwritten on the first update.
-    /// `sync_depth_cue` owns those four numbers; standing values here would
-    /// only be a second answer to the same question. The identity-ish pair
-    /// below is merely something finite to divide by until it arrives.
+    /// On, and with a projection that will be overwritten on the first update.
+    ///
+    /// The cue is what the scene is meant to look like: it is drawn unlit and
+    /// often parallel, and without the darkening there is no geometric cue
+    /// left to say which of two touching faces is in front. It stood off by
+    /// default only for as long as a key was the only way to reach it.
+    ///
+    /// `sync_depth_cue` owns those four projection numbers; standing values
+    /// here would only be a second answer to the same question. The
+    /// identity-ish pair below is merely something finite to divide by until
+    /// it arrives.
     fn default() -> Self {
         Self {
             clip_z_scale: 1.0,
@@ -164,21 +170,10 @@ impl Default for DepthCue {
             edge_radius: EDGE_RADIUS,
             edge_strength: EDGE_STRENGTH,
             edge_depth: EDGE_DEPTH,
-            mode: MODE_OFF,
+            mode: MODE_CUE,
         }
     }
 }
-
-/// The key that walks through [`MODES`].
-///
-/// A function key, and read straight from `ButtonInput` rather than from the
-/// keyboard message the editor listens to. Both halves of that matter: the
-/// letters all belong to NORMAL mode or to the insert prompt, and a function
-/// key carries no text, so this cannot end up typed into a field. It is also
-/// left outside `keyboard_captured` on purpose — what it changes is how the
-/// scene is drawn, not what the editor is doing, so it stays available while a
-/// modal or an evaluation owns the keyboard.
-const TOGGLE_KEY: KeyCode = KeyCode::F9;
 
 /// Keep the cue's picture of the camera in step with the camera.
 ///
@@ -215,22 +210,6 @@ fn sync_depth_cue(
     }
 }
 
-fn toggle_depth_cue(keys: Res<ButtonInput<KeyCode>>, mut cues: Query<&mut DepthCue>) {
-    if !keys.just_pressed(TOGGLE_KEY) {
-        return;
-    }
-    for mut cue in &mut cues {
-        // Walk the list rather than counting modulo the count, so a mode that
-        // has fallen out of `MODES` cannot strand the cue on a number the
-        // shader no longer knows.
-        let next = MODES
-            .iter()
-            .position(|m| *m == cue.mode)
-            .map_or(MODE_OFF, |i| MODES[(i + 1) % MODES.len()]);
-        cue.mode = next;
-    }
-}
-
 pub struct DepthCuePlugin;
 
 impl Plugin for DepthCuePlugin {
@@ -246,7 +225,7 @@ impl Plugin for DepthCuePlugin {
             ExtractComponentPlugin::<DepthCue>::default(),
             UniformComponentPlugin::<DepthCue>::default(),
         ))
-        .add_systems(Update, (sync_depth_cue, toggle_depth_cue));
+        .add_systems(Update, sync_depth_cue);
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;

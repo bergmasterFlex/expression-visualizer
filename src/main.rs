@@ -1779,7 +1779,7 @@ fn setup_scene(
         // Reads the depth buffer back in a full-screen pass. OIT is what makes
         // that possible without a depth prepass: it already marks the depth
         // texture as bindable, so the cue samples the one the main pass wrote.
-        // Off until F9 says otherwise.
+        // On from the start; the `Depth` checkbox is what turns it off.
         depth_cue::DepthCue::default(),
         camera::OrbitCameraTag,
         AmbientLight {
@@ -3050,6 +3050,7 @@ fn spawn_view_bar(mut commands: Commands, ui_font: Res<UiFont>) {
                 ClippingCheckboxBox,
             );
             spawn_inline_checkbox(bar, &font, "Guides", GuidesCheckbox, GuidesCheckboxBox);
+            spawn_inline_checkbox(bar, &font, "Depth", DepthCueCheckbox, DepthCueCheckboxBox);
         });
 }
 
@@ -3125,6 +3126,58 @@ struct GuidesCheckbox;
 /// Marker on that checkbox's swatch.
 #[derive(Component)]
 struct GuidesCheckboxBox;
+
+/// Marker for the checkbox that turns the depth cue on.
+#[derive(Component)]
+struct DepthCueCheckbox;
+
+/// Marker on that checkbox's swatch.
+#[derive(Component)]
+struct DepthCueCheckboxBox;
+
+/// Toggle the depth darkening.
+///
+/// The odd one of the three, and only in where it writes: `Clipping` and
+/// `Guides` each own a resource, while the cue is a component on the camera —
+/// that is what puts it in front of the render world, where the pass reaches
+/// it as a uniform. So this is a query and not a `ResMut`.
+///
+/// No rebuild: nothing about the cue is baked into a material. The pass reads
+/// the uniform every frame and simply reads a different number.
+///
+/// `sync_depth_cue` writes the other ten fields and never this one, so the two
+/// do not fight over the component.
+fn handle_depth_cue_checkbox(
+    interaction_q: Query<&Interaction, (Changed<Interaction>, With<DepthCueCheckbox>)>,
+    mut cues: Query<&mut depth_cue::DepthCue>,
+) {
+    if !interaction_q
+        .iter()
+        .any(|interaction| *interaction == Interaction::Pressed)
+    {
+        return;
+    }
+    for mut cue in cues.iter_mut() {
+        cue.mode = if cue.mode == depth_cue::MODE_OFF {
+            depth_cue::MODE_CUE
+        } else {
+            depth_cue::MODE_OFF
+        };
+    }
+}
+
+fn sync_depth_cue_checkbox(
+    cues: Query<&depth_cue::DepthCue>,
+    mut box_q: Query<&mut BackgroundColor, With<DepthCueCheckboxBox>>,
+) {
+    let on = cues.iter().any(|cue| cue.mode != depth_cue::MODE_OFF);
+    let wanted = if on { CHECKED_COLOR } else { UNCHECKED_COLOR };
+    for mut color in box_q.iter_mut() {
+        if color.0 != wanted {
+            color.0 = wanted;
+        }
+    }
+}
 
 /// Toggle the guides.
 ///
@@ -9395,8 +9448,8 @@ fn apply_room_insert(
 /// keys mean here — so the arms below are reachable only through an `Action`,
 /// and an `Action` comes only from a row that the same predicate put on
 /// screen. What the editor claims and what it does are one statement now. They
-/// were two, and they had already drifted: the old list of the controls never
-/// mentioned `F9`.
+/// were two, and they had already drifted — the list of the controls was hand
+/// written and stood behind a button nobody pressed twice.
 ///
 /// So what is left here is what each action *does*, which is graph work and
 /// belongs nowhere else. Where a row is alive — that the room-makers want an
@@ -11571,6 +11624,7 @@ fn main() {
                 // that reads what it wrote.
                 (handle_clipping_checkbox, sync_clipping_checkbox).chain(),
                 (handle_guides_checkbox, sync_guides_checkbox).chain(),
+                (handle_depth_cue_checkbox, sync_depth_cue_checkbox).chain(),
                 handle_modal_ok_button,
                 handle_modal_cancel_button,
                 handle_modal_evaluate_button,

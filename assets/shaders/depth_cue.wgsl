@@ -59,7 +59,6 @@ struct DepthCue {
 
 const MODE_OFF: u32 = 0u;
 const MODE_CUE: u32 = 1u;
-const MODE_DEPTH: u32 = 2u;
 
 // Sample pattern for the blur: rings of spokes around the centre. A separable
 // two-pass Gaussian would be cheaper per unit of radius, but it needs an
@@ -215,14 +214,6 @@ fn fragment(in: FullscreenVertexOutput) -> @location(0) vec4<f32> {
     let size = vec2<i32>(textureDimensions(depth_texture));
     let coord = vec2<i32>(in.position.xy);
     let dist = distance_at(coord, size);
-
-    // Contour bands, one per world unit — which is one grid cell, since `CELL`
-    // is 1.0 and `LAYOUT_SCALE` only flips signs. This is what the spike drew,
-    // kept as a way to see the depth the cue is reading rather than the cue.
-    if cue.mode == MODE_DEPTH {
-        let band = fract(dist);
-        return vec4<f32>(band, band, band, 1.0);
-    }
 
     // The same mask at two scales. The broad one is the shadow a nearer thing
     // casts across what lies behind it; the tight one is the dark edge at its

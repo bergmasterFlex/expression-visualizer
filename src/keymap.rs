@@ -8,12 +8,12 @@
 //! string that has not been closed. Nothing on screen used to say which.
 //!
 //! So the bindings live here as data, with the condition under which each one
-//! is alive written beside it, and both the bar along the bottom edge and —
-//! from `resolve` on — the dispatch itself read this one table. A key with no
-//! row here is a key that cannot act, which is the only arrangement in which
-//! the help and the behaviour cannot drift apart. They already had: `F9` has
-//! toggled the depth cue since `depth_cue.rs` was written and has never
-//! appeared in any list of the controls.
+//! is alive written beside it, and both the panel on the right and the
+//! dispatch itself read this one table. A key with no row here is a key that
+//! cannot act: the arm is reachable only through an `Action`, and an `Action`
+//! comes only from `resolve`. That is the only arrangement in which the help
+//! and the behaviour cannot drift apart — and they had drifted, for as long as
+//! the help was a hand-written list behind a button nobody pressed twice.
 //!
 //! **The order of the rows is semantic.** The three `Space` rows and the two
 //! `Return` rows are told apart by guards that used to sit in `match`-arm
@@ -136,7 +136,6 @@ pub enum Group {
     Build,
     Text,
     Mode,
-    View,
     Pointer,
 }
 
@@ -226,8 +225,8 @@ pub struct Binding {
     /// A function rather than a plain `Action`, so that one row may stand for
     /// several keys that do different things — `Home` and `End` are one line
     /// to read and two things to do. The rows that act on no key at all answer
-    /// `None` always: the pointer's, and `F9`, which is `depth_cue.rs`' and
-    /// deliberately outside everything this module gates.
+    /// `None` always: the pointer's, and the held `Alt` that only announces
+    /// the layer the keys below it belong to.
     pub acts: fn(&bevy::input::keyboard::Key, Mods) -> Option<Action>,
     /// A held key auto-repeats. Rows that make room, delete, or commit must
     /// fire once per press; typing must not.
@@ -358,9 +357,8 @@ fn is(key: &bevy::input::keyboard::Key, want: &bevy::input::keyboard::Key) -> bo
     key == want
 }
 
-/// Rows that are a readout and not a binding: the pointer's, the held `Alt`
-/// that only announces the layer, and `F9`, which belongs to `depth_cue.rs`
-/// and is read from `KeyCode` outside every guard here.
+/// Rows that are a readout and not a binding: the pointer's, and the held
+/// `Alt`, which only announces the layer the six keys under it belong to.
 fn act_none(_: &bevy::input::keyboard::Key, _: Mods) -> Option<Action> {
     None
 }
@@ -736,15 +734,6 @@ pub static BINDINGS: &[Binding] = &[
         group: Group::Mode,
         when: dragging,
         acts: act_leave,
-        once: false,
-    },
-    // ── The view ──
-    Binding {
-        keys: "F9",
-        says: "cycle the depth cue",
-        group: Group::View,
-        when: always,
-        acts: act_none,
         once: false,
     },
     // ── The pointer ──
