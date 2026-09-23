@@ -24,12 +24,18 @@ use bevy::shader::ShaderRef;
 /// nothing to flip. Unlike `lod::Clipping` beside it, which is baked into every
 /// material at spawn and so has to ask for a rebuild, the guides are placed
 /// afresh each frame and simply stop being placed.
+///
+/// Off to begin with. Six dashed lines from the caret to the six walls answer
+/// a question — *where in the volume is this cell* — that is worth asking
+/// while the shape is being learnt and not once it is known, and they are the
+/// one piece of chrome drawn in among the nodes rather than over them. The
+/// checkbox is where they are asked for.
 #[derive(Resource)]
 pub struct Guides(pub bool);
 
 impl Default for Guides {
     fn default() -> Self {
-        Self(true)
+        Self(false)
     }
 }
 
