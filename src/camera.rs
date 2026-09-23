@@ -15,12 +15,49 @@ use bevy::input::mouse::{MouseMotion, MouseScrollUnit, MouseWheel};
 /// side effect of dragging.
 use bevy::prelude::*;
 
-/// Which of the two camera purposes is active.
+/// Which of the two camera purposes is active — who steers, and nothing else.
+///
+/// It used to decide the projection too: free meant perspective because that
+/// was the only way to reach one. Those were two questions wearing one answer,
+/// and `ViewProjection` is the other half of the split.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum CameraMode {
+    /// The camera follows the caret and the mouse cannot move it. The
+    /// orientation is fixed, which is what makes a measurement readable off
+    /// the screen.
     #[default]
     Bound,
+    /// Orbit, pan and zoom by hand. The guarantees of the bound mode are
+    /// deliberately suspended, and so is writing to the graph.
     Free,
+}
+
+/// Which picture is drawn, independent of who is steering.
+///
+/// The first two are the oblique projections of technical drawing: the camera
+/// points straight down the depth axis and a shear lays the third axis out at
+/// an angle, so all three can be read at once (see `ObliqueOrthographic`).
+/// They differ only in whether the depth converges.
+///
+/// `Perspective` is the odd one. It has no shear — and a projection with no
+/// shear, seen from the bound orientation, would collapse the depth axis to a
+/// point, because that orientation *is* straight down it. So it is the one
+/// view that also moves the camera: to `oblique_view_angles`, where a real
+/// viewer would have to stand to see what the shear draws.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewProjection {
+    /// Oblique, with a little convergence eased in. Flat is exact but blind;
+    /// a shallow perspective keeps the axis mapping and hands the eye back the
+    /// depth cue it normally gets for free.
+    #[default]
+    Default,
+    /// Oblique and parallel. The exact picture the layout is specified in, and
+    /// the one to come back to when something has to be measured rather than
+    /// looked at.
+    Orthographic,
+    /// A real camera's perspective, unsheared, from the angle the shear
+    /// implies.
+    Perspective,
 }
 
 /// Orbit camera state stored as a resource.
@@ -50,13 +87,10 @@ pub struct OrbitCamera {
     /// It runs on the same clock as every other camera transition, so the
     /// switch is a movement and not a cut.
     pub blend: f32,
-    /// Draw the bound mode with a little convergence instead of none. A
-    /// parallel projection is exact but flat; a shallow perspective keeps the
-    /// axis mapping and hands the eye back the depth cue it normally gets for
-    /// free. On by default: the flat picture is the one you ask for, not the
-    /// one you start in.
-    pub semi_ortho: bool,
-    /// The same, as a position between the two, on the same clock.
+    /// Which picture is drawn. `mode` beside it says only who steers.
+    pub view: ViewProjection,
+    /// Where the bound picture stands between parallel and converging, on the
+    /// same clock as everything else about the camera.
     pub semi_blend: f32,
     /// The free camera's field of view. Fixed when the free mode takes over,
     /// at whatever makes the caret's plane the size it already was — after
@@ -74,7 +108,7 @@ impl Default for OrbitCamera {
             mode: CameraMode::Bound,
             cell_pixels: DEFAULT_CELL_PIXELS,
             blend: 0.0,
-            semi_ortho: true,
+            view: ViewProjection::Default,
             semi_blend: 1.0,
             free_fov: FREE_FOV,
         }
@@ -245,8 +279,11 @@ impl Plugin for OrbitCameraPlugin {
 
 /// Handle mouse input.
 ///
-/// All camera interactions require a held Ctrl key — this keeps
-/// left-drag/right-drag/scroll free for grid and node interactions.
+/// Whether Ctrl is needed is the mode's answer. In the bound mode every mouse
+/// button is spoken for — a drag draws an edge, a click moves the caret, the
+/// wheel steps the pick through what stands behind — so Ctrl is what lends one
+/// of them to the camera. In the free mode the graph is read-only and none of
+/// them is spoken for, so the camera simply has them.
 ///
 /// In the bound mode only the scale responds: orbiting and panning would
 /// detach the view from the caret, and detaching is what the mode switch is
@@ -278,11 +315,10 @@ fn orbit_input(
         };
     }
 
-    if !ctrl {
+    let free = orbit.mode == CameraMode::Free;
+    if !free && !ctrl {
         return;
     }
-
-    let free = orbit.mode == CameraMode::Free;
 
     // Any actual mouse-driven camera motion cancels a running transition.
     // Zooming does not, since it leaves the framing alone.
@@ -343,11 +379,12 @@ fn camera_tween_apply(
     mut tween: ResMut<CameraTween>,
     mut orbit: ResMut<OrbitCamera>,
 ) {
-    // The projection follows the mode on the same clock as the framing, so both
-    // halves of a mode switch arrive together.
-    let blend_target = match orbit.mode {
-        CameraMode::Bound => 0.0,
-        CameraMode::Free => 1.0,
+    // The projection follows the *view* on the same clock as the framing, so
+    // both halves of a change arrive together. It followed the mode once, which
+    // is why free and perspective could not be had apart.
+    let blend_target = match orbit.view {
+        ViewProjection::Perspective => 1.0,
+        ViewProjection::Default | ViewProjection::Orthographic => 0.0,
     };
     let step = time.delta_secs() / CAMERA_TWEEN_DURATION;
     if orbit.blend != blend_target {
@@ -357,7 +394,14 @@ fn camera_tween_apply(
             (orbit.blend - step).max(blend_target)
         };
     }
-    let semi_target = if orbit.semi_ortho { 1.0 } else { 0.0 };
+    let semi_target = match orbit.view {
+        ViewProjection::Default => 1.0,
+        ViewProjection::Orthographic => 0.0,
+        // Under `blend == 1` the free projection is drawn whole and this says
+        // nothing; holding it still is what keeps the way back a fade out of
+        // the picture that was actually on screen.
+        ViewProjection::Perspective => orbit.semi_blend,
+    };
     if orbit.semi_blend != semi_target {
         orbit.semi_blend = if semi_target > orbit.semi_blend {
             (orbit.semi_blend + step).min(semi_target)
@@ -707,6 +751,23 @@ pub fn bound_projection(cell_pixels: f32, focal_distance: f32, semi: f32) -> Pro
 /// The free mode's projection.
 pub fn free_projection(fov: f32) -> Projection {
     Projection::Perspective(PerspectiveProjection { fov, ..default() })
+}
+
+/// Where the bound camera looks for a given view.
+///
+/// The two oblique views look straight down the depth axis and let the shear
+/// show the third one. The perspective has no shear to hide an axis in, so the
+/// camera itself has to go where the shear was pretending to stand — otherwise
+/// it would be aimed along the very axis it is meant to show, and the depth
+/// would collapse to a point.
+///
+/// Only the bound camera asks. In the free mode the angles are the user's, and
+/// a view that pulled them back would be exactly the tutelage that mode lifts.
+pub fn view_angles(view: ViewProjection) -> (f32, f32) {
+    match view {
+        ViewProjection::Default | ViewProjection::Orthographic => (RESET_THETA, RESET_PHI),
+        ViewProjection::Perspective => oblique_view_angles(),
+    }
 }
 
 /// Where the oblique projection implies the viewer stands, as the orbit angles

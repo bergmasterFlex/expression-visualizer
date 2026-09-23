@@ -62,6 +62,13 @@ pub struct Context {
     pub in_quote: bool,
     /// The pointer is dragging an edge out of an anchor.
     pub drafting: bool,
+    /// The graph may only be read: the camera's `Explore` mode has the mouse,
+    /// and with it the editing.
+    ///
+    /// In here rather than tested by the caller, so that the panel and the
+    /// dispatch stop offering the same keys at the same moment. A guard that
+    /// only refused would leave the list advertising an `i` that does nothing.
+    pub read_only: bool,
 }
 
 /// `InsertTarget` with the identities taken out.
@@ -97,6 +104,7 @@ pub fn context(
     prompt: &crate::InsertPrompt,
     draft: &crate::DraftState,
     aiming: bool,
+    read_only: bool,
 ) -> Context {
     let here = match crate::insert_target(state, pick) {
         crate::InsertTarget::Create => Where::Create,
@@ -121,6 +129,7 @@ pub fn context(
         highlighted: prompt.selected.is_some(),
         in_quote: crate::in_open_quote(&prompt.text),
         drafting: draft.pointer_active(),
+        read_only,
     }
 }
 
@@ -241,6 +250,16 @@ fn normal(c: &Context) -> bool {
     c.mode == crate::EditorMode::Normal && !c.aiming
 }
 
+/// NORMAL, and the graph is there to be changed.
+///
+/// The split is between walking and writing: `normal` keeps the four movement
+/// keys and `Tab`, which read the graph and move the caret; this carries the
+/// three that alter it — `i`, `Delete`, and the shove, which is a move of a
+/// node and not of the caret.
+fn editing(c: &Context) -> bool {
+    normal(c) && !c.read_only
+}
+
 /// `Alt` is down and the caret is reading the wiring.
 fn walking(c: &Context) -> bool {
     c.mode == crate::EditorMode::Normal && c.aiming
@@ -266,8 +285,12 @@ fn walking_open(c: &Context) -> bool {
     walking(c) && !on_anchor(c)
 }
 
+/// INSERT, which the read-only mode cannot be in — the switch to it leaves
+/// INSERT on the way. The condition is here anyway: one line covers every
+/// INSERT row at once, and a mode that cannot be entered is cheaper to state
+/// than to rely on.
 fn insert(c: &Context) -> bool {
-    c.mode == crate::EditorMode::Insert
+    c.mode == crate::EditorMode::Insert && !c.read_only
 }
 
 /// INSERT on an anchor: the prompt offers nothing and the keys aim an edge.
@@ -325,6 +348,16 @@ fn always(_: &Context) -> bool {
 /// go back to being about the pointer.
 fn pointing(c: &Context) -> bool {
     !c.drafting
+}
+
+/// The pointer, where it may also change something.
+fn pointing_editing(c: &Context) -> bool {
+    pointing(c) && !c.read_only
+}
+
+/// The camera has the mouse outright, so the gestures need no modifier.
+fn steering(c: &Context) -> bool {
+    c.read_only
 }
 
 fn dragging(c: &Context) -> bool {
@@ -500,7 +533,7 @@ pub static BINDINGS: &[Binding] = &[
         keys: "Ctrl+hjkl \u{2190}\u{2192}\u{2191}\u{2193}",
         says: "shove the node the caret is on",
         group: Group::Move,
-        when: normal,
+        when: editing,
         acts: act_shove,
         once: true,
     },
@@ -583,7 +616,7 @@ pub static BINDINGS: &[Binding] = &[
         keys: "i",
         says: "build, wire or edit what is here",
         group: Group::Mode,
-        when: normal,
+        when: editing,
         // Not `once`: the arm flips the mode and falls through to the rest of
         // the batch, so a repeat resolves against an INSERT context and lands
         // in the prompt as the letter it is.
@@ -594,7 +627,7 @@ pub static BINDINGS: &[Binding] = &[
         keys: "Delete",
         says: "take this node out, its edges too",
         group: Group::Build,
-        when: normal,
+        when: editing,
         acts: act_delete_node,
         once: true,
     },
@@ -772,26 +805,41 @@ pub static BINDINGS: &[Binding] = &[
         keys: "Drag anchor",
         says: "draw an edge to the nearest",
         group: Group::Pointer,
-        when: pointing,
+        when: pointing_editing,
         acts: act_none,
         once: false,
     },
     // Its own row again. It shared one with the click while the bar had no
     // line to spare, and stepping the pick through what stands behind the
     // cursor is not something a reader guesses from a row about clicking.
+    //
+    // Gone under read-only, where the wheel is the camera's zoom outright —
+    // the row beside it says so, and two rows claiming one wheel would be the
+    // drift this table exists to stop.
     Binding {
         keys: "Wheel",
         says: "step the pick deeper behind",
         group: Group::Pointer,
-        when: pointing,
+        when: pointing_editing,
+        acts: act_none,
+        once: false,
+    },
+    // Two rows for one gesture, because the gesture itself differs: in Edit
+    // every mouse button is spoken for and Ctrl is what lends one to the
+    // camera, while in Explore the camera has them outright.
+    Binding {
+        keys: "Drag",
+        says: "orbit \u{2014} right pans, wheel zooms",
+        group: Group::Pointer,
+        when: steering,
         acts: act_none,
         once: false,
     },
     Binding {
         keys: "Ctrl+drag",
-        says: "orbit \u{2014} right drag pans, wheel zooms",
+        says: "orbit \u{2014} right pans, wheel zooms",
         group: Group::Pointer,
-        when: pointing,
+        when: pointing_editing,
         acts: act_none,
         once: false,
     },

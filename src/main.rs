@@ -1398,6 +1398,11 @@ struct ModeToggle(EditorMode);
 #[derive(Component)]
 struct EvalModeLabel;
 
+/// The word inside it. Two things can own the mode now — a run and the camera
+/// — and the word says which, so a sync writes it.
+#[derive(Component)]
+struct EvalModeText;
+
 /// Marker for the INSERT-mode caret faces, which blink instead of standing
 /// still like the NORMAL-mode outline.
 #[derive(Component)]
@@ -1480,6 +1485,20 @@ fn modal_is_open(eval: &EvalState) -> bool {
         eval.phase,
         EvalPhase::ErrorModal(_) | EvalPhase::ConfirmNew | EvalPhase::SourcePrompt { .. }
     )
+}
+
+/// Whether the graph may only be read.
+///
+/// The camera's `Explore` mode is for looking: the mouse steers, and a graph
+/// that changed under a freely flying camera would be a change nobody saw
+/// happen. So the mode that hands over the camera takes the editing away, and
+/// that is not a second setting — it is the same answer read twice.
+///
+/// Derived rather than stored, for the reason `view_entry` is: two truths
+/// about one state drift apart, and this one would drift into a graph that
+/// could be edited in a mode that promised it could not.
+fn exploring(orbit: &camera::OrbitCamera) -> bool {
+    orbit.mode == camera::CameraMode::Free
 }
 
 #[derive(Component)]
@@ -2649,46 +2668,92 @@ struct RunPanel;
 #[derive(Component)]
 struct RunPanelRule;
 
-/// One of the four ways of looking at the program.
+/// What the screen shows: one of the three projections, or nothing of the
+/// editor at all.
 ///
-/// Three of them are camera states and the fourth is not, which is the whole
-/// reason they are one control: what the user is choosing between is *what the
-/// screen shows*, and "everything but the program" belongs in that list beside
-/// "from here" and "from anywhere". The three controls this replaced —
-/// `Camera: bound/free`, a `semi ortho` checkbox and a `Screenshot` button —
-/// spread one question over three widgets and two idioms.
+/// These four used to be one control together with the camera mode, on the
+/// argument that the user is choosing "what the screen shows" and that the
+/// camera belongs in that list. It held until the two answers had to differ:
+/// rotating freely and projecting in parallel are both reasonable and were
+/// unreachable together, because one entry decided both. So the question is
+/// two questions now, and `CameraEntry` is the other.
+///
+/// `Screenshot` stays here rather than moving out with the camera. It is not a
+/// projection either, but it is the same kind of statement — what is left
+/// standing on the screen — and it has nothing to do with who steers.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewEntry {
-    /// The bound camera with the convergence eased in: the oblique picture at
-    /// its usual standoff, depth that converges a little. The default.
+    /// The oblique picture with the convergence eased in. The default.
     Default,
-    /// The bound camera, parallel. The exact picture the layout is specified
-    /// in, and the one to come back to when a measurement has to be read off
-    /// the screen rather than looked at.
-    Ortho,
-    /// The free camera. Orbit, pan and zoom by hand, and the guarantees of the
-    /// bound mode deliberately suspended.
-    Explore,
-    /// Everything the editor draws about itself, gone. Not a camera state at
-    /// all — it changes nothing about where the view is, only what is left
-    /// standing in it.
+    /// The oblique picture, parallel. The one the layout is specified in.
+    Orthographic,
+    /// A real camera's perspective, from the angle the oblique shear implies.
+    /// The one view that also turns the camera, and the reason is in
+    /// `camera::view_angles`.
+    Perspective,
+    /// Everything the editor draws about itself, gone. Not a way of looking at
+    /// the program so much as a way of looking at nothing else.
     Screenshot,
 }
 
 impl ViewEntry {
     const ALL: [ViewEntry; 4] = [
         ViewEntry::Default,
-        ViewEntry::Ortho,
-        ViewEntry::Explore,
+        ViewEntry::Orthographic,
+        ViewEntry::Perspective,
         ViewEntry::Screenshot,
     ];
 
     fn label(self) -> &'static str {
         match self {
             ViewEntry::Default => "Default",
-            ViewEntry::Ortho => "ortho",
-            ViewEntry::Explore => "Explore",
+            ViewEntry::Orthographic => "Orthographic",
+            ViewEntry::Perspective => "Perspective",
             ViewEntry::Screenshot => "Screenshot",
+        }
+    }
+
+    /// The projection this entry stands for. `Screenshot` stands for none —
+    /// it leaves the camera exactly where it is.
+    fn projection(self) -> Option<camera::ViewProjection> {
+        match self {
+            ViewEntry::Default => Some(camera::ViewProjection::Default),
+            ViewEntry::Orthographic => Some(camera::ViewProjection::Orthographic),
+            ViewEntry::Perspective => Some(camera::ViewProjection::Perspective),
+            ViewEntry::Screenshot => None,
+        }
+    }
+}
+
+/// Who steers the camera.
+///
+/// Two purposes rather than two settings: `Edit` keeps the camera on the caret
+/// and the graph in reach, `Explore` hands the camera to the mouse and takes
+/// the graph away. The second half of that is not a side effect — a graph that
+/// changed under a freely flying camera would be a change nobody saw happen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CameraEntry {
+    /// The camera follows the caret. Editing is what this mode is for.
+    Edit,
+    /// Orbit, pan and zoom by hand — and with the mouse busy steering, the
+    /// graph is read-only.
+    Explore,
+}
+
+impl CameraEntry {
+    const ALL: [CameraEntry; 2] = [CameraEntry::Edit, CameraEntry::Explore];
+
+    fn label(self) -> &'static str {
+        match self {
+            CameraEntry::Edit => "Edit",
+            CameraEntry::Explore => "Explore",
+        }
+    }
+
+    fn mode(self) -> camera::CameraMode {
+        match self {
+            CameraEntry::Edit => camera::CameraMode::Bound,
+            CameraEntry::Explore => camera::CameraMode::Free,
         }
     }
 }
@@ -2700,31 +2765,49 @@ impl ViewEntry {
 /// `end_screenshot_mode` clears `entered_at` the answer falls back to whatever
 /// the camera was already doing. A remembered selection would have to be put
 /// back by hand, and would be wrong the first time something else moved it.
-///
-/// `semi_ortho` is only read in the bound mode — `apply_projection` takes the
-/// free branch whole — so the free camera answers `Explore` whatever it is set
-/// to, and carries the value untouched until the user comes back.
 fn view_entry(orbit: &camera::OrbitCamera, screenshot: &ScreenshotMode) -> ViewEntry {
     if screenshot.active() {
         return ViewEntry::Screenshot;
     }
-    match (orbit.mode, orbit.semi_ortho) {
-        (camera::CameraMode::Free, _) => ViewEntry::Explore,
-        (camera::CameraMode::Bound, true) => ViewEntry::Default,
-        (camera::CameraMode::Bound, false) => ViewEntry::Ortho,
+    match orbit.view {
+        camera::ViewProjection::Default => ViewEntry::Default,
+        camera::ViewProjection::Orthographic => ViewEntry::Orthographic,
+        camera::ViewProjection::Perspective => ViewEntry::Perspective,
     }
 }
 
-/// Whether the view list is unfolded.
-#[derive(Resource, Default)]
-struct ViewMenuOpen(bool);
+/// The same for the other question, and derived for the same reason.
+///
+/// Unlike the view, this one has nothing that overrides it: the screenshot
+/// mode hides the chrome and leaves the camera to whoever had it.
+fn camera_entry(orbit: &camera::OrbitCamera) -> CameraEntry {
+    match orbit.mode {
+        camera::CameraMode::Bound => CameraEntry::Edit,
+        camera::CameraMode::Free => CameraEntry::Explore,
+    }
+}
 
-/// The row at the bottom-left holding the view control and the two checkboxes
-/// beside it. Wears `EditorChrome` for everything in it.
+/// Which list, if either, is unfolded.
+///
+/// One resource for two menus rather than a flag each, and that is what makes
+/// the awkward case disappear: with two flags, opening the second list while
+/// the first stands open leaves both open and overlapping, and each handler
+/// would have to know about the other to prevent it. A single answer to "which
+/// one" cannot represent the broken state at all.
+#[derive(Resource, Default, Clone, Copy, PartialEq, Eq)]
+enum MenuOpen {
+    #[default]
+    None,
+    Camera,
+    View,
+}
+
+/// The row at the bottom-left holding the two menus and the three checkboxes
+/// beside them. Wears `EditorChrome` for everything in it.
 #[derive(Component)]
 struct ViewBar;
 
-/// The button that opens the list, and shows what is chosen.
+/// The button that opens the view list, and shows what is chosen.
 #[derive(Component)]
 struct ViewMenuButton;
 
@@ -2737,28 +2820,45 @@ struct ViewMenuLabel;
 #[derive(Component)]
 struct ViewMenuPopup;
 
-/// On every node the list is built from, so the sweep that clears it cannot
-/// reach anything else. The same arrangement `PlayerControlsEntity` has.
+/// On every node the view list is built from, so the sweep that clears it
+/// cannot reach anything else — the camera list least of all, since that one
+/// is built the same way and would go with it.
 #[derive(Component)]
 struct ViewMenuEntity;
 
-/// One row of the list.
+/// One row of the view list.
 #[derive(Component)]
 struct ViewMenuOption(ViewEntry);
 
+/// The same five, for the camera list. Separate types rather than one generic
+/// marker because `trigger_q.single()` has to find exactly one button, and a
+/// shared marker would make it find two and silently open neither.
+#[derive(Component)]
+struct CameraMenuButton;
+
+#[derive(Component)]
+struct CameraMenuLabel;
+
+#[derive(Component)]
+struct CameraMenuPopup;
+
+#[derive(Component)]
+struct CameraMenuEntity;
+
+/// One row of the camera list.
+#[derive(Component)]
+struct CameraMenuOption(CameraEntry);
+
 /// Go to a view.
 ///
-/// The two camera arms are the ones the camera-mode button used to carry, and
-/// they are unchanged: bound to free matches the free camera's distance to the
-/// scale being looked at, so the caret's plane keeps its size and what happens
-/// is the depth opening up rather than a jump; free to bound is a journey back
-/// to the default view and leaves the scale setting alone.
+/// Three of the four are projections and the fourth is the screenshot mode,
+/// which is not a camera state at all and returns before touching one.
 ///
-/// What is new is that the target is *named* rather than toggled to, so coming
-/// back from `Explore` says which of the two bound pictures it is coming back
-/// to. Going *out* to `Explore` leaves `semi_ortho` alone on purpose: the
-/// blend's near half is built from it, so the transition fades out of the
-/// picture that was actually on screen.
+/// The camera is turned with the view, but only in the bound mode. The two
+/// oblique views look straight down the depth axis; the perspective has no
+/// shear to carry the third axis, so it has to be looked at from where the
+/// shear implies a viewer stands, or the depth folds into a point. In the free
+/// mode the angles are the user's and nothing here takes them back.
 #[allow(clippy::too_many_arguments)]
 fn apply_view_entry(
     entry: ViewEntry,
@@ -2770,47 +2870,72 @@ fn apply_view_entry(
     caret: Vec3,
     now: f32,
 ) {
-    if entry == ViewEntry::Screenshot {
+    let Some(projection) = entry.projection() else {
         // Not a camera state: the camera is left exactly where it is, and the
         // rebuild is for the caret, which goes away by not being spawned.
         screenshot.entered_at = Some(now);
         rebuild.0 = true;
         return;
-    }
-    let wanted_semi = match entry {
-        ViewEntry::Default => Some(true),
-        ViewEntry::Ortho => Some(false),
-        // Inert while free, and what the return trip fades out of.
-        ViewEntry::Explore | ViewEntry::Screenshot => None,
     };
-    if let Some(semi) = wanted_semi {
-        orbit.semi_ortho = semi;
-    }
-    let wanted_mode = match entry {
-        ViewEntry::Explore => camera::CameraMode::Free,
-        _ => camera::CameraMode::Bound,
-    };
-    if orbit.mode == wanted_mode {
+    if orbit.view == projection {
         return;
     }
-    match wanted_mode {
-        camera::CameraMode::Free => {
-            let (theta, phi) = camera::oblique_view_angles();
-            let visible_world = height / orbit.cell_pixels;
-            orbit.free_fov = 2.0 * (visible_world * 0.5 / orbit.radius).atan();
-            orbit.mode = camera::CameraMode::Free;
-            tween.to_view(&*orbit, theta, phi, orbit.radius, orbit.target);
-        }
+    // The field of view that keeps the picture the size it already is, worked
+    // out before the view changes and from the standoff that is still in
+    // force. It belongs to the perspective from then on and nothing recomputes
+    // it — the same handover the free camera used to get.
+    if projection == camera::ViewProjection::Perspective {
+        let visible_world = height / orbit.cell_pixels;
+        orbit.free_fov = 2.0 * (visible_world * 0.5 / orbit.radius).atan();
+    }
+    orbit.view = projection;
+    if orbit.mode != camera::CameraMode::Bound {
+        return;
+    }
+    let (theta, phi) = camera::view_angles(projection);
+    let radius = match projection {
+        // The parallel picture is indifferent to the standoff and the shallow
+        // one derives its convergence from it, so both want the bound radius.
+        // The perspective keeps the one it had, which is what the field of
+        // view above was just matched to.
+        camera::ViewProjection::Perspective => orbit.radius,
+        _ => camera::bound_radius(&*orbit, height),
+    };
+    tween.to_view(&*orbit, theta, phi, radius, caret);
+}
+
+/// Hand the camera over, or take it back.
+///
+/// Going free keeps the picture exactly as it stands and only stops following
+/// the caret — there is nothing to travel to, because the view is already the
+/// view. Coming back is a journey to where the current view says the camera
+/// belongs, and it leaves the scale setting alone.
+///
+/// The read-only half of `Explore` is not here: it is a question asked of the
+/// mode by `exploring`, so there is one answer and not a second flag to keep
+/// in step.
+fn apply_camera_entry(
+    entry: CameraEntry,
+    orbit: &mut camera::OrbitCamera,
+    tween: &mut camera::CameraTween,
+    height: f32,
+    caret: Vec3,
+) {
+    let wanted = entry.mode();
+    if orbit.mode == wanted {
+        return;
+    }
+    orbit.mode = wanted;
+    match wanted {
+        // The camera stays where the hand found it; only the leash is off.
+        camera::CameraMode::Free => tween.cancel(),
         camera::CameraMode::Bound => {
-            let radius = camera::bound_radius(&*orbit, height);
-            orbit.mode = camera::CameraMode::Bound;
-            tween.to_view(
-                &*orbit,
-                camera::RESET_THETA,
-                camera::RESET_PHI,
-                radius,
-                caret,
-            );
+            let (theta, phi) = camera::view_angles(orbit.view);
+            let radius = match orbit.view {
+                camera::ViewProjection::Perspective => orbit.radius,
+                _ => camera::bound_radius(&*orbit, height),
+            };
+            tween.to_view(&*orbit, theta, phi, radius, caret);
         }
     }
 }
@@ -2822,6 +2947,11 @@ fn apply_view_entry(
 /// on a row leaves the trigger and the list itself at `None`. Everything that
 /// counts as "inside" is therefore asked before the fall-through, and each of
 /// the three answers returns rather than dropping into the next.
+///
+/// Both menus are folded through one resource, so a press on the other menu's
+/// trigger is not a case this has to know about: that handler writes `Camera`
+/// where this one wrote `View`, and the list that was open simply is not any
+/// more.
 #[allow(clippy::too_many_arguments)]
 fn handle_view_menu_click(
     trigger_q: Query<&Interaction, (Changed<Interaction>, With<ViewMenuButton>)>,
@@ -2831,7 +2961,7 @@ fn handle_view_menu_click(
     windows: Query<&Window>,
     pick: Res<PickState>,
     time: Res<Time>,
-    mut open: ResMut<ViewMenuOpen>,
+    mut open: ResMut<MenuOpen>,
     mut orbit: ResMut<camera::OrbitCamera>,
     mut tween: ResMut<camera::CameraTween>,
     mut screenshot: ResMut<ScreenshotMode>,
@@ -2856,11 +2986,15 @@ fn handle_view_menu_click(
             render::cell_center_world(pick.selected_pos.as_vec3()),
             time.elapsed_secs(),
         );
-        open.0 = false;
+        *open = MenuOpen::None;
         return;
     }
     if trigger_q.iter().any(|i| *i == Interaction::Pressed) {
-        open.0 = !open.0;
+        *open = if *open == MenuOpen::View {
+            MenuOpen::None
+        } else {
+            MenuOpen::View
+        };
         return;
     }
     // The list's own padding is inside it, and a press there is not a press
@@ -2868,9 +3002,143 @@ fn handle_view_menu_click(
     if popup_q.iter().any(|i| *i == Interaction::Pressed) {
         return;
     }
-    if open.0 && mouse.just_pressed(MouseButton::Left) {
-        open.0 = false;
+    if *open == MenuOpen::View && mouse.just_pressed(MouseButton::Left) {
+        *open = MenuOpen::None;
     }
+}
+
+/// The same three questions for the camera list.
+///
+/// Handing the camera to the mouse also takes the graph away, and taking it
+/// away has to be tidy: `leave_insert_mode` is what ends INSERT, drops what
+/// was typed, tears down a draft by either hand and unmakes a node that was
+/// still owed a property. Without it a half-built node would stand in a graph
+/// nothing can finish, and `sync_prompt_seed` would delete it on the next
+/// caret move — quietly, in a mode that promised to change nothing.
+///
+/// A confirmation modal is closed too. `handle_confirm_new_button` has no
+/// guard of its own beyond the one added for this, and a dialogue left
+/// standing across the switch would be a button that wipes the graph in the
+/// read-only mode.
+#[allow(clippy::too_many_arguments)]
+fn handle_camera_menu_click(
+    trigger_q: Query<&Interaction, (Changed<Interaction>, With<CameraMenuButton>)>,
+    popup_q: Query<&Interaction, (Changed<Interaction>, With<CameraMenuPopup>)>,
+    option_q: Query<(&Interaction, &CameraMenuOption), Changed<Interaction>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window>,
+    mut open: ResMut<MenuOpen>,
+    mut orbit: ResMut<camera::OrbitCamera>,
+    mut tween: ResMut<camera::CameraTween>,
+    mut eval: ResMut<EvalState>,
+    mut state: ResMut<GraphState>,
+    mut pick: ResMut<PickState>,
+    mut prompt: ResMut<InsertPrompt>,
+    mut pending: ResMut<PendingNode>,
+    mut draft: ResMut<DraftState>,
+    mut mode: ResMut<EditorMode>,
+    mut rebuild: ResMut<NeedsRebuild>,
+) {
+    if let Some(entry) = option_q
+        .iter()
+        .find(|(interaction, _)| **interaction == Interaction::Pressed)
+        .map(|(_, option)| option.0)
+    {
+        if entry == CameraEntry::Explore {
+            leave_insert_mode(
+                &mut state,
+                &mut pick,
+                &mut prompt,
+                &mut pending,
+                &mut draft,
+                &mut mode,
+                &mut rebuild,
+            );
+            if matches!(eval.phase, EvalPhase::ConfirmNew) {
+                eval.phase = EvalPhase::Idle;
+            }
+        }
+        let height = windows
+            .single()
+            .map(|window| window.height())
+            .unwrap_or(1080.0);
+        apply_camera_entry(
+            entry,
+            &mut orbit,
+            &mut tween,
+            height,
+            render::cell_center_world(pick.selected_pos.as_vec3()),
+        );
+        *open = MenuOpen::None;
+        return;
+    }
+    if trigger_q.iter().any(|i| *i == Interaction::Pressed) {
+        *open = if *open == MenuOpen::Camera {
+            MenuOpen::None
+        } else {
+            MenuOpen::Camera
+        };
+        return;
+    }
+    if popup_q.iter().any(|i| *i == Interaction::Pressed) {
+        return;
+    }
+    if *open == MenuOpen::Camera && mouse.just_pressed(MouseButton::Left) {
+        *open = MenuOpen::None;
+    }
+}
+
+/// The node a menu's list stands in.
+///
+/// A child of the trigger, opening upward — the bar sits on the bottom edge
+/// and there is no room below it.
+fn menu_popup_node() -> Node {
+    Node {
+        position_type: PositionType::Absolute,
+        left: Val::Px(0.0),
+        bottom: Val::Percent(100.0),
+        margin: UiRect::bottom(Val::Px(6.0)),
+        min_width: Val::Percent(100.0),
+        flex_direction: FlexDirection::Column,
+        padding: UiRect::all(Val::Px(2.0)),
+        border_radius: BorderRadius::all(Val::Px(4.0)),
+        border: UiRect::all(Val::Px(1.0)),
+        ..default()
+    }
+}
+
+/// The look of one row, and the ink its text takes.
+///
+/// The chosen row rests lit, so its hover has to lift from *there* rather than
+/// from nothing: a painter that sent it back to transparent would unchoose it
+/// on the way out.
+fn menu_row_look(chosen: bool) -> (impl Bundle, Color) {
+    let rest = if chosen { ROW_HOT } else { FILL_NONE };
+    let ink_rest = if chosen { INK_BRIGHT } else { INK_DIM };
+    (
+        (
+            Node {
+                padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
+                border_radius: BorderRadius::all(Val::Px(3.0)),
+                ..default()
+            },
+            BackgroundColor(rest),
+            HoverFill {
+                rest,
+                hot: if chosen {
+                    Color::srgba(0.26, 0.26, 0.36, 0.95)
+                } else {
+                    ROW_HOT
+                },
+            },
+            HoverInk {
+                rest: ink_rest,
+                hot: INK_BRIGHT,
+            },
+            Button,
+        ),
+        ink_rest,
+    )
 }
 
 /// Write the trigger's caption, and build or clear the list.
@@ -2883,14 +3151,14 @@ fn handle_view_menu_click(
 /// not there cannot be revealed. `PlayerControls` holds its row the same way.
 fn sync_view_menu(
     mut commands: Commands,
-    open: Res<ViewMenuOpen>,
+    open: Res<MenuOpen>,
     orbit: Res<camera::OrbitCamera>,
     screenshot: Res<ScreenshotMode>,
     ui_font: Res<UiFont>,
     trigger_q: Query<Entity, With<ViewMenuButton>>,
     content_q: Query<Entity, With<ViewMenuEntity>>,
     mut label_q: Query<&mut Text, With<ViewMenuLabel>>,
-    mut cache: Local<Option<(bool, bool, bool, bool)>>,
+    mut cache: Local<Option<(bool, ViewEntry)>>,
 ) {
     let current = view_entry(&orbit, &screenshot);
     let caption = format!("View: {} \u{25BE}", current.label());
@@ -2900,14 +3168,10 @@ fn sync_view_menu(
         }
     }
 
-    // `ViewEntry` is not hashable and there are four of them, so the latch is
-    // the open flag beside the three bits that decide which row is lit.
-    let fp = (
-        open.0,
-        orbit.mode == camera::CameraMode::Free,
-        orbit.semi_ortho,
-        screenshot.active(),
-    );
+    // Whether this list is unfolded, and which row is lit. `ViewEntry` is
+    // `PartialEq` but not `Hash`, which is all a latch needs.
+    let unfolded = *open == MenuOpen::View;
+    let fp = (unfolded, current);
     if *cache == Some(fp) {
         return;
     }
@@ -2916,30 +3180,17 @@ fn sync_view_menu(
     for e in content_q.iter() {
         commands.entity(e).despawn();
     }
-    if !open.0 {
+    if !unfolded {
         return;
     }
     let Ok(trigger) = trigger_q.single() else {
         return;
     };
-    let font = &ui_font.0;
+    let font = ui_font.0.clone();
     commands.entity(trigger).with_children(|parent| {
         parent
             .spawn((
-                Node {
-                    position_type: PositionType::Absolute,
-                    left: Val::Px(0.0),
-                    // Standing on the trigger's top edge, opening upward —
-                    // there is no room below it.
-                    bottom: Val::Percent(100.0),
-                    margin: UiRect::bottom(Val::Px(6.0)),
-                    min_width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Column,
-                    padding: UiRect::all(Val::Px(2.0)),
-                    border_radius: BorderRadius::all(Val::Px(4.0)),
-                    border: UiRect::all(Val::Px(1.0)),
-                    ..default()
-                },
+                menu_popup_node(),
                 BackgroundColor(Color::srgba(0.08, 0.08, 0.14, 0.98)),
                 BorderColor::all(Color::srgb(0.25, 0.25, 0.4)),
                 // Above everything that stacks by spawn order — the run panel
@@ -2952,53 +3203,83 @@ fn sync_view_menu(
             ))
             .with_children(|list| {
                 for entry in ViewEntry::ALL {
-                    let chosen = entry == current;
-                    // The chosen row rests lit, so its hover has to lift from
-                    // *there* rather than from nothing: a painter that sent it
-                    // back to transparent would unchoose it on the way out.
-                    let rest = if chosen { ROW_HOT } else { FILL_NONE };
-                    let ink_rest = if chosen { INK_BRIGHT } else { INK_DIM };
-                    list.spawn((
-                        Node {
-                            padding: UiRect::axes(Val::Px(8.0), Val::Px(4.0)),
-                            border_radius: BorderRadius::all(Val::Px(3.0)),
-                            ..default()
-                        },
-                        BackgroundColor(rest),
-                        HoverFill {
-                            rest,
-                            hot: if chosen {
-                                Color::srgba(0.26, 0.26, 0.36, 0.95)
-                            } else {
-                                ROW_HOT
-                            },
-                        },
-                        HoverInk {
-                            rest: ink_rest,
-                            hot: INK_BRIGHT,
-                        },
-                        Button,
-                        ViewMenuOption(entry),
-                        ViewMenuEntity,
-                    ))
-                    .with_children(|row| {
-                        row.spawn((
-                            Text::new(entry.label()),
-                            text_font(font, 14.0),
-                            TextColor(ink_rest),
-                        ));
-                    });
+                    let (look, ink) = menu_row_look(entry == current);
+                    list.spawn((look, ViewMenuOption(entry), ViewMenuEntity))
+                        .with_children(|row| {
+                            row.spawn((
+                                Text::new(entry.label()),
+                                text_font(&font, 14.0),
+                                TextColor(ink),
+                            ));
+                        });
                 }
             });
     });
 }
 
-/// The bottom-left row: how to look, and how much to look at.
-///
-/// Both are about the picture rather than about the program, which is why they
-/// stand together and why neither is near the run controls. A flex row rather
-/// than two corner addresses, so the widths settle themselves — the view
-/// caption changes length as the entry does.
+/// The same, for the camera list.
+fn sync_camera_menu(
+    mut commands: Commands,
+    open: Res<MenuOpen>,
+    orbit: Res<camera::OrbitCamera>,
+    ui_font: Res<UiFont>,
+    trigger_q: Query<Entity, With<CameraMenuButton>>,
+    content_q: Query<Entity, With<CameraMenuEntity>>,
+    mut label_q: Query<&mut Text, With<CameraMenuLabel>>,
+    mut cache: Local<Option<(bool, CameraEntry)>>,
+) {
+    let current = camera_entry(&orbit);
+    let caption = format!("Camera: {} \u{25BE}", current.label());
+    for mut text in label_q.iter_mut() {
+        if text.0 != caption {
+            text.0 = caption.clone();
+        }
+    }
+
+    let unfolded = *open == MenuOpen::Camera;
+    let fp = (unfolded, current);
+    if *cache == Some(fp) {
+        return;
+    }
+    *cache = Some(fp);
+
+    for e in content_q.iter() {
+        commands.entity(e).despawn();
+    }
+    if !unfolded {
+        return;
+    }
+    let Ok(trigger) = trigger_q.single() else {
+        return;
+    };
+    let font = ui_font.0.clone();
+    commands.entity(trigger).with_children(|parent| {
+        parent
+            .spawn((
+                menu_popup_node(),
+                BackgroundColor(Color::srgba(0.08, 0.08, 0.14, 0.98)),
+                BorderColor::all(Color::srgb(0.25, 0.25, 0.4)),
+                GlobalZIndex(10),
+                Button,
+                CameraMenuPopup,
+                CameraMenuEntity,
+            ))
+            .with_children(|list| {
+                for entry in CameraEntry::ALL {
+                    let (look, ink) = menu_row_look(entry == current);
+                    list.spawn((look, CameraMenuOption(entry), CameraMenuEntity))
+                        .with_children(|row| {
+                            row.spawn((
+                                Text::new(entry.label()),
+                                text_font(&font, 14.0),
+                                TextColor(ink),
+                            ));
+                        });
+                }
+            });
+    });
+}
+
 fn spawn_view_bar(mut commands: Commands, ui_font: Res<UiFont>) {
     let font = ui_font.0.clone();
     commands
@@ -3016,32 +3297,46 @@ fn spawn_view_bar(mut commands: Commands, ui_font: Res<UiFont>) {
             EditorChrome,
         ))
         .with_children(|bar| {
-            bar.spawn((
-                Button,
-                Node {
-                    padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
-                    border_radius: BorderRadius::all(Val::Px(6.0)),
-                    ..default()
-                },
-                BackgroundColor(CONTROL_REST),
-                HoverFill {
-                    rest: CONTROL_REST,
-                    hot: CONTROL_HOT,
-                },
-                HoverInk {
-                    rest: INK_DIM,
-                    hot: INK_BRIGHT,
-                },
-                ViewMenuButton,
-            ))
-            .with_children(|button| {
-                button.spawn((
-                    Text::new("View: Default \u{25BE}"),
-                    text_font(&font, 14.0),
-                    TextColor(INK_DIM),
-                    ViewMenuLabel,
-                ));
-            });
+            let trigger = || {
+                (
+                    Button,
+                    Node {
+                        padding: UiRect::axes(Val::Px(14.0), Val::Px(8.0)),
+                        border_radius: BorderRadius::all(Val::Px(6.0)),
+                        ..default()
+                    },
+                    BackgroundColor(CONTROL_REST),
+                    HoverFill {
+                        rest: CONTROL_REST,
+                        hot: CONTROL_HOT,
+                    },
+                    HoverInk {
+                        rest: INK_DIM,
+                        hot: INK_BRIGHT,
+                    },
+                )
+            };
+            // Who steers first, then what is drawn: the camera decides whether
+            // the graph can be touched at all, which is the larger of the two
+            // answers.
+            bar.spawn((trigger(), CameraMenuButton))
+                .with_children(|button| {
+                    button.spawn((
+                        Text::new("Camera: Edit \u{25BE}"),
+                        text_font(&font, 14.0),
+                        TextColor(INK_DIM),
+                        CameraMenuLabel,
+                    ));
+                });
+            bar.spawn((trigger(), ViewMenuButton))
+                .with_children(|button| {
+                    button.spawn((
+                        Text::new("View: Default \u{25BE}"),
+                        text_font(&font, 14.0),
+                        TextColor(INK_DIM),
+                        ViewMenuLabel,
+                    ));
+                });
             spawn_inline_checkbox(
                 bar,
                 &font,
@@ -3681,6 +3976,7 @@ fn apply_prompt_action(
 fn handle_mode_toggle(
     interaction_q: Query<(&Interaction, &ModeToggle), Changed<Interaction>>,
     eval: Res<EvalState>,
+    orbit: Res<camera::OrbitCamera>,
     mut state: ResMut<GraphState>,
     mut pick: ResMut<PickState>,
     mut prompt: ResMut<InsertPrompt>,
@@ -3689,7 +3985,7 @@ fn handle_mode_toggle(
     mut mode: ResMut<EditorMode>,
     mut rebuild: ResMut<NeedsRebuild>,
 ) {
-    if is_evaluating(&eval) {
+    if is_evaluating(&eval) || exploring(&orbit) {
         return;
     }
     for (interaction, toggle) in interaction_q.iter() {
@@ -3725,6 +4021,7 @@ fn handle_mode_toggle(
 fn handle_insert_prompt_click(
     interaction_q: Query<(&Interaction, &InsertPromptOption), Changed<Interaction>>,
     eval: Res<EvalState>,
+    orbit: Res<camera::OrbitCamera>,
     mut state: ResMut<GraphState>,
     // Written, not read: a kind that comes into the world unfinished moves the
     // caret onto the cell that finishes it.
@@ -3734,7 +4031,7 @@ fn handle_insert_prompt_click(
     mut mode: ResMut<EditorMode>,
     mut rebuild: ResMut<NeedsRebuild>,
 ) {
-    if is_evaluating(&eval) {
+    if is_evaluating(&eval) || exploring(&orbit) {
         return;
     }
     for (interaction, option) in interaction_q.iter() {
@@ -5286,8 +5583,9 @@ fn modal_button() -> impl Bundle {
 fn handle_new_button(
     interaction_q: Query<&Interaction, (Changed<Interaction>, With<NewButton>)>,
     mut eval: ResMut<EvalState>,
+    orbit: Res<camera::OrbitCamera>,
 ) {
-    if is_evaluating(&eval) {
+    if is_evaluating(&eval) || exploring(&orbit) {
         return;
     }
     if interaction_q.iter().any(|i| *i == Interaction::Pressed) {
@@ -5346,7 +5644,17 @@ fn handle_confirm_new_button(
     mut rebuild: ResMut<NeedsRebuild>,
     mut pick: ResMut<PickState>,
     mut eval: ResMut<EvalState>,
+    orbit: Res<camera::OrbitCamera>,
 ) {
+    // It had no guard until the read-only mode arrived, and did not need one:
+    // the button only exists while the modal stands, and `handle_new_button`
+    // refuses to open that modal while a run owns the graph. A modal left
+    // standing across a switch to `Explore` is the case that breaks the
+    // argument — the switch closes it, and this refuses it too, because a
+    // guarantee resting on nobody reaching the button is not a guarantee.
+    if exploring(&orbit) {
+        return;
+    }
     for interaction in interaction_q.iter() {
         if *interaction != Interaction::Pressed {
             continue;
@@ -8188,6 +8496,7 @@ fn spawn_mode_display(mut commands: Commands, ui_font: Res<UiFont>) {
                     Text::new("EVALUATE"),
                     text_font(&ui_font.0, 14.0),
                     TextColor(Color::srgb(0.85, 0.85, 0.9)),
+                    EvalModeText,
                 ));
             });
         });
@@ -8410,6 +8719,7 @@ fn sync_which_key(
     prompt: Res<InsertPrompt>,
     draft: Res<DraftState>,
     keys: Res<ButtonInput<KeyCode>>,
+    orbit: Res<camera::OrbitCamera>,
     open: Res<WhichKeyOpen>,
     time: Res<Time>,
     ui_font: Res<UiFont>,
@@ -8419,7 +8729,15 @@ fn sync_which_key(
     content_q: Query<Entity, With<WhichKeyEntity>>,
     mut cache: Local<WhichKeyFingerprint>,
 ) {
-    let context = keymap::context(*mode, &state, &pick, &prompt, &draft, alt_held(&keys));
+    let context = keymap::context(
+        *mode,
+        &state,
+        &pick,
+        &prompt,
+        &draft,
+        alt_held(&keys),
+        exploring(&orbit),
+    );
     let mode_word = match *mode {
         EditorMode::Normal => "NORMAL",
         EditorMode::Insert => "INSERT",
@@ -8733,16 +9051,34 @@ fn sync_mode_toggles(
         Without<EvalModeLabel>,
     >,
     mut eval_label_q: Query<&mut Node, With<EvalModeLabel>>,
+    mut eval_text_q: Query<&mut Text, With<EvalModeText>>,
     mut text_color_q: Query<&mut TextColor>,
+    orbit: Res<camera::OrbitCamera>,
 ) {
     // An evaluation owns the graph, so it owns the mode with it: neither half
     // is offered, and the word that stands there instead says whose it is.
-    let evaluating = is_evaluating(&eval);
+    // Exploring owns it for the other reason — the graph is read-only, so
+    // there is no mode to be in — and says so in the same place.
+    let taken = if is_evaluating(&eval) {
+        Some("EVALUATE")
+    } else if exploring(&orbit) {
+        Some("EXPLORE")
+    } else {
+        None
+    };
+    let evaluating = taken.is_some();
     let halves = if evaluating {
         Display::None
     } else {
         Display::Flex
     };
+    if let Some(word) = taken {
+        for mut text in eval_text_q.iter_mut() {
+            if text.0 != word {
+                text.0 = word.to_string();
+            }
+        }
+    }
     for (toggle, interaction, mut node, mut bg, children) in toggle_q.iter_mut() {
         if node.display != halves {
             node.display = halves;
@@ -8890,6 +9226,7 @@ fn pick_cells(
     mut pick: ResMut<PickState>,
     index: Res<PickIndex>,
     eval: Res<EvalState>,
+    orbit: Res<camera::OrbitCamera>,
     ui_interactions: Query<&Interaction, With<Button>>,
     mut rebuild: ResMut<NeedsRebuild>,
     mut last_cursor: Local<Option<Vec2>>,
@@ -8907,9 +9244,14 @@ fn pick_cells(
             bevy::input::mouse::MouseScrollUnit::Pixel => ev.y * 0.01,
         };
     }
-    // Ctrl is the camera's. Dropping the accumulator rather than keeping it
-    // means a zoom does not leave a step behind to be taken later.
-    if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
+    // The wheel is the camera's under Ctrl, and in `Explore` outright — there
+    // it zooms with no modifier, so stepping the pick would be two answers to
+    // one turn. Dropping the accumulator rather than keeping it means a zoom
+    // does not leave a step behind to be taken later.
+    let camera_has_wheel = exploring(&orbit)
+        || keys.pressed(KeyCode::ControlLeft)
+        || keys.pressed(KeyCode::ControlRight);
+    if camera_has_wheel {
         *wheel_acc = 0.0;
     } else {
         *wheel_acc += scrolled;
@@ -9247,6 +9589,7 @@ fn sync_prompt_seed(
     mut rebuild: ResMut<NeedsRebuild>,
     mut draft: ResMut<DraftState>,
     clipping: Res<lod::Clipping>,
+    orbit: Res<camera::OrbitCamera>,
     mut last: Local<Option<(EditorMode, InsertTarget)>>,
 ) {
     let mut target = insert_target(&state, &pick);
@@ -9272,7 +9615,13 @@ fn sync_prompt_seed(
         Some(edit) => addressed_cell(&state, &pick).is_some_and(|(id, _)| id == edit.node),
         None => false,
     };
-    if !pending_here {
+    // Not while the graph is read-only. This is the one mutation in the whole
+    // editor that no input asks for — it follows a caret move, and the caret
+    // still moves in `Explore`. The switch itself resolves a placeholder
+    // standing at the time (`leave_insert_mode`), so what this guard covers is
+    // one arriving afterwards: none, by construction, and this is what keeps
+    // it so.
+    if !pending_here && !exploring(&orbit) {
         if let Some(edit) = pending.0.take() {
             if remove_node(&mut state, &edit.node) {
                 rebuild.0 = true;
@@ -9554,6 +9903,7 @@ fn handle_editor_keys(
     mut rebuild: ResMut<NeedsRebuild>,
     mut draft: ResMut<DraftState>,
     clipping: Res<lod::Clipping>,
+    orbit: Res<camera::OrbitCamera>,
 ) {
     let captured = keyboard_captured(&text_inputs, &eval);
     let mods = keymap::Mods {
@@ -9593,7 +9943,15 @@ fn handle_editor_keys(
         // gives it to the list, and `i` changes the mode for everything
         // behind it in the same batch. A context hoisted out of this loop
         // would answer every key in a burst with the state the burst began in.
-        let context = keymap::context(*mode, &state, &pick, &prompt, &draft, aiming);
+        let context = keymap::context(
+            *mode,
+            &state,
+            &pick,
+            &prompt,
+            &draft,
+            aiming,
+            exploring(&orbit),
+        );
         let Some((action, binding)) = keymap::resolve(&context, &ev.logical_key, mods) else {
             continue;
         };
@@ -10117,6 +10475,7 @@ fn handle_arrow_keys(
     mode: Res<EditorMode>,
     prompt: Res<InsertPrompt>,
     draft: Res<DraftState>,
+    orbit: Res<camera::OrbitCamera>,
 ) {
     // INSERT mode freezes the caret: the keys belong to NORMAL, and moving
     // a node (Ctrl+key) is a NORMAL operation too. The letters are dropped
@@ -10180,7 +10539,15 @@ fn handle_arrow_keys(
         return;
     };
     // `Alt` is off by the guard above, so the context is NORMAL's.
-    let context = keymap::context(*mode, &state, &pick, &prompt, &draft, false);
+    let context = keymap::context(
+        *mode,
+        &state,
+        &pick,
+        &prompt,
+        &draft,
+        false,
+        exploring(&orbit),
+    );
     let shoving = match keymap::resolve(&context, &struck, mods) {
         Some((keymap::Action::ShoveNode, _)) => true,
         Some((keymap::Action::CaretStep, _)) => false,
@@ -10554,6 +10921,7 @@ fn handle_edge_hop_keys(
     clipping: Res<lod::Clipping>,
     prompt: Res<InsertPrompt>,
     draft: Res<DraftState>,
+    orbit: Res<camera::OrbitCamera>,
 ) {
     // The gates the caret's own keys go through, and the key itself. A run
     // owns the graph, INSERT owns the keyboard, a focused field owns the
@@ -10609,7 +10977,15 @@ fn handle_edge_hop_keys(
     // `None` is also the ordinary case — `Alt` held with nothing struck — and
     // the reach below reads it as the request for a preview that it is.
     let direction = arrow.or(letter).and_then(|struck| {
-        let context = keymap::context(*mode, &state, &pick, &prompt, &draft, true);
+        let context = keymap::context(
+            *mode,
+            &state,
+            &pick,
+            &prompt,
+            &draft,
+            true,
+            exploring(&orbit),
+        );
         let mods = keymap::Mods { shift, ctrl: false };
         matches!(
             keymap::resolve(&context, &struck, mods),
@@ -11226,8 +11602,9 @@ fn drag_start_system(
     mut rebuild: ResMut<NeedsRebuild>,
     state: Res<GraphState>,
     eval: Res<EvalState>,
+    orbit: Res<camera::OrbitCamera>,
 ) {
-    if is_evaluating(&eval) || modal_is_open(&eval) {
+    if is_evaluating(&eval) || modal_is_open(&eval) || exploring(&orbit) {
         return;
     }
     if !mouse.just_pressed(MouseButton::Left) {
@@ -11273,11 +11650,12 @@ fn drag_update_system(
     mut draft: ResMut<DraftState>,
     mut rebuild: ResMut<NeedsRebuild>,
     eval: Res<EvalState>,
+    orbit: Res<camera::OrbitCamera>,
     state: Res<GraphState>,
     pick: Res<PickState>,
     clipping: Res<lod::Clipping>,
 ) {
-    if is_evaluating(&eval) {
+    if is_evaluating(&eval) || exploring(&orbit) {
         return;
     }
     let Some(ref mut info) = draft.active else {
@@ -11464,8 +11842,9 @@ fn drag_end_system(
     mut rebuild: ResMut<NeedsRebuild>,
     mut state: ResMut<GraphState>,
     eval: Res<EvalState>,
+    orbit: Res<camera::OrbitCamera>,
 ) {
-    if is_evaluating(&eval) {
+    if is_evaluating(&eval) || exploring(&orbit) {
         if draft.active.take().is_some() {
             rebuild.0 = true;
         }
@@ -11531,7 +11910,7 @@ fn main() {
         .init_resource::<guide::Guides>()
         .init_resource::<Diagnostics>()
         .init_resource::<DiagnosticsOpen>()
-        .init_resource::<ViewMenuOpen>()
+        .init_resource::<MenuOpen>()
         .init_resource::<WhichKeyOpen>()
         .add_systems(
             Startup,
@@ -11684,6 +12063,7 @@ fn main() {
                 // Chained: the click folds or unfolds the list, and the sync
                 // that draws it has to see the fold in the same frame.
                 (handle_view_menu_click, sync_view_menu).chain(),
+                (handle_camera_menu_click, sync_camera_menu).chain(),
                 // Chained for the same reason: a handler runs before the sync
                 // that reads what it wrote.
                 (handle_clipping_checkbox, sync_clipping_checkbox).chain(),
