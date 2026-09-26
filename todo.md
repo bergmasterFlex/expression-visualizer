@@ -27,41 +27,56 @@ Gefunden beim vollständigen Gegenlesen von Code gegen `03-concept-design.tex`
 
 ### Wie es ist
 
-`LayoutGraph::grid_bounds()` (`src/layout.rs:2758`) **leitet** die Ausdehnung ab:
+**Teilweise nachgezogen am 26.09. (1.1).** Die Ausdehnung ist jetzt gespeichert —
+`LayoutGraph::extent: IVec3` — und `grid_bounds()` liest Z daraus, statt sie aus dem Sink
+abzuleiten. Was bleibt, ist der X/Y-Teil derselben Ableitung:
 
 ```rust
-let mut max = IVec3::new(self.reserved_max.x, self.reserved_max.y, sink_z);
+// src/layout.rs, grid_bounds()
+self.sink_id()?;             // no Sink, no volume
+let mut max = self.extent;   // Z is read, not derived
 for id in self.layout_nodes.keys() {
     let Some(fp) = self.node_footprint(id) else { continue };
-    max.x = max.x.max(fp.max.x);
-    max.y = max.y.max(fp.max.y);
+    max.x = max.x.max(fp.max.x);   // <- still a lower bound
+    max.y = max.y.max(fp.max.y);   // <- still a lower bound
 }
 ```
 
-Daraus folgt dreierlei, und jedes davon ist die Abweichung:
+Davon ist erledigt und davon steht noch:
 
-- **`reserved_max` ist eine Untergrenze, keine Schranke.** Es merkt sich nur, was ein expliziter
-  Insert geöffnet hat, und begrenzt nichts. Ein Knoten, dessen Footprint darüber hinausreicht,
-  weitet das Volumen stillschweigend.
-- **Z ist überhaupt nicht gespeichert**, sondern wird aus der Z des Sinks gelesen. Die Tiefe des
-  Volumens ist damit eine Eigenschaft eines Knotens und nicht des Volumens.
-- **Der Verdrängungslauf weitet als Nebenwirkung.** `move_node_delta` (`src/layout.rs:1362`)
-  klemmt bei 0 und verweigert Züge auf die Quellreihe und auf die Sink-Reihe, aber auf der
-  *fernen* X/Y-Seite begrenzt ihn nichts. Ein von `settle_footprints` hinausgedrängter Knoten
-  vergrössert also das Volumen, ohne dass jemand darum gebeten hätte.
-- Der Doc-Kommentar zu `clamp_to_volume` (`src/layout.rs:2782`) sagt es selbst, nur als
-  Feststellung statt als Befund: *„the volume follows the nodes"*. Genau das soll es nicht.
+- **`extent` ist auf X/Y eine Untergrenze, keine Schranke.** Es merkt sich, was ein expliziter
+  Insert geöffnet hat, und begrenzt auf diesen beiden Achsen nichts: ein Knoten, dessen Footprint
+  darüber hinausreicht, weitet das Volumen stillschweigend. Offen, siehe 1.2.
+- ~~**Z ist überhaupt nicht gespeichert**, sondern wird aus der Z des Sinks gelesen.~~ Erledigt.
+  Die Tiefe ist eine Eigenschaft des Volumens; der Sink *sitzt* auf der letzten Ebene, und jeder
+  Weg, der ihn bewegt (`plus_empty_layer`, `settle_sink`, `harmonize_match_sinks`), schreibt
+  `extent.z` mit.
+- **Der Verdrängungslauf weitet als Nebenwirkung.** `move_node_delta` klemmt bei 0 und verweigert
+  Züge auf die Quellreihe und auf die Sink-Reihe, aber auf der *fernen* X/Y-Seite begrenzt ihn
+  nichts. Ein von `settle_footprints` hinausgedrängter Knoten vergrössert also das Volumen, ohne
+  dass jemand darum gebeten hätte. Offen, siehe 1.5.
+- Der Doc-Kommentar zu `clamp_to_volume` sagte es selbst, nur als Feststellung statt als Befund:
+  *„the volume follows the nodes"*. Er sagt jetzt, auf welcher Achse das noch gilt und wo der
+  Punkt dazu steht.
 
 ### Zu tun
 
-- [ ] `reserved_max: IVec2` → eine gespeicherte Ausdehnung auf allen drei Achsen (Vorschlag:
-      `extent: IVec3`, inklusives Maximum; `min` bleibt der Ursprung und ist ohnehin fix).
+- [x] `reserved_max: IVec2` → `extent: IVec3`, inklusives Maximum; `min` bleibt der Ursprung
+      und ist ohnehin fix. Erledigt am 26.09.
 - [ ] `grid_bounds()` gibt diese Ausdehnung **zurück**, statt sie über die Footprints zu maximieren.
-- [ ] Z aus der Ausdehnung lesen statt aus dem Sink. Der Sink *sitzt* dann auf der letzten Reihe,
-      statt sie zu *definieren* — `settle_sink` zieht ihn dorthin, weitet aber nicht mehr.
+      Gilt nur noch für X/Y — Z kommt seit 1.1 aus `extent`. Die Stelle ist zwei Zeilen
+      (`src/layout.rs`, `grid_bounds`), aber sie braucht 1.5 und 1.6 mit, sonst stehen Knoten
+      ausserhalb ihres eigenen Volumens und sind nicht mehr adressierbar.
+- [x] Z aus der Ausdehnung lesen statt aus dem Sink. Der Sink *sitzt* jetzt auf der letzten Reihe,
+      statt sie zu *definieren*. Erledigt am 26.09. — `grid_bounds` liest `extent.z` und fragt den
+      Sink nur noch, *ob* es einen gibt; `plus_empty_layer`, `settle_sink` und
+      `harmonize_match_sinks` schreiben `extent.z` mit, wenn sie den Sink bewegen.
 - [ ] Jede Stelle, die heute implizit weitet, explizit machen: Knoten anlegen, `plus_empty_cell`,
       `plus_empty_slab`, `plus_arm_row`. Die drei Insert-Wege schreiben `extent` ohnehin schon
       teilweise fort — sie müssen es künftig für alle drei Achsen und als einzige tun.
+      **Seit 1.1 ist die verbleibende implizite Weitung genau eine Zuweisung:** `settle_sink`
+      schreibt `extent.z`, wenn ein tief gebauter Knoten den Sink nach hinten zieht. Der Kommentar
+      dort zeigt auf diesen Punkt.
 - [ ] `move_node_delta` gegen die Ausdehnung klemmen, nicht nur gegen den Ursprung.
 - [ ] **Entscheiden und festhalten: was passiert, wenn eine Kaskade nirgendwo hin kann?**
       Der Plan wird heute schon als Ganzes verworfen, wenn ein Zug über den Ursprung hinausführt
@@ -194,7 +209,7 @@ späterer kann einen früheren erneut stören. Das Ergebnis kann damit im Prinzi
 Hash-Iterationsreihenfolge abhängen.
 
 Dass es ein Versehen ist und keine Haltung, zeigt der Kontrast: `lint.rs` sortiert seine Ids,
-`source_order` sortiert mit `total_cmp` samt Id-Tiebreak, `hop_candidates`, `reachable_anchors`
+`source_order` sortiert samt Id-Tiebreak, `hop_candidates`, `reachable_anchors`
 und `create_candidates` sortieren ebenfalls — und jede dieser Stellen begründet es im Kommentar.
 
 ### Zu tun
@@ -212,10 +227,12 @@ und `create_candidates` sortieren ebenfalls — und jede dieser Stellen begründ
 ## 7. [!] `LayoutNode::pos` ist `Vec3`, sollte aber eine Zelladresse sein
 
 Aufgefallen am 23.09.\ beim Zeichnen der Datenstruktur für Abbildung 4.2: der Autor ging davon aus,
-dass die Position ganzzahlig ist. Sie ist es nicht.
+dass die Position ganzzahlig ist. Sie war es nicht.
+
+**Erledigt am 26.09.** Der Befund, wie er stand:
 
 ```rust
-// src/layout.rs:100
+// src/layout.rs, vor dem 26.09.
 pub struct LayoutNode {
     pub node_id: crate::model::node::Id,
     pub pos: Vec3,          // <- f32 x 3
@@ -223,6 +240,12 @@ pub struct LayoutNode {
     pub gap_above: i32,
 }
 ```
+
+`pos` ist jetzt `IVec3`, und `gap_above` bleibt genau da, wo es ist: eine Arm-Zeile wird von
+`respace_match_patterns` *abgeleitet* (erste Zeile fest, dann je Arm `+ gap_above`
+`+ branch_row_height`), also ist `pos.y` eines Patterns eine Antwort. Den erklärten Weissraum aus
+dem Abstand zweier Zeilen zurückzulesen hiesse, die Frage aus der Antwort zu stellen — und ein
+Zweig, der in die Lücke wächst, frisst sie dann auf und gibt sie beim Schrumpfen nicht zurück.
 
 **Der Widerspruch steht im selben `struct`:** `shape` adressiert Zellen mit `IVec3`, `pos` mit
 `Vec3`. Jede Stelle, die aus `pos` eine Adresse braucht, rundet — `ln.pos.round().as_ivec3()`
@@ -238,13 +261,25 @@ die Kanonizität des Layouts (§6) wackliger, als sie sein müsste.
 
 ### Zu tun
 
-- [ ] `pos: Vec3` → `pos: IVec3`, und die `round().as_ivec3()`-Aufrufe entfallen lassen.
-- [ ] Dabei prüfen, ob irgendwo eine Zwischenposition gebraucht wird — falls ja, gehört sie in die
-      Darstellung und nicht in das Layout.
+- [x] `pos: Vec3` → `pos: IVec3`, und die `round().as_ivec3()`-Aufrufe entfallen lassen.
+      Erledigt am 26.09. Mitgegangen sind vier Toleranzvergleiche (`< 0.5` zweimal, `+ 0.001`,
+      `length_squared() < 0.25`), das `total_cmp` in `source_order` — auf `i32` gibt es kein NaN,
+      die Ordnung ist total, weil der Typ es ist —, `PATTERN_LOCAL_Z: f32` → `i32` und
+      `Axis::unit`. `render::cell_center_world` nimmt jetzt eine `IVec3`: das ist der eine Ort, an
+      dem aus einer Adresse ein Punkt wird, und fünf Aufrufstellen in `main.rs` haben dafür ihr
+      `.as_vec3()` verloren. `LayoutAnchor::pos` ist weg — es war immer `Vec3::splat(1.0)` und
+      wurde nirgends gelesen, also gerade keine Adresse.
+- [x] Dabei prüfen, ob irgendwo eine Zwischenposition gebraucht wird: **nein.** Positionen werden
+      ausschliesslich in `src/layout.rs` geschrieben, und `animate_nodes` (`src/main.rs`) ist
+      auskommentiert. Die einzigen echten Halbzahlen sind Zell- und Volumen-Mittelpunkte, und die
+      entstehen beide erst in der Darstellung (`cell_center_world`, `spawn_volume_surfaces`).
 - [ ] Zusammen mit §6 erledigen: ganzzahlige Positionen sind die halbe Miete für ein vergleichbares,
-      kanonisches Layout.
-- [ ] Danach `figures/implementation-architecture.tex` nachziehen --- dort steht heute `Vec3`, mit
-      einem Kommentar, der auf diesen Punkt zeigt.
+      kanonisches Layout. Die Gegenprobe ist jetzt billig — ein `Vec<(node::Id, IVec3)>` sortiert
+      und verglichen —, aber §6 selbst (die ungeordnete Iteration in `settle_footprints`) steht noch.
+- [ ] Danach `figures/implementation-datamodel.tex` nachziehen — dort steht `pos & Vec3` und
+      `reserved_max & IVec2`, beides jetzt falsch, und ein `[!]`-Block zeigt auf diesen Punkt.
+      Nicht bloss zwei Wörter: die Kommentare in der Abbildung rechnen Geometrie an der Breite der
+      Zelle `reserved_max`+`IVec2` vor, und `extent`+`IVec3` ist schmaler.
 
 ---
 
@@ -279,4 +314,5 @@ die Kanonizität des Layouts (§6) wackliger, als sie sein müsste.
 - [ ] Die drei harten Schleifendeckel (`0..128` in `settle_footprints` und in `move_node_delta`,
       `MAX_WALK_STEPS` beim Strahl) stehen begründet da und sollen bleiben — aber wenn (1) das
       Volumen zu einer echten Schranke macht, ist zu prüfen, ob der Deckel in `settle_footprints`
-      danach überhaupt noch erreicht werden kann.
+      danach überhaupt noch erreicht werden kann. Hängt an 1.2/1.5, nicht an 1.1: die Ausdehnung
+      ist gespeichert, klemmt aber noch nichts.
