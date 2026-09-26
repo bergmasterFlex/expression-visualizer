@@ -98,8 +98,7 @@ impl State {
         if self.node_ids_to_values.contains_key(&visitor_node_id) {
             Ok(self.clone())
         } else {
-            let input_anchor_ids_to_node_ids =
-                graph.get_connected_nodes_to_node_input_anchors(&visitor_node_id);
+            let input_anchor_ids_to_node_ids = graph.source_nodes_by_input(&visitor_node_id);
             let input_anchor_ids_to_values = input_anchor_ids_to_node_ids
                 .iter()
                 .filter_map(|(anchor_id, node_id)| {
@@ -112,9 +111,9 @@ impl State {
             // and a count of anchors on the right, and they may be compared
             // because an input anchor carries at most one incoming edge.
             // That is a structural invariant of the language rather than an
-            // assumption made here, and `LayoutGraph::plus_edge` is where it
-            // is kept — a new edge onto an occupied input replaces what was
-            // there instead of joining it.
+            // assumption made here, and the shape of the edge table is what
+            // keeps it — `incoming_edge` is keyed by the arriving end, so a
+            // second producer on one input has nowhere to be recorded.
             //
             // Stated rather than defended. A graph that broke the invariant
             // would leave this comparison unsatisfiable and the node
@@ -342,9 +341,8 @@ impl State {
                 };
                 match graph.nodes.get(&parent_match) {
                     Some(crate::model::node::ENode::Match { input_anchor, .. }) => graph
-                        .get_connected_nodes_to_anchor(input_anchor.clone())
-                        .into_iter()
-                        .find_map(|source_node_id| {
+                        .source_node_for_input(input_anchor)
+                        .and_then(|source_node_id| {
                             self.node_ids_to_values.get(&source_node_id).cloned()
                         })
                         .map(|value| self.with_value(node_id, value))
@@ -367,9 +365,8 @@ impl State {
             // arrived, while a Tunnel is wired to its producer directly and
             // need only ask its own anchor.
             crate::model::node::ENode::Tunnel { input_anchor, .. } => graph
-                .get_connected_nodes_to_anchor(input_anchor.clone())
-                .into_iter()
-                .find_map(|source_node_id| self.node_ids_to_values.get(&source_node_id).cloned())
+                .source_node_for_input(&input_anchor)
+                .and_then(|source_node_id| self.node_ids_to_values.get(&source_node_id).cloned())
                 .map(|value| self.with_value(node_id, value))
                 .ok_or_else(|| vec![format!("nothing arrives at tunnel {}", node_id)]),
         }

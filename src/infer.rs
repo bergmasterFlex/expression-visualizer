@@ -653,29 +653,15 @@ pub fn collect_sources(
     out
 }
 
-/// Direction-agnostic neighbours of an anchor: returns every node sharing an
-/// edge with `anchor`, regardless of which end the edge was recorded from.
-/// Drag-to-connect lets the user start from either anchor, so we accept both.
-fn neighbours_of_anchor(
-    graph: &crate::model::term_graph::TermGraph,
-    anchor: &crate::model::anchor::Id,
-) -> Vec<crate::model::node::Id> {
-    let mut out: Vec<crate::model::node::Id> = graph.get_connected_nodes_to_anchor(anchor.clone());
-    if let Some(edges) = graph.edges.get(anchor) {
-        for e in edges {
-            if let Some(n) = graph.anchor_to_node.get(&e.to) {
-                out.push(n.clone());
-            }
-        }
-    }
-    out
-}
-
-/// True if any Sink has at least one edge on its input anchor.
+/// True if any Sink has an edge on its input anchor.
+///
+/// Asked of the input alone, because a Sink has nothing else: its one anchor is
+/// an `EAnchor::Input`, so it can never stand on the producing end of an edge
+/// and there is no second direction to look in.
 pub fn sink_has_input(graph: &crate::model::term_graph::TermGraph) -> bool {
     graph.nodes.values().any(|node| match node {
         crate::model::node::ENode::Sink { input_anchor } => {
-            !neighbours_of_anchor(graph, input_anchor).is_empty()
+            graph.source_node_for_input(input_anchor).is_some()
         }
         _ => false,
     })
@@ -1000,22 +986,18 @@ fn incoming_type(
     anchor_type_guarded(graph, &source, function_declarations, visiting)
 }
 
-/// Source anchor feeding into `input`, if connected. Drag-to-connect records
-/// an edge from either end, so both directions are checked.
+/// Source anchor feeding into `input`, if connected.
+///
+/// One direction, because there is only one: every edge is recorded
+/// output → input, which `commit_draft` is the sole door of and normalises at.
+/// An input anchor therefore never stands on the producing end, and a second
+/// lookup for one that cannot exist would be a full walk of the table in
+/// exchange for nothing.
 pub fn source_anchor_for_input(
     graph: &crate::model::term_graph::TermGraph,
     input: &crate::model::anchor::Id,
 ) -> Option<crate::model::anchor::Id> {
-    for (from, edges) in &graph.edges {
-        if edges.iter().any(|e| &e.to == input) {
-            return Some(from.clone());
-        }
-    }
-    graph
-        .edges
-        .get(input)
-        .and_then(|edges| edges.first())
-        .map(|e| e.to.clone())
+    graph.incoming_edge.get(input).cloned()
 }
 
 /// What a run has proved about the graph, as types.

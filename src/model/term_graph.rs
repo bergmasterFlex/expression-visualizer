@@ -3,7 +3,22 @@ pub struct TermGraph {
     pub nodes: std::collections::HashMap<super::node::Id, super::node::ENode>,
     pub anchors: std::collections::HashMap<super::anchor::Id, super::anchor::EAnchor>,
     pub anchor_to_node: std::collections::HashMap<super::anchor::Id, super::node::Id>,
-    pub edges: std::collections::HashMap<super::anchor::Id, Vec<super::edge::Edge>>,
+    /// The edge arriving at an input anchor: the key is the input, the value the
+    /// output that feeds it.
+    ///
+    /// Keyed by the arriving end, because that is where the language's one
+    /// constraint sits — an input anchor carries *at most one* incoming edge,
+    /// and a map keyed this way has nowhere to put a second. A producer is under
+    /// no such rule and may feed as many consumers as it likes; those are
+    /// several entries sharing one value.
+    ///
+    /// Edges are recorded output → input and only ever that way: `commit_draft`
+    /// is the sole door and turns every pair into that direction before it comes
+    /// through. That half is *not* structural — both ends are an `anchor::Id`,
+    /// so a swapped insert would type-check — and is guarded by a
+    /// `debug_assert!` in `LayoutGraph::plus_edge` instead, which is the one
+    /// place that can resolve an anchor across scopes.
+    pub incoming_edge: std::collections::HashMap<super::anchor::Id, super::anchor::Id>,
     /// The Sink node that terminates this graph. Always present: an `TermGraph` is born
     /// with its sink in `new`, and every builder carries it forward unchanged.
     pub sink_node_id: super::node::Id,
@@ -27,7 +42,7 @@ impl TermGraph {
             nodes: std::collections::HashMap::new(),
             anchors: std::collections::HashMap::new(),
             anchor_to_node: std::collections::HashMap::new(),
-            edges: std::collections::HashMap::new(),
+            incoming_edge: std::collections::HashMap::new(),
             sink_node_id: sink_node_id.clone(),
         }
         .plus_node(
@@ -77,13 +92,21 @@ impl TermGraph {
 
     /// Union another graph's nodes/anchors/edges into this one, keeping this graph's
     /// `sink_node_id` as the root. Node/anchor ids are globally unique across a
-    /// (sub-)graph tree, so those maps never collide; edge lists that share a
-    /// `from` anchor are concatenated defensively.
+    /// (sub-)graph tree, so those maps never collide.
+    ///
+    /// Neither do the edge tables, and that is worth saying rather than
+    /// assuming: every edge is recorded on the root graph, because
+    /// `LayoutGraph::plus_edge` is only ever called there — so a sub-graph's
+    /// `incoming_edge` is empty and there is nothing here to resolve. Were one
+    /// ever not empty, an input held on both sides would be settled last-wins
+    /// and an edge would go missing without a word. That is what the assertion
+    /// is for: the emptiness is load-bearing, and this is the only place it
+    /// would be quietly relied on.
     pub fn merged_with(self, other: Self) -> Self {
-        let mut edges = self.edges;
-        for (from, list) in other.edges {
-            edges.entry(from).or_default().extend(list);
-        }
+        debug_assert!(
+            other.incoming_edge.is_empty(),
+            "merged_with: only the root graph records edges"
+        );
         Self {
             nodes: self.nodes.into_iter().chain(other.nodes).collect(),
             anchors: self.anchors.into_iter().chain(other.anchors).collect(),
@@ -92,70 +115,33 @@ impl TermGraph {
                 .into_iter()
                 .chain(other.anchor_to_node)
                 .collect(),
-            edges,
+            incoming_edge: self
+                .incoming_edge
+                .into_iter()
+                .chain(other.incoming_edge)
+                .collect(),
             sink_node_id: self.sink_node_id,
         }
     }
 
+    /// Wire `from` to `to`, taking the place of whatever arrived at `to`.
+    ///
+    /// Replacing is not this function being lenient about a rule it could have
+    /// enforced: the table holds one source per input and has nowhere to put a
+    /// second. `LayoutGraph::plus_edge` is where that is argued for — it is a
+    /// decision about what the editor does to a wired input, not a property of
+    /// a `HashMap` — and it is also where the direction is asserted.
     pub fn plus_edge(&self, from: super::anchor::Id, to: super::anchor::Id) -> Self {
-        let edge = super::edge::Edge { to };
         Self {
             anchors: self.anchors.clone(),
             nodes: self.nodes.clone(),
             anchor_to_node: self.anchor_to_node.clone(),
             sink_node_id: self.sink_node_id.clone(),
-            edges: self
-                .edges
+            incoming_edge: self
+                .incoming_edge
                 .clone()
                 .into_iter()
-                .chain(vec![(
-                    from.clone(),
-                    self.edges.get(&from).map_or(vec![edge.clone()], |edges| {
-                        edges.clone().into_iter().chain(vec![edge]).collect()
-                    }),
-                )])
-                .collect(),
-        }
-    }
-
-    /// Every edge arriving at `anchor`, gone.
-    ///
-    /// An input anchor carries *at most one* incoming edge. That is a
-    /// structural invariant of the language and not a convention of this
-    /// editor, and the graph has to satisfy it at every moment rather than
-    /// once the user is finished. So there is no way to *add* a second one:
-    /// `LayoutGraph::plus_edge` clears the target first, and this is what it
-    /// clears with.
-    ///
-    /// The stored direction alone, which is output → input — what
-    /// `drag_end_system` normalises to and the only direction
-    /// `get_connected_nodes_to_anchor` reads. An anchor standing on the `from`
-    /// side is a producer, and a producer may feed as many consumers as it
-    /// likes; nothing here touches those.
-    ///
-    /// An entry left with no edges is dropped rather than kept empty, the way
-    /// `minus_node` drops it: an anchor with an empty edge list and an anchor
-    /// with no entry are the same statement, and only one of them should be
-    /// writable.
-    pub fn minus_edges_into(&self, anchor: &super::anchor::Id) -> Self {
-        Self {
-            nodes: self.nodes.clone(),
-            anchors: self.anchors.clone(),
-            anchor_to_node: self.anchor_to_node.clone(),
-            sink_node_id: self.sink_node_id.clone(),
-            edges: self
-                .edges
-                .clone()
-                .into_iter()
-                .filter_map(|(from, edges)| {
-                    let kept: Vec<super::edge::Edge> =
-                        edges.into_iter().filter(|e| e.to != *anchor).collect();
-                    if kept.is_empty() {
-                        None
-                    } else {
-                        Some((from, kept))
-                    }
-                })
+                .chain(vec![(to, from)])
                 .collect(),
         }
     }
@@ -176,29 +162,17 @@ impl TermGraph {
     /// and a list one entry short leaves an edge pointing at nothing, which
     /// `LayoutGraph::layout_anchor` meets as a panic rather than as a missing
     /// strand. There is nothing for this to be short of.
-    ///
-    /// An entry left with no edges is dropped rather than kept empty, for the
-    /// reason `minus_edges_into` gives.
     pub fn retaining_edges(&self, live: &std::collections::HashSet<super::anchor::Id>) -> Self {
         Self {
             nodes: self.nodes.clone(),
             anchors: self.anchors.clone(),
             anchor_to_node: self.anchor_to_node.clone(),
             sink_node_id: self.sink_node_id.clone(),
-            edges: self
-                .edges
+            incoming_edge: self
+                .incoming_edge
                 .clone()
                 .into_iter()
-                .filter(|(from, _)| live.contains(from))
-                .filter_map(|(from, edges)| {
-                    let kept: Vec<super::edge::Edge> =
-                        edges.into_iter().filter(|e| live.contains(&e.to)).collect();
-                    if kept.is_empty() {
-                        None
-                    } else {
-                        Some((from, kept))
-                    }
-                })
+                .filter(|(to, from)| live.contains(to) && live.contains(from))
                 .collect(),
         }
     }
@@ -224,7 +198,7 @@ impl TermGraph {
                 .into_iter()
                 .chain(anchors.into_iter().map(|(id, _)| (id, node_id.clone())))
                 .collect(),
-            edges: self.edges.clone(),
+            incoming_edge: self.incoming_edge.clone(),
             sink_node_id: self.sink_node_id.clone(),
         }
     }
@@ -248,7 +222,7 @@ impl TermGraph {
                 .collect(),
             anchors: self.anchors.clone(),
             anchor_to_node: self.anchor_to_node.clone(),
-            edges: self.edges.clone(),
+            incoming_edge: self.incoming_edge.clone(),
             sink_node_id: self.sink_node_id.clone(),
         }
     }
@@ -281,42 +255,37 @@ impl TermGraph {
                 .into_iter()
                 .filter(|(id, _)| !anchor_ids.contains(id))
                 .collect(),
-            edges: self
-                .edges
+            incoming_edge: self
+                .incoming_edge
                 .clone()
                 .into_iter()
-                .filter(|(from, _)| !anchor_ids.contains(from))
-                .filter_map(|(from, edges)| {
-                    let kept: Vec<super::edge::Edge> = edges
-                        .into_iter()
-                        .filter(|e| !anchor_ids.contains(&e.to))
-                        .collect();
-                    if kept.is_empty() {
-                        None
-                    } else {
-                        Some((from, kept))
-                    }
-                })
+                .filter(|(to, from)| !anchor_ids.contains(to) && !anchor_ids.contains(from))
                 .collect(),
             sink_node_id: self.sink_node_id.clone(),
         }
     }
 
-    pub fn get_connected_nodes_to_anchor(&self, anchor: super::anchor::Id) -> Vec<super::node::Id> {
-        self.edges
-            .iter()
-            .flat_map(|(from, edges)| edges.iter().map(|e| (from.clone(), e)))
-            .filter_map(|(from, edge)| {
-                if edge.to == anchor {
-                    Some(self.anchor_to_node.get(&from).unwrap().clone())
-                } else {
-                    None
-                }
-            })
-            .collect()
+    /// The node producing the value that arrives at `input`, if one does.
+    ///
+    /// An `Option` and not a list, because an input anchor carries at most one
+    /// incoming edge and the edge table is shaped to say so. One hop upstream
+    /// and no further: `infer::source_anchor_for_input` is the same hop asked
+    /// about the anchor rather than the node.
+    ///
+    /// The `unwrap` stands on `minus_dangling_edges`: an edge whose producer is
+    /// not an anchor of anything is a scene that was left unswept, and meeting
+    /// that as a panic here is what the sweep exists to prevent. Answering
+    /// `None` instead would let it pass as an unwired input.
+    pub fn source_node_for_input(&self, input: &super::anchor::Id) -> Option<super::node::Id> {
+        self.incoming_edge
+            .get(input)
+            .map(|from| self.anchor_to_node.get(from).unwrap().clone())
     }
 
-    pub fn get_connected_nodes_to_node_input_anchors(
+    /// Every input of `node_id` that something arrives at, with the node it
+    /// arrives from. Inputs nothing is wired to are left out rather than
+    /// carried as absences: what the caller counts is what has arrived.
+    pub fn source_nodes_by_input(
         &self,
         node_id: &super::node::Id,
     ) -> Vec<(super::anchor::Id, super::node::Id)> {
@@ -324,10 +293,9 @@ impl TermGraph {
             .get(node_id)
             .into_iter()
             .flat_map(|node| node.input_anchors())
-            .flat_map(|(anchor_id, _)| {
-                self.get_connected_nodes_to_anchor(anchor_id.clone())
-                    .into_iter()
-                    .map(move |node_id| (anchor_id.clone(), node_id))
+            .filter_map(|(anchor_id, _)| {
+                self.source_node_for_input(&anchor_id)
+                    .map(|node_id| (anchor_id, node_id))
             })
             .collect()
     }

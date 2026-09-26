@@ -2012,9 +2012,10 @@ impl LayoutGraph {
     ///
     /// *Wire*, not *add*. An input anchor takes at most one incoming edge —
     /// a structural invariant of the language, which the graph has to satisfy
-    /// at every moment and not merely when the user stops editing — so
-    /// whatever already arrives at `to` is dropped first and the new edge
-    /// wins.
+    /// at every moment and not merely when the user stops editing — so the new
+    /// edge takes the place of whatever already arrives at `to`. The edge table
+    /// is keyed by the arriving end and holds one source per input, so that is
+    /// what an insert does; nothing has to clear the way first.
     ///
     /// Refusing the drag would satisfy the same invariant and strand the
     /// user: an edge cannot be deleted on its own, only along with one of the
@@ -2029,8 +2030,21 @@ impl LayoutGraph {
     /// count of anchors and never finding them equal, so `Next` went dead
     /// with nothing said.
     pub fn plus_edge(&self, from: crate::model::anchor::Id, to: crate::model::anchor::Id) -> Self {
+        // The half of the stored direction the table cannot state: both ends of
+        // an edge are an `anchor::Id`, so only this can tell that `to` is the
+        // consuming one. Asked here and not in `TermGraph::plus_edge` because a
+        // Tunnel's input belongs to a scope one level in and is absent from the
+        // root graph's own anchor table — `try_layout_anchor` is what reaches
+        // across, and it lives here.
+        debug_assert!(
+            matches!(
+                self.try_layout_anchor(&to).map(|a| a.anchor),
+                Some(crate::model::anchor::EAnchor::Input(_))
+            ),
+            "plus_edge: edges are stored output -> input"
+        );
         Self {
-            graph: self.graph.minus_edges_into(&to).plus_edge(from, to),
+            graph: self.graph.plus_edge(from, to),
             layout_nodes: self.layout_nodes.clone(),
             reserved_max: self.reserved_max,
             sub_layouts: self.sub_layouts.clone(),
@@ -2934,13 +2948,11 @@ impl LayoutGraph {
 
     pub fn edges(&self) -> Vec<LayoutEdge> {
         self.graph
-            .edges
+            .incoming_edge
             .iter()
-            .flat_map(|(from_anchor_id, edges)| {
-                edges.clone().into_iter().map(|edge| LayoutEdge {
-                    from_anchor: self.layout_anchor(from_anchor_id.clone()),
-                    to_anchor: self.layout_anchor(edge.to.clone()),
-                })
+            .map(|(to_anchor_id, from_anchor_id)| LayoutEdge {
+                from_anchor: self.layout_anchor(from_anchor_id.clone()),
+                to_anchor: self.layout_anchor(to_anchor_id.clone()),
             })
             .collect()
     }

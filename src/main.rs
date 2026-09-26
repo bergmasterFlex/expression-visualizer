@@ -10258,7 +10258,7 @@ fn open_caret_draft(
     // anyway — an edge wired before a node moved may now cross a boundary that
     // is no longer allowed, and opening on it would propose a wiring that
     // `commit_draft` then refuses.
-    let standing = incoming_edge_source(root, anchor)
+    let standing = infer::source_anchor_for_input(&root.graph, anchor)
         .filter(|from| candidates.iter().any(|(id, _)| id == from));
     let target = standing.or_else(|| {
         let from = *source_cells.first()?;
@@ -10335,21 +10335,6 @@ fn draft_holds_caret(state: &GraphState, pick: &PickState, draft: &DraftState) -
         .as_ref()
         .and_then(|id| state.root_graph().anchor_cells_of(id))
         .is_some_and(|cells| cells.contains(&pick.selected_pos))
-}
-
-/// The anchor an edge arrives at `anchor` from, if one does.
-///
-/// An input carries at most one — that is the invariant `LayoutGraph::plus_edge`
-/// keeps — so the first answer is the answer.
-fn incoming_edge_source(
-    root: &layout::LayoutGraph,
-    anchor: &model::anchor::Id,
-) -> Option<model::anchor::Id> {
-    root.graph
-        .edges
-        .iter()
-        .find(|(_, edges)| edges.iter().any(|e| e.to == *anchor))
-        .map(|(from, _)| from.clone())
 }
 
 /// The next anchor in a direction: the nearest one whose way lies that way.
@@ -10729,16 +10714,18 @@ fn anchor_is_hidden(
 /// Every anchor an edge reaches from `anchor`, with the cell it is addressed
 /// by, in address order.
 ///
-/// One list whichever end the caret is standing at. An output may feed as many
-/// consumers as it likes, and the list is then the choice `Alt` offers; an
-/// input carries at most one incoming edge — the invariant
-/// `LayoutGraph::plus_edge` keeps — so the list is one long or empty and there
-/// is nothing to choose.
+/// One list whichever end the caret is standing at, but the two ends ask the
+/// table two different questions. An output may feed as many consumers as it
+/// likes, so its side is a walk of every entry whose source is this anchor, and
+/// the list is then the choice `Alt` offers. An input carries at most one
+/// incoming edge — the table is keyed by the arriving end, so there is nowhere
+/// for a second — and its side is a single lookup with nothing to choose.
 ///
-/// Sorted for the reason `draft_candidates` is sorted: the edge table is a
-/// hash map, and a choice that reshuffled on a tie would have the editor
-/// pointing at a different edge from one frame to the next while nothing
-/// moved.
+/// Sorted for the reason `draft_candidates` is sorted, and the output side is
+/// why: it walks a hash map, and a choice that reshuffled on a tie would have
+/// the editor pointing at a different edge from one frame to the next while
+/// nothing moved. The anchor id closes the order for good, since the ends the
+/// walk yields are distinct keys.
 fn hop_candidates(
     state: &GraphState,
     grading: &lod::Lod,
@@ -10748,12 +10735,15 @@ fn hop_candidates(
     let root = state.root_graph();
     let ends: Vec<model::anchor::Id> = if is_output {
         root.graph
-            .edges
-            .get(anchor)
-            .map(|edges| edges.iter().map(|e| e.to.clone()).collect())
-            .unwrap_or_default()
+            .incoming_edge
+            .iter()
+            .filter(|(_, from)| *from == anchor)
+            .map(|(to, _)| to.clone())
+            .collect()
     } else {
-        incoming_edge_source(root, anchor).into_iter().collect()
+        infer::source_anchor_for_input(&root.graph, anchor)
+            .into_iter()
+            .collect()
     };
     let mut out: Vec<(model::anchor::Id, IVec3)> = ends
         .into_iter()
@@ -11352,9 +11342,12 @@ fn caret_grading(state: &GraphState, pick: &PickState, clipping: &lod::Clipping)
 /// Make the edge the draft stands for. Returns whether the graph changed, so
 /// the caller knows whether to flag a rebuild.
 ///
-/// The one door, for the pointer and the caret alike. Edges are always stored
-/// output → input: `edge::EdgeCurve::from_endpoints` derives its tangents from
-/// that direction and the renderer stacks the leaves by source and target.
+/// The one door, for the pointer and the caret alike — and the door is what
+/// makes the stored direction true. Edges are always recorded output → input:
+/// `edge::EdgeCurve::from_endpoints` derives its tangents from that direction
+/// and the renderer stacks the leaves by source and target. The edge table is
+/// keyed by the arriving end but cannot check which end that is, both being an
+/// `anchor::Id`, so the orientation below is the whole of what keeps it.
 ///
 /// Every condition is asked again here even though nothing is offered that
 /// would fail them. A rebuild can land between the aim and the press, and a
@@ -11377,19 +11370,22 @@ fn commit_draft(state: &mut GraphState, draft: &EdgeDraft) -> bool {
     ) {
         return false;
     }
-    // Nothing to do, and saying so is the point: an input opened on the edge it
-    // already carries proposes that edge back, and confirming it must leave the
-    // graph exactly as it was. Dropping the edge and putting the identical one
-    // back would re-settle the layout and flicker the whole scene in exchange
-    // for nothing.
-    if anchors_already_connected(state.root_graph(), &draft.source_anchor_id, &target_id) {
-        return false;
-    }
+    // Turned into the direction edges are stored before anything is asked about
+    // it. `connection_offered` above has already refused a pair of two outputs
+    // or two inputs, so exactly one of these two is the producer.
     let (from, to) = if draft.source_is_output {
         (draft.source_anchor_id.clone(), target_id)
     } else {
         (target_id, draft.source_anchor_id.clone())
     };
+    // Nothing to do, and saying so is the point: an input opened on the edge it
+    // already carries proposes that edge back, and confirming it must leave the
+    // graph exactly as it was. Dropping the edge and putting the identical one
+    // back would re-settle the layout and flicker the whole scene in exchange
+    // for nothing.
+    if anchors_already_connected(state.root_graph(), &from, &to) {
+        return false;
+    }
     let updated = state.root_graph().plus_edge(from, to);
     *state.root_graph_mut() = updated;
     // A new edge can grow the target's anchor, which changes its footprint.
@@ -11736,33 +11732,24 @@ fn drag_update_system(
     }
 }
 
-/// True if `a` and `b` are already joined by an edge, in either stored
-/// direction.
+/// True if this edge already stands.
 ///
-/// Not what keeps a pair from being doubled any more — `LayoutGraph::plus_edge`
-/// clears the target input before wiring, so a second edge onto it is not a
-/// thing that can exist. What this still answers is whether there is anything
-/// to do: re-drafting a connection that already stands would drop it and put
-/// the identical one back, and a rebuild for that is a flicker in exchange for
-/// nothing.
+/// Not what keeps a pair from being doubled — the edge table holds one source
+/// per input, so a second edge onto one is not a thing that can exist. What
+/// this answers is whether there is anything *to do*: re-drafting a connection
+/// that already stands would drop it and put the identical one back, and a
+/// rebuild for that is a flicker in exchange for nothing.
 ///
-/// The reverse direction is checked too because edges recorded before the
-/// commit started normalising to output → input may still sit the other way
-/// around, and `eval::neighbours_of_anchor` treats both orientations as
-/// connected.
+/// Takes the pair already turned into the direction edges are stored, so one
+/// lookup settles it. The caller has that direction to hand — `commit_draft`
+/// works it out from `source_is_output` — and asking the other way round would
+/// be asking after an edge that cannot have been recorded.
 fn anchors_already_connected(
     layout_graph: &layout::LayoutGraph,
-    a: &model::anchor::Id,
-    b: &model::anchor::Id,
+    from: &model::anchor::Id,
+    to: &model::anchor::Id,
 ) -> bool {
-    let joined = |from: &model::anchor::Id, to: &model::anchor::Id| {
-        layout_graph
-            .graph
-            .edges
-            .get(from)
-            .is_some_and(|edges| edges.iter().any(|e| e.to == *to))
-    };
-    joined(a, b) || joined(b, a)
+    layout_graph.graph.incoming_edge.get(to) == Some(from)
 }
 
 /// Whether an edge may join these two anchors at all.

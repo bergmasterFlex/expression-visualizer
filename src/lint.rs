@@ -555,19 +555,18 @@ fn unreachable_tails(
     // anything: the one that takes it is further down the same dead run.
     let mut feeds_the_dead: std::collections::HashSet<crate::model::node::Id> =
         std::collections::HashSet::new();
-    for (from, edges) in &graph.edges {
+    for (to, from) in &graph.incoming_edge {
         let Some(producer) = graph.anchor_to_node.get(from) else {
             continue;
         };
         if !speaks_for_itself(producer) {
             continue;
         }
-        if edges.iter().any(|edge| {
-            graph
-                .anchor_to_node
-                .get(&edge.to)
-                .is_some_and(|consumer| speaks_for_itself(consumer))
-        }) {
+        if graph
+            .anchor_to_node
+            .get(to)
+            .is_some_and(|consumer| speaks_for_itself(consumer))
+        {
             feeds_the_dead.insert(producer.clone());
         }
     }
