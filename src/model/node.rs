@@ -148,10 +148,7 @@ impl ENode {
                 .map(|(i, anchor_id)| {
                     (
                         anchor_id,
-                        super::anchor::EAnchor::Input(super::anchor::InputAnchor {
-                            order_num: i,
-                            name: Some(format!("param{}", i)),
-                        }),
+                        super::anchor::EAnchor::Input(super::anchor::InputAnchor { order_num: i }),
                     )
                 })
                 .chain(vec![(
@@ -161,10 +158,7 @@ impl ENode {
                 .collect(),
             ENode::Sink { input_anchor } => vec![(
                 input_anchor.clone(),
-                super::anchor::EAnchor::Input(super::anchor::InputAnchor {
-                    order_num: 0,
-                    name: None,
-                }),
+                super::anchor::EAnchor::Input(super::anchor::InputAnchor { order_num: 0 }),
             )],
             ENode::Constant { output_anchor, .. } => {
                 vec![(output_anchor.clone(), super::anchor::EAnchor::Output)]
@@ -176,10 +170,7 @@ impl ENode {
             } => vec![
                 (
                     input_anchor.clone(),
-                    super::anchor::EAnchor::Input(super::anchor::InputAnchor {
-                        order_num: 0,
-                        name: None,
-                    }),
+                    super::anchor::EAnchor::Input(super::anchor::InputAnchor { order_num: 0 }),
                 ),
                 (output_anchor.clone(), super::anchor::EAnchor::Output),
             ],
@@ -193,10 +184,7 @@ impl ENode {
             } => vec![
                 (
                     input_anchor.clone(),
-                    super::anchor::EAnchor::Input(super::anchor::InputAnchor {
-                        order_num: 0,
-                        name: None,
-                    }),
+                    super::anchor::EAnchor::Input(super::anchor::InputAnchor { order_num: 0 }),
                 ),
                 (output_anchor.clone(), super::anchor::EAnchor::Output),
             ],
@@ -214,10 +202,7 @@ impl ENode {
             } => vec![
                 (
                     input_anchor.clone(),
-                    super::anchor::EAnchor::Input(super::anchor::InputAnchor {
-                        order_num: 0,
-                        name: None,
-                    }),
+                    super::anchor::EAnchor::Input(super::anchor::InputAnchor { order_num: 0 }),
                 ),
                 (output_anchor.clone(), super::anchor::EAnchor::Output),
             ],

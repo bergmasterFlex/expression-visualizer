@@ -19,7 +19,6 @@ use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::{
     input::keyboard::KeyboardInput,
     input::mouse::{MouseMotion, MouseWheel},
-    math::VectorSpace,
     prelude::*,
 };
 
@@ -936,14 +935,6 @@ impl GraphState {
     fn caret_graph(&self, pick: &PickState) -> Option<(&layout::LayoutGraph, IVec3)> {
         let scope = self.scope_of_caret(pick)?;
         Some((self.root_graph().resolve_context(&scope.path), scope.local))
-    }
-
-    /// Mutable counterpart to `caret_graph`. The path is resolved first so the
-    /// immutable and mutable borrows never overlap.
-    fn caret_graph_mut(&mut self, pick: &PickState) -> Option<(&mut layout::LayoutGraph, IVec3)> {
-        let scope = self.scope_of_caret(pick)?;
-        let graph = self.root_graph_mut().resolve_context_mut(&scope.path)?;
-        Some((graph, scope.local))
     }
 }
 
@@ -6404,17 +6395,6 @@ fn sync_value_labels(
     }
 }
 
-/// Gentle pulsing animation for nodes.
-fn animate_nodes(time: Res<Time>, mut query: Query<(&NodeEntity, &mut Transform)>) {
-    /*
-    let t = time.elapsed_seconds();
-    for (node_ent, mut transform) in query.iter_mut() {
-        let pulse = 1.0 + 0.04 * (t * 2.0 + node_ent.node_id as f32 * 1.5).sin();
-        transform.scale = Vec3::splat(pulse);
-    }
-    */
-}
-
 /// One of the twelve dashed guides: six leaving the caret, six the pointer.
 ///
 /// A caret says which cell is addressed; its guides say where that cell *is* —
@@ -6707,7 +6687,6 @@ fn clear_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    state: Res<GraphState>,
     rebuild: ResMut<NeedsRebuild>,
     kept: Res<PersistentAssets>,
     query_ast_entities: Query<Entity, With<SceneEntity>>,
@@ -11975,7 +11954,6 @@ fn main() {
             Update,
             (
                 (
-                    animate_nodes,
                     (
                         // First, because the mode it ends is the reason the
                         // caret is missing: leaving has to be seen before

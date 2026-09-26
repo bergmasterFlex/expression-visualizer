@@ -7,9 +7,9 @@
 //! a grey box that cannot be looked into.
 //!
 //! Two numbers describe where a scope stands relative to the caret's, and the
-//! whole module is built on them. `out + into` is the wall
-//! count [`volume_boundaries`] has always measured; `into` alone is how deep
-//! inside the caret's line of sight the scope sits.
+//! whole module is built on them. `out + into` is the number of walls standing
+//! between the two scopes; `into` alone is how deep inside the caret's line of
+//! sight the scope sits.
 //!
 //! Everything here is read at rebuild time and baked into the materials. A
 //! caret move already rebuilds the scene, so there is nothing to follow per
@@ -56,22 +56,6 @@ pub const SOLID_DEPTH: usize = SHELL_RAMP.len() - 1;
 /// substance an unresolved anchor is drawn in, saying only that something is
 /// there.
 pub const SHELL_COLOR: Srgba = Srgba::new(0.30, 0.30, 0.34, 1.0);
-
-/// Volume boundaries between two volumes: the walls crossed going from one to
-/// the other through their nearest common ancestor.
-///
-/// Both paths are scope `context`s, which is all a volume path is — a Match used
-/// to be a rung between a scope and its arms, and is not any more: it is drawn
-/// as the node it is, so there is no wall there to cross.
-///
-/// Siblings come out two apart, not one — there is a wall out of the first and a
-/// wall into the second, and no shortcut between them. Going out to the scope
-/// that holds their Match is one, because that is one wall and there is nothing
-/// standing behind it.
-pub fn volume_boundaries(a: &[crate::model::node::Id], b: &[crate::model::node::Id]) -> usize {
-    let common = a.iter().zip(b).take_while(|(x, y)| x == y).count();
-    (a.len() - common) + (b.len() - common)
-}
 
 /// What a rebuild pass reads to grade one scope against another. Fixed for the
 /// whole pass: the caret cannot move inside one.

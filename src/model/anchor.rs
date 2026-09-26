@@ -25,5 +25,4 @@ pub enum EAnchor {
 #[derive(Clone, Debug)]
 pub struct InputAnchor {
     pub order_num: usize,
-    pub name: Option<String>,
 }

@@ -2827,7 +2827,7 @@ impl LayoutGraph {
     /// additional offset. The outer root's `layout_nodes` is expected to be
     /// empty (Root has no LayoutNode) so `sub_layouts[root_id]` is
     /// entered with offset (0,0,0).
-    pub fn walk_all(&self) -> Vec<WalkedNode> {
+    pub fn walk_all(&self) -> Vec<WalkedNode<'_>> {
         let mut out = Vec::new();
         self.walk_all_into(Vec::new(), IVec3::ZERO, &mut out);
         out
@@ -2858,7 +2858,7 @@ impl LayoutGraph {
     /// Yield every LayoutGraph reachable from `self`, including `self` itself.
     /// Each entry carries the owner path from `self` down to the yielded graph
     /// (empty at `self`) and the accumulated grid-space offset.
-    pub fn walk_all_graphs(&self) -> Vec<WalkedGraph> {
+    pub fn walk_all_graphs(&self) -> Vec<WalkedGraph<'_>> {
         let mut out = Vec::new();
         self.walk_all_graphs_into(Vec::new(), IVec3::ZERO, &mut out);
         out

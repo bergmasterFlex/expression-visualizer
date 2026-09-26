@@ -32,10 +32,6 @@
 //!   Z-level planes, none of which are part of the scene the cue is about.
 
 use bevy::asset::{load_internal_asset, uuid_handle};
-// `Projection` derefs to `dyn CameraProjection`, so the trait has to be in
-// scope for `get_clip_from_view` — including on the custom projections the
-// bound camera is built from, which is the whole reason for asking the matrix.
-use bevy::camera::CameraProjection;
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
 use bevy::core_pipeline::FullscreenShader;
 use bevy::ecs::query::QueryItem;
