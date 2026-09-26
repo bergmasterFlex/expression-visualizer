@@ -436,6 +436,17 @@ impl AABB {
     }
 }
 
+/// Depth the program scope is born with: its Sink on Z=4, so three working
+/// layers stand between the source row and the terminal from the start.
+///
+/// Written into the extent *and* into the Sink's position, because the two have
+/// to agree: the Sink sits on the volume's last layer, and a volume stopping
+/// short of its own Sink would hide it.
+const ROOT_SCOPE_DEPTH: i32 = 4;
+/// Depth a fresh branch is born with — see `initial_pattern_sub_layout` for why
+/// two is the smallest depth that is worth anything.
+const BRANCH_SCOPE_DEPTH: i32 = 2;
+
 #[derive(Clone)]
 pub struct LayoutGraph {
     pub graph: crate::model::term_graph::TermGraph,
@@ -445,15 +456,26 @@ pub struct LayoutGraph {
     /// is the source of truth for the top-level context — the ENode::Root's
     /// own `graph` field is unused in Step 1 and stays empty.
     pub sub_layouts: std::collections::HashMap<crate::model::node::Id, LayoutGraph>,
-    /// Volume this scope claims beyond what its nodes occupy: the inclusive
-    /// maximum cell address on X and Y. Whitespace is a first-class part of a
-    /// scope, so the room an INSERT-mode row or column opened stays open even
-    /// while nothing stands in it — bounds derived from the nodes alone would
-    /// renormalise and the graph would merely look shifted.
+    /// How far this scope reaches: the inclusive maximum cell address, on all
+    /// three axes. `min` is the origin and is fixed, so this is the whole of
+    /// the volume's extent.
     ///
-    /// Z needs no counterpart: the Sink is a node, sits on the scope's last
-    /// row, and only ever moves outward, so it holds the depth open itself.
-    pub reserved_max: IVec2,
+    /// Stored and not derived, because whitespace is a first-class part of a
+    /// scope: the room an INSERT-mode cell, column or row opened stays open
+    /// while nothing stands in it. An extent read back out of the nodes alone
+    /// would renormalise, and the graph would merely look shifted, not wider.
+    ///
+    /// Z is in here for the same reason X and Y are, and it had to be: it used
+    /// to be read off the Sink, which made the depth of the volume a property
+    /// of a node rather than of the volume. The Sink now *sits* on the last
+    /// layer instead of defining it — `settle_sink` pulls it there and writes
+    /// the layer it landed on back here.
+    ///
+    /// X and Y are still a lower bound rather than a bound: `grid_bounds`
+    /// unions them with the node footprints, so a node reaching past them
+    /// widens the scope without anyone having asked. That is the open half of
+    /// the same question, and it is written down in `todo.md` §1.
+    pub extent: IVec3,
 }
 
 impl LayoutGraph {
@@ -470,10 +492,10 @@ impl LayoutGraph {
         let layout = Self {
             graph,
             layout_nodes: std::collections::HashMap::new(),
-            reserved_max: IVec2::ZERO,
+            extent: IVec3::new(0, 0, ROOT_SCOPE_DEPTH),
             sub_layouts: std::collections::HashMap::new(),
         }
-        ._plus_layout_node(&sink_node_id, IVec3::new(0, 0, 4));
+        ._plus_layout_node(&sink_node_id, IVec3::new(0, 0, ROOT_SCOPE_DEPTH));
         (layout, node_id_domain, anchor_id_domain)
     }
 
@@ -496,7 +518,7 @@ impl LayoutGraph {
         let outer = Self {
             graph: outer_graph,
             layout_nodes: std::collections::HashMap::new(),
-            reserved_max: IVec2::ZERO,
+            extent: IVec3::ZERO,
             sub_layouts: std::collections::HashMap::from([(root_id.clone(), root_sub)]),
         };
         (outer, root_id, node_id_domain, anchor_id_domain)
@@ -521,7 +543,7 @@ impl LayoutGraph {
                         .into_iter()
                         .filter(|(id, _)| id != node_id)
                         .collect(),
-                    reserved_max: self.reserved_max,
+                    extent: self.extent,
                     sub_layouts: self
                         .sub_layouts
                         .clone()
@@ -537,7 +559,7 @@ impl LayoutGraph {
                             .into_iter()
                             .filter(|(id, _)| id != &parent_id)
                             .collect(),
-                        reserved_max: after_pattern.reserved_max,
+                        extent: after_pattern.extent,
                         sub_layouts: after_pattern.sub_layouts,
                     }
                 } else {
@@ -552,7 +574,7 @@ impl LayoutGraph {
                     Self {
                         graph: self.graph.clone(),
                         layout_nodes: self.layout_nodes.clone(),
-                        reserved_max: self.reserved_max,
+                        extent: self.extent,
                         sub_layouts: self.sub_layouts.clone(),
                     },
                     |acc, pid| Self {
@@ -562,7 +584,7 @@ impl LayoutGraph {
                             .into_iter()
                             .filter(|(id, _)| id != pid)
                             .collect(),
-                        reserved_max: acc.reserved_max,
+                        extent: acc.extent,
                         sub_layouts: acc
                             .sub_layouts
                             .into_iter()
@@ -577,7 +599,7 @@ impl LayoutGraph {
                         .into_iter()
                         .filter(|(id, _)| id != node_id)
                         .collect(),
-                    reserved_max: after_children.reserved_max,
+                    extent: after_children.extent,
                     sub_layouts: after_children.sub_layouts,
                 }
             }
@@ -589,7 +611,7 @@ impl LayoutGraph {
                     .into_iter()
                     .filter(|(id, _)| id != node_id)
                     .collect(),
-                reserved_max: self.reserved_max,
+                extent: self.extent,
                 sub_layouts: self.sub_layouts.clone(),
             },
         }
@@ -640,7 +662,7 @@ impl LayoutGraph {
         Self {
             graph: self.graph.retaining_edges(live),
             layout_nodes: self.layout_nodes.clone(),
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self
                 .sub_layouts
                 .iter()
@@ -841,7 +863,7 @@ impl LayoutGraph {
         let staged = Self {
             graph: self.graph.clone(),
             layout_nodes: self.layout_nodes.clone(),
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self
                 .sub_layouts
                 .iter()
@@ -871,7 +893,7 @@ impl LayoutGraph {
         Self {
             graph: staged.graph,
             layout_nodes,
-            reserved_max: staged.reserved_max,
+            extent: staged.extent,
             sub_layouts: staged.sub_layouts,
         }
     }
@@ -1116,9 +1138,9 @@ impl LayoutGraph {
     pub fn inner_footprint(&self) -> Option<AABB> {
         // Whitespace the scope reserved is part of it: a branch that opened a
         // column is that much wider, and the arm around it has to make room.
-        let mut bbox: Option<AABB> = (self.reserved_max != IVec2::ZERO).then(|| AABB {
+        let mut bbox: Option<AABB> = (self.extent != IVec3::ZERO).then(|| AABB {
             min: IVec3::ZERO,
-            max: self.reserved_max.extend(0),
+            max: self.extent,
         });
         for (id, ln) in &self.layout_nodes {
             let node_bbox = if self.is_match(id) {
@@ -1202,7 +1224,7 @@ impl LayoutGraph {
         Self {
             graph: self.graph.clone(),
             layout_nodes,
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self.sub_layouts.clone(),
         }
     }
@@ -1241,7 +1263,7 @@ impl LayoutGraph {
             Self {
                 graph: self.graph.clone(),
                 layout_nodes,
-                reserved_max: self.reserved_max,
+                extent: self.extent,
                 sub_layouts: self.sub_layouts.clone(),
             },
             here + IVec3::new(0, moved, 0),
@@ -1277,7 +1299,7 @@ impl LayoutGraph {
         Some(Self {
             graph: self.graph.clone(),
             layout_nodes,
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self.sub_layouts.clone(),
         })
     }
@@ -1523,7 +1545,7 @@ impl LayoutGraph {
                     )
                 })
                 .collect(),
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self.sub_layouts.clone(),
         };
 
@@ -1551,7 +1573,7 @@ impl LayoutGraph {
         Self {
             graph: self.graph.clone(),
             layout_nodes: self.layout_nodes.clone(),
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self.sub_layouts.clone(),
         }
     }
@@ -1598,7 +1620,7 @@ impl LayoutGraph {
         let layout = Self {
             graph: self.graph.clone(),
             layout_nodes: self.layout_nodes.clone(),
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: settled_subs,
         };
         // Branch heights are final now, so pack every arm stack before any
@@ -1826,6 +1848,15 @@ impl LayoutGraph {
             ln.pos.x = 0;
             ln.pos.z = new_sink_z;
         }
+        // The Sink stands on the volume's last layer, so a Sink that moved back
+        // took the layer with it. Monotone, like the move itself: the extent is
+        // only ever pushed out here, never pulled in.
+        //
+        // This is also the one place left where depth grows without anyone
+        // having asked for it — a node built deep enough drags the Sink, and the
+        // Sink drags the volume. Made visible rather than fixed: it is one
+        // assignment, which is what `todo.md` §1.6 has to decide about.
+        layout.extent.z = layout.extent.z.max(new_sink_z);
         layout
     }
 
@@ -1849,11 +1880,16 @@ impl LayoutGraph {
     }
 
     /// Align the Sink of every Pattern under each Match at this level to
-    /// a common position: the deepest sibling sink (minimum Z). Copies that
-    /// reference sink's (x, z) onto every sibling sink so the match's back wall
-    /// is a single flat plane and the sinks stack exactly above each other
-    /// (only Y differs). Nested matches are handled by `settle_footprints`'s
-    /// recursion, so this only needs to touch matches owned at this level.
+    /// a common position: the deepest sibling sink, i.e. the one at the
+    /// greatest Z. Copies that reference sink's (x, z) onto every sibling sink
+    /// so the match's back wall is a single flat plane and the sinks stack
+    /// exactly above each other (only Y differs), and takes each branch's own
+    /// extent along so no volume stops short of its Sink. Nested matches are
+    /// handled by `settle_footprints`'s recursion, so this only needs to touch
+    /// matches owned at this level.
+    ///
+    /// Only ever outward: the reference is the maximum, so no Sink is pulled
+    /// forward here and no extent has to shrink.
     fn harmonize_match_sinks(&self) -> Self {
         let mut layout = self.clone_shape();
         let match_ids: Vec<crate::model::node::Id> = layout
@@ -1894,6 +1930,11 @@ impl LayoutGraph {
                     ln.pos.x = ref_x;
                     ln.pos.z = ref_z;
                 }
+                // The branch's volume goes with its Sink. The flat back wall
+                // these Sinks make is the far face of every one of these
+                // volumes, and a branch whose extent stopped in front of its
+                // own Sink would hide it.
+                sub.extent.z = sub.extent.z.max(ref_z);
             }
         }
         layout
@@ -2035,7 +2076,7 @@ impl LayoutGraph {
         Self {
             graph: self.graph.plus_edge(from, to),
             layout_nodes: self.layout_nodes.clone(),
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self.sub_layouts.clone(),
         }
     }
@@ -2072,7 +2113,7 @@ impl LayoutGraph {
         let layout = Self {
             graph,
             layout_nodes: self.layout_nodes.clone(),
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&node_id, pos);
@@ -2100,7 +2141,7 @@ impl LayoutGraph {
         let layout = Self {
             graph,
             layout_nodes: self.layout_nodes.clone(),
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&node_id, pos);
@@ -2148,7 +2189,7 @@ impl LayoutGraph {
         let layout = Self {
             graph,
             layout_nodes: self.layout_nodes.clone(),
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&node_id, pos);
@@ -2212,7 +2253,7 @@ impl LayoutGraph {
         let layout = Self {
             graph,
             layout_nodes: self.layout_nodes.clone(),
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self
                 .sub_layouts
                 .clone()
@@ -2250,10 +2291,10 @@ impl LayoutGraph {
                 ),
                 (
                     sub_sink_id.clone(),
-                    LayoutNode::unshaped(sub_sink_id.clone(), IVec3::new(0, 0, 2)),
+                    LayoutNode::unshaped(sub_sink_id.clone(), IVec3::new(0, 0, BRANCH_SCOPE_DEPTH)),
                 ),
             ]),
-            reserved_max: IVec2::ZERO,
+            extent: IVec3::new(0, 0, BRANCH_SCOPE_DEPTH),
             sub_layouts: std::collections::HashMap::new(),
         }
     }
@@ -2285,7 +2326,7 @@ impl LayoutGraph {
                     Self {
                         graph: self.graph.clone(),
                         layout_nodes: self.layout_nodes.clone(),
-                        reserved_max: self.reserved_max,
+                        extent: self.extent,
                         sub_layouts: self.sub_layouts.clone(),
                     },
                     node_id_domain,
@@ -2327,7 +2368,7 @@ impl LayoutGraph {
         let shifted = Self {
             graph: self.graph.clone(),
             layout_nodes: shifted_layout_nodes,
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self.sub_layouts.clone(),
         };
         let sibling_ids: Vec<crate::model::node::Id> = match shifted.graph.nodes.get(&parent_id) {
@@ -2396,7 +2437,7 @@ impl LayoutGraph {
         let with_new = Self {
             graph,
             layout_nodes: shifted.layout_nodes,
-            reserved_max: shifted.reserved_max,
+            extent: shifted.extent,
             sub_layouts: shifted
                 .sub_layouts
                 .into_iter()
@@ -2437,7 +2478,7 @@ impl LayoutGraph {
                 return Self {
                     graph: self.graph.clone(),
                     layout_nodes: self.layout_nodes.clone(),
-                    reserved_max: self.reserved_max,
+                    extent: self.extent,
                     sub_layouts: self.sub_layouts.clone(),
                 }
             }
@@ -2450,7 +2491,7 @@ impl LayoutGraph {
             return Self {
                 graph: self.graph.clone(),
                 layout_nodes: self.layout_nodes.clone(),
-                reserved_max: self.reserved_max,
+                extent: self.extent,
                 sub_layouts: self.sub_layouts.clone(),
             };
         };
@@ -2476,7 +2517,7 @@ impl LayoutGraph {
                     }
                 })
                 .collect(),
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self.sub_layouts.clone(),
         }
     }
@@ -2496,7 +2537,7 @@ impl LayoutGraph {
                 return Self {
                     graph: self.graph.clone(),
                     layout_nodes: self.layout_nodes.clone(),
-                    reserved_max: self.reserved_max,
+                    extent: self.extent,
                     sub_layouts: self.sub_layouts.clone(),
                 }
             }
@@ -2511,7 +2552,7 @@ impl LayoutGraph {
                 },
             ),
             layout_nodes: self.layout_nodes.clone(),
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self.sub_layouts.clone(),
         }
     }
@@ -2591,7 +2632,7 @@ impl LayoutGraph {
         let layout = Self {
             graph,
             layout_nodes: self.layout_nodes.clone(),
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&node_id, pos);
@@ -2626,7 +2667,7 @@ impl LayoutGraph {
         let layout = Self {
             graph,
             layout_nodes: self.layout_nodes.clone(),
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self.sub_layouts.clone(),
         }
         ._plus_layout_node(&node_id, pos);
@@ -2667,7 +2708,7 @@ impl LayoutGraph {
                 .into_iter()
                 .chain([(node_id.clone(), LayoutNode::unshaped(node_id.clone(), pos))])
                 .collect(),
-            reserved_max: self.reserved_max,
+            extent: self.extent,
             sub_layouts: self.sub_layouts.clone(),
         }
     }
@@ -2743,12 +2784,14 @@ impl LayoutGraph {
     /// they never pull the near one along, so a graph that moved off the
     /// origin leaves whitespace behind instead of dragging its volume with it.
     ///
-    /// - Z: `[0, sink.z]` where `sink.z` is the single Sink's layout-Z. Both
-    ///   ends are reserved: local Z=0 is the source row (Sources in the root
-    ///   scope, the BranchSource in a branch) and `sink.z` belongs to the Sink
-    ///   alone. Returns `None` if no Sink exists.
-    /// - X / Y: `[0, max]` over every node's footprint, unioned with
-    ///   `reserved_max` — the width and height the scope claims explicitly.
+    /// - Z: `[0, extent.z]`, read straight out of the stored extent. Both ends
+    ///   are reserved: local Z=0 is the source row (Sources in the root scope,
+    ///   the BranchSource in a branch) and the last layer belongs to the Sink
+    ///   alone, which is why every path that moves the Sink writes the extent
+    ///   too. Returns `None` where there is no Sink: the outer Root wrapper
+    ///   holds none, and a scope with no terminal is not a volume yet.
+    /// - X / Y: `[0, max]` over every node's footprint, unioned with the
+    ///   extent — the width and height the scope claims explicitly.
     ///   Multi-cell footprints (matches, ≥3-input function calls) push the far
     ///   corner out so their extra cells are drawable; a Match contributes its
     ///   whole Pattern stack on Y, so a scope containing one spans every row
@@ -2757,17 +2800,13 @@ impl LayoutGraph {
     ///   a caret on any Pattern below the first row would fall outside every
     ///   scope.
     ///
-    /// Only nodes and `reserved_max` decide this: the caret cannot widen the
+    /// Only nodes and the extent decide this: the caret cannot widen the
     /// volume by moving, since `clamp_to_volume` keeps it inside.
     pub fn grid_bounds(&self) -> Option<GridBounds> {
-        let sink_z =
-            self.layout_nodes
-                .iter()
-                .find_map(|(id, ln)| match self.graph.nodes.get(id) {
-                    Some(crate::model::node::ENode::Sink { .. }) => Some(ln.pos.z),
-                    _ => None,
-                })?;
-        let mut max = IVec3::new(self.reserved_max.x, self.reserved_max.y, sink_z);
+        // Asked for the terminal and not for its depth. A Sink is what makes a
+        // scope a volume, and where it stands is the extent's business now.
+        self.sink_id()?;
+        let mut max = self.extent;
         for id in self.layout_nodes.keys() {
             let Some(fp) = self.node_footprint(id) else {
                 continue;
@@ -2784,9 +2823,11 @@ impl LayoutGraph {
     /// Clamp a global cell address into this graph's volume, i.e. the bounds
     /// every scope nested in it lives inside.
     ///
-    /// Caret navigation goes through here: the volume follows the nodes, and
-    /// widening it — adding empty cells to move into — is an explicit action,
-    /// never a side effect of moving. With no Sink there is no volume yet;
+    /// Caret navigation goes through here: widening the volume — adding empty
+    /// cells to move into — is an explicit action and never a side effect of
+    /// moving. On Z that now holds all the way down, because the depth is the
+    /// volume's own; on X and Y the far corner still follows the nodes, and
+    /// closing that gap is `todo.md` §1.2. With no Sink there is no volume yet;
     /// only the non-negative half-space constrains the address then.
     pub fn clamp_to_volume(&self, global: IVec3) -> IVec3 {
         match self.grid_bounds() {
@@ -2849,10 +2890,11 @@ impl LayoutGraph {
     /// predicate selects and whose footprint starts at or beyond `cut` on
     /// `axis` moves one cell outward, leaving an empty layer at `cut`.
     ///
-    /// The volume grows by exactly the layer that was opened, whether or not
-    /// a node had to move for it: a slab insert claims one more cell on
-    /// `reserved_max`, a depth insert takes the Sink along. So a layer opens
-    /// in whitespace just as well as in front of a node.
+    /// The volume grows by exactly the layer that was opened, whether or not a
+    /// node had to move for it: the extent claims one more cell on the axis,
+    /// and a depth insert takes the Sink along so it keeps standing on the new
+    /// last layer. So a layer opens in whitespace just as well as in front of
+    /// a node.
     ///
     /// `None` refuses the insert rather than approximating it when a selected
     /// footprint straddles `cut`: a node occupies its cells as one piece and
@@ -2902,7 +2944,7 @@ impl LayoutGraph {
         }
         if moved.is_empty() && axis == Axis::Z {
             // Without a Sink a scope has no depth to open. A slab insert has
-            // nothing to prove: its claim on `reserved_max` is the insert.
+            // nothing to prove: its claim on the extent is the insert.
             return None;
         }
         let mut layout = self.clone_shape();
@@ -2912,11 +2954,12 @@ impl LayoutGraph {
         if let Some(prev) = self.grid_bounds() {
             let claim = axis.of(prev.max) + 1;
             match axis {
-                Axis::X => layout.reserved_max.x = layout.reserved_max.x.max(claim),
-                Axis::Y => layout.reserved_max.y = layout.reserved_max.y.max(claim),
-                // Depth needs no claim of its own: the Sink moved with the
-                // insert and holds the scope open that far.
-                Axis::Z => {}
+                Axis::X => layout.extent.x = layout.extent.x.max(claim),
+                Axis::Y => layout.extent.y = layout.extent.y.max(claim),
+                // Depth claims its layer like the other two now. It used to
+                // lean on the Sink riding along, which is what made the depth
+                // of a volume a property of a node.
+                Axis::Z => layout.extent.z = layout.extent.z.max(claim),
             }
         }
         for id in &moved {
