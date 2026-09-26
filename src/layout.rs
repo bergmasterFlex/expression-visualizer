@@ -99,7 +99,7 @@ impl NodeShape {
 #[derive(Debug, Clone)]
 pub struct LayoutNode {
     pub node_id: crate::model::node::Id,
-    pub pos: Vec3,
+    pub pos: IVec3,
     /// Cell layout, refreshed by `LayoutGraph::with_shapes` whenever types or
     /// wiring change. Independent of `pos`, so it survives the settle pass.
     pub shape: NodeShape,
@@ -128,7 +128,7 @@ pub struct LayoutNode {
 impl LayoutNode {
     /// A node at `pos` whose shape is not known yet (see
     /// `NodeShape::placeholder`).
-    pub fn unshaped(node_id: crate::model::node::Id, pos: Vec3) -> Self {
+    pub fn unshaped(node_id: crate::model::node::Id, pos: IVec3) -> Self {
         Self {
             node_id,
             pos,
@@ -143,7 +143,7 @@ impl LayoutNode {
 ///
 /// That first cell of a Pattern is its gap, not its type — see
 /// `PATTERN_TYPE_LOCAL_Z`.
-pub const PATTERN_LOCAL_Z: f32 = 1.0;
+pub const PATTERN_LOCAL_Z: i32 = 1;
 /// Pattern-local Z of the cell that names the arm's type. Local 0 is the gap
 /// the Pattern holds open in front of it, which is where the next arm is added.
 pub const PATTERN_TYPE_LOCAL_Z: i32 = 1;
@@ -285,7 +285,6 @@ pub struct LayoutAnchor {
     pub anchor_id: crate::model::anchor::Id,
     pub node_id: crate::model::node::Id,
     pub anchor: crate::model::anchor::EAnchor,
-    pub pos: Vec3,
 }
 
 /// A single entry produced by `LayoutGraph::walk_all`. Groups a LayoutNode with
@@ -299,7 +298,7 @@ pub struct WalkedNode<'a> {
     /// path `WalkedGraph::context` carries, and the one a scope *is*. Empty at
     /// the outermost LayoutGraph.
     pub context: Vec<crate::model::node::Id>,
-    pub extra_offset: Vec3,
+    pub extra_offset: IVec3,
 }
 
 /// One entry per LayoutGraph reached from a root. Used by the per-graph grid
@@ -310,7 +309,7 @@ pub struct WalkedGraph<'a> {
     /// LayoutGraph (the one `walk_all_graphs` was called on).
     pub context: Vec<crate::model::node::Id>,
     /// Accumulated grid-space offset from the root to this graph's origin.
-    pub extra_offset: Vec3,
+    pub extra_offset: IVec3,
 }
 
 /// Bounds of an graph grid in that graph's local grid coordinates. Both corners
@@ -343,11 +342,11 @@ impl Axis {
     }
 
     /// One cell along this axis, in layout space.
-    fn unit(self) -> Vec3 {
+    fn unit(self) -> IVec3 {
         match self {
-            Axis::X => Vec3::X,
-            Axis::Y => Vec3::Y,
-            Axis::Z => Vec3::Z,
+            Axis::X => IVec3::X,
+            Axis::Y => IVec3::Y,
+            Axis::Z => IVec3::Z,
         }
     }
 }
@@ -474,7 +473,7 @@ impl LayoutGraph {
             reserved_max: IVec2::ZERO,
             sub_layouts: std::collections::HashMap::new(),
         }
-        ._plus_layout_node(&sink_node_id, Vec3::new(0.0, 0.0, 4.0));
+        ._plus_layout_node(&sink_node_id, IVec3::new(0, 0, 4));
         (layout, node_id_domain, anchor_id_domain)
     }
 
@@ -687,7 +686,7 @@ impl LayoutGraph {
             return self.match_footprint(id);
         }
         let ln = self.layout_nodes.get(id)?;
-        Some(ln.shape.bbox().translated(ln.pos.round().as_ivec3()))
+        Some(ln.shape.bbox().translated(ln.pos))
     }
 
     /// Every global cell an anchor claims, in row order.
@@ -696,9 +695,9 @@ impl LayoutGraph {
     /// reachable from anywhere in the program — an edge may cross into a branch
     /// — so a scope-local answer would have to be lifted by every caller.
     ///
-    /// It has to be derived rather than read, because nothing stores it.
-    /// `try_layout_anchor` carries a `pos` that is a stub, and the world
-    /// positions the renderer computes live in a map local to one spawn pass.
+    /// It has to be derived rather than read, because nothing stores it. A
+    /// `LayoutAnchor` carries no address of its own, and the world positions the
+    /// renderer computes live in a map local to one spawn pass.
     /// What *is* stored is the node's position and its `NodeShape`, and an
     /// anchor's cells are the cells of that shape whose role names it.
     ///
@@ -718,7 +717,7 @@ impl LayoutGraph {
         let graph = self.resolve_context(&context);
         let layout_node = graph.layout_nodes.get(&layout_anchor.node_id)?;
         let node = graph.graph.nodes.get(&layout_anchor.node_id)?;
-        let origin = self.scope_offset(&context) + layout_node.pos.round().as_ivec3();
+        let origin = self.scope_offset(&context) + layout_node.pos;
         let locals = anchor_local_cells(node, &layout_node.shape, anchor)?;
         Some(locals.into_iter().map(|local| origin + local).collect())
     }
@@ -1106,7 +1105,7 @@ impl LayoutGraph {
             .map(|b| b.max.z)
             .max()
             .unwrap_or(0);
-        PATTERN_LOCAL_Z as i32 + BRANCH_LOCAL_Z + deepest_sink + 2
+        PATTERN_LOCAL_Z + BRANCH_LOCAL_Z + deepest_sink + 2
     }
 
     /// Union of all visible grid cells in this LayoutGraph's local coords.
@@ -1125,12 +1124,12 @@ impl LayoutGraph {
             let node_bbox = if self.is_match(id) {
                 self.match_footprint(id)
             } else {
-                Some(ln.shape.bbox().translated(ln.pos.round().as_ivec3()))
+                Some(ln.shape.bbox().translated(ln.pos))
             };
             bbox = AABB::union_opt(bbox, node_bbox);
         }
         for (owner_id, sub) in &self.sub_layouts {
-            let owner_pos = self.sub_layout_origin(owner_id).round().as_ivec3();
+            let owner_pos = self.sub_layout_origin(owner_id);
             let sub_bbox = sub.inner_footprint().map(|b| b.translated(owner_pos));
             bbox = AABB::union_opt(bbox, sub_bbox);
         }
@@ -1193,12 +1192,12 @@ impl LayoutGraph {
         let mut row = first_row;
         for (index, pid) in ordered.iter().enumerate() {
             if index > 0 {
-                row += layout_nodes.get(pid).map_or(0, |ln| ln.gap_above.max(0)) as f32;
+                row += layout_nodes.get(pid).map_or(0, |ln| ln.gap_above.max(0));
             }
             if let Some(ln) = layout_nodes.get_mut(pid) {
                 ln.pos.y = row;
             }
-            row += self.branch_row_height(pid) as f32;
+            row += self.branch_row_height(pid);
         }
         Self {
             graph: self.graph.clone(),
@@ -1223,7 +1222,7 @@ impl LayoutGraph {
         let here = self
             .layout_nodes
             .get(pattern_id)
-            .map(|ln| ln.pos.round().as_ivec3())
+            .map(|ln| ln.pos)
             .unwrap_or(IVec3::ZERO);
         let Some(match_id) = self.parent_match_of(pattern_id) else {
             return (self.clone_shape(), here);
@@ -1267,7 +1266,7 @@ impl LayoutGraph {
             .find(|pid| {
                 self.layout_nodes
                     .get(*pid)
-                    .is_some_and(|ln| ln.pos.y.round() as i32 >= cut)
+                    .is_some_and(|ln| ln.pos.y >= cut)
             })?
             .clone();
         if ordered.first() == Some(&target) {
@@ -1325,12 +1324,12 @@ impl LayoutGraph {
         let mut bbox: Option<AABB> = self
             .layout_nodes
             .get(match_id)
-            .map(|ln| ln.shape.bbox().translated(ln.pos.round().as_ivec3()));
+            .map(|ln| ln.shape.bbox().translated(ln.pos));
         for pid in &pattern_ids {
             let Some(p_ln) = self.layout_nodes.get(pid) else {
                 continue;
             };
-            let p_pos = p_ln.pos.round().as_ivec3();
+            let p_pos = p_ln.pos;
             let sub = self.sub_layouts.get(pid);
             let sub_bbox = sub.and_then(|s| s.inner_footprint());
             let arm_y = self.branch_row_height(pid);
@@ -1362,7 +1361,7 @@ impl LayoutGraph {
     pub fn move_node_delta(
         &self,
         node_id: crate::model::node::Id,
-        delta_pos: Vec3,
+        delta_pos: IVec3,
     ) -> (Self, IVec3) {
         let Some(primary_ln) = self.layout_nodes.get(&node_id) else {
             return (self.clone_shape(), IVec3::ZERO);
@@ -1377,8 +1376,8 @@ impl LayoutGraph {
         // it, not its position, and that is what is edited. Only for a move
         // that is purely vertical: an arm travelling in X or Z is moving the
         // whole stack (see `move_group`) and has nothing to do with spacing.
-        if self.is_pattern(&node_id) && delta_pos.x.abs() < 0.5 && delta_pos.z.abs() < 0.5 {
-            return self.with_arm_gap_delta(&node_id, delta_pos.y.round() as i32);
+        if self.is_pattern(&node_id) && delta_pos.x == 0 && delta_pos.z == 0 {
+            return self.with_arm_gap_delta(&node_id, delta_pos.y);
         }
         // Sources are pinned to the source row (Y=0, Z=0) and may only be
         // reordered along X; a Tunnel is the same thing one scope in, so it
@@ -1389,28 +1388,28 @@ impl LayoutGraph {
         let delta_pos = match self.graph.nodes.get(&node_id) {
             Some(
                 crate::model::node::ENode::Source { .. } | crate::model::node::ENode::Tunnel { .. },
-            ) => Vec3::new(delta_pos.x, 0.0, 0.0),
-            Some(crate::model::node::ENode::BranchSource { .. }) => Vec3::ZERO,
+            ) => IVec3::new(delta_pos.x, 0, 0),
+            Some(crate::model::node::ENode::BranchSource { .. }) => IVec3::ZERO,
             _ => {
                 // Z=0 is the source row and the sink's Z is the sink's alone,
                 // so everything else lives strictly between them.
-                let target_z = (primary_origin.z + delta_pos.z).round() as i32;
+                let target_z = primary_origin.z + delta_pos.z;
                 let sink_z = self.sink_z();
                 if target_z <= 0 || sink_z.is_some_and(|s| target_z >= s) {
-                    Vec3::new(delta_pos.x, delta_pos.y, 0.0)
+                    IVec3::new(delta_pos.x, delta_pos.y, 0)
                 } else {
                     delta_pos
                 }
             }
         };
-        let clamp_axis = |origin: f32, delta: f32| {
-            if (origin + delta).round() as i32 >= 0 {
+        let clamp_axis = |origin: i32, delta: i32| {
+            if origin + delta >= 0 {
                 delta
             } else {
-                0.0
+                0
             }
         };
-        let delta_pos = Vec3::new(
+        let delta_pos = IVec3::new(
             clamp_axis(primary_origin.x, delta_pos.x),
             clamp_axis(primary_origin.y, delta_pos.y),
             delta_pos.z,
@@ -1429,12 +1428,9 @@ impl LayoutGraph {
         // and not an anomaly — the same answer the pins above give, and
         // `settle_footprints` already reads an unchanged position as "refused"
         // and stops asking.
-        let outside_space = |p: Vec3| {
-            let cell = p.round().as_ivec3();
-            cell.x < 0 || cell.y < 0 || cell.z < 0
-        };
+        let outside_space = |p: IVec3| p.x < 0 || p.y < 0 || p.z < 0;
 
-        let mut plan: std::collections::HashMap<crate::model::node::Id, Vec3> =
+        let mut plan: std::collections::HashMap<crate::model::node::Id, IVec3> =
             std::collections::HashMap::new();
         let mut worklist: std::collections::VecDeque<crate::model::node::Id> =
             std::collections::VecDeque::new();
@@ -1443,10 +1439,10 @@ impl LayoutGraph {
                 .layout_nodes
                 .get(&id)
                 .map(|ln| ln.pos)
-                .unwrap_or(Vec3::ZERO);
+                .unwrap_or(IVec3::ZERO);
             let target = origin + d;
             if outside_space(target) {
-                return (self.clone_shape(), primary_origin.round().as_ivec3());
+                return (self.clone_shape(), primary_origin);
             }
             plan.insert(id.clone(), target);
             worklist.push_back(id);
@@ -1457,12 +1453,12 @@ impl LayoutGraph {
             iterations += 1;
             if iterations > 128 {
                 warn!("move_node_delta: aborted after 128 iterations");
-                return (self.clone_shape(), primary_origin.round().as_ivec3());
+                return (self.clone_shape(), primary_origin);
             }
             let Some(new_pos) = plan.get(&cur).copied() else {
                 continue;
             };
-            let key = new_pos.round().as_ivec3();
+            let key = new_pos;
             let Some(occ) = occupancy.get(&key) else {
                 continue;
             };
@@ -1473,12 +1469,12 @@ impl LayoutGraph {
                 .layout_nodes
                 .get(occ)
                 .map(|ln| ln.pos)
-                .unwrap_or(Vec3::ZERO);
+                .unwrap_or(IVec3::ZERO);
             let cur_origin = self
                 .layout_nodes
                 .get(&cur)
                 .map(|ln| ln.pos)
-                .unwrap_or(Vec3::ZERO);
+                .unwrap_or(IVec3::ZERO);
             let cur_delta = new_pos - cur_origin;
             // Section-swap for multi-cell owners: the owner rides in the same
             // direction as the intruder so its footprint fully vacates the
@@ -1493,16 +1489,16 @@ impl LayoutGraph {
             for (id, d) in self.move_group(occ, swap_delta) {
                 if plan.contains_key(&id) {
                     warn!("move_node_delta: plan conflict, aborted");
-                    return (self.clone_shape(), primary_origin.round().as_ivec3());
+                    return (self.clone_shape(), primary_origin);
                 }
                 let origin = self
                     .layout_nodes
                     .get(&id)
                     .map(|ln| ln.pos)
-                    .unwrap_or(Vec3::ZERO);
+                    .unwrap_or(IVec3::ZERO);
                 let target = origin + d;
                 if outside_space(target) {
-                    return (self.clone_shape(), primary_origin.round().as_ivec3());
+                    return (self.clone_shape(), primary_origin);
                 }
                 plan.insert(id.clone(), target);
                 worklist.push_back(id);
@@ -1547,12 +1543,7 @@ impl LayoutGraph {
             .iter()
             .fold(moved, |acc, mid| acc.recompute_match_pos(mid));
 
-        let effective_primary = plan
-            .get(&node_id)
-            .copied()
-            .unwrap_or(primary_origin)
-            .round()
-            .as_ivec3();
+        let effective_primary = plan.get(&node_id).copied().unwrap_or(primary_origin);
         (after_recompute, effective_primary)
     }
 
@@ -1696,7 +1687,7 @@ impl LayoutGraph {
                     // in, and it is pinned to Y=0, Z=0 for exactly that reason
                     // — so nothing may lie across it, and since it cannot move
                     // out of the way, the other one does.
-                    let ipos = ln.pos.round().as_ivec3();
+                    let ipos = ln.pos;
                     let ibox = layout.node_footprint(id)?;
                     let inside = bbox.contains(ipos);
                     if inside || (entry_row_owner && bbox.intersects(&ibox)) {
@@ -1769,11 +1760,11 @@ impl LayoutGraph {
                     (1u8, push_y)
                 };
                 let delta = match best_axis {
-                    0 => Vec3::new(best_dist as f32, 0.0, 0.0),
-                    2 => Vec3::new(0.0, 0.0, best_dist as f32),
-                    _ => Vec3::new(0.0, best_dist as f32, 0.0),
+                    0 => IVec3::new(best_dist, 0, 0),
+                    2 => IVec3::new(0, 0, best_dist),
+                    _ => IVec3::new(0, best_dist, 0),
                 };
-                if delta.length_squared() < 0.25 {
+                if delta == IVec3::ZERO {
                     break;
                 }
                 let before = layout.layout_nodes.get(&intruder_id).map(|ln| ln.pos);
@@ -1810,7 +1801,7 @@ impl LayoutGraph {
         let Some(sink_ln) = self.layout_nodes.get(&sink_id) else {
             return self.clone_shape();
         };
-        let current_sink_z = sink_ln.pos.round().as_ivec3().z;
+        let current_sink_z = sink_ln.pos.z;
 
         let mut deepest_z = i32::MIN;
         for id in self.layout_nodes.keys() {
@@ -1832,8 +1823,8 @@ impl LayoutGraph {
 
         let mut layout = self.clone_shape();
         if let Some(ln) = layout.layout_nodes.get_mut(&sink_id) {
-            ln.pos.x = 0.0;
-            ln.pos.z = new_sink_z as f32;
+            ln.pos.x = 0;
+            ln.pos.z = new_sink_z;
         }
         layout
     }
@@ -1842,9 +1833,7 @@ impl LayoutGraph {
     /// the scope's maximum Z and that row is reserved for it.
     pub fn sink_z(&self) -> Option<i32> {
         let sink_id = self.sink_id()?;
-        self.layout_nodes
-            .get(&sink_id)
-            .map(|ln| ln.pos.round().as_ivec3().z)
+        self.layout_nodes.get(&sink_id).map(|ln| ln.pos.z)
     }
     /// The single Sink node id of this LayoutGraph, if present.
     pub fn sink_id(&self) -> Option<crate::model::node::Id> {
@@ -1876,7 +1865,7 @@ impl LayoutGraph {
         for match_id in &match_ids {
             let pattern_ids = layout.match_pattern_ids(match_id);
             // Reference = the sibling sink furthest back (largest Z).
-            let mut reference: Option<(f32, f32)> = None;
+            let mut reference: Option<(i32, i32)> = None;
             for pid in &pattern_ids {
                 let Some(sub) = layout.sub_layouts.get(pid) else {
                     continue;
@@ -1919,16 +1908,16 @@ impl LayoutGraph {
         &self,
         occupancy: &std::collections::HashMap<IVec3, crate::model::node::Id>,
         mover: &crate::model::node::Id,
-        origin: Vec3,
-        nominal_delta: Vec3,
-    ) -> Vec3 {
-        if nominal_delta.y.abs() < 0.5 {
+        origin: IVec3,
+        nominal_delta: IVec3,
+    ) -> IVec3 {
+        if nominal_delta.y == 0 {
             return nominal_delta;
         }
-        let step = if nominal_delta.y > 0.0 { 1.0 } else { -1.0 };
+        let step = if nominal_delta.y > 0 { 1 } else { -1 };
         let mut target = origin + nominal_delta;
         for _ in 0..32 {
-            let key = target.round().as_ivec3();
+            let key = target;
             let Some(occ) = occupancy.get(&key) else {
                 return target - origin;
             };
@@ -1955,10 +1944,10 @@ impl LayoutGraph {
                 return target - origin;
             };
             // Clamp the upward jump at 0: layout space has no negative row.
-            target.y = if step > 0.0 {
-                bbox.max.y as f32 + step
+            target.y = if step > 0 {
+                bbox.max.y + step
             } else {
-                (bbox.min.y as f32 + step).max(0.0)
+                (bbox.min.y + step).max(0)
             };
         }
         nominal_delta
@@ -1974,10 +1963,10 @@ impl LayoutGraph {
     fn move_group(
         &self,
         seed: &crate::model::node::Id,
-        seed_delta: Vec3,
-    ) -> Vec<(crate::model::node::Id, Vec3)> {
+        seed_delta: IVec3,
+    ) -> Vec<(crate::model::node::Id, IVec3)> {
         if self.is_match(seed) {
-            let mut group: Vec<(crate::model::node::Id, Vec3)> = vec![(seed.clone(), seed_delta)];
+            let mut group: Vec<(crate::model::node::Id, IVec3)> = vec![(seed.clone(), seed_delta)];
             for pid in self.match_pattern_ids(seed) {
                 group.push((pid, seed_delta));
             }
@@ -1986,7 +1975,7 @@ impl LayoutGraph {
         if !self.is_pattern(seed) {
             return vec![(seed.clone(), seed_delta)];
         }
-        let xz_zero = seed_delta.x.abs() < 0.5 && seed_delta.z.abs() < 0.5;
+        let xz_zero = seed_delta.x == 0 && seed_delta.z == 0;
         if xz_zero {
             return vec![(seed.clone(), seed_delta)];
         }
@@ -1995,8 +1984,8 @@ impl LayoutGraph {
         };
         // Sibling patterns co-move on XZ, and the parent Match must follow
         // so its footprint stays aligned during the swap-cascade phase.
-        let xz_delta = Vec3::new(seed_delta.x, 0.0, seed_delta.z);
-        let mut group: Vec<(crate::model::node::Id, Vec3)> = self
+        let xz_delta = IVec3::new(seed_delta.x, 0, seed_delta.z);
+        let mut group: Vec<(crate::model::node::Id, IVec3)> = self
             .match_pattern_ids(&match_id)
             .into_iter()
             .map(|sid| {
@@ -2067,7 +2056,7 @@ impl LayoutGraph {
     pub fn plus_constant(
         &self,
         r#type: crate::model::r#type::EType,
-        pos: Vec3,
+        pos: IVec3,
         node_id_domain: NodeIdDomain,
         anchor_id_domain: AnchorIdDomain,
     ) -> (Self, NodeIdDomain, AnchorIdDomain) {
@@ -2093,7 +2082,7 @@ impl LayoutGraph {
     pub fn plus_type_cast(
         &self,
         r#type: Option<crate::model::r#type::EType>,
-        pos: Vec3,
+        pos: IVec3,
         node_id_domain: NodeIdDomain,
         anchor_id_domain: AnchorIdDomain,
     ) -> (Self, NodeIdDomain, AnchorIdDomain) {
@@ -2124,7 +2113,7 @@ impl LayoutGraph {
             crate::model::function_declaration::FunctionDeclarationId,
             &crate::model::function_declaration::FunctionDeclaration,
         ),
-        pos: Vec3,
+        pos: IVec3,
         node_id_domain: NodeIdDomain,
         anchor_id_domain: AnchorIdDomain,
     ) -> (Self, NodeIdDomain, AnchorIdDomain) {
@@ -2175,7 +2164,7 @@ impl LayoutGraph {
     /// adjoining the arm's type in +Z.
     pub fn plus_match(
         &self,
-        pos: Vec3,
+        pos: IVec3,
         node_id_domain: NodeIdDomain,
         anchor_id_domain: AnchorIdDomain,
     ) -> (Self, NodeIdDomain, AnchorIdDomain) {
@@ -2234,7 +2223,7 @@ impl LayoutGraph {
         // The Match keeps `pos` for its input anchor; the Pattern begins one
         // cell behind it — with its gap, then its type — and its branch behind
         // those (`sub_layout_origin`).
-        ._plus_layout_node(&pattern_node_id, pos + Vec3::new(0.0, 0.0, PATTERN_LOCAL_Z))
+        ._plus_layout_node(&pattern_node_id, pos + IVec3::new(0, 0, PATTERN_LOCAL_Z))
         ._plus_layout_node(&match_node_id, pos);
         (layout, node_id_domain, anchor_id_domain)
     }
@@ -2257,11 +2246,11 @@ impl LayoutGraph {
             layout_nodes: std::collections::HashMap::from([
                 (
                     branch_source_id.clone(),
-                    LayoutNode::unshaped(branch_source_id.clone(), Vec3::ZERO),
+                    LayoutNode::unshaped(branch_source_id.clone(), IVec3::ZERO),
                 ),
                 (
                     sub_sink_id.clone(),
-                    LayoutNode::unshaped(sub_sink_id.clone(), Vec3::new(0.0, 0.0, 2.0)),
+                    LayoutNode::unshaped(sub_sink_id.clone(), IVec3::new(0, 0, 2)),
                 ),
             ]),
             reserved_max: IVec2::ZERO,
@@ -2320,12 +2309,12 @@ impl LayoutGraph {
                 if !match_pattern_ids.contains(id) {
                     return (id.clone(), ln.clone());
                 }
-                if ln.pos.y > selected_y + 0.001 {
+                if ln.pos.y > selected_y {
                     (
                         id.clone(),
                         LayoutNode {
                             node_id: id.clone(),
-                            pos: ln.pos + Vec3::new(0.0, 1.0, 0.0),
+                            pos: ln.pos + IVec3::Y,
                             shape: ln.shape.clone(),
                             gap_above: ln.gap_above,
                         },
@@ -2416,7 +2405,7 @@ impl LayoutGraph {
         }
         ._plus_layout_node(
             &new_pattern_id,
-            Vec3::new(column_x, selected_y + 1.0, column_z),
+            IVec3::new(column_x, selected_y + 1, column_z),
         );
         let match_ids: Vec<crate::model::node::Id> = with_new
             .graph
@@ -2456,7 +2445,7 @@ impl LayoutGraph {
         let lowest_pos = pattern_ids
             .iter()
             .filter_map(|pid| self.layout_nodes.get(pid).map(|ln| ln.pos))
-            .min_by(|a, b| a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal));
+            .min_by_key(|p| p.y);
         let Some(lowest_pos) = lowest_pos else {
             return Self {
                 graph: self.graph.clone(),
@@ -2465,7 +2454,7 @@ impl LayoutGraph {
                 sub_layouts: self.sub_layouts.clone(),
             };
         };
-        let new_pos = lowest_pos - Vec3::new(0.0, 0.0, PATTERN_LOCAL_Z);
+        let new_pos = lowest_pos - IVec3::new(0, 0, PATTERN_LOCAL_Z);
         Self {
             graph: self.graph.clone(),
             layout_nodes: self
@@ -2550,10 +2539,11 @@ impl LayoutGraph {
             })
             .collect();
         sources.sort_by(|a, b| {
-            // `total_cmp`, not `partial_cmp`: an X that came out NaN would
-            // otherwise compare equal to everything and scramble the order,
-            // rather than sorting to one end of it.
-            let lateral = a.pos.x.total_cmp(&b.pos.x);
+            // The id breaks a tie, so two Sources sharing a column still
+            // have one order and not two. X is the whole of where a Source
+            // stands — its row and its depth are pinned — and an integer order
+            // is total because the type is, so there is nothing else to say.
+            let lateral = a.pos.x.cmp(&b.pos.x);
             lateral.then_with(|| a.node_id.cmp(&b.node_id))
         });
         sources
@@ -2570,12 +2560,12 @@ impl LayoutGraph {
 
     pub fn plus_source(
         &self,
-        pos: Vec3,
+        pos: IVec3,
         node_id_domain: NodeIdDomain,
         anchor_id_domain: AnchorIdDomain,
     ) -> (Self, NodeIdDomain, AnchorIdDomain) {
         // Sources live only on the root scope's wall (Y=0, Z=0). Snap defensively.
-        let pos = Vec3::new(pos.x, 0.0, 0.0);
+        let pos = IVec3::new(pos.x, 0, 0);
         let (anchor_id_domain, output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, node_id) = node_id_domain.next_id();
         let graph = self.graph.plus_node(
@@ -2615,13 +2605,13 @@ impl LayoutGraph {
     /// the caret is built standing on the cell that declares it.
     pub fn plus_tunnel(
         &self,
-        pos: Vec3,
+        pos: IVec3,
         node_id_domain: NodeIdDomain,
         anchor_id_domain: AnchorIdDomain,
     ) -> (Self, NodeIdDomain, AnchorIdDomain) {
         // The entry row (Y=0, Z=0), the way a Source snaps to the root's.
         // Defensive: `kind_allowed` has already refused every other cell.
-        let pos = Vec3::new(pos.x, 0.0, 0.0);
+        let pos = IVec3::new(pos.x, 0, 0);
         let (anchor_id_domain, input_anchor_id) = anchor_id_domain.next_id();
         let (anchor_id_domain, output_anchor_id) = anchor_id_domain.next_id();
         let (node_id_domain, node_id) = node_id_domain.next_id();
@@ -2652,23 +2642,23 @@ impl LayoutGraph {
     /// `BranchSource` sits — lands at `BRANCH_LOCAL_Z`, just past the cell that
     /// names the arm's type. Every other owner (the Root wrapper) contributes
     /// no shift.
-    fn sub_layout_origin(&self, owner_id: &crate::model::node::Id) -> Vec3 {
+    fn sub_layout_origin(&self, owner_id: &crate::model::node::Id) -> IVec3 {
         let base = self
             .layout_nodes
             .get(owner_id)
             .map(|ln| ln.pos)
-            .unwrap_or(Vec3::ZERO);
+            .unwrap_or(IVec3::ZERO);
         if matches!(
             self.graph.nodes.get(owner_id),
             Some(crate::model::node::ENode::Pattern { .. })
         ) {
-            base + Vec3::new(0.0, 0.0, BRANCH_LOCAL_Z as f32)
+            base + IVec3::new(0, 0, BRANCH_LOCAL_Z)
         } else {
             base
         }
     }
 
-    fn _plus_layout_node(&self, node_id: &crate::model::node::Id, pos: Vec3) -> Self {
+    fn _plus_layout_node(&self, node_id: &crate::model::node::Id, pos: IVec3) -> Self {
         Self {
             graph: self.graph.clone(),
             layout_nodes: self
@@ -2692,14 +2682,14 @@ impl LayoutGraph {
     /// entered with offset (0,0,0).
     pub fn walk_all(&self) -> Vec<WalkedNode> {
         let mut out = Vec::new();
-        self.walk_all_into(Vec::new(), Vec3::ZERO, &mut out);
+        self.walk_all_into(Vec::new(), IVec3::ZERO, &mut out);
         out
     }
 
     fn walk_all_into<'a>(
         &'a self,
         context: Vec<crate::model::node::Id>,
-        offset: Vec3,
+        offset: IVec3,
         out: &mut Vec<WalkedNode<'a>>,
     ) {
         for layout_node in self.layout_nodes.values() {
@@ -2723,14 +2713,14 @@ impl LayoutGraph {
     /// (empty at `self`) and the accumulated grid-space offset.
     pub fn walk_all_graphs(&self) -> Vec<WalkedGraph> {
         let mut out = Vec::new();
-        self.walk_all_graphs_into(Vec::new(), Vec3::ZERO, &mut out);
+        self.walk_all_graphs_into(Vec::new(), IVec3::ZERO, &mut out);
         out
     }
 
     fn walk_all_graphs_into<'a>(
         &'a self,
         context: Vec<crate::model::node::Id>,
-        offset: Vec3,
+        offset: IVec3,
         out: &mut Vec<WalkedGraph<'a>>,
     ) {
         out.push(WalkedGraph {
@@ -2774,9 +2764,7 @@ impl LayoutGraph {
             self.layout_nodes
                 .iter()
                 .find_map(|(id, ln)| match self.graph.nodes.get(id) {
-                    Some(crate::model::node::ENode::Sink { .. }) => {
-                        Some(ln.pos.round().as_ivec3().z)
-                    }
+                    Some(crate::model::node::ENode::Sink { .. }) => Some(ln.pos.z),
                     _ => None,
                 })?;
         let mut max = IVec3::new(self.reserved_max.x, self.reserved_max.y, sink_z);
@@ -2976,7 +2964,6 @@ impl LayoutGraph {
                 anchor_id: anchor_id.clone(),
                 anchor: anchor.clone(),
                 node_id,
-                pos: Vec3::splat(1.0),
             });
         }
         for sub in self.sub_layouts.values() {
@@ -3077,7 +3064,7 @@ impl LayoutGraph {
             let Some(bounds) = walked.layout_graph.grid_bounds() else {
                 continue;
             };
-            let offset = walked.extra_offset.round().as_ivec3();
+            let offset = walked.extra_offset;
             let local = global - offset;
             let inside = local.x >= bounds.min.x
                 && local.x <= bounds.max.x
@@ -3106,7 +3093,7 @@ impl LayoutGraph {
         let mut offset = IVec3::ZERO;
         let mut graph = self;
         for id in path {
-            offset += graph.sub_layout_origin(id).round().as_ivec3();
+            offset += graph.sub_layout_origin(id);
             let Some(next) = graph.sub_layouts.get(id) else {
                 break;
             };

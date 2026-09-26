@@ -35,8 +35,12 @@ pub fn layout_to_world(pos: Vec3) -> Vec3 {
 }
 
 /// World-space centre of the cell at `cell`. Node meshes and anchors sit here.
-pub fn cell_center_world(cell: Vec3) -> Vec3 {
-    layout_to_world(cell + Vec3::splat(0.5))
+///
+/// Takes an address and not a point, which is the whole of the difference
+/// between this and `layout_to_world`: the half cell added here is the one step
+/// that turns the corner a cell *is* into somewhere inside it.
+pub fn cell_center_world(cell: IVec3) -> Vec3 {
+    layout_to_world(cell.as_vec3() + Vec3::splat(0.5))
 }
 
 /// Inverse of `layout_to_world`. Turns a world-space point (e.g. a grid
@@ -933,21 +937,17 @@ pub fn anchor_body_face_world(anchor_world_pos: Vec3, is_input: bool) -> Vec3 {
 /// A Pattern owns no anchor, so this address exists nowhere else — and it is
 /// needed twice, by the node pass that draws the band and by the link pass that
 /// has to meet it. Written once here so the two cannot drift.
-pub fn pattern_band_world(layout_node: &crate::layout::LayoutNode, extra_offset: Vec3) -> Vec3 {
+pub fn pattern_band_world(layout_node: &crate::layout::LayoutNode, extra_offset: IVec3) -> Vec3 {
     cell_center_world(
-        layout_node.pos
-            + extra_offset
-            + Vec3::new(0.0, 0.0, crate::layout::PATTERN_TYPE_LOCAL_Z as f32),
+        layout_node.pos + extra_offset + IVec3::new(0, 0, crate::layout::PATTERN_TYPE_LOCAL_Z),
     )
 }
 
 /// World centre of the cell a TypeCast names its target type on. The same
 /// address a Pattern's arm has, one node-local hop instead of two: a cast
 /// borrows the Match's rhythm but has no Pattern node to go through.
-pub fn cast_band_world(layout_node: &crate::layout::LayoutNode, extra_offset: Vec3) -> Vec3 {
-    cell_center_world(
-        layout_node.pos + extra_offset + Vec3::new(0.0, 0.0, crate::layout::CAST_TYPE_Z as f32),
-    )
+pub fn cast_band_world(layout_node: &crate::layout::LayoutNode, extra_offset: IVec3) -> Vec3 {
+    cell_center_world(layout_node.pos + extra_offset + IVec3::new(0, 0, crate::layout::CAST_TYPE_Z))
 }
 
 /// Whether a strand stack writes in words what its shape already says.
@@ -1303,7 +1303,7 @@ fn plain_anchor_body(cell_center: Vec3, span: Span) -> RenderObject {
 
 /// Spawn the graph node meshes.
 ///
-/// `extra_offset` (grid units) is added to `layout_node.pos` before the
+/// `extra_offset` (in cells) is added to `layout_node.pos` before the
 /// grid→world conversion; used for pattern sub-graph nodes whose positions are
 /// relative to the containing pattern.
 ///
@@ -1323,14 +1323,14 @@ pub fn layoutnode_to_rendernode(
     // the literals are read from it: an anchor's rows are the ones its declared
     // type reserved, evaluated or not, so the node keeps its footprint.
     known: &crate::infer::Known,
-    extra_offset: Vec3,
+    extra_offset: IVec3,
 ) -> RenderNode {
     let graph = &layout_graph.graph;
     // World centre of a node-local cell. Every part of a node — each anchor
     // row, the body — lives in its own cell, so placement goes through this
     // rather than nudging sub-meshes around inside a single cell.
     let cell = |x: i32, y: i32, z: i32| {
-        cell_center_world(layout_node.pos + extra_offset + Vec3::new(x as f32, y as f32, z as f32))
+        cell_center_world(layout_node.pos + extra_offset + IVec3::new(x, y, z))
     };
     let node = graph.nodes.get(&layout_node.node_id).unwrap();
     match node {

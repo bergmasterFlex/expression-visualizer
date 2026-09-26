@@ -906,7 +906,7 @@ fn addressed_cell(
     let (layout, local) = state.caret_graph(pick)?;
     let id = layout.node_at(local)?;
     let ln = layout.layout_nodes.get(&id)?;
-    let role = ln.shape.role_at(local - ln.pos.round().as_ivec3())?.clone();
+    let role = ln.shape.role_at(local - ln.pos)?.clone();
     Some((id, role))
 }
 
@@ -1057,9 +1057,7 @@ fn anchor_at_caret(state: &GraphState, pick: &PickState) -> Option<model::anchor
     let (layout, local) = state.caret_graph(pick)?;
     let anchor_of = |id: &model::node::Id| -> Option<model::anchor::Id> {
         let layout_node = layout.layout_nodes.get(id)?;
-        let role = layout_node
-            .shape
-            .role_at(local - layout_node.pos.round().as_ivec3())?;
+        let role = layout_node.shape.role_at(local - layout_node.pos)?;
         anchor_of_role(layout.graph.nodes.get(id)?, role)
     };
     layout
@@ -1244,9 +1242,7 @@ fn panel_subject(state: &GraphState, pick: &PickState) -> Option<PanelSubject> {
         None => {
             let match_id = graph.match_containing(scope.local)?;
             let layout_node = graph.layout_nodes.get(&match_id)?;
-            layout_node
-                .shape
-                .role_at(scope.local - layout_node.pos.round().as_ivec3())?;
+            layout_node.shape.role_at(scope.local - layout_node.pos)?;
             return match_subject(state, graph, origin, &match_id);
         }
     };
@@ -1270,7 +1266,7 @@ fn node_subject(
     node: &model::node::ENode,
 ) -> Option<PanelSubject> {
     let ln = graph.layout_nodes.get(id)?;
-    let node_origin = ln.pos.round().as_ivec3() + origin;
+    let node_origin = ln.pos + origin;
     let mut rows: Vec<PanelRow> = Vec::new();
     let mut seen: Vec<EditTarget> = Vec::new();
     for (local, role) in ln.shape.cells() {
@@ -1322,7 +1318,7 @@ fn match_subject(
         let Some(ln) = graph.layout_nodes.get(pattern_id) else {
             continue;
         };
-        let pattern_origin = ln.pos.round().as_ivec3() + origin;
+        let pattern_origin = ln.pos + origin;
         let cell_of = |wanted: layout::CellRole| {
             ln.shape
                 .cells()
@@ -1742,7 +1738,7 @@ fn setup_scene(
     // had moved and `trigger_camera_focus_on_selection_change` had had its
     // say: the first framing was the one framing not expressed in the same
     // terms as the rest.
-    orbit.target = render::cell_center_world(pick.selected_pos.as_vec3());
+    orbit.target = render::cell_center_world(pick.selected_pos);
 
     // Camera with order-independent transparency for correct intersection
     // of the two walls and the grid. OIT requires MSAA off.
@@ -1909,7 +1905,7 @@ fn spawn_graph_nodes(
     // fall off smoothly around it instead of in steps. Baked in for the same
     // reason, and it is the caret's point for every volume alike: a fade that
     // re-centred per volume would say nothing about where the work is.
-    let fog_origin = render::cell_center_world(pick.selected_pos.as_vec3());
+    let fog_origin = render::cell_center_world(pick.selected_pos);
     let mut node_entites = std::collections::HashMap::<model::node::Id, Entity>::new();
     let mut anchor_entities = std::collections::HashMap::<model::anchor::Id, Entity>::new();
     let mut anchor_world_positions = std::collections::HashMap::<model::anchor::Id, Vec3>::new();
@@ -1973,7 +1969,7 @@ fn spawn_graph_nodes(
 
         // Past the `hidden` check above and nowhere else, so a node the grading
         // dropped is as unreachable to the pointer as it is invisible.
-        let node_origin = (walked.extra_offset + layout_node.pos).round().as_ivec3();
+        let node_origin = walked.extra_offset + layout_node.pos;
         for cell in node_cells_global(&layout_node.shape, node_origin) {
             pick_index
                 .occupants
@@ -2326,7 +2322,7 @@ fn spawn_graph_nodes(
             // `Lod::dropped` fires one level inside a scope that is still
             // drawn, so this leaves a hole in a floor the pointer can otherwise
             // reach straight through.
-            let dropped_offset = walked_graph.extra_offset.round().as_ivec3();
+            let dropped_offset = walked_graph.extra_offset;
             pick_index.blocked.push(PickVolume {
                 min: bounds.min + dropped_offset,
                 max: bounds.max + dropped_offset,
@@ -2338,8 +2334,8 @@ fn spawn_graph_nodes(
         // Z, so scaling the corners individually would yield an inverted rect
         // and the shader would draw no border at all.
         let (border_lo, border_hi) = render::layout_range_to_world(
-            bounds.min.as_vec3() + offset,
-            bounds.max.as_vec3() + offset,
+            (bounds.min + offset).as_vec3(),
+            (bounds.max + offset).as_vec3(),
             0.0,
         );
         // Collect multi-cell node footprints in this LayoutGraph and convert
@@ -2375,8 +2371,8 @@ fn spawn_graph_nodes(
                 break;
             }
             let (fp_lo, fp_hi) = render::layout_range_to_world(
-                fp.min.as_vec3() + offset,
-                fp.max.as_vec3() + offset,
+                (fp.min + offset).as_vec3(),
+                (fp.max + offset).as_vec3(),
                 0.0,
             );
             footprints[footprint_count as usize] = Vec4::new(fp_lo.x, fp_lo.z, fp_hi.x, fp_hi.z);
@@ -2983,7 +2979,7 @@ fn handle_view_menu_click(
             &mut screenshot,
             &mut rebuild,
             height,
-            render::cell_center_world(pick.selected_pos.as_vec3()),
+            render::cell_center_world(pick.selected_pos),
             time.elapsed_secs(),
         );
         *open = MenuOpen::None;
@@ -3067,7 +3063,7 @@ fn handle_camera_menu_click(
             &mut orbit,
             &mut tween,
             height,
-            render::cell_center_world(pick.selected_pos.as_vec3()),
+            render::cell_center_world(pick.selected_pos),
         );
         *open = MenuOpen::None;
         return;
@@ -3792,7 +3788,7 @@ fn insert_node_kind(
     if !kind_allowed(scope_graph, scope.path.is_empty(), scope.local, kind) {
         return None;
     }
-    let new_pos = scope.local.as_vec3();
+    let new_pos = scope.local;
     let (new_layout, new_node_id_domain, new_anchor_id_domain) = match kind {
         AddKind::Constant(choice, value) => scope_graph.plus_constant(
             make_etype(*choice, value.clone()),
@@ -6314,12 +6310,10 @@ fn sync_value_labels(
                 .nodes
                 .get(&walked.layout_node.node_id)
             {
-                Some(model::node::ENode::Match { patterns, .. }) => Vec3::new(
-                    0.0,
-                    0.0,
-                    walked.layout_graph.match_output_z(patterns) as f32,
-                ),
-                _ => Vec3::ZERO,
+                Some(model::node::ENode::Match { patterns, .. }) => {
+                    IVec3::new(0, 0, walked.layout_graph.match_output_z(patterns))
+                }
+                _ => IVec3::ZERO,
             };
             (
                 walked.layout_node.node_id.clone(),
@@ -6817,7 +6811,7 @@ fn spawn_volume_surfaces(
     materials: &mut Assets<StandardMaterial>,
     min: IVec3,
     max: IVec3,
-    offset: Vec3,
+    offset: IVec3,
     fade: f32,
     shell: f32,
     fog_origin: Vec3,
@@ -6830,7 +6824,8 @@ fn spawn_volume_surfaces(
     // The inclusive range spans [min, max+1], so its centre is (min+max+1)/2 on
     // every axis. Where a surface pins one of the three, it takes an edge
     // instead — and which edge is the whole of what that surface says.
-    let centre = |x: f32, y: f32, z: f32| render::layout_to_world(Vec3::new(x, y, z) + offset);
+    let centre =
+        |x: f32, y: f32, z: f32| render::layout_to_world(Vec3::new(x, y, z) + offset.as_vec3());
     let mid_x = (min.x + max.x + 1) as f32 * 0.5;
     let mid_y = (min.y + max.y + 1) as f32 * 0.5;
     let mid_z = (min.z + max.z + 1) as f32 * 0.5;
@@ -6870,8 +6865,8 @@ fn spawn_volume_surfaces(
     // below is the only thing that chooses, so there is no copy of this
     // condition left to fall out of step with it.
     let lifted = PickVolume {
-        min: min + offset.round().as_ivec3(),
-        max: max + offset.round().as_ivec3(),
+        min: min + offset,
+        max: max + offset,
     };
 
     // Nothing of the volume itself survives the grading. With no floor there is
@@ -8146,13 +8141,7 @@ struct DiagnosticsFingerprint {
 fn cell_of_node(state: &GraphState, id: &model::node::Id) -> Option<IVec3> {
     let root = state.root_graph();
     let context = root.context_of_node(id)?;
-    let local = root
-        .resolve_context(&context)
-        .layout_nodes
-        .get(id)?
-        .pos
-        .round()
-        .as_ivec3();
+    let local = root.resolve_context(&context).layout_nodes.get(id)?.pos;
     Some(local + root.scope_offset(&context))
 }
 
@@ -9153,10 +9142,9 @@ fn relative_path_text(state: &GraphState, scope: &CaretScope) -> String {
         let into_branch =
             root.scope_offset(&scope.path[..=i]) - root.scope_offset(&scope.path[..i]);
         let to_match = match parent.graph.nodes.get(&scope.path[i]) {
-            Some(model::node::ENode::Pattern { parent_match, .. }) => parent
-                .layout_nodes
-                .get(parent_match)
-                .map(|ln| ln.pos.round().as_ivec3()),
+            Some(model::node::ENode::Pattern { parent_match, .. }) => {
+                parent.layout_nodes.get(parent_match).map(|ln| ln.pos)
+            }
             _ => None,
         };
         match to_match {
@@ -9796,7 +9784,7 @@ fn trigger_camera_focus_on_selection_change(
         if last_selection.is_some() {
             // The caret is already a global address, so it converts to world
             // space directly.
-            tween.focus_on(&orbit, render::cell_center_world(current.as_vec3()));
+            tween.focus_on(&orbit, render::cell_center_world(current));
         }
         *last_selection = Some(current);
     }
@@ -10554,8 +10542,7 @@ fn handle_arrow_keys(
         };
         let scope_graph = state.root_graph().resolve_context(&scope.path);
         if let Some(node_id) = scope_graph.node_at(scope.local) {
-            let (new_layout, effective_local) =
-                scope_graph.move_node_delta(node_id, delta.as_vec3());
+            let (new_layout, effective_local) = scope_graph.move_node_delta(node_id, delta);
             let scope_origin = state.root_graph().scope_offset(&scope.path);
             if let Some(target) = state.root_graph_mut().resolve_context_mut(&scope.path) {
                 *target = new_layout;
