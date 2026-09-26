@@ -63,12 +63,64 @@ impl GraphState {
     /// declared types — a constraint-less input takes the height of whatever is
     /// wired into it — which is why connecting, disconnecting and deleting all
     /// have to come through here, not just moving and adding.
-    fn resettle(&mut self) {
+    ///
+    /// `widening` says what the settle may do at the volume's far face, and
+    /// every caller has to answer it. See `layout::Widening`; the two wrappers
+    /// below are the two answers.
+    fn settle(&mut self, widening: layout::Widening) {
         let flat = self.root_graph().flattened_graph();
         self.layout_graph = self
             .layout_graph
             .with_shapes(&flat, &self.function_declarations)
-            .settle_footprints();
+            .settle_footprints(widening);
+    }
+
+    /// Settle for an edit that asked for room, and let the volume grow to hold
+    /// what came of it.
+    ///
+    /// Which is nearly every edit: building a node, opening a cell, a column, a
+    /// row or an arm row, declaring a type or typing a name that makes a node
+    /// bigger, wiring an edge that makes an anchor taller — and removing, which
+    /// asks for nothing but has to settle all the same, because a removal can
+    /// shrink an input that fed off what is gone.
+    ///
+    /// **The volume grows only here**, and only because one of those asked. A
+    /// node is as big as its type and its name make it, and the room it stands
+    /// in, along with the room whatever it displaced stands in, is part of
+    /// granting the request rather than a side effect of it. What §1 rules out
+    /// is growth nobody asked for — which is the other wrapper's business.
+    fn resettle(&mut self) {
+        self.settle(layout::Widening::Allowed);
+        self.layout_graph = self.layout_graph.claiming_extent();
+    }
+
+    /// Settle for an edit that may **not** widen the volume, keeping the result
+    /// only if it did not. `before` is the layout as it stood before the edit,
+    /// and it is what a refusal restores. Returns whether the edit survived.
+    ///
+    /// The shove is the only edit here, and the rule is the one
+    /// `clamp_to_volume` already stated for the caret: widening is an explicit
+    /// action, never a side effect of moving. `move_node_delta` holds that line
+    /// for the move itself, and this catches the two ways a move can still reach
+    /// the far face without ever stepping there — an arm stack that repacks
+    /// wider (a vertical shove of an arm is a change to the space above it), and
+    /// an intruder the cascade had nowhere to push. Either way the edit is a
+    /// plan that cannot be placed, so it is dropped whole and silently, exactly
+    /// as a plan reaching back through the origin already was.
+    fn resettle_bounded(&mut self, before: layout::LayoutGraph) -> bool {
+        self.settle(layout::Widening::Refused);
+        let within = self.layout_graph.within_extent();
+        let settled = self.layout_graph.footprints_settled();
+        if within && settled {
+            return true;
+        }
+        // Silent to the user, because it is a refusal and not an anomaly — but
+        // not silent to the log. On screen a refusal and a bug read exactly
+        // alike: nothing happened. Only one of the two is the volume doing its
+        // job, and this is the one line that tells them apart.
+        debug!("shove refused: within_extent={within}, footprints_settled={settled}");
+        self.layout_graph = before;
+        false
     }
 }
 
@@ -10542,12 +10594,20 @@ fn handle_arrow_keys(
         };
         let scope_graph = state.root_graph().resolve_context(&scope.path);
         if let Some(node_id) = scope_graph.node_at(scope.local) {
-            let (new_layout, effective_local) = scope_graph.move_node_delta(node_id, delta);
+            let (new_layout, effective_local) =
+                scope_graph.move_node_delta(node_id, delta, layout::Widening::Refused);
             let scope_origin = state.root_graph().scope_offset(&scope.path);
+            let before = state.layout_graph.clone();
             if let Some(target) = state.root_graph_mut().resolve_context_mut(&scope.path) {
                 *target = new_layout;
             }
-            state.resettle();
+            // A move may not widen the scope, so a settle that could only finish
+            // by widening it puts the move back instead — `resettle_bounded` has
+            // the two ways that happens. Nothing else changes then: not the
+            // caret, not the scene, because nothing about the graph changed.
+            if !state.resettle_bounded(before) {
+                return;
+            }
             // `move_node_delta` may report a different cell than
             // `local + delta` when the move jumped a match footprint.
             pick.selected_pos = effective_local + scope_origin;

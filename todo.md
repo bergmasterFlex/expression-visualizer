@@ -10,10 +10,12 @@ Gefunden beim vollständigen Gegenlesen von Code gegen `03-concept-design.tex`
 
 ---
 
-## 1. [!] Das Volumen ist transient, wo es persistent sein muss
+## 1. ~~[!] Das Volumen ist transient, wo es persistent sein muss~~ — erledigt
 
-**Das Grösste. Es ist keine Kleinigkeit an der Oberfläche, sondern die Frage, was ein Volumen
-überhaupt ist.**
+**Erledigt am 26.09.** Das Volumen ist jetzt eine gespeicherte Ausdehnung auf allen drei Achsen,
+`grid_bounds()` gibt sie zurück statt sie abzuleiten, und sie wächst an genau zwei Stellen. Was
+sich verschiebt, ist gegen sie geklemmt; was nirgendwo hin kann, wird verworfen. Die beiden
+offenen Entscheidungen (1.6, 1.7) sind unten getroffen und begründet.
 
 ### Wie es sein soll
 
@@ -25,69 +27,118 @@ Gefunden beim vollständigen Gegenlesen von Code gegen `03-concept-design.tex`
 - **Bumping bleibt**: ein Edit darf kaskadierend verschieben, was im Weg steht. Aber die
   Kaskade endet **an der Volumengrenze** und schiebt nicht durch sie hindurch.
 
-### Wie es ist
+### Wie es jetzt ist
 
-**Teilweise nachgezogen am 26.09. (1.1).** Die Ausdehnung ist jetzt gespeichert —
-`LayoutGraph::extent: IVec3` — und `grid_bounds()` liest Z daraus, statt sie aus dem Sink
-abzuleiten. Was bleibt, ist der X/Y-Teil derselben Ableitung:
+`LayoutGraph::extent: IVec3` ist die Ausdehnung, und `grid_bounds()` gibt sie zurück:
 
 ```rust
-// src/layout.rs, grid_bounds()
-self.sink_id()?;             // no Sink, no volume
-let mut max = self.extent;   // Z is read, not derived
-for id in self.layout_nodes.keys() {
-    let Some(fp) = self.node_footprint(id) else { continue };
-    max.x = max.x.max(fp.max.x);   // <- still a lower bound
-    max.y = max.y.max(fp.max.y);   // <- still a lower bound
+// src/layout.rs
+pub fn grid_bounds(&self) -> Option<GridBounds> {
+    self.sink_id()?;   // the one thing still asked of the nodes, and it is a
+                       // yes-or-no question rather than a measure
+    Some(GridBounds { min: IVec3::ZERO, max: self.extent })
 }
 ```
 
-Davon ist erledigt und davon steht noch:
+Kein Knoten wird mehr gefragt, wie weit das Volumen reicht. Damit sind die drei Befunde
+beantwortet:
 
-- **`extent` ist auf X/Y eine Untergrenze, keine Schranke.** Es merkt sich, was ein expliziter
-  Insert geöffnet hat, und begrenzt auf diesen beiden Achsen nichts: ein Knoten, dessen Footprint
-  darüber hinausreicht, weitet das Volumen stillschweigend. Offen, siehe 1.2.
-- ~~**Z ist überhaupt nicht gespeichert**, sondern wird aus der Z des Sinks gelesen.~~ Erledigt.
-  Die Tiefe ist eine Eigenschaft des Volumens; der Sink *sitzt* auf der letzten Ebene, und jeder
-  Weg, der ihn bewegt (`plus_empty_layer`, `settle_sink`, `harmonize_match_sinks`), schreibt
-  `extent.z` mit.
-- **Der Verdrängungslauf weitet als Nebenwirkung.** `move_node_delta` klemmt bei 0 und verweigert
-  Züge auf die Quellreihe und auf die Sink-Reihe, aber auf der *fernen* X/Y-Seite begrenzt ihn
-  nichts. Ein von `settle_footprints` hinausgedrängter Knoten vergrössert also das Volumen, ohne
-  dass jemand darum gebeten hätte. Offen, siehe 1.5.
-- Der Doc-Kommentar zu `clamp_to_volume` sagte es selbst, nur als Feststellung statt als Befund:
-  *„the volume follows the nodes"*. Er sagt jetzt, auf welcher Achse das noch gilt und wo der
-  Punkt dazu steht.
+- ~~**`extent` ist auf X/Y eine Untergrenze, keine Schranke.**~~ Sie ist jetzt auf allen drei
+  Achsen die Schranke.
+- ~~**Z ist überhaupt nicht gespeichert.**~~ Gespeichert, und `settle_sink` schreibt sie nicht mehr:
+  der Sink wird auf die letzte Ebene gezogen, und ob das Volumen mitwachsen *darf*, ist die Frage
+  des Edits und nicht die des Normalisierungslaufs.
+- ~~**Der Verdrängungslauf weitet als Nebenwirkung.**~~ `move_node_delta` nimmt jetzt eine
+  `Widening`-Politik: unter `Refused` ist es gegen beide Flächen geklemmt und verwirft einen Plan,
+  der nicht hineinpasst, als Ganzes. Der Shove ist der einzige Aufrufer, der `Refused` verlangt.
+
+**Zwei Türen, durch die das Volumen wächst, und keine dritte:**
+
+1. `claiming_extent()` — wächst, um zu halten, was drinsteht. Bottom-up, nur nach aussen. Wird
+   ausschliesslich von `GraphState::resettle()` gerufen, also von jedem Edit, der um Platz bittet.
+2. Der Anspruch in `plus_empty_layer` — eine in leeren Raum geöffnete Ebene bewegt keinen Knoten,
+   also ist dieser Anspruch der einzige Beleg, dass sie geöffnet wurde. `claiming_extent` kann
+   messen, was sich bewegt *hat*; nicht, was sich nicht bewegen musste.
+
+**Und zwei Prüfungen, denen ein Edit unterliegt, der nicht weiten darf** (`resettle_bounded`):
+`within_extent()` und `footprints_settled()`. Die erste fängt die zwei Wege, auf denen eine
+Verschiebung die ferne Fläche erreicht, ohne dorthin zu treten — ein Armstapel, der breiter
+umpackt, und ein Sink, der nachgezogen wird. Die zweite fängt den Eindringling, den die Kaskade
+nirgendwo hinschieben konnte: `settle_footprints` liest die unveränderte Position als „verweigert",
+bricht ab und lässt ihn stehen. Zwei Knoten auf einer Zelle ist kein Layout, das man behält.
+
+### Was sich dadurch am Bedienen ändert
+
+Das ist keine offene Frage, sondern die Folge, und sie gehört aufgeschrieben, weil sie sich beim
+ersten Ausprobieren wie ein Fehler anfühlen kann.
+
+Der Caret war schon immer ans Volumen geklemmt (`clamp_to_volume`) — nur konnte er praktisch
+überall hin, weil jeder Knoten das Volumen mitzog. Jetzt zieht keiner mehr, also gilt die Klemme
+wirklich. Ein frisches Programm ist eine Zelle breit und eine hoch: um einen zweiten Knoten
+**neben** den ersten zu setzen, wird erst eine Spalte geöffnet (`Return`), dann der Caret bewegt,
+dann gebaut. Dasselbe für eine Zeile (`Shift+Return`).
+
+Das ist genau der Satz aus „Wie es sein soll" — *eine Zelle einfügen, eine Zeile einfügen* —, nur
+vorher nicht zu merken. Was **nicht** erst Platz braucht: einen Knoten anlegen, der von sich aus
+breiter ist (ein Aufruf mit drei Eingängen beansprucht seine drei Spalten selbst), einen Arm
+hinzufügen, einen Typ oder Namen setzen, eine Kante ziehen. Die weiten alle.
 
 ### Zu tun
 
 - [x] `reserved_max: IVec2` → `extent: IVec3`, inklusives Maximum; `min` bleibt der Ursprung
       und ist ohnehin fix. Erledigt am 26.09.
-- [ ] `grid_bounds()` gibt diese Ausdehnung **zurück**, statt sie über die Footprints zu maximieren.
-      Gilt nur noch für X/Y — Z kommt seit 1.1 aus `extent`. Die Stelle ist zwei Zeilen
-      (`src/layout.rs`, `grid_bounds`), aber sie braucht 1.5 und 1.6 mit, sonst stehen Knoten
-      ausserhalb ihres eigenen Volumens und sind nicht mehr adressierbar.
+- [x] `grid_bounds()` gibt diese Ausdehnung **zurück**, statt sie über die Footprints zu
+      maximieren. Erledigt am 26.09., zusammen mit 1.4/1.5/1.6, weil es ohne sie Knoten ausserhalb
+      ihres eigenen Volumens hinterlassen hätte.
 - [x] Z aus der Ausdehnung lesen statt aus dem Sink. Der Sink *sitzt* jetzt auf der letzten Reihe,
       statt sie zu *definieren*. Erledigt am 26.09. — `grid_bounds` liest `extent.z` und fragt den
       Sink nur noch, *ob* es einen gibt; `plus_empty_layer`, `settle_sink` und
       `harmonize_match_sinks` schreiben `extent.z` mit, wenn sie den Sink bewegen.
-- [ ] Jede Stelle, die heute implizit weitet, explizit machen: Knoten anlegen, `plus_empty_cell`,
-      `plus_empty_slab`, `plus_arm_row`. Die drei Insert-Wege schreiben `extent` ohnehin schon
-      teilweise fort — sie müssen es künftig für alle drei Achsen und als einzige tun.
-      **Seit 1.1 ist die verbleibende implizite Weitung genau eine Zuweisung:** `settle_sink`
-      schreibt `extent.z`, wenn ein tief gebauter Knoten den Sink nach hinten zieht. Der Kommentar
-      dort zeigt auf diesen Punkt.
-- [ ] `move_node_delta` gegen die Ausdehnung klemmen, nicht nur gegen den Ursprung.
-- [ ] **Entscheiden und festhalten: was passiert, wenn eine Kaskade nirgendwo hin kann?**
-      Der Plan wird heute schon als Ganzes verworfen, wenn ein Zug über den Ursprung hinausführt
-      (`src/layout.rs:1422`) — dieselbe Behandlung an der fernen Grenze ist naheliegend und
-      konsistent: **den Edit verweigern**, still, so wie die Verweigerung am Ursprung still ist.
-      Die Alternative — automatisch weiten — ist genau der jetzige Zustand und fällt damit weg.
-- [ ] Danach prüfen, ob eine Kante eines Knotens, der beim Typwechsel wächst (Anker werden höher,
-      wenn ein Summentyp ankommt), noch Platz findet. Das ist der eine Fall, in dem heute etwas
-      wächst, **ohne** dass der Benutzer eine Ausdehnung verlangt hat, und er braucht eine Antwort:
-      weiten (dann ist es eine vierte explizite Handlung) oder verweigern (dann ist das Verdrahten
-      der Kante der verweigerte Edit).
+- [x] Jede Stelle, die implizit weitete, explizit gemacht. Erledigt am 26.09., aber anders als
+      hier vorgeschlagen: nicht jeder Insert-Weg schreibt `extent` selbst, sondern **eine** Funktion
+      tut es für alle — `claiming_extent()`, gerufen von `GraphState::resettle()`. Damit ist die
+      Antwort strukturell statt aufzählend: jeder andere Pfad *liest* die Ausdehnung und keiner
+      schreibt sie, und das ist prüfbar (`grep`). `settle_sink` und `harmonize_match_sinks` haben
+      ihre Zuweisungen verloren. Die eine Ausnahme ist `plus_empty_layer`, und sie ist notwendig:
+      eine in leeren Raum geöffnete Ebene bewegt keinen Knoten, also gibt es nichts zu messen.
+- [x] `move_node_delta` gegen die Ausdehnung klemmen, nicht nur gegen den Ursprung. Erledigt am
+      26.09. Dabei zwei Dinge gefunden, die mehr als der Buchstabe des Punktes sind:
+      **(a) Zellen statt Adresse.** Geklemmt wurde die *Position*. Am Ursprung geht das auf, weil
+      jede Form von ihrer Ursprungszelle nach +X/+Y/+Z wächst; an der fernen Fläche nicht. Ein
+      Aufruf legt seinen Körper über alle seine Eingänge, ein `Match` reicht bis hinter den
+      tiefsten Zweig. Geklemmt wird jetzt gegen `node_footprint`, verschoben um den Zug.
+      **(b) Die Sink-Reihe war auch nur gegen die Position geprüft.** `target_z >= sink_z` liess
+      die *hintere* Zelle eines tiefen Knotens auf der Sink-Reihe landen; `settle_sink` zog den
+      Sink dann nach hinten und weitete. Jetzt `target_z + span.z >= sink_z`.
+- [x] **Entschieden am 26.09.: den Edit verweigern, still.** Wie vorgeschlagen, und an derselben
+      Tür wie die Verweigerung am Ursprung — `outside_volume` prüft beide Flächen und verwirft den
+      Plan als Ganzes.
+      Beim Umsetzen kam heraus, dass die Tür allein nicht reicht, und das ist der Teil, der hier
+      vorher fehlte: eine Verschiebung erreicht die ferne Fläche auch, **ohne dorthin zu treten**.
+      Ein senkrechter Zug an einem Arm ist eine Änderung des Abstands darüber
+      (`with_arm_gap_delta`), und der Stapel packt erst im Settle breiter um; und ein Eindringling,
+      den die Kaskade nirgendwo hinschieben kann, bleibt einfach stehen, weil
+      `settle_footprints` die unveränderte Position als „verweigert" liest und abbricht. Beides
+      hinterlässt nichts, was am Plan zu sehen wäre. Deshalb prüft `resettle_bounded` **nach** dem
+      Settle `within_extent()` und `footprints_settled()` und stellt sonst das Layout von vorher
+      wieder her.
+      Eine Abweichung von „still": die Verweigerung schreibt eine `debug!`-Zeile mit dem Grund.
+      Auf dem Bildschirm sind eine Verweigerung und ein Fehler nicht zu unterscheiden — in beiden
+      Fällen passiert nichts —, und das ist die eine Zeile, die sie auseinanderhält.
+- [x] **Entschieden am 26.09.: weiten. Das Umformen eines Knotens ist die vierte explizite
+      Handlung.** Betrifft drei Wege, nicht nur den einen: einen Typ deklarieren (Anker werden
+      höher), einen Namen tippen (der Körper wird länger), eine Kante ziehen (der Zielanker nimmt
+      die Höhe dessen an, was ankommt).
+      **Begründung.** Ein Knoten ist so gross, wie sein Typ und sein Name ihn machen. Alle drei
+      Handlungen sind ausdrückliche Handlungen *an einem Knoten* und keine Nebenwirkungen — was
+      §1 ausschliesst, ist Wachstum, um das niemand gebeten hat, und keine davon ist das.
+      Verweigern hätte drei Preise: eine Verdrahtung, die stumm nichts tut und dem Benutzer keinen
+      Weg lässt zu sehen, warum; eine Ankerhöhe, die davon abhängt, wie viel Platz zufällig übrig
+      war — also ein Bild, das über den Typ lügt; und eine Reihenfolge-Abhängigkeit, in der
+      dasselbe Programm je nach Bauweise verdrahtbar oder nicht ist, was §6 (Kanonizität) direkt
+      widerspricht.
+      Im Code ist das `Widening::Allowed` und damit kein Sonderfall: alle drei gehen durch
+      `resettle()`, wie das Anlegen eines Knotens auch.
 
 ---
 
@@ -311,8 +362,13 @@ die Kanonizität des Layouts (§6) wackliger, als sie sein müsste.
       in `model::r#type` und in `infer`, mit verschiedenen Varianten und einer Einbahn-Brücke
       (`infer::graph_type_to_eval_type`). Zwei gleichnamige Typen in einem Crate sind eine
       Falle, ganz gleich wie das Präfix ausgeht.
-- [ ] Die drei harten Schleifendeckel (`0..128` in `settle_footprints` und in `move_node_delta`,
-      `MAX_WALK_STEPS` beim Strahl) stehen begründet da und sollen bleiben — aber wenn (1) das
-      Volumen zu einer echten Schranke macht, ist zu prüfen, ob der Deckel in `settle_footprints`
-      danach überhaupt noch erreicht werden kann. Hängt an 1.2/1.5, nicht an 1.1: die Ausdehnung
-      ist gespeichert, klemmt aber noch nichts.
+- [x] Die drei harten Schleifendeckel (`0..128` in `settle_footprints` und in `move_node_delta`,
+      `MAX_WALK_STEPS` beim Strahl) stehen begründet da und bleiben. Nachgesehen am 26.09., nachdem
+      §1 das Volumen zu einer echten Schranke gemacht hat: der Deckel in `settle_footprints` ist
+      **weiterhin erreichbar**, aber seltener, weil eine verweigerte Verschiebung jetzt früher
+      abbricht — die Schleife liest die unveränderte Position und bricht ab, statt zu pollen. Neu
+      ist, dass ein nicht konvergierter Lauf nicht mehr stillschweigend durchgeht: unter
+      `Widening::Refused` prüft `footprints_settled()` genau das und verwirft den Edit.
+      **Was offen bleibt:** unter `Widening::Allowed` wird nicht geprüft. Ein Edit, der um Platz
+      bittet, bekommt ihn, also hat die Kaskade dort immer ein Ziel — bis auf den Deckel selbst.
+      Falls der je zuschlägt, steht das Layout mit einer Überlappung da, so wie vorher auch.

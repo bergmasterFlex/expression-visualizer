@@ -351,6 +351,41 @@ impl Axis {
     }
 }
 
+/// A node standing where another node's footprint is.
+///
+/// Named rather than returned as a tuple because the four parts answer four
+/// different questions further down — see `LayoutGraph::footprint_intruder`,
+/// which is the one place the rule lives.
+struct Intruder {
+    id: crate::model::node::Id,
+    /// Its own position lies inside the footprint, rather than only a cell of
+    /// it reaching across the line. Which of the two it is decides where the
+    /// way out leads and how far.
+    inside: bool,
+    pos: IVec3,
+    footprint: AABB,
+}
+
+/// Whether a displacement may push the volume's far face outward.
+///
+/// Two answers, and which of them applies is the edit's to say. An edit that
+/// *asks* for room — building a node, opening a cell or a layer, adding an arm,
+/// declaring a type or a name that makes a node bigger — may have what it
+/// displaces widen the scope: the displacement is part of granting the request,
+/// and bounding it would refuse the request rather than the side effect.
+///
+/// A move may not, and that is the whole of `todo.md` §1. The rule
+/// `clamp_to_volume` states for the caret — *widening it is an explicit action,
+/// never a side effect of moving* — holds for what moves just as it does for
+/// what addresses. Under `Refused` the cascade stops at the boundary instead of
+/// pushing through it, and a plan that cannot be placed inside the volume is
+/// dropped whole, the way a plan reaching back through the origin already was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Widening {
+    Allowed,
+    Refused,
+}
+
 /// Inclusive 3D bounding box in grid cells. Used for match footprint math.
 #[derive(Debug, Clone, Copy)]
 pub struct AABB {
@@ -1384,11 +1419,26 @@ impl LayoutGraph {
         &self,
         node_id: crate::model::node::Id,
         delta_pos: IVec3,
+        widening: Widening,
     ) -> (Self, IVec3) {
         let Some(primary_ln) = self.layout_nodes.get(&node_id) else {
             return (self.clone_shape(), IVec3::ZERO);
         };
         let primary_origin = primary_ln.pos;
+        // How far the node reaches past the cell it is addressed by. What
+        // bounds a move is the whole of what a node occupies and not its
+        // address: a call's body lies across all of its inputs, and a Match's
+        // envelope runs to the back of its deepest branch.
+        let span = self
+            .node_footprint(&node_id)
+            .map(|fp| fp.max - primary_origin)
+            .unwrap_or(IVec3::ZERO);
+        // The far face, where there is one. `None` is not "unbounded space" but
+        // "not this edit's business": see `Widening`.
+        let far = match widening {
+            Widening::Refused => Some(self.extent),
+            Widening::Allowed => None,
+        };
         // An arm's row is not its own to set. `respace_match_patterns` derives
         // every arm's row from the arms above it, so writing one here would be
         // overwritten by the next settle — which is exactly what used to
@@ -1417,40 +1467,65 @@ impl LayoutGraph {
                 // so everything else lives strictly between them.
                 let target_z = primary_origin.z + delta_pos.z;
                 let sink_z = self.sink_z();
-                if target_z <= 0 || sink_z.is_some_and(|s| target_z >= s) {
+                if target_z <= 0 || sink_z.is_some_and(|s| target_z + span.z >= s) {
                     IVec3::new(delta_pos.x, delta_pos.y, 0)
                 } else {
                     delta_pos
                 }
             }
         };
-        let clamp_axis = |origin: i32, delta: i32| {
-            if origin + delta >= 0 {
-                delta
-            } else {
+        // The moved node alone, and on both faces now: layout space starts at
+        // the origin and the volume ends at its far corner, so a shove against
+        // either is simply no shove on that axis — the same answer the pins
+        // above give.
+        //
+        // Z is left to the pin, which is stricter than the extent would be: the
+        // last layer belongs to the Sink alone, so a node has to stop one short
+        // of the far face rather than on it.
+        let clamp_axis = |origin: i32, reach: i32, limit: Option<i32>, delta: i32| {
+            let target = origin + delta;
+            if target < 0 || limit.is_some_and(|l| target + reach > l) {
                 0
+            } else {
+                delta
             }
         };
         let delta_pos = IVec3::new(
-            clamp_axis(primary_origin.x, delta_pos.x),
-            clamp_axis(primary_origin.y, delta_pos.y),
+            clamp_axis(primary_origin.x, span.x, far.map(|f| f.x), delta_pos.x),
+            clamp_axis(primary_origin.y, span.y, far.map(|f| f.y), delta_pos.y),
             delta_pos.z,
         );
         let occupancy = self.occupancy_map();
 
         let primary_delta = self.jump_delta(&occupancy, &node_id, primary_origin, delta_pos);
 
-        // Layout space is the non-negative octant, and the clamp above speaks
-        // for the moved node alone. Everyone else who moves here moves because
-        // that one asked for it — a sibling arm carried along, a multi-cell
-        // owner riding out of its own cell in the mover's direction — and
-        // nothing clamps those. Stepping out through the origin is a move that
-        // cannot be placed, and no half of it is worth keeping: it is dropped
-        // whole, the way a plan conflict is. Silently, because it is a refusal
-        // and not an anomaly — the same answer the pins above give, and
-        // `settle_footprints` already reads an unchanged position as "refused"
-        // and stops asking.
-        let outside_space = |p: IVec3| p.x < 0 || p.y < 0 || p.z < 0;
+        // Layout space is the non-negative octant and the volume bounds it on
+        // the far side; the clamp above speaks for the moved node alone.
+        // Everyone else who moves here moves because that one asked for it — a
+        // sibling arm carried along, a multi-cell owner riding out of its own
+        // cell in the mover's direction — and nothing clamps those. A target
+        // where any cell of a node would stand outside is a move that cannot be
+        // placed, and no half of it is worth keeping: it is dropped whole, the
+        // way a plan conflict is. Silently, because it is a refusal and not an
+        // anomaly, and `settle_footprints` already reads an unchanged position
+        // as "refused" and stops asking.
+        //
+        // Cells and not addresses, for the reason `span` gives above. Read from
+        // the pre-move footprint and stepped by the move, because that is the
+        // same box in a different place — nothing about a move reshapes a node.
+        let outside_volume = |id: &crate::model::node::Id, target: IVec3| {
+            let Some(fp) = self.node_footprint(id) else {
+                return target.cmplt(IVec3::ZERO).any();
+            };
+            let origin = self
+                .layout_nodes
+                .get(id)
+                .map(|ln| ln.pos)
+                .unwrap_or(IVec3::ZERO);
+            let step = target - origin;
+            (fp.min + step).cmplt(IVec3::ZERO).any()
+                || far.is_some_and(|f| (fp.max + step).cmpgt(f).any())
+        };
 
         let mut plan: std::collections::HashMap<crate::model::node::Id, IVec3> =
             std::collections::HashMap::new();
@@ -1463,7 +1538,7 @@ impl LayoutGraph {
                 .map(|ln| ln.pos)
                 .unwrap_or(IVec3::ZERO);
             let target = origin + d;
-            if outside_space(target) {
+            if outside_volume(&id, target) {
                 return (self.clone_shape(), primary_origin);
             }
             plan.insert(id.clone(), target);
@@ -1519,7 +1594,7 @@ impl LayoutGraph {
                     .map(|ln| ln.pos)
                     .unwrap_or(IVec3::ZERO);
                 let target = origin + d;
-                if outside_space(target) {
+                if outside_volume(&id, target) {
                     return (self.clone_shape(), primary_origin);
                 }
                 plan.insert(id.clone(), target);
@@ -1578,6 +1653,122 @@ impl LayoutGraph {
         }
     }
 
+    /// Every node of this scope whose footprint is more than a single cell, and
+    /// which therefore has an inside for something to be in the wrong half of.
+    ///
+    /// Nearly all of them: a Match, a multi-input call, and equally the two
+    /// cells a Tunnel or a Constant claims for what it declares and the anchor
+    /// behind it.
+    fn multi_cell_owners(&self) -> Vec<crate::model::node::Id> {
+        self.layout_nodes
+            .keys()
+            .filter(|id| {
+                self.node_footprint(id)
+                    .map(|b| b.cells().count() > 1)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The node standing in `owner_id`'s footprint that has to give way, if one
+    /// is standing there.
+    ///
+    /// Asked twice and answered once: `settle_footprints` asks in order to push,
+    /// `footprints_settled` asks in order to find out whether there is anything
+    /// left to push. Two copies of this rule would be two rules.
+    ///
+    /// Patterns of a Match ride along with their parent, so they are never
+    /// intruders — not in their own Match's footprint and not in anyone else's.
+    /// `move_node_delta` reads a vertical move of an arm as a change to the
+    /// space above it rather than to its row, so an arm offered a push would
+    /// absorb it as spacing and sit exactly where it was, and the settle loop
+    /// would spin to its cap. For non-match owners there are no other related
+    /// ids.
+    ///
+    /// A BranchSource and a Sink are skipped for the same kind of reason:
+    /// neither can be displaced, so picking one only spins that loop. A
+    /// BranchSource is pinned to its branch origin; the Sink is placed by
+    /// `settle_sink` a moment later, which pulls it behind the deepest footprint
+    /// anyway, and `move_node_delta` refuses every move into its row.
+    ///
+    /// **Two tests, and which one applies is the owner's answer.** A node whose
+    /// own position stands inside the footprint is in the wrong place outright,
+    /// and that is the rule for every owner. It is also an asymmetric rule,
+    /// deliberately: a position is a node's address, a new node is only ever
+    /// built on a free cell, and so what is built stays where it was asked for
+    /// and what was already there gives way. A node that merely reaches in with
+    /// a cell is *not* in the wrong place by that rule — both nodes stand on
+    /// free cells and there is nothing to choose between them.
+    ///
+    /// Unless what it reaches into cannot step aside. The entry row is
+    /// furniture — it is where a scope takes its values in, and it is pinned to
+    /// Y=0, Z=0 for exactly that reason — so nothing may lie across it, and
+    /// since it cannot move out of the way, the other one does. True for the two
+    /// kinds that are an entry row: a Source in the root scope, a Tunnel one
+    /// scope in.
+    fn footprint_intruder(&self, owner_id: &crate::model::node::Id) -> Option<Intruder> {
+        let bbox = self.node_footprint(owner_id)?;
+        let related: Vec<crate::model::node::Id> = if self.is_match(owner_id) {
+            self.match_pattern_ids(owner_id)
+        } else {
+            vec![]
+        };
+        let entry_row_owner = matches!(
+            self.graph.nodes.get(owner_id),
+            Some(
+                crate::model::node::ENode::Source { .. } | crate::model::node::ENode::Tunnel { .. }
+            )
+        );
+        self.layout_nodes.iter().find_map(|(id, ln)| {
+            if id == owner_id || related.contains(id) || self.is_pattern(id) {
+                return None;
+            }
+            if matches!(
+                self.graph.nodes.get(id),
+                Some(
+                    crate::model::node::ENode::BranchSource { .. }
+                        | crate::model::node::ENode::Sink { .. }
+                )
+            ) {
+                return None;
+            }
+            let pos = ln.pos;
+            let footprint = self.node_footprint(id)?;
+            let inside = bbox.contains(pos);
+            if inside || (entry_row_owner && bbox.intersects(&footprint)) {
+                Some(Intruder {
+                    id: id.clone(),
+                    inside,
+                    pos,
+                    footprint,
+                })
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Whether every multi-cell footprint in this scope and in every scope
+    /// nested in it is clear of intruders.
+    ///
+    /// What an edit that may not widen is held to, alongside `within_extent`.
+    /// `settle_footprints` pushes every intruder out, so this is true after a
+    /// pass that finished — and false after one that could not, which with a
+    /// bounded volume is a real outcome: a push whose every exit lies outside
+    /// the volume is refused, and the intruder stays where it was. Two nodes on
+    /// one cell is not a layout to keep, and there is nothing to repair it into,
+    /// so the edit that asked for it is dropped whole.
+    pub fn footprints_settled(&self) -> bool {
+        self.multi_cell_owners()
+            .iter()
+            .all(|id| self.footprint_intruder(id).is_none())
+            && self
+                .sub_layouts
+                .values()
+                .all(|sub| sub.footprints_settled())
+    }
+
     /// Push external nodes out of every multi-cell node footprint, bottom-up.
     /// Applies to any node whose `node_footprint` has volume > 1, which is
     /// nearly all of them: a match, a multi-input call, and equally the two
@@ -1585,37 +1776,32 @@ impl LayoutGraph {
     /// behind it. Recurses into `sub_layouts` first, so inner owners settle
     /// before their container measures its own footprint.
     ///
-    /// At each level, for every such owner: scan `layout_nodes` for non-related
-    /// nodes standing inside the footprint and bump them along the axis with
-    /// the smallest exit distance — +Y for Y-overlap, ±X toward the near
-    /// footprint edge, +Z toward the sub-sink side (never −Z; that side faces
-    /// the parent wall). Every push target is clamped to the non-negative
-    /// octant, so an intruder on the low-X side of a footprint touching x=0 is
-    /// pushed out the high side instead. Uses `move_node_delta` for each bump
-    /// so cascading collisions resolve automatically. Iterates until stable
-    /// (128-step cap).
+    /// At each level, for every such owner: ask `footprint_intruder` who is in
+    /// the way — that is where *being in the way* is defined, and it is asked
+    /// rather than repeated here — and bump them along the axis with the
+    /// smallest exit distance: +Y for Y-overlap, ±X toward the near footprint
+    /// edge, +Z toward the sub-sink side (never −Z; that side faces the parent
+    /// wall). Every push goes through `move_node_delta`, so cascading
+    /// collisions resolve automatically and every push is bound by the same
+    /// rules a move is. Iterates until stable (128-step cap).
     ///
-    /// *Standing inside* means the node's own position, not its cells, and the
-    /// asymmetry is the point: a position is a node's address, and a node is
-    /// only ever built on a free cell — so what was just built keeps the place
-    /// it was asked for and what was already there gives way, rather than the
-    /// new node being shouldered off to somewhere nobody pointed at.
-    ///
-    /// The one exception is an owner that is an entry row, a Source or a
-    /// Tunnel. Those are pinned to Y=0, Z=0 and cannot step aside for anyone,
-    /// so against them a single cell reaching in is enough — which is what a
-    /// call does, one cell per input, when it stands beside one and lays an
-    /// input across it. That one steps sideways rather than going out the back.
+    /// `widening` is handed straight to those pushes and decides what happens at
+    /// the volume's far face: the cascade of an edit that asked for room may
+    /// widen the scope, the cascade of a move may not. Under `Refused` a push
+    /// with no exit inside the volume is refused, this loop reads the unchanged
+    /// position and stops, and the intruder is left standing — which is why an
+    /// edit under that policy is only kept if `footprints_settled` afterwards
+    /// says the pass actually finished.
     ///
     /// Between the recursion and the intruder pass, every Match at this level
     /// re-spaces its arms (`respace_match_patterns`). By then the branches
     /// below have settled, so their heights are final — that ordering is what
     /// carries growth out of nested Matches into their enclosing ones.
-    pub fn settle_footprints(&self) -> Self {
+    pub fn settle_footprints(&self, widening: Widening) -> Self {
         let settled_subs: std::collections::HashMap<crate::model::node::Id, LayoutGraph> = self
             .sub_layouts
             .iter()
-            .map(|(k, v)| (k.clone(), v.settle_footprints()))
+            .map(|(k, v)| (k.clone(), v.settle_footprints(widening)))
             .collect();
         let layout = Self {
             graph: self.graph.clone(),
@@ -1634,91 +1820,19 @@ impl LayoutGraph {
         let mut layout = match_ids.iter().fold(layout, |acc, mid| {
             acc.respace_match_patterns(mid).recompute_match_pos(mid)
         });
-        let owner_ids: Vec<crate::model::node::Id> = layout
-            .layout_nodes
-            .keys()
-            .filter(|id| {
-                layout
-                    .node_footprint(id)
-                    .map(|b| b.cells().count() > 1)
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
+        let owner_ids = layout.multi_cell_owners();
         for owner_id in &owner_ids {
-            // Patterns of a Match ride along with their parent, so they are
-            // never intruders — not in their own Match's footprint and not in
-            // anyone else's. `move_node_delta` reads a vertical move of an arm
-            // as a change to the space above it rather than to its row, so an
-            // arm offered a push would absorb it as spacing and sit exactly
-            // where it was, and the loop below would spin to its cap. For
-            // non-match owners there are no other related ids.
-            let related: Vec<crate::model::node::Id> = if layout.is_match(owner_id) {
-                layout.match_pattern_ids(owner_id)
-            } else {
-                vec![]
-            };
-            // Whether a cell reaching into this owner is enough to be pushed
-            // out of it, or whether it takes standing in it — see the test
-            // below. True for the two kinds that are an entry row: a Source in
-            // the root scope, a Tunnel one scope in.
-            let entry_row_owner = matches!(
-                layout.graph.nodes.get(owner_id),
-                Some(
-                    crate::model::node::ENode::Source { .. }
-                        | crate::model::node::ENode::Tunnel { .. }
-                )
-            );
             for _ in 0..128 {
                 let Some(bbox) = layout.node_footprint(owner_id) else {
                     break;
                 };
-                let intruder = layout.layout_nodes.iter().find_map(|(id, ln)| {
-                    if id == owner_id || related.contains(id) || layout.is_pattern(id) {
-                        return None;
-                    }
-                    // Neither of these can be displaced, so picking one only
-                    // spins the loop to its iteration cap. A BranchSource is
-                    // pinned to its branch origin. The Sink is placed by
-                    // `settle_sink` a moment later, which pulls it behind the
-                    // deepest footprint anyway, and `move_node_delta` refuses
-                    // every move into its row.
-                    if matches!(
-                        layout.graph.nodes.get(id),
-                        Some(
-                            crate::model::node::ENode::BranchSource { .. }
-                                | crate::model::node::ENode::Sink { .. }
-                        )
-                    ) {
-                        return None;
-                    }
-                    // Two tests, and which one applies is the owner's answer.
-                    //
-                    // A node whose own position stands inside the footprint is
-                    // in the wrong place outright, and that is the rule for
-                    // every owner. It is also an asymmetric rule, deliberately:
-                    // a position is a node's address, a new node is only ever
-                    // built on a free cell, and so what is built stays where it
-                    // was asked for and what was already there gives way. A
-                    // node that merely reaches in with a cell is *not* in the
-                    // wrong place by that rule — both nodes stand on free cells
-                    // and there is nothing to choose between them.
-                    //
-                    // Unless what it reaches into cannot step aside. The entry
-                    // row is furniture — it is where a scope takes its values
-                    // in, and it is pinned to Y=0, Z=0 for exactly that reason
-                    // — so nothing may lie across it, and since it cannot move
-                    // out of the way, the other one does.
-                    let ipos = ln.pos;
-                    let ibox = layout.node_footprint(id)?;
-                    let inside = bbox.contains(ipos);
-                    if inside || (entry_row_owner && bbox.intersects(&ibox)) {
-                        Some((id.clone(), inside, ipos, ibox))
-                    } else {
-                        None
-                    }
-                });
-                let Some((intruder_id, inside, ipos, ibox)) = intruder else {
+                let Some(Intruder {
+                    id: intruder_id,
+                    inside,
+                    pos: ipos,
+                    footprint: ibox,
+                }) = layout.footprint_intruder(owner_id)
+                else {
                     break;
                 };
                 // What the exit is measured from: the cell the node stands on,
@@ -1790,7 +1904,7 @@ impl LayoutGraph {
                     break;
                 }
                 let before = layout.layout_nodes.get(&intruder_id).map(|ln| ln.pos);
-                let (new_layout, _) = layout.move_node_delta(intruder_id.clone(), delta);
+                let (new_layout, _) = layout.move_node_delta(intruder_id.clone(), delta, widening);
                 layout = new_layout;
                 // A push the constraints refuse is not worth repeating —
                 // nothing about the next iteration would differ, and the cap
@@ -1804,7 +1918,7 @@ impl LayoutGraph {
     }
 
     /// Pin the Sink to the scope's terminal corner: X=0 always, and Z far
-    /// enough back that the volume encapsulates the deepest node.
+    /// enough back that every other node stands in front of it.
     ///
     /// `deepest_z` is the maximum over every non-sink node's `node_footprint`
     /// max.z (so multi-cell owners — function calls, Match footprints
@@ -1848,15 +1962,12 @@ impl LayoutGraph {
             ln.pos.x = 0;
             ln.pos.z = new_sink_z;
         }
-        // The Sink stands on the volume's last layer, so a Sink that moved back
-        // took the layer with it. Monotone, like the move itself: the extent is
-        // only ever pushed out here, never pulled in.
-        //
-        // This is also the one place left where depth grows without anyone
-        // having asked for it — a node built deep enough drags the Sink, and the
-        // Sink drags the volume. Made visible rather than fixed: it is one
-        // assignment, which is what `todo.md` §1.6 has to decide about.
-        layout.extent.z = layout.extent.z.max(new_sink_z);
+        // The extent is deliberately *not* written here. The Sink stands on the
+        // volume's last layer, so one that moved back needs the volume to
+        // follow — but whether it may is the edit's answer and not this pass's:
+        // `claiming_extent` records it for an edit that asked for room, and
+        // `within_extent` refuses the whole edit for one that did not. A
+        // normalisation that widened on its own is exactly what §1 is about.
         layout
     }
 
@@ -1883,13 +1994,13 @@ impl LayoutGraph {
     /// a common position: the deepest sibling sink, i.e. the one at the
     /// greatest Z. Copies that reference sink's (x, z) onto every sibling sink
     /// so the match's back wall is a single flat plane and the sinks stack
-    /// exactly above each other (only Y differs), and takes each branch's own
-    /// extent along so no volume stops short of its Sink. Nested matches are
-    /// handled by `settle_footprints`'s recursion, so this only needs to touch
-    /// matches owned at this level.
+    /// exactly above each other (only Y differs). Nested matches are handled by
+    /// `settle_footprints`'s recursion, so this only needs to touch matches
+    /// owned at this level.
     ///
     /// Only ever outward: the reference is the maximum, so no Sink is pulled
-    /// forward here and no extent has to shrink.
+    /// forward here. The branch extents that have to follow are written by
+    /// `claiming_extent`, for the reason `settle_sink` gives.
     fn harmonize_match_sinks(&self) -> Self {
         let mut layout = self.clone_shape();
         let match_ids: Vec<crate::model::node::Id> = layout
@@ -1930,11 +2041,6 @@ impl LayoutGraph {
                     ln.pos.x = ref_x;
                     ln.pos.z = ref_z;
                 }
-                // The branch's volume goes with its Sink. The flat back wall
-                // these Sinks make is the far face of every one of these
-                // volumes, and a branch whose extent stopped in front of its
-                // own Sink would hide it.
-                sub.extent.z = sub.extent.z.max(ref_z);
             }
         }
         layout
@@ -2780,44 +2886,85 @@ impl LayoutGraph {
     /// Compute the grid bounds for this graph in its own local coordinates.
     ///
     /// The volume is anchored at the scope origin — `min` is always (0,0,0),
-    /// the corner every scope owns. Nodes are what push the far corner out;
-    /// they never pull the near one along, so a graph that moved off the
-    /// origin leaves whitespace behind instead of dragging its volume with it.
+    /// the corner every scope owns — and reaches to `extent`, the far corner the
+    /// scope claims. That is the whole of the answer: **the extent is returned,
+    /// not derived.** No node is consulted about how far the scope goes, which
+    /// is what makes the volume the scope's own rather than the bounding box of
+    /// whatever happens to stand in it.
     ///
-    /// - Z: `[0, extent.z]`, read straight out of the stored extent. Both ends
-    ///   are reserved: local Z=0 is the source row (Sources in the root scope,
-    ///   the BranchSource in a branch) and the last layer belongs to the Sink
-    ///   alone, which is why every path that moves the Sink writes the extent
-    ///   too. Returns `None` where there is no Sink: the outer Root wrapper
-    ///   holds none, and a scope with no terminal is not a volume yet.
-    /// - X / Y: `[0, max]` over every node's footprint, unioned with the
-    ///   extent — the width and height the scope claims explicitly.
-    ///   Multi-cell footprints (matches, ≥3-input function calls) push the far
-    ///   corner out so their extra cells are drawable; a Match contributes its
-    ///   whole Pattern stack on Y, so a scope containing one spans every row
-    ///   its patterns occupy. That Y span is also what `scope_at` needs — the
-    ///   grid mesh itself is a single plane and uses X/Z alone, but without it
-    ///   a caret on any Pattern below the first row would fall outside every
-    ///   scope.
+    /// Both ends of Z are reserved: local Z=0 is the source row (Sources in the
+    /// root scope, the BranchSource in a branch) and the last layer belongs to
+    /// the Sink alone. On X and Y the far layer is ordinary space.
     ///
-    /// Only nodes and the extent decide this: the caret cannot widen the
-    /// volume by moving, since `clamp_to_volume` keeps it inside.
+    /// `None` where there is no Sink — the outer Root wrapper holds none, and a
+    /// scope with no terminal is not a volume yet. It is the one thing still
+    /// asked of the nodes, and it is a yes-or-no question rather than a measure.
+    ///
+    /// Widening goes through `claiming_extent` and nowhere else, so a footprint
+    /// can only ever reach past this if an edit that was not allowed to widen
+    /// produced it — which `within_extent` catches, and which is the whole of
+    /// why that check exists.
     pub fn grid_bounds(&self) -> Option<GridBounds> {
-        // Asked for the terminal and not for its depth. A Sink is what makes a
-        // scope a volume, and where it stands is the extent's business now.
         self.sink_id()?;
-        let mut max = self.extent;
-        for id in self.layout_nodes.keys() {
-            let Some(fp) = self.node_footprint(id) else {
-                continue;
-            };
-            max.x = max.x.max(fp.max.x);
-            max.y = max.y.max(fp.max.y);
-        }
         Some(GridBounds {
             min: IVec3::ZERO,
-            max,
+            max: self.extent,
         })
+    }
+
+    /// The smallest extent that would hold every node of this scope: what it
+    /// has to claim for nothing to stand outside it.
+    ///
+    /// Sub-scopes are in here through their owning Match's footprint — a branch
+    /// that grew pushes its arm out, and the arm is a cell of *this* scope —
+    /// which is what carries a claim outward through arbitrarily deep nesting.
+    fn required_extent(&self) -> IVec3 {
+        self.layout_nodes
+            .keys()
+            .filter_map(|id| self.node_footprint(id))
+            .fold(IVec3::ZERO, |acc, fp| acc.max(fp.max))
+    }
+
+    /// Whether every node of this scope, and of every scope nested in it,
+    /// stands inside its own volume.
+    ///
+    /// What an edit that may not widen is held to, alongside
+    /// `footprints_settled`. Asked *after* the settle, because the settle is
+    /// where an arm stack repacks and a Sink moves back — a move can reach the
+    /// far face through one of those without ever stepping there itself.
+    pub fn within_extent(&self) -> bool {
+        self.required_extent().cmple(self.extent).all()
+            && self.sub_layouts.values().all(|sub| sub.within_extent())
+    }
+
+    /// Grow this scope's extent — and every nested scope's — to hold what
+    /// stands in it.
+    ///
+    /// **The one door the volume ever widens through.** Every other path reads
+    /// the extent and none writes it, which is the whole of what makes the
+    /// volume the scope's own: it is as big as some edit asked for it to be, and
+    /// never as big as the nodes happen to have spread.
+    ///
+    /// Bottom-up, because an enclosing scope measures its arms against a branch
+    /// that has already claimed what it needs.
+    ///
+    /// Only ever outward. Room made is room kept — the same sentence
+    /// `plus_empty_layer` says about a layer it opened — so deleting a node
+    /// leaves the whitespace it stood in rather than closing the scope around
+    /// the hole.
+    pub fn claiming_extent(&self) -> Self {
+        let claimed = Self {
+            graph: self.graph.clone(),
+            layout_nodes: self.layout_nodes.clone(),
+            extent: self.extent,
+            sub_layouts: self
+                .sub_layouts
+                .iter()
+                .map(|(k, v)| (k.clone(), v.claiming_extent()))
+                .collect(),
+        };
+        let extent = claimed.extent.max(claimed.required_extent());
+        Self { extent, ..claimed }
     }
 
     /// Clamp a global cell address into this graph's volume, i.e. the bounds
@@ -2825,10 +2972,11 @@ impl LayoutGraph {
     ///
     /// Caret navigation goes through here: widening the volume — adding empty
     /// cells to move into — is an explicit action and never a side effect of
-    /// moving. On Z that now holds all the way down, because the depth is the
-    /// volume's own; on X and Y the far corner still follows the nodes, and
-    /// closing that gap is `todo.md` §1.2. With no Sink there is no volume yet;
-    /// only the non-negative half-space constrains the address then.
+    /// moving. It holds on all three axes now, and for everything and not only
+    /// the caret: `grid_bounds` returns the stored extent, `move_node_delta`
+    /// bounds a move against it, and `claiming_extent` is the one thing that
+    /// writes it. With no Sink there is no volume yet; only the non-negative
+    /// half-space constrains the address then.
     pub fn clamp_to_volume(&self, global: IVec3) -> IVec3 {
         match self.grid_bounds() {
             Some(bounds) => global.clamp(bounds.min, bounds.max),
@@ -2948,9 +3096,10 @@ impl LayoutGraph {
             return None;
         }
         let mut layout = self.clone_shape();
-        // Room made is room kept. The bounds are otherwise re-derived from the
-        // node positions alone, so the freed layer would collapse as soon as
-        // the graph normalises and the scope would read as shifted, not wider.
+        // Room made is room kept, and this is where the making is said out loud:
+        // a layer opened in empty space moves no node at all, so the claim below
+        // is the only record that it was opened. `claiming_extent` afterwards
+        // covers whatever *did* move; it cannot cover what did not.
         if let Some(prev) = self.grid_bounds() {
             let claim = axis.of(prev.max) + 1;
             match axis {
